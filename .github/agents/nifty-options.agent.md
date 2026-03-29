@@ -11,8 +11,19 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 
 ## Project Structure
 
+- `app.py` — Top-level entry point for production (gunicorn import)
+- `requirements.txt` — Python dependencies (Flask, yfinance, curl_cffi, websocket-client, gunicorn)
+- `render.yaml` — Render.com deployment config (auto-deploy from GitHub)
 - `scripts/fetch_nifty_options.py` — NSE options chain fetcher (uses `curl_cffi` with Chrome TLS impersonation to bypass NSE bot detection)
 - `scripts/nifty_chart.py` — Flask-based interactive candlestick chart server (port 5050)
+- `scripts/__init__.py` — Package init for module imports
+
+## Deployment
+
+- **GitHub Repository**: https://github.com/MangalParan/mangal-view
+- **Live Site**: https://mangal-view.onrender.com (Render.com free tier)
+- **Production Server**: gunicorn with 2 workers, 4 threads, 120s timeout
+- **Auto-deploy**: Push to `master` branch triggers automatic Render redeploy
 
 ## Capabilities
 
@@ -95,8 +106,9 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Key difference from Default**: Default engine is trend-following (9 indicators, momentum-based, threshold ≥ 3.5). Janestreet is contrarian (7 indicators, mean-reversion, threshold ≥ 3.0).
 
 ### Backtest (Strategy Tester)
-- **Backtest dropdown menu** in toolbar with two items:
-  - **Strategy** — opens TradingView-style Strategy Tester panel
+- **Backtest dropdown menu** in toolbar with three items:
+  - **Strategy** — opens TradingView-style Strategy Tester panel with the currently active algorithm
+  - **Janestreet** — switches to Janestreet algorithm, reloads data, and opens backtest panel with full results (also updates FII dropdown to reflect Janestreet as active)
   - **Options** — placeholder for future options backtesting
 - **Strategy Tester Panel** with 3 tabs:
   - **Overview** — initial/final capital (₹1,00,000 default), net profit, buy & hold comparison, profit factor, win rate, Sharpe ratio, max drawdown, expectancy
@@ -151,7 +163,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Search**: Yahoo Finance ticker info API — resolves symbol names, exchanges, and proper ticker suffixes
 
 ## Dependencies
-- Python 3.13, Flask 3.1.0, yfinance 1.2.0, curl_cffi, requests, websocket-client 1.9.0
+- Python 3.13, Flask 3.1.0, yfinance 1.2.0, curl_cffi 0.13.0, websocket-client 1.9.0, gunicorn 23.0.0
 - TradingView Lightweight Charts v4.1.3 (loaded via CDN: unpkg.com)
 
 ## Performance
