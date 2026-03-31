@@ -141,6 +141,33 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
   - **V −** — Vertical zoom out
   - **↺ Reset** — Fit all data to view
 
+### Trade Menu & Futures Paper Trading
+- **Trade dropdown menu** in toolbar with three items:
+  - **Stocks** — placeholder for future stock trading
+  - **Futures** — click to expand sub-menu with:
+    - **Positions** — opens draggable Futures Trading panel
+    - **Log** — opens draggable Trade Log panel
+  - **Options** — placeholder for future options trading
+- **Futures sub-menu** is click-based (not hover) — clicking "Futures" toggles inline expand/collapse of Positions and Log items
+- **Futures Trading Panel** (Positions):
+  - **Symbol dropdown** — all 11 preset symbols (auto-selects current chart symbol)
+  - **Capital input** — starting capital (default: ₹1,00,000)
+  - **Algorithm dropdown** — choose Default Strategy or Janestreet Strategy for signal generation
+  - **Start/Stop Trading** button — starts paper trading session; auto-trades based on live chart signals
+  - **Live status section** — shows: Status (Flat/Long), Entry Price, Qty, Unrealized P/L, Capital, Total Trades, Net P/L, Win Rate, Max Drawdown
+  - Symbol, Capital, and Algorithm inputs are disabled during active trading
+- **Trade Log Panel** — shows full trade history table: #, Type (BUY/SELL), Price, Qty, Time (IST), P/L (with color coding), Capital after trade
+- **Signal-based auto-trading**: When paper trading is active, new BUY/SELL signals from the chart are automatically sent to the server for execution
+- **Draggable panels** — both Positions and Trade Log panels can be dragged anywhere on the chart by grabbing the header bar
+- **Click-to-dismiss** — clicking anywhere on the chart area closes both trade panels; re-open via Trade → Futures → Positions/Log
+
+### Trade API (Backend)
+- **In-memory state** — `paper_trades` dict keyed by session ID (non-persistent, resets on server restart)
+- `POST /api/trade/start` — creates new session with `{symbol, capital, algo}`, returns `{sessionId}`
+- `POST /api/trade/execute` — processes signal `{sessionId, signal, price, time}`, executes BUY (enter long) or SELL (exit long), tracks equity curve and drawdown
+- `POST /api/trade/stop` — closes any open position at `{currentPrice}`, returns final summary with all metrics
+- `GET /api/trade/status?sessionId=...` — returns full session state: trades, equity curve, summary (totalTrades, winRate, profitFactor, avgTrade, avgWin, avgLoss, largestWin, largestLoss, maxDrawdown, netPnl)
+
 ## Commands
 
 ### Options Chain
@@ -153,6 +180,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Start server**: `python scripts/nifty_chart.py` → opens at http://localhost:5050
 - **API endpoint**: `GET /api/candles?interval=5m&symbol=NIFTY50&source=tradingview&algo=janestreet&st_period=10&st_multiplier=3&sar_start=0.02&sar_inc=0.02&sar_max=0.2&bb_period=20&bb_stddev=2.0&bt_qty=0`
 - **Search endpoint**: `GET /api/search?q=reliance` — searches Yahoo Finance, auto-resolves `.NS`/`.BO` suffixes for Indian stocks
+- **Trade endpoints**: `POST /api/trade/start`, `POST /api/trade/execute`, `POST /api/trade/stop`, `GET /api/trade/status?sessionId=...`
 - Returns JSON: `{candles, supertrend, parabolicSAR, supportResistance, ema9, ema21, vwap, rsi, macd, patterns, signals, signalSummary, cpr, bollingerBands, liquidityPools, fairValueGaps, bosChoch, cvd, backtest}`
 
 ## Data Sources

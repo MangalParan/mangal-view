@@ -14,14 +14,62 @@ import os
 import random
 import re
 import string
+import uuid
 from datetime import datetime, timedelta
 
 import websocket
 import yfinance as yf
 from curl_cffi import requests as cffi_requests
+
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
+
+# --- Real Trade (Delta) State ---
+delta_sessions = {}
+delta_orders = {}
+
+# --- Real Trade (Delta) API Stubs ---
+@app.route('/api/realtrade/delta/login', methods=['POST'])
+def delta_login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    # TODO: Integrate with Delta API
+    if username and password:
+        session_id = str(uuid.uuid4())
+        delta_sessions[session_id] = {'username': username, 'token': 'mock_token'}
+        return jsonify({'success': True, 'sessionId': session_id})
+    return jsonify({'success': False, 'error': 'Missing credentials'}), 400
+
+@app.route('/api/realtrade/delta/order', methods=['POST'])
+def delta_order():
+    data = request.json
+    session_id = data.get('sessionId')
+    symbol = data.get('symbol')
+    qty = data.get('qty')
+    side = data.get('side')
+    sl_pct = data.get('sl_pct')
+    tgt_pct = data.get('tgt_pct')
+    capital = data.get('capital')
+    # TODO: Place real order via Delta API
+    if session_id in delta_sessions:
+        order_id = str(uuid.uuid4())
+        delta_orders[order_id] = {
+            'symbol': symbol, 'qty': qty, 'side': side, 'sl_pct': sl_pct, 'tgt_pct': tgt_pct, 'capital': capital,
+            'status': 'placed', 'timestamp': datetime.utcnow().isoformat()
+        }
+        return jsonify({'success': True, 'orderId': order_id})
+    return jsonify({'success': False, 'error': 'Invalid session'}), 403
+
+@app.route('/api/realtrade/delta/status', methods=['GET'])
+def delta_status():
+    session_id = request.args.get('sessionId')
+    # TODO: Query real position/P&L from Delta API
+    if session_id in delta_sessions:
+        # Mock status
+        return jsonify({'success': True, 'position': 'FLAT', 'pnl': 0, 'orders': list(delta_orders.values())})
+    return jsonify({'success': False, 'error': 'Invalid session'}), 403
 
 TICKER = "^NSEI"
 IST_OFFSET = 19800  # UTC+5:30 in seconds
@@ -32,8 +80,8 @@ SYMBOL_MAP = {
     "SENSEX":     {"ticker": "^BSESN",    "name": "SENSEX",      "exchange": "BSE"},
     "GOLD":       {"ticker": "GC=F",      "name": "Gold Futures", "exchange": "COMEX"},
     "SILVER":     {"ticker": "SI=F",      "name": "Silver Futures", "exchange": "COMEX"},
-    "XAUUSD":     {"ticker": "GC=F",      "name": "XAU/USD",     "exchange": "COMEX"},
-    "XAGUSD":     {"ticker": "SI=F",      "name": "XAG/USD",     "exchange": "COMEX"},
+    "XAUUSD":     {"ticker": "XAUUSD=X",  "name": "XAU/USD",     "exchange": "FX"},
+    "XAGUSD":     {"ticker": "XAGUSD=X",  "name": "XAG/USD",     "exchange": "FX"},
     "GOLDTEN":    {"ticker": "GOLDBEES.NS", "name": "Gold ETF",  "exchange": "NSE"},
     "SILVERBEES": {"ticker": "SILVERBEES.NS", "name": "Silver ETF", "exchange": "NSE"},
     "BTC":        {"ticker": "BTC-USD",        "name": "Bitcoin",    "exchange": "CRYPTO"},
@@ -60,8 +108,8 @@ TV_SYMBOL_MAP = {
     "SENSEX":     "BSE:SENSEX",
     "GOLD":       "COMEX:GC1!",
     "SILVER":     "COMEX:SI1!",
-    "XAUUSD":     "COMEX:GC1!",
-    "XAGUSD":     "COMEX:SI1!",
+    "XAUUSD":     "FX_IDC:XAUUSD",
+    "XAGUSD":     "FX_IDC:XAGUSD",
     "GOLDTEN":    "NSE:GOLDBEES",
     "SILVERBEES": "NSE:SILVERBEES",
     "BTC":        "BITSTAMP:BTCUSD",
@@ -2121,6 +2169,201 @@ def api_search():
     return jsonify([])
 
 
+# ---------------------------------------------------------------------------
+# Paper Trading State (in-memory)
+# ---------------------------------------------------------------------------
+paper_trades = {}  # session_id -> session dict
+
+
+@app.route("/api/trade/start", methods=["POST"])
+def api_trade_start():
+    data = request.get_json(force=True)
+    symbol = data.get("symbol", "NIFTY50")
+    capital = float(data.get("capital", 100000))
+    algo = data.get("algo", "janestreet")
+    sid = uuid.uuid4().hex[:12]
+    paper_trades[sid] = {
+        "symbol": symbol,
+        "algo": algo,
+        "initialCapital": capital,
+        "capital": capital,
+        "position": 0,
+        "entryPrice": 0,
+        "entryTime": 0,
+        "qty": 0,
+        "trades": [],
+        "equityCurve": [{"time": 0, "value": capital}],
+        "peakEquity": capital,
+        "maxDrawdown": 0,
+        "maxDrawdownPct": 0,
+        "active": True,
+        "lastSignalTime": 0,
+    }
+    return jsonify({"sessionId": sid, "status": "started"})
+
+
+@app.route("/api/trade/execute", methods=["POST"])
+def api_trade_execute():
+    data = request.get_json(force=True)
+    sid = data.get("sessionId", "")
+    session = paper_trades.get(sid)
+    if not session or not session["active"]:
+        return jsonify({"error": "Invalid or inactive session"}), 400
+
+    sig_type = data.get("signalType", "")
+    price = float(data.get("price", 0))
+    sig_time = data.get("time", 0)
+
+    if sig_time <= session["lastSignalTime"]:
+        return jsonify({"status": "duplicate", "trade": None})
+
+    session["lastSignalTime"] = sig_time
+    trade = None
+
+    if sig_type in ("BUY", "STRONG_BUY") and session["position"] == 0:
+        qty = int(session["capital"] / price) if price > 0 else 0
+        if qty <= 0:
+            return jsonify({"status": "insufficient_capital", "trade": None})
+        session["position"] = 1
+        session["entryPrice"] = price
+        session["entryTime"] = sig_time
+        session["qty"] = qty
+        trade = {"action": "BUY", "price": round(price, 2), "qty": qty,
+                 "time": sig_time, "capital": round(session["capital"], 2)}
+
+    elif sig_type in ("SELL", "STRONG_SELL") and session["position"] == 1:
+        pnl = (price - session["entryPrice"]) * session["qty"]
+        pnl_pct = ((price - session["entryPrice"]) / session["entryPrice"]) * 100 if session["entryPrice"] else 0
+        session["capital"] += pnl
+        trade_rec = {
+            "entryTime": session["entryTime"],
+            "exitTime": sig_time,
+            "entryPrice": round(session["entryPrice"], 2),
+            "exitPrice": round(price, 2),
+            "qty": session["qty"],
+            "pnl": round(pnl, 2),
+            "pnlPct": round(pnl_pct, 2),
+            "capital": round(session["capital"], 2),
+        }
+        session["trades"].append(trade_rec)
+        session["equityCurve"].append({"time": sig_time, "value": round(session["capital"], 2)})
+        session["peakEquity"] = max(session["peakEquity"], session["capital"])
+        dd = session["peakEquity"] - session["capital"]
+        dd_pct = (dd / session["peakEquity"] * 100) if session["peakEquity"] else 0
+        session["maxDrawdown"] = max(session["maxDrawdown"], dd)
+        session["maxDrawdownPct"] = max(session["maxDrawdownPct"], dd_pct)
+        session["position"] = 0
+        session["qty"] = 0
+        session["entryPrice"] = 0
+        session["entryTime"] = 0
+        trade = {"action": "SELL", "price": round(price, 2), "qty": trade_rec["qty"],
+                 "time": sig_time, "pnl": trade_rec["pnl"], "capital": trade_rec["capital"]}
+
+    return jsonify({"status": "ok", "trade": trade, "summary": _trade_summary(session)})
+
+
+@app.route("/api/trade/stop", methods=["POST"])
+def api_trade_stop():
+    data = request.get_json(force=True)
+    sid = data.get("sessionId", "")
+    price = float(data.get("price", 0))
+    session = paper_trades.get(sid)
+    if not session:
+        return jsonify({"error": "Invalid session"}), 400
+
+    # Close open position at provided price
+    if session["position"] == 1 and price > 0:
+        pnl = (price - session["entryPrice"]) * session["qty"]
+        pnl_pct = ((price - session["entryPrice"]) / session["entryPrice"]) * 100 if session["entryPrice"] else 0
+        session["capital"] += pnl
+        trade_rec = {
+            "entryTime": session["entryTime"],
+            "exitTime": int(datetime.now().timestamp()),
+            "entryPrice": round(session["entryPrice"], 2),
+            "exitPrice": round(price, 2),
+            "qty": session["qty"],
+            "pnl": round(pnl, 2),
+            "pnlPct": round(pnl_pct, 2),
+            "capital": round(session["capital"], 2),
+            "forced": True,
+        }
+        session["trades"].append(trade_rec)
+        session["equityCurve"].append({"time": trade_rec["exitTime"], "value": round(session["capital"], 2)})
+        session["peakEquity"] = max(session["peakEquity"], session["capital"])
+        dd = session["peakEquity"] - session["capital"]
+        dd_pct = (dd / session["peakEquity"] * 100) if session["peakEquity"] else 0
+        session["maxDrawdown"] = max(session["maxDrawdown"], dd)
+        session["maxDrawdownPct"] = max(session["maxDrawdownPct"], dd_pct)
+        session["position"] = 0
+
+    session["active"] = False
+    return jsonify({"status": "stopped", "summary": _trade_summary(session)})
+
+
+@app.route("/api/trade/status")
+def api_trade_status():
+    sid = request.args.get("session_id", "")
+    session = paper_trades.get(sid)
+    if not session:
+        return jsonify({"error": "Invalid session"}), 400
+    return jsonify({
+        "active": session["active"],
+        "symbol": session["symbol"],
+        "algo": session["algo"],
+        "position": session["position"],
+        "entryPrice": round(session["entryPrice"], 2),
+        "qty": session["qty"],
+        "capital": round(session["capital"], 2),
+        "trades": session["trades"],
+        "equityCurve": session["equityCurve"],
+        "summary": _trade_summary(session),
+    })
+
+
+def _trade_summary(session):
+    trades = session["trades"]
+    initial = session["initialCapital"]
+    capital = session["capital"]
+    net = capital - initial
+    net_pct = (net / initial * 100) if initial else 0
+    total = len(trades)
+    if total == 0:
+        return {"totalTrades": 0, "netProfit": 0, "netProfitPct": 0,
+                "initialCapital": initial, "finalCapital": round(capital, 2),
+                "maxDrawdown": 0, "maxDrawdownPct": 0}
+    winners = [t for t in trades if t["pnl"] > 0]
+    losers = [t for t in trades if t["pnl"] < 0]
+    gross_profit = sum(t["pnl"] for t in winners)
+    gross_loss = abs(sum(t["pnl"] for t in losers))
+    pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else ("∞" if gross_profit > 0 else 0)
+    win_rate = round(len(winners) / total * 100, 2) if total else 0
+    avg_trade = round(net / total, 2)
+    avg_win = round(gross_profit / len(winners), 2) if winners else 0
+    avg_loss = round(-gross_loss / len(losers), 2) if losers else 0
+    largest_win = round(max((t["pnl"] for t in winners), default=0), 2)
+    largest_loss = round(min((t["pnl"] for t in losers), default=0), 2)
+    return {
+        "totalTrades": total,
+        "winningTrades": len(winners),
+        "losingTrades": len(losers),
+        "netProfit": round(net, 2),
+        "netProfitPct": round(net_pct, 2),
+        "grossProfit": round(gross_profit, 2),
+        "grossLoss": round(gross_loss, 2),
+        "profitFactor": pf,
+        "winRate": win_rate,
+        "avgTrade": avg_trade,
+        "avgWin": avg_win,
+        "avgLoss": avg_loss,
+        "largestWin": largest_win,
+        "largestLoss": largest_loss,
+        "maxDrawdown": round(session["maxDrawdown"], 2),
+        "maxDrawdownPct": round(session["maxDrawdownPct"], 2),
+        "initialCapital": initial,
+        "finalCapital": round(capital, 2),
+    }
+
+
 @app.route("/")
 def index():
     """Serve the main HTML page containing the interactive TradingView-style chart.
@@ -2509,6 +2752,121 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
   }
   .zm-item:hover { background: #2a2e39; }
+
+  /* Trade Dropdown */
+  .trade-dropdown-wrapper { position: relative; }
+  .trade-dropdown {
+    position: absolute; top: 100%; left: 0; background: #1e222d; border: 1px solid #2a2e39;
+    border-radius: 6px; padding: 4px 0; min-width: 160px; z-index: 300;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none;
+  }
+  .trade-dropdown.open { display: block; }
+  .trade-item {
+    display: block; padding: 8px 16px; color: #d1d4dc; font-size: 13px;
+    cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
+    position: relative;
+  }
+  .trade-item:hover { background: #2a2e39; }
+  .trade-item.disabled { color: #555; cursor: default; }
+  .trade-item.disabled:hover { background: none; }
+  .trade-item.has-sub::after { content: '\25B6'; float: right; font-size: 10px; margin-top: 2px; }
+  .trade-item.has-sub.expanded::after { content: '\25BC'; }
+  .trade-sub {
+    display: none; padding-left: 12px; background: #181c27;
+    border-left: 2px solid #2962ff;
+  }
+  .trade-sub.open { display: block; }
+  .trade-sub-item {
+    display: block; padding: 8px 16px; color: #d1d4dc; font-size: 13px;
+    cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
+  }
+  .trade-sub-item:hover { background: #2a2e39; }
+
+  /* Trade Panels */
+  .trade-panel, .trade-log-panel {
+    position: absolute; top: 44px; right: 12px; z-index: 200;
+    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    padding: 0; width: 420px; display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5); max-height: calc(100vh - 100px); overflow-y: auto;
+  }
+  .trade-panel.open, .trade-log-panel.open { display: block; }
+  .tp-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px; border-bottom: 1px solid #2a2e39; cursor: move; user-select: none;
+  }
+  .tp-header h3 { font-size: 14px; color: #fff; margin: 0; }
+  .tp-close { background: none; border: none; color: #787b86; font-size: 20px; cursor: pointer; }
+  .tp-close:hover { color: #fff; }
+  .tp-body { padding: 16px; }
+  .tp-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .tp-row label { color: #787b86; font-size: 12px; min-width: 60px; }
+  .tp-row select, .tp-row input[type=number] {
+    flex: 1; padding: 6px 10px; background: #131722; border: 1px solid #2a2e39;
+    border-radius: 4px; color: #d1d4dc; font-size: 13px;
+  }
+  .tp-algo { color: #787b86; font-size: 11px; margin-bottom: 12px; }
+  .tp-start-btn {
+    width: 100%; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
+    font-weight: 700; cursor: pointer; transition: background 0.2s;
+  }
+  .tp-start-btn.start { background: #26a69a; color: #fff; }
+  .tp-start-btn.start:hover { background: #2bbd8e; }
+  .tp-start-btn.stop { background: #ef5350; color: #fff; }
+  .tp-start-btn.stop:hover { background: #ff6b68; }
+  .tp-status {
+    margin-top: 16px; padding: 12px; background: #131722; border-radius: 6px;
+    border: 1px solid #2a2e39; display: none;
+  }
+  .tp-status.visible { display: block; }
+  .tp-status-row {
+    display: flex; justify-content: space-between; padding: 4px 0;
+    font-size: 12px; color: #787b86;
+  }
+  .tp-status-row .val { color: #d1d4dc; font-weight: 600; }
+  .tp-status-row .val.positive { color: #26a69a; }
+  .tp-status-row .val.negative { color: #ef5350; }
+
+  /* Real Trade Dropdown */
+  .realtrade-dropdown-wrapper { position: relative; display: inline-block; }
+  .realtrade-dropdown {
+    position: absolute; top: 36px; left: 0; background: #23273a; border: 1px solid #2a2e39; border-radius: 8px;
+    min-width: 160px; z-index: 210; display: none; box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  .realtrade-dropdown.open { display: block; }
+  .realtrade-item { width: 100%; background: none; border: none; color: #d1d4dc; padding: 10px 18px; text-align: left; font-size: 14px; cursor: pointer; transition: background 0.2s; }
+  .realtrade-item:hover:not(.disabled) { background: #2a2e39; }
+  .realtrade-item.disabled { color: #787b86; cursor: not-allowed; }
+
+  /* Real Trade Panel */
+  .realtrade-panel {
+    position: absolute; top: 80px; right: 60px; z-index: 220;
+    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    padding: 0; width: 420px; display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5); max-height: calc(100vh - 100px); overflow-y: auto;
+  }
+  .realtrade-panel.open { display: block; }
+  .rt-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px; border-bottom: 1px solid #2a2e39; cursor: move; user-select: none;
+  }
+  .rt-header h3 { font-size: 14px; color: #fff; margin: 0; }
+  .rt-close { background: none; border: none; color: #787b86; font-size: 20px; cursor: pointer; }
+  .rt-close:hover { color: #fff; }
+  .rt-body { padding: 16px; }
+  .rt-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .rt-row label { color: #787b86; font-size: 12px; min-width: 60px; }
+  .rt-row input[type=text], .rt-row input[type=password], .rt-row input[type=number] {
+    flex: 1; padding: 6px 10px; background: #131722; border: 1px solid #2a2e39;
+    border-radius: 4px; color: #d1d4dc; font-size: 13px;
+  }
+  .rt-start-btn {
+    width: 100%; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
+    font-weight: 700; cursor: pointer; transition: background 0.2s;
+    background: #43a047; color: #fff;
+  }
+  .rt-start-btn:hover { background: #388e3c; }
+  .rt-status { margin-top: 16px; padding: 12px; background: #131722; border-radius: 6px; border: 1px solid #2a2e39; color: #d1d4dc; font-size: 13px; }
+
   /* Signal Panel */
   .signal-panel {
     position: absolute; top: 44px; right: 300px; z-index: 200;
@@ -2744,6 +3102,92 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="separator"></div>
+  <div class="trade-dropdown-wrapper">
+    <button class="ind-btn" id="btnTrade"><span class="dot" style="background:#FF5722"></span>Trade &#9662;</button>
+    <div class="trade-dropdown" id="tradeDropdown">
+      <button class="trade-item disabled">&#128200; Stocks</button>
+      <button class="trade-item has-sub" id="tradeFutures">&#128202; Futures</button>
+      <div class="trade-sub" id="futuresSub">
+        <button class="trade-sub-item" id="tradePositions">&#128203; Positions</button>
+        <button class="trade-sub-item" id="tradeLog">&#128196; Log</button>
+      </div>
+      <button class="trade-item disabled">&#128176; Options</button>
+    </div>
+  </div>
+  <div class="realtrade-dropdown-wrapper">
+    <button class="ind-btn" id="btnRealTrade"><span class="dot" style="background:#43a047"></span>Real Trade &#9662;</button>
+    <div class="realtrade-dropdown" id="realTradeDropdown">
+      <button class="realtrade-item" id="realDelta">Delta</button>
+      <button class="realtrade-item disabled">Zerodha</button>
+      <button class="realtrade-item disabled">Mt5</button>
+    </div>
+  </div>
+  <!-- Delta Real Trade Panel Modal -->
+  <div class="realtrade-panel" id="realTradePanel" style="display:none">
+    <div class="rt-header">
+      <h3>&#128179; Delta Real Trading</h3>
+      <button class="rt-close" id="rtClose">&times;</button>
+    </div>
+    <div class="rt-body">
+      <div class="rt-row">
+        <label>Username</label>
+        <input type="text" id="rtUsername" autocomplete="username">
+      </div>
+      <div class="rt-row">
+        <label>Password</label>
+        <input type="password" id="rtPassword" autocomplete="current-password">
+      </div>
+      <div class="rt-row">
+        <label>Capital</label>
+        <input type="number" id="rtCapital" value="100000" min="1000" step="1000">
+      </div>
+      <div class="rt-row">
+        <label>Quantity</label>
+        <input type="number" id="rtQty" value="" min="1" step="1" placeholder="Auto from capital">
+      </div>
+      <div class="rt-row">
+        <label>Symbol</label>
+        <input type="text" id="rtSymbol" placeholder="e.g. NIFTY50">
+      </div>
+      <div class="rt-row">
+        <label>SL %</label>
+        <input type="number" id="rtSL" value="1.0" min="0.1" step="0.1">
+      </div>
+      <div class="rt-row">
+        <label>Target %</label>
+        <input type="number" id="rtTarget" value="2.0" min="0.1" step="0.1">
+      </div>
+      <div class="rt-row" id="rtModeRow" style="display:flex">
+        <label>Mode</label>
+        <select id="rtMode">
+          <option value="signals">Signals</option>
+          <option value="manual">Manual</option>
+        </select>
+      </div>
+      <div class="rt-row" id="rtManualBtns" style="display:none;gap:10px">
+        <button class="rt-buy-btn" id="rtBuyBtn">Buy</button>
+        <button class="rt-sell-btn" id="rtSellBtn">Sell</button>
+      </div>
+      <button class="rt-start-btn start" id="rtStartBtn">Start Trading</button>
+      <div class="rt-status" id="rtStatus" style="display:none"></div>
+      <div class="tp-status" id="rtPosStatusBox" style="display:none;margin-top:16px">
+        <div class="tp-status-row"><span>Status</span><span class="val" id="rtPosStatus">Flat</span></div>
+        <div class="tp-status-row"><span>Entry Price</span><span class="val" id="rtEntryPrice">-</span></div>
+        <div class="tp-status-row"><span>Qty</span><span class="val" id="rtQtyVal">-</span></div>
+        <div class="tp-status-row"><span>Unrealized P/L</span><span class="val" id="rtUnrealPnl">-</span></div>
+        <div class="tp-status-row"><span>Capital</span><span class="val" id="rtCurCapital">-</span></div>
+        <div class="tp-status-row"><span>Total Trades</span><span class="val" id="rtTotalTrades">0</span></div>
+        <div class="tp-status-row"><span>Net P/L</span><span class="val" id="rtNetPnl">-</span></div>
+        <div class="tp-status-row"><span>Win Rate</span><span class="val" id="rtWinRate">-</span></div>
+        <div class="tp-status-row"><span>Max Drawdown</span><span class="val" id="rtMaxDD">-</span></div>
+      </div>
+      <div class="rt-log-panel" id="rtLogPanel" style="margin-top:18px;display:none">
+        <h4 style="color:#fff;font-size:13px;margin:0 0 8px 0">Trade Log</h4>
+        <div id="rtLogBody" style="max-height:120px;overflow-y:auto;background:#181c27;border-radius:6px;padding:8px 6px;font-size:12px;color:#d1d4dc"></div>
+      </div>
+    </div>
+  </div>
+  <div class="separator"></div>
   <button class="live-btn" id="btnLive" title="Toggle live continuous data feed"><span class="live-dot"></span>LIVE</button>
   <div class="separator"></div>
   <div class="zoom-dropdown-wrapper">
@@ -2820,6 +3264,54 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="bt-content hidden" id="btPerformance"></div>
     <div class="bt-content hidden" id="btTrades"></div>
   </div>
+
+  <!-- Futures Positions Panel -->
+  <div class="trade-panel" id="tradePanel">
+    <div class="tp-header">
+      <h3>&#128202; Futures Trading</h3>
+      <button class="tp-close" id="tpClose">&times;</button>
+    </div>
+    <div class="tp-body">
+      <div class="tp-row">
+        <label>Symbol</label>
+        <select id="tpSymbol"></select>
+      </div>
+      <div class="tp-row">
+        <label>Capital</label>
+        <input type="number" id="tpCapital" value="100000" min="1000" step="1000">
+      </div>
+      <div class="tp-row">
+        <label>Algorithm</label>
+        <select id="tpAlgo">
+          <option value="default">Default Strategy</option>
+          <option value="janestreet" selected>Janestreet Strategy</option>
+        </select>
+      </div>
+      <button class="tp-start-btn start" id="tpStartBtn">Start Trading</button>
+      <div class="tp-status" id="tpStatus">
+        <div class="tp-status-row"><span>Status</span><span class="val" id="tpPosStatus">Flat</span></div>
+        <div class="tp-status-row"><span>Entry Price</span><span class="val" id="tpEntryPrice">-</span></div>
+        <div class="tp-status-row"><span>Qty</span><span class="val" id="tpQty">-</span></div>
+        <div class="tp-status-row"><span>Unrealized P/L</span><span class="val" id="tpUnrealPnl">-</span></div>
+        <div class="tp-status-row"><span>Capital</span><span class="val" id="tpCurCapital">-</span></div>
+        <div class="tp-status-row"><span>Total Trades</span><span class="val" id="tpTotalTrades">0</span></div>
+        <div class="tp-status-row"><span>Net P/L</span><span class="val" id="tpNetPnl">-</span></div>
+        <div class="tp-status-row"><span>Win Rate</span><span class="val" id="tpWinRate">-</span></div>
+        <div class="tp-status-row"><span>Max Drawdown</span><span class="val" id="tpMaxDD">-</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trade Log Panel -->
+  <div class="trade-log-panel" id="tradeLogPanel">
+    <div class="tp-header">
+      <h3>&#128196; Trade Log</h3>
+      <button class="tp-close" id="tlClose">&times;</button>
+    </div>
+    <div class="tp-body" id="tradeLogBody">
+      <div style="text-align:center;padding:30px;color:#787b86">No trades yet. Start a Futures position first.</div>
+    </div>
+  </div>
 </div>
 
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -2891,6 +3383,187 @@ HTML_PAGE = r"""<!DOCTYPE html>
   cvdSeries.priceScale().applyOptions({ scaleMargins: { top: 0.7, bottom: 0.02 }, visible: false });
   cvdSeries.applyOptions({ visible: false });
 
+
+    // ---- Delta Real Trading Logic ----
+    let deltaSessionId = null;
+    let deltaTrading = false;
+    let deltaStatusInterval = null;
+    const rtStartBtn = document.getElementById('rtStartBtn');
+    const rtStatus = document.getElementById('rtStatus');
+    function setDeltaPanelEnabled(enabled) {
+      document.getElementById('rtUsername').disabled = !enabled;
+      document.getElementById('rtPassword').disabled = !enabled;
+      document.getElementById('rtCapital').disabled = !enabled;
+      document.getElementById('rtQty').disabled = !enabled;
+      document.getElementById('rtSymbol').disabled = !enabled;
+      document.getElementById('rtSL').disabled = !enabled;
+      document.getElementById('rtTarget').disabled = !enabled;
+    }
+    rtStartBtn.addEventListener('click', async function() {
+      if (!deltaTrading) {
+        // Login and start trading
+        const username = document.getElementById('rtUsername').value.trim();
+        const password = document.getElementById('rtPassword').value.trim();
+        const capital = parseFloat(document.getElementById('rtCapital').value) || 100000;
+        const qtyInput = parseInt(document.getElementById('rtQty').value) || 0;
+        const symbol = document.getElementById('rtSymbol').value.trim();
+        const sl_pct = parseFloat(document.getElementById('rtSL').value) || 1.0;
+        const tgt_pct = parseFloat(document.getElementById('rtTarget').value) || 2.0;
+        if (!username || !password || !symbol) {
+          rtStatus.style.display = 'block';
+          rtStatus.textContent = 'Please enter all required fields.';
+          return;
+        }
+        rtStatus.style.display = 'block';
+        rtStatus.textContent = 'Logging in...';
+          document.getElementById('rtPosStatusBox').style.display = 'none';
+        try {
+          const resp = await fetch('/api/realtrade/delta/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({username, password})
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            rtStatus.textContent = 'Login failed: ' + (data.error || 'Unknown error');
+            return;
+          }
+          deltaSessionId = data.sessionId;
+          setDeltaPanelEnabled(false);
+          rtStartBtn.textContent = 'Stop Trading';
+          rtStartBtn.classList.remove('start');
+          rtStartBtn.classList.add('stop');
+          deltaTrading = true;
+          rtStatus.textContent = 'Trading started. Waiting for signals...';
+          // Start polling status
+          deltaStatusInterval = setInterval(async function() {
+            if (!deltaSessionId) return;
+            const resp = await fetch('/api/realtrade/delta/status?sessionId=' + deltaSessionId);
+            const data = await resp.json();
+            if (data.success) {
+              // Update status box
+              document.getElementById('rtPosStatusBox').style.display = 'block';
+              document.getElementById('rtPosStatus').textContent = data.position || '-';
+              document.getElementById('rtEntryPrice').textContent = data.entryPrice || '-';
+              document.getElementById('rtQtyVal').textContent = data.qty || '-';
+              document.getElementById('rtUnrealPnl').textContent = data.unrealPnl || '-';
+              document.getElementById('rtCurCapital').textContent = data.capital || '-';
+              document.getElementById('rtTotalTrades').textContent = data.totalTrades || '0';
+              document.getElementById('rtNetPnl').textContent = data.netPnl || '-';
+              document.getElementById('rtWinRate').textContent = data.winRate || '-';
+              document.getElementById('rtMaxDD').textContent = data.maxDrawdown || '-';
+              // Update trade log
+              if (data.orders) {
+                renderDeltaTradeLog(data.orders);
+              }
+            }
+          }, 3000);
+
+          // Show log panel
+          document.getElementById('rtLogPanel').style.display = 'block';
+              // Render Delta trade log
+              function renderDeltaTradeLog(orders) {
+                const body = document.getElementById('rtLogBody');
+                if (!orders || orders.length === 0) {
+                  body.innerHTML = '<div style="text-align:center;color:#787b86">No trades yet.</div>';
+                  return;
+                }
+                let html = '<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="color:#aaa"><th style="text-align:left">#</th><th>Type</th><th>Price</th><th>Qty</th><th>Time</th><th>P/L</th></tr></thead><tbody>';
+                orders.slice(-20).forEach((o, i) => {
+                  html += `<tr><td>${orders.length-20+i+1}</td><td>${o.side}</td><td>${o.price}</td><td>${o.qty}</td><td>${o.time||'-'}</td><td style="color:${o.pnl>0?'#26a69a':o.pnl<0?'#ef5350':'#d1d4dc'}">${o.pnl||'-'}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                body.innerHTML = html;
+              }
+          // Attach signal handler
+          // Attach signal handler (signals mode only)
+          window.deltaRealTradeSignalHandler = async function(signal, price) {
+            if (!deltaTrading || !deltaSessionId) return;
+            if (document.getElementById('rtMode').value !== 'signals') return;
+            // Only act on BUY/SELL signals
+            if (signal.type !== 'BUY' && signal.type !== 'SELL') return;
+            await placeDeltaOrder(signal.type, price);
+          };
+        } catch(err) {
+          rtStatus.textContent = 'Login error: ' + err;
+        }
+      } else {
+        // Stop trading
+        deltaTrading = false;
+        deltaSessionId = null;
+        setDeltaPanelEnabled(true);
+        rtStartBtn.textContent = 'Start Trading';
+        rtStartBtn.classList.remove('stop');
+        rtStartBtn.classList.add('start');
+        rtStatus.textContent = 'Stopped.';
+        if (deltaStatusInterval) clearInterval(deltaStatusInterval);
+        window.deltaRealTradeSignalHandler = null;
+        document.getElementById('rtPosStatusBox').style.display = 'none';
+      }
+    });
+
+    // Hook into signal processing
+        // Manual buy/sell button logic
+        document.getElementById('rtMode').addEventListener('change', function() {
+          if (this.value === 'manual') {
+            document.getElementById('rtManualBtns').style.display = 'flex';
+          } else {
+            document.getElementById('rtManualBtns').style.display = 'none';
+          }
+        });
+        async function placeDeltaOrder(side, price) {
+          const capital = parseFloat(document.getElementById('rtCapital').value) || 100000;
+          const qtyInput = parseInt(document.getElementById('rtQty').value) || 0;
+          const symbol = document.getElementById('rtSymbol').value.trim();
+          const sl_pct = parseFloat(document.getElementById('rtSL').value) || 1.0;
+          const tgt_pct = parseFloat(document.getElementById('rtTarget').value) || 2.0;
+          let qty = qtyInput > 0 ? qtyInput : Math.floor(capital / price);
+          try {
+            const resp = await fetch('/api/realtrade/delta/order', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                sessionId: deltaSessionId,
+                symbol,
+                qty,
+                side,
+                sl_pct,
+                tgt_pct,
+                capital
+              })
+            });
+            const data = await resp.json();
+            if (data.success) {
+              rtStatus.textContent = 'Order placed: ' + side + ' ' + qty + ' ' + symbol + ' @ ' + price;
+            } else {
+              rtStatus.textContent = 'Order error: ' + (data.error || 'Unknown error');
+            }
+          } catch(err) {
+            rtStatus.textContent = 'Order error: ' + err;
+          }
+        }
+        document.getElementById('rtBuyBtn').addEventListener('click', async function() {
+          if (!deltaTrading || !deltaSessionId) return;
+          // Use latest price from chart
+          const lastBar = candleData[candleData.length-1];
+          const price = lastBar ? lastBar.close : 0;
+          await placeDeltaOrder('BUY', price);
+        });
+        document.getElementById('rtSellBtn').addEventListener('click', async function() {
+          if (!deltaTrading || !deltaSessionId) return;
+          const lastBar = candleData[candleData.length-1];
+          const price = lastBar ? lastBar.close : 0;
+          await placeDeltaOrder('SELL', price);
+        });
+    const origProcessTradeSignal = window.processTradeSignal;
+    window.processTradeSignal = async function(signal, price) {
+      if (window.deltaRealTradeSignalHandler) {
+        await window.deltaRealTradeSignalHandler(signal, price);
+      }
+      if (origProcessTradeSignal) {
+        await origProcessTradeSignal(signal, price);
+      }
+    };
   // SuperTrend: two line series (bullish=green, bearish=red)
   const stBullSeries = chart.addLineSeries({ color: '#26a69a', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
   const stBearSeries = chart.addLineSeries({ color: '#ef5350', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
@@ -3472,6 +4145,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         renderBacktest(lastBacktest);
       }
 
+      // --- Paper Trading: process new signals ---
+      if (paperTrading && tradeSessionId && sigs.length > 0) {
+        const latestSig = sigs[sigs.length - 1];
+        if (latestSig.time > lastProcessedSigTime) {
+          const sigCandle = json.candles.find(c => c.time === latestSig.time);
+          const sigPrice = sigCandle ? sigCandle.close : (candleData.length > 0 ? candleData[candleData.length - 1].close : 0);
+          processTradeSignal(latestSig, sigPrice);
+        }
+        // Update unrealized P/L
+        if (candleData.length > 0) {
+          updateUnrealizedPnl(candleData[candleData.length - 1].close);
+        }
+        // Auto-refresh log panel if open
+        if (tradeLogPanel.classList.contains('open')) renderTradeLog();
+      }
+
       // Restore zoom position if this is a background update, otherwise fit
       if (background && savedLogicalRange) {
         chart.timeScale().setVisibleLogicalRange(savedLogicalRange);
@@ -3768,6 +4457,354 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('btTrades').classList.toggle('hidden', target !== 'trades');
     });
   });
+
+  // ---- Trade Dropdown ----
+    // ---- Real Trade Dropdown ----
+    const realTradeDropdown = document.getElementById('realTradeDropdown');
+    document.getElementById('btnRealTrade').addEventListener('click', function(e) {
+      e.stopPropagation();
+      realTradeDropdown.classList.toggle('open');
+      tradeDropdown.classList.remove('open');
+      indDropdown.classList.remove('open');
+      btDropdown.classList.remove('open');
+      dsDropdown.classList.remove('open');
+      fiiDropdown.classList.remove('open');
+      if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
+      if (typeof zoomDropdown !== 'undefined') zoomDropdown.classList.remove('open');
+    });
+    document.addEventListener('click', function(e) {
+      if (!e.target.closest('.realtrade-dropdown-wrapper')) realTradeDropdown.classList.remove('open');
+    });
+    // Delta panel open/close
+    const realTradePanel = document.getElementById('realTradePanel');
+    document.getElementById('realDelta').addEventListener('click', function(e) {
+      e.stopPropagation();
+      realTradeDropdown.classList.remove('open');
+      realTradePanel.style.display = 'block';
+      setTimeout(function() { realTradePanel.classList.add('open'); }, 10);
+    });
+    document.getElementById('rtClose').addEventListener('click', function() {
+      realTradePanel.classList.remove('open');
+      setTimeout(function() { realTradePanel.style.display = 'none'; }, 200);
+    });
+    // Dismiss modal on chart click
+    container.addEventListener('click', function(e) {
+      if (!e.target.closest('.realtrade-panel') && !e.target.closest('.realtrade-dropdown-wrapper')) {
+        realTradePanel.classList.remove('open');
+        setTimeout(function() { realTradePanel.style.display = 'none'; }, 200);
+      }
+    });
+    // Make Delta panel draggable
+    (function() {
+      const panel = realTradePanel;
+      const header = panel.querySelector('.rt-header');
+      let isDragging = false, startX, startY, origLeft, origTop;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('.rt-close')) return;
+        isDragging = true;
+        const rect = panel.getBoundingClientRect();
+        const parentRect = panel.offsetParent.getBoundingClientRect();
+        origLeft = rect.left - parentRect.left;
+        origTop = rect.top - parentRect.top;
+        startX = e.clientX;
+        startY = e.clientY;
+        panel.style.right = 'auto';
+        panel.style.left = origLeft + 'px';
+        panel.style.top = origTop + 'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', function(e) {
+        if (!isDragging) return;
+        panel.style.left = (origLeft + e.clientX - startX) + 'px';
+        panel.style.top = (origTop + e.clientY - startY) + 'px';
+      });
+      document.addEventListener('mouseup', function() { isDragging = false; });
+    })();
+  let paperTrading = false;
+  let tradeSessionId = null;
+  let lastProcessedSigTime = 0;
+  const tradeDropdown = document.getElementById('tradeDropdown');
+  const tradePanel = document.getElementById('tradePanel');
+  const tradeLogPanel = document.getElementById('tradeLogPanel');
+
+  // Populate symbol dropdown
+  const tpSymbol = document.getElementById('tpSymbol');
+  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH'];
+  symbolKeys.forEach(function(k) {
+    const opt = document.createElement('option');
+    opt.value = k;
+    opt.textContent = k;
+    if (k === currentSymbol) opt.selected = true;
+    tpSymbol.appendChild(opt);
+  });
+
+  document.getElementById('btnTrade').addEventListener('click', function(e) {
+    e.stopPropagation();
+    tradeDropdown.classList.toggle('open');
+    indDropdown.classList.remove('open');
+    btDropdown.classList.remove('open');
+    dsDropdown.classList.remove('open');
+    fiiDropdown.classList.remove('open');
+    if (typeof zoomDropdown !== 'undefined') zoomDropdown.classList.remove('open');
+    if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
+  });
+  document.addEventListener('click', function(e) {
+    if (!e.target.closest('.trade-dropdown-wrapper')) tradeDropdown.classList.remove('open');
+  });
+
+  document.getElementById('tradeFutures').addEventListener('click', function(e) {
+    e.stopPropagation();
+    this.classList.toggle('expanded');
+    document.getElementById('futuresSub').classList.toggle('open');
+  });
+  document.getElementById('tradePositions').addEventListener('click', function(e) {
+    e.stopPropagation();
+    tradeDropdown.classList.remove('open');
+    tradeLogPanel.classList.remove('open');
+    tradePanel.classList.toggle('open');
+    document.getElementById('tpAlgo').value = currentAlgo;
+  });
+  document.getElementById('tradeLog').addEventListener('click', function(e) {
+    e.stopPropagation();
+    tradeDropdown.classList.remove('open');
+    tradePanel.classList.remove('open');
+    tradeLogPanel.classList.toggle('open');
+    if (tradeLogPanel.classList.contains('open')) renderTradeLog();
+  });
+  document.getElementById('tpClose').addEventListener('click', function() {
+    tradePanel.classList.remove('open');
+  });
+  document.getElementById('tlClose').addEventListener('click', function() {
+    tradeLogPanel.classList.remove('open');
+  });
+
+  // Click on chart dismisses trade panels
+  container.addEventListener('click', function(e) {
+    if (!e.target.closest('.trade-panel') && !e.target.closest('.trade-log-panel') && !e.target.closest('.trade-dropdown-wrapper')) {
+      tradePanel.classList.remove('open');
+      tradeLogPanel.classList.remove('open');
+    }
+  });
+
+  // Draggable trade panels
+  function makeDraggable(panel) {
+    const header = panel.querySelector('.tp-header');
+    let isDragging = false, startX, startY, origLeft, origTop;
+    header.addEventListener('mousedown', function(e) {
+      if (e.target.closest('.tp-close')) return;
+      isDragging = true;
+      const rect = panel.getBoundingClientRect();
+      const parentRect = panel.offsetParent.getBoundingClientRect();
+      origLeft = rect.left - parentRect.left;
+      origTop = rect.top - parentRect.top;
+      startX = e.clientX;
+      startY = e.clientY;
+      panel.style.right = 'auto';
+      panel.style.left = origLeft + 'px';
+      panel.style.top = origTop + 'px';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+      if (!isDragging) return;
+      panel.style.left = (origLeft + e.clientX - startX) + 'px';
+      panel.style.top = (origTop + e.clientY - startY) + 'px';
+    });
+    document.addEventListener('mouseup', function() {
+      isDragging = false;
+    });
+  }
+  makeDraggable(tradePanel);
+  makeDraggable(tradeLogPanel);
+
+  // Start / Stop trading
+  const tpStartBtn = document.getElementById('tpStartBtn');
+  tpStartBtn.addEventListener('click', async function() {
+    if (!paperTrading) {
+      // START
+      const symbol = tpSymbol.value;
+      const capital = parseFloat(document.getElementById('tpCapital').value) || 100000;
+      const tradeAlgo = document.getElementById('tpAlgo').value;
+      try {
+        const resp = await fetch('/api/trade/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({symbol: symbol, capital: capital, algo: tradeAlgo})
+        });
+        const data = await resp.json();
+        tradeSessionId = data.sessionId;
+        paperTrading = true;
+        lastProcessedSigTime = 0;
+        tpStartBtn.textContent = 'Stop Trading';
+        tpStartBtn.classList.remove('start');
+        tpStartBtn.classList.add('stop');
+        tpSymbol.disabled = true;
+        document.getElementById('tpCapital').disabled = true;
+        document.getElementById('tpAlgo').disabled = true;
+        document.getElementById('tpStatus').classList.add('visible');
+        updateTradeStatus({
+          totalTrades: 0, netProfit: 0, winRate: 0, maxDrawdown: 0,
+          initialCapital: capital, finalCapital: capital
+        }, 0, 0, 0, capital);
+        // Enable live mode if not already
+        if (!liveMode) {
+          document.getElementById('btnLive').click();
+        }
+      } catch(err) {
+        console.error('Trade start error:', err);
+      }
+    } else {
+      // STOP
+      const lastPrice = candleData.length > 0 ? candleData[candleData.length - 1].close : 0;
+      try {
+        const resp = await fetch('/api/trade/stop', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sessionId: tradeSessionId, price: lastPrice})
+        });
+        const data = await resp.json();
+        paperTrading = false;
+        tpStartBtn.textContent = 'Start Trading';
+        tpStartBtn.classList.remove('stop');
+        tpStartBtn.classList.add('start');
+        tpSymbol.disabled = false;
+        document.getElementById('tpCapital').disabled = false;
+        document.getElementById('tpAlgo').disabled = false;
+        if (data.summary) {
+          updateTradeStatus(data.summary, 0, 0, 0, data.summary.finalCapital);
+        }
+      } catch(err) {
+        console.error('Trade stop error:', err);
+      }
+    }
+  });
+
+  function updateTradeStatus(summary, position, entryPrice, qty, capital) {
+    document.getElementById('tpPosStatus').textContent = position === 1 ? 'LONG' : 'Flat';
+    document.getElementById('tpPosStatus').className = 'val' + (position === 1 ? ' positive' : '');
+    document.getElementById('tpEntryPrice').textContent = entryPrice > 0 ? fmtNum(entryPrice) : '-';
+    document.getElementById('tpQty').textContent = qty > 0 ? qty : '-';
+    document.getElementById('tpCurCapital').textContent = '\u20B9' + fmtNum(capital);
+    document.getElementById('tpTotalTrades').textContent = summary.totalTrades || 0;
+    const netPnl = summary.netProfit || 0;
+    const netEl = document.getElementById('tpNetPnl');
+    netEl.textContent = (netPnl >= 0 ? '+' : '') + '\u20B9' + fmtNum(netPnl);
+    netEl.className = 'val ' + (netPnl >= 0 ? 'positive' : 'negative');
+    const wr = document.getElementById('tpWinRate');
+    wr.textContent = summary.winRate !== undefined ? fmtNum(summary.winRate) + '%' : '-';
+    wr.className = 'val ' + (summary.winRate >= 50 ? 'positive' : 'negative');
+    const dd = document.getElementById('tpMaxDD');
+    dd.textContent = '\u20B9' + fmtNum(summary.maxDrawdown || 0) + ' (' + fmtNum(summary.maxDrawdownPct || 0) + '%)';
+    dd.className = 'val negative';
+  }
+
+  function updateUnrealizedPnl(currentPrice) {
+    if (!paperTrading || !tradeSessionId) return;
+    const entryP = parseFloat(document.getElementById('tpEntryPrice').textContent.replace(/,/g, ''));
+    const qtyText = document.getElementById('tpQty').textContent;
+    if (isNaN(entryP) || qtyText === '-') {
+      document.getElementById('tpUnrealPnl').textContent = '-';
+      document.getElementById('tpUnrealPnl').className = 'val';
+      return;
+    }
+    const qty = parseInt(qtyText);
+    const unrealPnl = (currentPrice - entryP) * qty;
+    const el = document.getElementById('tpUnrealPnl');
+    el.textContent = (unrealPnl >= 0 ? '+' : '') + '\u20B9' + fmtNum(unrealPnl);
+    el.className = 'val ' + (unrealPnl >= 0 ? 'positive' : 'negative');
+  }
+
+  async function processTradeSignal(signal, price) {
+    if (!paperTrading || !tradeSessionId) return;
+    if (signal.time <= lastProcessedSigTime) return;
+    try {
+      const resp = await fetch('/api/trade/execute', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          sessionId: tradeSessionId,
+          signalType: signal.type,
+          price: price,
+          time: signal.time
+        })
+      });
+      const data = await resp.json();
+      if (data.status === 'ok') {
+        lastProcessedSigTime = signal.time;
+        // Refresh status from server
+        const statusResp = await fetch('/api/trade/status?session_id=' + tradeSessionId);
+        const statusData = await statusResp.json();
+        updateTradeStatus(
+          statusData.summary,
+          statusData.position,
+          statusData.entryPrice,
+          statusData.qty,
+          statusData.capital
+        );
+      }
+    } catch(err) {
+      console.error('Trade execute error:', err);
+    }
+  }
+
+  function renderTradeLog() {
+    const body = document.getElementById('tradeLogBody');
+    if (!tradeSessionId) {
+      body.innerHTML = '<div style="text-align:center;padding:30px;color:#787b86">No trades yet. Start a Futures position first.</div>';
+      return;
+    }
+    fetch('/api/trade/status?session_id=' + tradeSessionId)
+      .then(r => r.json())
+      .then(data => {
+        const trades = data.trades || [];
+        const summary = data.summary || {};
+        if (trades.length === 0) {
+          body.innerHTML = '<div style="text-align:center;padding:30px;color:#787b86">No trades executed yet. Waiting for signals...</div>';
+          return;
+        }
+        let html = '<table class="bt-trade-table"><thead><tr>' +
+          '<th>#</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Entry &#8377;</th><th>Exit &#8377;</th><th>P&L</th><th>%</th>' +
+          '</tr></thead><tbody>';
+        trades.forEach(function(tr, i) {
+          const cls = tr.pnl >= 0 ? 'positive' : 'negative';
+          const barW = Math.min(Math.abs(tr.pnlPct) * 5, 60);
+          const barColor = tr.pnl >= 0 ? '#26a69a' : '#ef5350';
+          html += '<tr>' +
+            '<td>' + (i + 1) + '</td>' +
+            '<td>' + fmtTime(tr.entryTime) + '</td>' +
+            '<td>' + fmtTime(tr.exitTime) + (tr.forced ? ' &#9888;' : '') + '</td>' +
+            '<td>' + tr.qty + '</td>' +
+            '<td>' + fmtNum(tr.entryPrice) + '</td>' +
+            '<td>' + fmtNum(tr.exitPrice) + '</td>' +
+            '<td class="' + cls + '">' + (tr.pnl >= 0 ? '+' : '') + fmtNum(tr.pnl) +
+              ' <span class="bt-pnl-bar" style="background:' + barColor + ';width:' + barW + 'px"></span></td>' +
+            '<td class="' + cls + '">' + (tr.pnlPct >= 0 ? '+' : '') + fmtNum(tr.pnlPct) + '%</td>' +
+            '</tr>';
+        });
+        html += '</tbody></table>';
+        // Summary footer
+        const npClass = (summary.netProfit || 0) >= 0 ? 'positive' : 'negative';
+        html += '<div class="bt-equity-box" style="margin-top:12px">' +
+          '<div class="bt-equity-row"><span class="label">Initial Capital</span><span class="val">&#8377;' + fmtNum(summary.initialCapital) + '</span></div>' +
+          '<div class="bt-equity-row"><span class="label">Final Capital</span><span class="val ' + npClass + '">&#8377;' + fmtNum(summary.finalCapital) + '</span></div>' +
+          '<div class="bt-equity-row"><span class="label">Net P/L</span><span class="val ' + npClass + '">&#8377;' + fmtNum(summary.netProfit) + ' (' + fmtNum(summary.netProfitPct) + '%)</span></div>' +
+          '</div>' +
+          '<div class="bt-stat-grid">' +
+            statCell('Total Trades', summary.totalTrades, '') +
+            statCell('Win Rate', fmtNum(summary.winRate) + '%', (summary.winRate || 0) >= 50 ? 'positive' : 'negative') +
+            statCell('Profit Factor', summary.profitFactor, '') +
+            statCell('Avg Trade', '&#8377;' + fmtNum(summary.avgTrade), (summary.avgTrade || 0) >= 0 ? 'positive' : 'negative') +
+            statCell('Avg Win', '&#8377;' + fmtNum(summary.avgWin), 'positive') +
+            statCell('Avg Loss', '&#8377;' + fmtNum(summary.avgLoss), 'negative') +
+            statCell('Largest Win', '&#8377;' + fmtNum(summary.largestWin), 'positive') +
+            statCell('Largest Loss', '&#8377;' + fmtNum(summary.largestLoss), 'negative') +
+            statCell('Max Drawdown', '&#8377;' + fmtNum(summary.maxDrawdown) + ' (' + fmtNum(summary.maxDrawdownPct) + '%)', 'negative') +
+          '</div>';
+        body.innerHTML = html;
+      })
+      .catch(function(err) {
+        body.innerHTML = '<div style="text-align:center;padding:30px;color:#ef5350">Error loading trade log.</div>';
+      });
+  }
 
   function fmtNum(n, decimal) {
     if (n === undefined || n === null) return '-';
