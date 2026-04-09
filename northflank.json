@@ -1,0 +1,32 @@
+{
+  "name": "mangal-view",
+  "description": "Mangal View - Trading Chart & Signal Tool",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "ports": [
+    {
+      "internalPort": 8080,
+      "protocol": "HTTP",
+      "public": true,
+      "name": "app",
+      "domains": []
+    }
+  ],
+  "environment": {
+    "PORT": "8080",
+    "SECRET_KEY": "change-me-in-production",
+    "DB_PATH": "/data/users.db"
+  },
+  "resources": {
+    "cpu": "0.5",
+    "memory": "1024"
+  },
+  "volumes": [
+    {
+      "name": "mangal-data",
+      "mountPath": "/data",
+      "size": "1Gi"
+    }
+  ]
+}

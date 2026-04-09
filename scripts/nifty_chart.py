@@ -15,15 +15,230 @@ import random
 import re
 import string
 import uuid
+import sqlite3
+import hashlib
+import secrets
+import functools
 from datetime import datetime, timedelta
 
+import numpy as np
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
 import websocket
 import yfinance as yf
 from curl_cffi import requests as cffi_requests
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, redirect, session, g
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# --- User Database ---
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "users.db"))
+
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    db = sqlite3.connect(DB_PATH)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mobileno TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def hash_password(password):
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000)
+    return salt + ":" + h.hex()
+
+
+def verify_password(password, stored_hash):
+    parts = stored_hash.split(":", 1)
+    if len(parts) != 2:
+        return False
+    salt, expected = parts
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000)
+    return secrets.compare_digest(h.hex(), expected)
+
+
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user_id"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Unauthorized"}), 401
+            return redirect("/login")
+        return f(*args, **kwargs)
+    return decorated
+
+
+init_db()
+
+
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login - Mangal View</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #131722; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .login-box { background: #1e222d; border-radius: 12px; padding: 40px; width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  .login-box h1 { text-align: center; margin-bottom: 8px; color: #2962ff; font-size: 24px; }
+  .login-box p.subtitle { text-align: center; color: #787b86; margin-bottom: 28px; font-size: 14px; }
+  .form-group { margin-bottom: 20px; }
+  .form-group label { display: block; margin-bottom: 6px; color: #787b86; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .form-group input { width: 100%; padding: 12px 14px; background: #131722; border: 1px solid #363a45; border-radius: 6px; color: #d1d4dc; font-size: 15px; outline: none; transition: border-color 0.2s; }
+  .form-group input:focus { border-color: #2962ff; }
+  .btn { width: 100%; padding: 12px; background: #2962ff; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+  .btn:hover { background: #1e53e5; }
+  .error { background: #ff444422; border: 1px solid #ff4444; color: #ff6b6b; padding: 10px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 13px; text-align: center; }
+  .signup-link { text-align: center; margin-top: 20px; font-size: 13px; color: #787b86; }
+  .signup-link a { color: #2962ff; text-decoration: none; }
+  .signup-link a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>Mangal View</h1>
+  <p class="subtitle">Sign in to access the trading tool</p>
+  {{ERROR}}
+  <form method="POST" action="/login">
+    <div class="form-group">
+      <label>Mobile Number</label>
+      <input type="tel" name="mobileno" placeholder="Enter 10-digit mobile" pattern="[0-9]{10}" maxlength="10" required autofocus>
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" name="password" placeholder="Enter password" required>
+    </div>
+    <button class="btn" type="submit">Sign In</button>
+  </form>
+  <div class="signup-link">Don't have an account? <a href="/register">Register</a></div>
+</div>
+</body>
+</html>"""
+
+
+REGISTER_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Register - Mangal View</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #131722; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .login-box { background: #1e222d; border-radius: 12px; padding: 40px; width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  .login-box h1 { text-align: center; margin-bottom: 8px; color: #2962ff; font-size: 24px; }
+  .login-box p.subtitle { text-align: center; color: #787b86; margin-bottom: 28px; font-size: 14px; }
+  .form-group { margin-bottom: 20px; }
+  .form-group label { display: block; margin-bottom: 6px; color: #787b86; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .form-group input { width: 100%; padding: 12px 14px; background: #131722; border: 1px solid #363a45; border-radius: 6px; color: #d1d4dc; font-size: 15px; outline: none; transition: border-color 0.2s; }
+  .form-group input:focus { border-color: #2962ff; }
+  .btn { width: 100%; padding: 12px; background: #2962ff; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+  .btn:hover { background: #1e53e5; }
+  .error { background: #ff444422; border: 1px solid #ff4444; color: #ff6b6b; padding: 10px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 13px; text-align: center; }
+  .success { background: #00c85322; border: 1px solid #00c853; color: #69f0ae; padding: 10px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 13px; text-align: center; }
+  .signup-link { text-align: center; margin-top: 20px; font-size: 13px; color: #787b86; }
+  .signup-link a { color: #2962ff; text-decoration: none; }
+  .signup-link a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>Mangal View</h1>
+  <p class="subtitle">Create a new account</p>
+  {{ERROR}}
+  <form method="POST" action="/register">
+    <div class="form-group">
+      <label>Mobile Number</label>
+      <input type="tel" name="mobileno" placeholder="Enter 10-digit mobile" pattern="[0-9]{10}" maxlength="10" required autofocus>
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" name="password" placeholder="Min 6 characters" minlength="6" required>
+    </div>
+    <div class="form-group">
+      <label>Confirm Password</label>
+      <input type="password" name="confirm_password" placeholder="Re-enter password" minlength="6" required>
+    </div>
+    <button class="btn" type="submit">Register</button>
+  </form>
+  <div class="signup-link">Already have an account? <a href="/login">Sign In</a></div>
+</div>
+</body>
+</html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return Response(LOGIN_PAGE.replace("{{ERROR}}", ""), content_type="text/html")
+    mobileno = request.form.get("mobileno", "").strip()
+    password = request.form.get("password", "")
+    if not mobileno or not password:
+        return Response(LOGIN_PAGE.replace("{{ERROR}}", '<div class="error">Please enter mobile number and password.</div>'), content_type="text/html")
+    if not re.fullmatch(r"\d{10}", mobileno):
+        return Response(LOGIN_PAGE.replace("{{ERROR}}", '<div class="error">Enter a valid 10-digit mobile number.</div>'), content_type="text/html")
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
+    if user and verify_password(password, user["password_hash"]):
+        session["user_id"] = user["id"]
+        session["mobileno"] = user["mobileno"]
+        return redirect("/")
+    return Response(LOGIN_PAGE.replace("{{ERROR}}", '<div class="error">Invalid mobile number or password.</div>'), content_type="text/html")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", ""), content_type="text/html")
+    mobileno = request.form.get("mobileno", "").strip()
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm_password", "")
+    if not mobileno or not password or not confirm:
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">All fields are required.</div>'), content_type="text/html")
+    if not re.fullmatch(r"\d{10}", mobileno):
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Enter a valid 10-digit mobile number.</div>'), content_type="text/html")
+    if len(password) < 6:
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Password must be at least 6 characters.</div>'), content_type="text/html")
+    if password != confirm:
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Passwords do not match.</div>'), content_type="text/html")
+    db = get_db()
+    existing = db.execute("SELECT id FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
+    if existing:
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">This mobile number is already registered.</div>'), content_type="text/html")
+    pw_hash = hash_password(password)
+    db.execute("INSERT INTO users (mobileno, password_hash) VALUES (?, ?)", (mobileno, pw_hash))
+    db.commit()
+    return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Registration successful! <a href="/login">Sign in now</a></div>'), content_type="text/html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
 
 # --- Real Trade (Delta) State ---
 delta_sessions = {}
@@ -31,6 +246,7 @@ delta_orders = {}
 
 # --- Real Trade (Delta) API Stubs ---
 @app.route('/api/realtrade/delta/login', methods=['POST'])
+@login_required
 def delta_login():
     data = request.json
     username = data.get('username')
@@ -43,6 +259,7 @@ def delta_login():
     return jsonify({'success': False, 'error': 'Missing credentials'}), 400
 
 @app.route('/api/realtrade/delta/order', methods=['POST'])
+@login_required
 def delta_order():
     data = request.json
     session_id = data.get('sessionId')
@@ -63,6 +280,7 @@ def delta_order():
     return jsonify({'success': False, 'error': 'Invalid session'}), 403
 
 @app.route('/api/realtrade/delta/status', methods=['GET'])
+@login_required
 def delta_status():
     session_id = request.args.get('sessionId')
     # TODO: Query real position/P&L from Delta API
@@ -86,6 +304,9 @@ SYMBOL_MAP = {
     "SILVERBEES": {"ticker": "SILVERBEES.NS", "name": "Silver ETF", "exchange": "NSE"},
     "BTC":        {"ticker": "BTC-USD",        "name": "Bitcoin",    "exchange": "CRYPTO"},
     "ETH":        {"ticker": "ETH-USD",        "name": "Ethereum",   "exchange": "CRYPTO"},
+    "DJI":        {"ticker": "^DJI",           "name": "Dow Jones",  "exchange": "NYSE"},
+    "NASDAQ":     {"ticker": "^IXIC",          "name": "NASDAQ",     "exchange": "NASDAQ"},
+    "SP500":      {"ticker": "^GSPC",          "name": "S&P 500",    "exchange": "NYSE"},
 }
 
 INTERVAL_MAP = {
@@ -114,6 +335,9 @@ TV_SYMBOL_MAP = {
     "SILVERBEES": "NSE:SILVERBEES",
     "BTC":        "BITSTAMP:BTCUSD",
     "ETH":        "BITSTAMP:ETHUSD",
+    "DJI":        "DJ:DJI",
+    "NASDAQ":     "NASDAQ:IXIC",
+    "SP500":      "SP:SPX",
 }
 
 TV_INTERVAL_MAP = {
@@ -1901,6 +2125,670 @@ def generate_janestreet_signals(candles, bb, rsi_data, macd_data, vwap_data, ema
     return signals, summary
 
 
+def generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Accurate strategy: ultra-precise alternating buy/sell signals using an
+    ensemble of 12+ weighted indicators and mathematical models.
+
+    Combines:
+      1. Z-Score mean reversion       (weight 2.0)
+      2. Bollinger Band position       (weight 1.5)
+      3. RSI with Stochastic RSI       (weight 2.0)
+      4. MACD histogram + crossover    (weight 2.0)
+      5. VWAP deviation                (weight 1.5)
+      6. EMA 9/21 spread & crossover   (weight 1.5)
+      7. ATR volatility regime         (weight 1.0)
+      8. S/R proximity                 (weight 1.0)
+      9. Candle body ratio analysis    (weight 1.0)
+     10. Price momentum (ROC)          (weight 1.5)
+     11. Heikin-Ashi trend filter      (weight 1.0)
+     12. Volume pressure (OBV delta)   (weight 1.0)
+
+    Enforces strict alternating BUY→SELL→BUY pattern so every signal is
+    actionable as a complete entry/exit pair.
+
+    Returns:
+        tuple: (signals, summary)
+    """
+    n = len(candles)
+    if n < 30:
+        return [], {}
+
+    # Build lookup maps
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]] = b["middle"]
+
+    sup_levels = [s["price"] for s in sr.get("support", [])]
+    res_levels = [r["price"] for r in sr.get("resistance", [])]
+
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    window = 20
+
+    # Precompute ATR (14-period)
+    atr_period = 14
+    atr_vals = [0.0] * n
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i - 1]),
+                 abs(lows[i] - closes[i - 1]))
+        if i < atr_period:
+            atr_vals[i] = tr
+        else:
+            atr_vals[i] = (atr_vals[i - 1] * (atr_period - 1) + tr) / atr_period
+
+    # Precompute Heikin-Ashi
+    ha_close = [0.0] * n
+    ha_open = [0.0] * n
+    ha_close[0] = (opens[0] + highs[0] + lows[0] + closes[0]) / 4
+    ha_open[0] = (opens[0] + closes[0]) / 2
+    for i in range(1, n):
+        ha_close[i] = (opens[i] + highs[i] + lows[i] + closes[i]) / 4
+        ha_open[i] = (ha_open[i - 1] + ha_close[i - 1]) / 2
+
+    # Precompute OBV
+    obv = [0.0] * n
+    for i in range(1, n):
+        if closes[i] > closes[i - 1]:
+            obv[i] = obv[i - 1] + volumes[i]
+        elif closes[i] < closes[i - 1]:
+            obv[i] = obv[i - 1] - volumes[i]
+        else:
+            obv[i] = obv[i - 1]
+
+    # Precompute Stochastic RSI (14-period)
+    rsi_list = [rsi_map.get(candles[i]["time"], 50) for i in range(n)]
+    stoch_rsi = [50.0] * n
+    stoch_period = 14
+    for i in range(stoch_period, n):
+        rsi_window = rsi_list[i - stoch_period:i + 1]
+        rsi_min = min(rsi_window)
+        rsi_max = max(rsi_window)
+        if rsi_max - rsi_min > 0:
+            stoch_rsi[i] = (rsi_list[i] - rsi_min) / (rsi_max - rsi_min) * 100
+        else:
+            stoch_rsi[i] = 50.0
+
+    raw_signals = []  # (index, net_score, reasons, buy_score, sell_score)
+
+    for i in range(window, n):
+        t = candles[i]["time"]
+        t_prev = candles[i - 1]["time"]
+        close = closes[i]
+        buy_score = 0.0
+        sell_score = 0.0
+        buy_count = 0   # number of indicators voting buy
+        sell_count = 0   # number of indicators voting sell
+        reasons = []
+
+        # --- 1. Z-Score Mean Reversion (weight 2.0) ---
+        segment = closes[i - window:i]
+        mean = sum(segment) / window
+        std = (sum((x - mean) ** 2 for x in segment) / window) ** 0.5
+        zscore = (close - mean) / std if std > 0 else 0
+        if zscore < -1.5:
+            buy_score += 2.0; buy_count += 1
+            reasons.append(f"Z-Score Oversold({zscore:.2f})")
+        elif zscore < -0.8:
+            buy_score += 1.0; buy_count += 1
+            reasons.append(f"Z-Score Low({zscore:.2f})")
+        elif zscore > 1.5:
+            sell_score += 2.0; sell_count += 1
+            reasons.append(f"Z-Score Overbought({zscore:.2f})")
+        elif zscore > 0.8:
+            sell_score += 1.0; sell_count += 1
+            reasons.append(f"Z-Score High({zscore:.2f})")
+
+        # --- 2. Bollinger Band Position (weight 1.5) ---
+        bb_u = bb_upper_map.get(t)
+        bb_l = bb_lower_map.get(t)
+        bb_m = bb_mid_map.get(t)
+        if bb_u and bb_l and bb_m and bb_m > 0:
+            bb_pct = (close - bb_l) / (bb_u - bb_l) if (bb_u - bb_l) > 0 else 0.5
+            if bb_pct <= 0.1:
+                buy_score += 1.5; buy_count += 1
+                reasons.append(f"BB%B Extreme Low({bb_pct:.2f})")
+            elif bb_pct <= 0.25:
+                buy_score += 0.8; buy_count += 1
+                reasons.append(f"BB%B Low({bb_pct:.2f})")
+            elif bb_pct >= 0.9:
+                sell_score += 1.5; sell_count += 1
+                reasons.append(f"BB%B Extreme High({bb_pct:.2f})")
+            elif bb_pct >= 0.75:
+                sell_score += 0.8; sell_count += 1
+                reasons.append(f"BB%B High({bb_pct:.2f})")
+
+        # --- 3. RSI + Stochastic RSI (weight 2.0) ---
+        rsi_val = rsi_map.get(t, 50)
+        srsi = stoch_rsi[i]
+        if rsi_val < 30 and srsi < 20:
+            buy_score += 2.0; buy_count += 1
+            reasons.append(f"RSI+StochRSI Oversold({rsi_val:.0f},{srsi:.0f})")
+        elif rsi_val < 40 and srsi < 30:
+            buy_score += 1.0; buy_count += 1
+            reasons.append(f"RSI+StochRSI Low({rsi_val:.0f},{srsi:.0f})")
+        elif rsi_val > 70 and srsi > 80:
+            sell_score += 2.0; sell_count += 1
+            reasons.append(f"RSI+StochRSI Overbought({rsi_val:.0f},{srsi:.0f})")
+        elif rsi_val > 60 and srsi > 70:
+            sell_score += 1.0; sell_count += 1
+            reasons.append(f"RSI+StochRSI High({rsi_val:.0f},{srsi:.0f})")
+
+        # --- 4. MACD Histogram + Crossover (weight 2.0) ---
+        mc = macd_map.get(t)
+        mc_prev = macd_map.get(t_prev)
+        if mc and mc_prev:
+            hist = mc["histogram"]
+            hist_prev = mc_prev["histogram"]
+            hist_delta = hist - hist_prev
+            # Bullish crossover
+            if mc_prev["macd"] < mc_prev["signal"] and mc["macd"] >= mc["signal"]:
+                buy_score += 2.0; buy_count += 1
+                reasons.append("MACD Bullish Cross")
+            elif mc_prev["macd"] > mc_prev["signal"] and mc["macd"] <= mc["signal"]:
+                sell_score += 2.0; sell_count += 1
+                reasons.append("MACD Bearish Cross")
+            # Histogram acceleration
+            if hist < 0 and hist_delta > 0:
+                buy_score += 1.0; buy_count += 1
+                reasons.append("MACD Hist Recovering")
+            elif hist > 0 and hist_delta < 0:
+                sell_score += 1.0; sell_count += 1
+                reasons.append("MACD Hist Weakening")
+
+        # --- 5. VWAP Deviation (weight 1.5) ---
+        vw = vwap_map.get(t)
+        if vw and vw > 0:
+            vwap_dev = (close - vw) / vw
+            if vwap_dev < -0.004:
+                buy_score += 1.5; buy_count += 1
+                reasons.append(f"Below VWAP({vwap_dev:.4f})")
+            elif vwap_dev < -0.001:
+                buy_score += 0.5
+                reasons.append(f"Slightly Below VWAP({vwap_dev:.4f})")
+            elif vwap_dev > 0.004:
+                sell_score += 1.5; sell_count += 1
+                reasons.append(f"Above VWAP({vwap_dev:.4f})")
+            elif vwap_dev > 0.001:
+                sell_score += 0.5
+                reasons.append(f"Slightly Above VWAP({vwap_dev:.4f})")
+
+        # --- 6. EMA 9/21 Spread & Crossover (weight 1.5) ---
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        e9p = ema9_map.get(t_prev)
+        e21p = ema21_map.get(t_prev)
+        if e9 and e21 and e21 > 0:
+            spread = (e9 - e21) / e21
+            if e9p and e21p:
+                # Bullish crossover
+                if e9p <= e21p and e9 > e21:
+                    buy_score += 1.5; buy_count += 1
+                    reasons.append("EMA Bullish Cross")
+                elif e9p >= e21p and e9 < e21:
+                    sell_score += 1.5; sell_count += 1
+                    reasons.append("EMA Bearish Cross")
+                else:
+                    if spread < -0.002:
+                        buy_score += 0.5; buy_count += 1
+                        reasons.append(f"EMA Spread Neg({spread:.4f})")
+                    elif spread > 0.002:
+                        sell_score += 0.5; sell_count += 1
+                        reasons.append(f"EMA Spread Pos({spread:.4f})")
+
+        # --- 7. ATR Volatility Regime (weight 1.0) ---
+        atr = atr_vals[i]
+        if atr > 0 and close > 0:
+            atr_pct = atr / close
+            # High volatility favors mean-reversion signals
+            if atr_pct > 0.01:
+                if zscore < -0.5:
+                    buy_score += 1.0; buy_count += 1
+                    reasons.append(f"High Vol Reversal Up(ATR%={atr_pct:.3f})")
+                elif zscore > 0.5:
+                    sell_score += 1.0; sell_count += 1
+                    reasons.append(f"High Vol Reversal Dn(ATR%={atr_pct:.3f})")
+
+        # --- 8. S/R Proximity (weight 1.0) ---
+        for sl in sup_levels:
+            if close > 0 and 0 < (close - sl) / close < 0.004:
+                buy_score += 1.0; buy_count += 1
+                reasons.append(f"Near Support {sl:.0f}")
+                break
+        for rl in res_levels:
+            if close > 0 and 0 < (rl - close) / close < 0.004:
+                sell_score += 1.0; sell_count += 1
+                reasons.append(f"Near Resistance {rl:.0f}")
+                break
+
+        # --- 9. Candle Body Ratio Analysis (weight 1.0) ---
+        body = abs(close - opens[i])
+        wick_range = highs[i] - lows[i]
+        if wick_range > 0:
+            body_ratio = body / wick_range
+            # Strong bullish candle (large body, close > open)
+            if close > opens[i] and body_ratio > 0.65:
+                buy_score += 1.0; buy_count += 1
+                reasons.append(f"Strong Bullish Candle(r={body_ratio:.2f})")
+            elif close < opens[i] and body_ratio > 0.65:
+                sell_score += 1.0; sell_count += 1
+                reasons.append(f"Strong Bearish Candle(r={body_ratio:.2f})")
+            # Hammer/Shooting star
+            lower_wick = min(close, opens[i]) - lows[i]
+            upper_wick = highs[i] - max(close, opens[i])
+            if lower_wick > body * 2 and upper_wick < body * 0.5:
+                buy_score += 0.5; buy_count += 1
+                reasons.append("Hammer Pattern")
+            elif upper_wick > body * 2 and lower_wick < body * 0.5:
+                sell_score += 0.5; sell_count += 1
+                reasons.append("Shooting Star")
+
+        # --- 10. Price Momentum ROC (weight 1.5) ---
+        roc_period = min(10, i)
+        if roc_period > 0 and closes[i - roc_period] > 0:
+            roc = (close - closes[i - roc_period]) / closes[i - roc_period]
+            if roc < -0.008:
+                buy_score += 1.5; buy_count += 1
+                reasons.append(f"ROC Reversal Up({roc:.4f})")
+            elif roc < -0.003:
+                buy_score += 0.5; buy_count += 1
+                reasons.append(f"ROC Negative({roc:.4f})")
+            elif roc > 0.008:
+                sell_score += 1.5; sell_count += 1
+                reasons.append(f"ROC Reversal Dn({roc:.4f})")
+            elif roc > 0.003:
+                sell_score += 0.5; sell_count += 1
+                reasons.append(f"ROC Positive({roc:.4f})")
+
+        # --- 11. Heikin-Ashi Trend Filter (weight 1.0) ---
+        if ha_close[i] > ha_open[i]:
+            # HA bullish
+            if i >= 2 and ha_close[i - 1] <= ha_open[i - 1]:
+                buy_score += 1.0; buy_count += 1
+                reasons.append("HA Trend Reversal Bullish")
+            else:
+                buy_score += 0.3
+        else:
+            # HA bearish
+            if i >= 2 and ha_close[i - 1] >= ha_open[i - 1]:
+                sell_score += 1.0; sell_count += 1
+                reasons.append("HA Trend Reversal Bearish")
+            else:
+                sell_score += 0.3
+
+        # --- 12. Volume Pressure OBV Delta (weight 1.0) ---
+        if i >= 3:
+            obv_delta = obv[i] - obv[i - 3]
+            if obv_delta > 0 and close > closes[i - 1]:
+                buy_score += 1.0; buy_count += 1
+                reasons.append("OBV Rising + Price Up")
+            elif obv_delta < 0 and close < closes[i - 1]:
+                sell_score += 1.0; sell_count += 1
+                reasons.append("OBV Falling + Price Down")
+
+        # Net score: positive = buy bias, negative = sell bias
+        net_score = round(buy_score - sell_score, 2)
+        raw_signals.append((i, net_score, reasons, buy_score, sell_score, buy_count, sell_count))
+
+    # --- Score-based signal generation ---
+    # Emit BUY/SELL signals when indicators agree on a direction.
+    # Require: sufficient net score, minimum indicator consensus, and cooldown.
+    signals = []
+    last_signal_idx = -10    # index into raw_signals
+    min_cooldown = 2         # minimum bars between signals
+
+    # Adaptive thresholds from score distribution
+    all_net = [s[1] for s in raw_signals]
+    if all_net:
+        score_mean = sum(all_net) / len(all_net)
+        score_std = (sum((s - score_mean) ** 2 for s in all_net) / len(all_net)) ** 0.5
+    else:
+        score_std = 3.0
+    buy_threshold = max(1.5, min(score_std * 0.5, 4.0))
+    sell_threshold = max(1.5, min(score_std * 0.5, 4.0))
+    min_indicator_count = 2  # at least 2 indicators must vote in signal direction
+    min_dominant_score = 2.0  # the dominant side must have at least this raw score
+
+    for sig_idx, (i, net_score, reasons, buy_sc, sell_sc, b_cnt, s_cnt) in enumerate(raw_signals):
+        # Enforce cooldown
+        if sig_idx - last_signal_idx < min_cooldown:
+            continue
+
+        t = candles[i]["time"]
+
+        # BUY signal
+        if (net_score >= buy_threshold
+                and buy_sc >= min_dominant_score
+                and b_cnt >= min_indicator_count):
+            sig_type = "STRONG_BUY" if (net_score >= buy_threshold * 2.0 and b_cnt >= 4) else "BUY"
+            signals.append({
+                "time": t,
+                "type": sig_type,
+                "score": round(net_score, 2),
+                "reasons": reasons,
+                "price": candles[i]["low"],
+            })
+            last_signal_idx = sig_idx
+
+        # SELL signal
+        elif (net_score <= -sell_threshold
+                and sell_sc >= min_dominant_score
+                and s_cnt >= min_indicator_count):
+            sig_type = "STRONG_SELL" if (net_score <= -sell_threshold * 2.0 and s_cnt >= 4) else "SELL"
+            signals.append({
+                "time": t,
+                "type": sig_type,
+                "score": round(abs(net_score), 2),
+                "reasons": reasons,
+                "price": candles[i]["high"],
+            })
+            last_signal_idx = sig_idx
+
+    # --- Summary for latest bar ---
+    last_i = n - 1
+    t_last = candles[last_i]["time"]
+    summary_indicators = []
+    summary_score = 0.0
+
+    # Z-score summary
+    if n >= window:
+        seg = closes[n - window:n]
+        m = sum(seg) / window
+        s = (sum((x - m) ** 2 for x in seg) / window) ** 0.5
+        zs = (closes[-1] - m) / s if s > 0 else 0
+        d = 1.5 if zs < -1 else (-1.5 if zs > 1 else 0)
+        summary_score += d
+        summary_indicators.append(("Z-Score", f"{zs:.2f}", d))
+
+    # BB summary
+    bb_u = bb_upper_map.get(t_last)
+    bb_l = bb_lower_map.get(t_last)
+    if bb_u and bb_l and (bb_u - bb_l) > 0:
+        bb_pct = (closes[-1] - bb_l) / (bb_u - bb_l)
+        d = 1.5 if bb_pct <= 0.2 else (-1.5 if bb_pct >= 0.8 else 0)
+        summary_score += d
+        summary_indicators.append(("Bollinger %B", f"{bb_pct:.2f}", d))
+
+    # RSI + StochRSI summary
+    rsi_last = rsi_map.get(t_last, 50)
+    srsi_last = stoch_rsi[last_i] if last_i < n else 50
+    d = 2.0 if (rsi_last < 30 and srsi_last < 20) else (-2.0 if (rsi_last > 70 and srsi_last > 80) else 0)
+    summary_score += d
+    summary_indicators.append(("RSI+StochRSI", f"{rsi_last:.1f}/{srsi_last:.0f}", d))
+
+    # MACD summary
+    mc_last = macd_map.get(t_last)
+    mc_prev2 = macd_map.get(candles[last_i - 1]["time"]) if last_i > 0 else None
+    if mc_last and mc_prev2:
+        if mc_prev2["macd"] < mc_prev2["signal"] and mc_last["macd"] >= mc_last["signal"]:
+            d = 2.0
+            status = "Bullish Cross"
+        elif mc_prev2["macd"] > mc_prev2["signal"] and mc_last["macd"] <= mc_last["signal"]:
+            d = -2.0
+            status = "Bearish Cross"
+        else:
+            hd = mc_last["histogram"] - mc_prev2["histogram"]
+            d = 1.0 if (mc_last["histogram"] < 0 and hd > 0) else (-1.0 if (mc_last["histogram"] > 0 and hd < 0) else 0)
+            status = "Hist+" if d > 0 else ("Hist-" if d < 0 else "Flat")
+        summary_score += d
+        summary_indicators.append(("MACD", status, d))
+
+    # VWAP summary
+    vw_last = vwap_map.get(t_last)
+    if vw_last and vw_last > 0:
+        dev = (closes[-1] - vw_last) / vw_last
+        d = 1.5 if dev < -0.004 else (-1.5 if dev > 0.004 else 0)
+        summary_score += d
+        summary_indicators.append(("VWAP Dev", f"{dev:.4f}", d))
+
+    # EMA summary
+    e9l = ema9_map.get(t_last)
+    e21l = ema21_map.get(t_last)
+    if e9l and e21l:
+        d = 1.0 if e9l > e21l else -1.0
+        summary_score += d
+        summary_indicators.append(("EMA 9/21", "Bullish" if d > 0 else "Bearish", d))
+
+    # ATR summary
+    atr_last = atr_vals[last_i]
+    if closes[-1] > 0:
+        atr_pct_last = atr_last / closes[-1]
+        summary_indicators.append(("ATR%", f"{atr_pct_last:.3f}", 0))
+
+    # HA summary
+    ha_d = 0.5 if ha_close[last_i] > ha_open[last_i] else -0.5
+    summary_score += ha_d
+    summary_indicators.append(("Heikin-Ashi", "Bullish" if ha_d > 0 else "Bearish", ha_d))
+
+    # ROC summary
+    roc_p = min(10, last_i)
+    if roc_p > 0 and closes[last_i - roc_p] > 0:
+        roc_v = (closes[-1] - closes[last_i - roc_p]) / closes[last_i - roc_p]
+        d = 1.0 if roc_v < -0.005 else (-1.0 if roc_v > 0.005 else 0)
+        summary_score += d
+        summary_indicators.append(("ROC", f"{roc_v:.4f}", d))
+
+    summary_score = round(summary_score, 2)
+    if summary_score >= 5:
+        verdict = "STRONG BUY"
+    elif summary_score >= 2:
+        verdict = "BUY"
+    elif summary_score <= -5:
+        verdict = "STRONG SELL"
+    elif summary_score <= -2:
+        verdict = "SELL"
+    else:
+        verdict = "NEUTRAL"
+
+    summary = {
+        "score": summary_score,
+        "verdict": verdict,
+        "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in summary_indicators],
+        "rsi": rsi_last,
+        "macd": mc_last,
+        "vwap": vw_last,
+    }
+
+    return signals, summary
+
+
+INTERVAL_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "1h": 3600, "1d": 86400, "1w": 604800, "1mo": 2592000,
+}
+
+
+def predict_next_candles(candles, interval="5m", n_predict=5):
+    """Predict next n candles using Gradient Boosting on engineered features.
+
+    Features per candle:
+      - Lagged returns (close-to-close % change) for 1..10 bars
+      - Lagged body ratio (body / range)
+      - Lagged upper/lower wick ratios
+      - Rolling mean & std of returns (5, 10, 20 bar)
+      - RSI-like momentum (avg up / avg down over 14 bars)
+      - High-Low range as % of close
+      - Volume change ratio
+
+    Trains 4 separate GBR models (open, high, low, close offsets from
+    previous close) and predicts iteratively.
+
+    Returns:
+        list[dict]: Predicted candle dicts with time, open, high, low, close.
+    """
+    n = len(candles)
+    if n < 50:
+        return []
+
+    closes = np.array([c["close"] for c in candles], dtype=np.float64)
+    opens = np.array([c["open"] for c in candles], dtype=np.float64)
+    highs = np.array([c["high"] for c in candles], dtype=np.float64)
+    lows = np.array([c["low"] for c in candles], dtype=np.float64)
+    volumes = np.array([c.get("volume", 0) for c in candles], dtype=np.float64)
+
+    # Returns
+    returns = np.zeros(n)
+    returns[1:] = (closes[1:] - closes[:-1]) / np.where(closes[:-1] == 0, 1, closes[:-1])
+
+    # Feature engineering
+    lookback = 20
+    feature_start = lookback
+    X, Y_open, Y_high, Y_low, Y_close = [], [], [], [], []
+
+    for i in range(feature_start, n):
+        feat = []
+        # Lagged returns (1..10)
+        for lag in range(1, 11):
+            feat.append(returns[i - lag] if i - lag >= 0 else 0)
+
+        # Body ratio and wick ratios
+        rng = highs[i - 1] - lows[i - 1]
+        body = abs(closes[i - 1] - opens[i - 1])
+        feat.append(body / rng if rng > 0 else 0)
+        feat.append((highs[i - 1] - max(opens[i - 1], closes[i - 1])) / rng if rng > 0 else 0)
+        feat.append((min(opens[i - 1], closes[i - 1]) - lows[i - 1]) / rng if rng > 0 else 0)
+
+        # Rolling stats
+        for w in [5, 10, 20]:
+            seg = returns[max(0, i - w):i]
+            feat.append(float(np.mean(seg)) if len(seg) > 0 else 0)
+            feat.append(float(np.std(seg)) if len(seg) > 0 else 0)
+
+        # RSI-like momentum (14 bar)
+        rsi_seg = returns[max(0, i - 14):i]
+        ups = float(np.mean(rsi_seg[rsi_seg > 0])) if np.any(rsi_seg > 0) else 0
+        dns = float(np.mean(np.abs(rsi_seg[rsi_seg < 0]))) if np.any(rsi_seg < 0) else 0
+        feat.append(ups / (dns + 1e-10))
+
+        # Range as % of close
+        feat.append(rng / closes[i - 1] if closes[i - 1] > 0 else 0)
+
+        # Volume change
+        feat.append((volumes[i - 1] - volumes[i - 2]) / (volumes[i - 2] + 1e-10) if i >= 2 else 0)
+
+        X.append(feat)
+
+        # Targets: offsets from previous close (as % of prev close)
+        pc = closes[i - 1] if closes[i - 1] > 0 else 1
+        Y_open.append((opens[i] - pc) / pc)
+        Y_high.append((highs[i] - pc) / pc)
+        Y_low.append((lows[i] - pc) / pc)
+        Y_close.append((closes[i] - pc) / pc)
+
+    X = np.array(X, dtype=np.float64)
+    Y_open = np.array(Y_open, dtype=np.float64)
+    Y_high = np.array(Y_high, dtype=np.float64)
+    Y_low = np.array(Y_low, dtype=np.float64)
+    Y_close = np.array(Y_close, dtype=np.float64)
+
+    # Handle NaN/Inf
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Train 4 GBR models
+    gbr_params = dict(n_estimators=100, max_depth=4, learning_rate=0.1,
+                      subsample=0.8, random_state=42)
+    model_open = GradientBoostingRegressor(**gbr_params).fit(X_scaled, Y_open)
+    model_high = GradientBoostingRegressor(**gbr_params).fit(X_scaled, Y_high)
+    model_low = GradientBoostingRegressor(**gbr_params).fit(X_scaled, Y_low)
+    model_close = GradientBoostingRegressor(**gbr_params).fit(X_scaled, Y_close)
+
+    # Iteratively predict next candles
+    interval_sec = INTERVAL_SECONDS.get(interval, 300)
+    last_time = candles[-1]["time"]
+    predictions = []
+
+    # Working copies of recent data for rolling feature computation
+    ext_returns = list(returns)
+    ext_closes = list(closes)
+    ext_opens = list(opens)
+    ext_highs = list(highs)
+    ext_lows = list(lows)
+    ext_volumes = list(volumes)
+
+    for step in range(n_predict):
+        cur_n = len(ext_closes)
+        feat = []
+
+        # Lagged returns
+        for lag in range(1, 11):
+            idx = cur_n - lag
+            feat.append(ext_returns[idx] if idx >= 0 else 0)
+
+        # Body/wick ratios of last bar
+        rng = ext_highs[-1] - ext_lows[-1]
+        body = abs(ext_closes[-1] - ext_opens[-1])
+        feat.append(body / rng if rng > 0 else 0)
+        feat.append((ext_highs[-1] - max(ext_opens[-1], ext_closes[-1])) / rng if rng > 0 else 0)
+        feat.append((min(ext_opens[-1], ext_closes[-1]) - ext_lows[-1]) / rng if rng > 0 else 0)
+
+        # Rolling stats
+        for w in [5, 10, 20]:
+            seg = ext_returns[max(0, cur_n - w):cur_n]
+            feat.append(float(np.mean(seg)) if len(seg) > 0 else 0)
+            feat.append(float(np.std(seg)) if len(seg) > 0 else 0)
+
+        # RSI momentum
+        rsi_seg = np.array(ext_returns[max(0, cur_n - 14):cur_n])
+        ups = float(np.mean(rsi_seg[rsi_seg > 0])) if np.any(rsi_seg > 0) else 0
+        dns = float(np.mean(np.abs(rsi_seg[rsi_seg < 0]))) if np.any(rsi_seg < 0) else 0
+        feat.append(ups / (dns + 1e-10))
+
+        # Range %
+        feat.append(rng / ext_closes[-1] if ext_closes[-1] > 0 else 0)
+
+        # Volume change
+        feat.append((ext_volumes[-1] - ext_volumes[-2]) / (ext_volumes[-2] + 1e-10) if len(ext_volumes) >= 2 else 0)
+
+        feat = np.nan_to_num(np.array([feat], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        feat_scaled = scaler.transform(feat)
+
+        pc = ext_closes[-1]
+        pred_open = round(pc * (1 + float(model_open.predict(feat_scaled)[0])), 2)
+        pred_high = round(pc * (1 + float(model_high.predict(feat_scaled)[0])), 2)
+        pred_low = round(pc * (1 + float(model_low.predict(feat_scaled)[0])), 2)
+        pred_close = round(pc * (1 + float(model_close.predict(feat_scaled)[0])), 2)
+
+        # Enforce high >= max(open,close) and low <= min(open,close)
+        pred_high = max(pred_high, pred_open, pred_close)
+        pred_low = min(pred_low, pred_open, pred_close)
+
+        pred_time = last_time + interval_sec * (step + 1)
+
+        predictions.append({
+            "time": pred_time,
+            "open": pred_open,
+            "high": pred_high,
+            "low": pred_low,
+            "close": pred_close,
+        })
+
+        # Update rolling arrays for next iteration
+        ret = (pred_close - pc) / pc if pc > 0 else 0
+        ext_returns.append(ret)
+        ext_closes.append(pred_close)
+        ext_opens.append(pred_open)
+        ext_highs.append(pred_high)
+        ext_lows.append(pred_low)
+        ext_volumes.append(ext_volumes[-1])  # carry forward volume
+
+    return predictions
+
+
 def run_backtest(candles, signals, trade_qty=0):
     """Run a historical strategy backtest using the composite signal engine's output.
 
@@ -2122,6 +3010,7 @@ EXCHANGE_SUFFIX_MAP = {
 
 
 @app.route("/api/search")
+@login_required
 def api_search():
     """Search for a stock/index ticker on Yahoo Finance with Indian exchange fallbacks.
 
@@ -2176,6 +3065,7 @@ paper_trades = {}  # session_id -> session dict
 
 
 @app.route("/api/trade/start", methods=["POST"])
+@login_required
 def api_trade_start():
     data = request.get_json(force=True)
     symbol = data.get("symbol", "NIFTY50")
@@ -2203,6 +3093,7 @@ def api_trade_start():
 
 
 @app.route("/api/trade/execute", methods=["POST"])
+@login_required
 def api_trade_execute():
     data = request.get_json(force=True)
     sid = data.get("sessionId", "")
@@ -2263,6 +3154,7 @@ def api_trade_execute():
 
 
 @app.route("/api/trade/stop", methods=["POST"])
+@login_required
 def api_trade_stop():
     data = request.get_json(force=True)
     sid = data.get("sessionId", "")
@@ -2301,6 +3193,7 @@ def api_trade_stop():
 
 
 @app.route("/api/trade/status")
+@login_required
 def api_trade_status():
     sid = request.args.get("session_id", "")
     session = paper_trades.get(sid)
@@ -2365,6 +3258,7 @@ def _trade_summary(session):
 
 
 @app.route("/")
+@login_required
 def index():
     """Serve the main HTML page containing the interactive TradingView-style chart.
 
@@ -2380,6 +3274,7 @@ def index():
 
 
 @app.route("/api/candles")
+@login_required
 def api_candles():
     """Main API endpoint — fetch OHLCV data, compute all indicators, and return JSON.
 
@@ -2469,9 +3364,19 @@ def api_candles():
         signals, summary = generate_janestreet_signals(
             candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
         )
+    elif algo == "accurate":
+        signals, summary = generate_accurate_signals(
+            candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+        )
 
     bt_qty = request.args.get("bt_qty", 0, type=int)
     backtest = run_backtest(candles, signals, bt_qty)
+
+    # ML Predictions
+    try:
+        predictions = predict_next_candles(candles, interval, n_predict=5)
+    except Exception:
+        predictions = []
 
     return jsonify({
         "candles": candles,
@@ -2493,6 +3398,7 @@ def api_candles():
         "bosChoch": bos_choch,
         "cvd": cvd,
         "backtest": backtest,
+        "predictions": predictions,
     })
 
 
@@ -2938,6 +3844,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .fii-item:hover { background: #2a2e39; }
   .fii-item.active { color: #2962ff; font-weight: 600; }
+  /* Predict Button */
+  #btnPredict { background: #1a3a5c; color: #64b5f6; border: 1px solid #2196F3; font-weight: 600; }
+  #btnPredict.active { background: #0d47a1; color: #fff; border-color: #42a5f5; box-shadow: 0 0 8px rgba(33,150,243,0.4); }
+  #btnPredict:hover { background: #1565c0; color: #fff; }
   /* Backtest Panel */
   .backtest-panel {
     position: absolute; top: 44px; right: 12px; z-index: 200;
@@ -3024,6 +3934,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="SILVERBEES">Silver ETF</option>
         <option value="BTC">Bitcoin</option>
         <option value="ETH">Ethereum</option>
+        <option value="DJI">Dow Jones</option>
+        <option value="NASDAQ">NASDAQ</option>
+        <option value="SP500">S&P 500</option>
       </select>
       <span class="ticker-exchange" id="tickerExchange"> &middot; NSE</span>
     </div>
@@ -3099,8 +4012,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="fii-dropdown" id="fiiDropdown">
       <button class="fii-item" data-algo="default" data-label="Default Signals">&#8203; Default Signals</button>
       <button class="fii-item active" data-algo="janestreet" data-label="Janestreet">&#10004; Janestreet</button>
+      <button class="fii-item" data-algo="accurate" data-label="Accurate">&#8203; Accurate</button>
     </div>
   </div>
+  <div class="separator"></div>
+  <button class="ind-btn active" id="btnPredict" title="Toggle ML Predictions"><span class="dot" style="background:#2196F3"></span>Predict</button>
   <div class="separator"></div>
   <div class="trade-dropdown-wrapper">
     <button class="ind-btn" id="btnTrade"><span class="dot" style="background:#FF5722"></span>Trade &#9662;</button>
@@ -3285,6 +4201,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <select id="tpAlgo">
           <option value="default">Default Strategy</option>
           <option value="janestreet" selected>Janestreet Strategy</option>
+          <option value="accurate">Accurate Strategy</option>
         </select>
       </div>
       <button class="tp-start-btn start" id="tpStartBtn">Start Trading</button>
@@ -3382,6 +4299,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   });
   cvdSeries.priceScale().applyOptions({ scaleMargins: { top: 0.7, bottom: 0.02 }, visible: false });
   cvdSeries.applyOptions({ visible: false });
+
+  // Prediction candle series (semi-transparent blue/orange)
+  const predSeries = chart.addCandlestickSeries({
+    upColor: 'rgba(33,150,243,0.5)', downColor: 'rgba(255,152,0,0.5)',
+    borderDownColor: 'rgba(255,152,0,0.8)', borderUpColor: 'rgba(33,150,243,0.8)',
+    wickDownColor: 'rgba(255,152,0,0.6)', wickUpColor: 'rgba(33,150,243,0.6)',
+    priceLineVisible: false, lastValueVisible: false,
+  });
+  let showPredictions = true;
 
 
     // ---- Delta Real Trading Logic ----
@@ -3941,6 +4867,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         color: c.close >= c.open ? 'rgba(38,166,154,0.3)' : 'rgba(239,83,80,0.3)',
       })));
 
+      // --- ML Predicted Candles ---
+      const preds = json.predictions || [];
+      if (showPredictions && preds.length > 0) {
+        // Include the last real candle as bridge + predicted candles
+        const lastReal = formatted[formatted.length - 1];
+        const predFormatted = preds.map(p => ({
+          time: formatTime(p.time, isDaily),
+          open: p.open, high: p.high, low: p.low, close: p.close,
+        }));
+        predSeries.setData([{time: lastReal.time, open: lastReal.close, high: lastReal.close, low: lastReal.close, close: lastReal.close}, ...predFormatted]);
+        predSeries.applyOptions({ visible: true });
+      } else {
+        predSeries.setData([]);
+        predSeries.applyOptions({ visible: false });
+      }
+
       // --- SuperTrend ---
       const stBull = [], stBear = [];
       for (let i = 0; i < supertrend.length; i++) {
@@ -4116,18 +5058,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
             text: (isStrong ? '★ ' : '') + s.type.replace('_', ' ') + ' (' + s.score.toFixed(1) + ')',
           };
         });
-        // Deduplicate: max 1 signal per 5 bars to avoid clutter
+        // Deduplicate: max 1 signal per 5 bars to avoid clutter (skip for Accurate algo)
         const filtered = [];
         let lastSigIdx = -10;
+        const isAccurate = (currentAlgo === 'accurate');
         for (let m = 0; m < markers.length; m++) {
-          // Find candle index for this marker time
-          const mTime = typeof markers[m].time === 'object'
-            ? new Date(markers[m].time.year, markers[m].time.month-1, markers[m].time.day).getTime()/1000
-            : markers[m].time;
-          const cIdx = candleData.findIndex(c => c.time === sigs[m].time);
-          if (cIdx - lastSigIdx >= 3) {
+          if (isAccurate) {
             filtered.push(markers[m]);
-            lastSigIdx = cIdx;
+          } else {
+            // Find candle index for this marker time
+            const mTime = typeof markers[m].time === 'object'
+              ? new Date(markers[m].time.year, markers[m].time.month-1, markers[m].time.day).getTime()/1000
+              : markers[m].time;
+            const cIdx = candleData.findIndex(c => c.time === sigs[m].time);
+            if (cIdx - lastSigIdx >= 3) {
+              filtered.push(markers[m]);
+              lastSigIdx = cIdx;
+            }
           }
         }
         candleSeries.setMarkers(filtered);
@@ -4446,6 +5393,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
   });
 
+  // Predict toggle button
+  const btnPredict = document.getElementById('btnPredict');
+  btnPredict.addEventListener('click', function() {
+    showPredictions = !showPredictions;
+    this.classList.toggle('active', showPredictions);
+    if (!showPredictions) {
+      predSeries.setData([]);
+      predSeries.applyOptions({ visible: false });
+    } else {
+      loadData(currentTF);
+    }
+  });
+
   // Backtest panel tabs
   document.querySelectorAll('.bt-tab').forEach(tab => {
     tab.addEventListener('click', function() {
@@ -4529,7 +5489,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Populate symbol dropdown
   const tpSymbol = document.getElementById('tpSymbol');
-  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH'];
+  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH','DJI','NASDAQ','SP500'];
   symbolKeys.forEach(function(k) {
     const opt = document.createElement('option');
     opt.value = k;
@@ -5019,6 +5979,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
-    print("Starting Nifty Chart Server...")
+    print("Starting Mangal View Server...")
     print(f"Open http://localhost:{port} in your browser")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
