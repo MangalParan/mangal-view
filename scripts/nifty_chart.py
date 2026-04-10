@@ -34,8 +34,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 # --- User Database ---
-DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "users.db"))
-os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+_default_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "users.db")
+DB_PATH = os.environ.get("DB_PATH", _default_db)
+try:
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+except PermissionError:
+    DB_PATH = _default_db
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 
 
 def get_db():
