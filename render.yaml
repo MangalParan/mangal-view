@@ -1,9 +1,13 @@
 services:
   - type: web
     name: mangal-view
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    runtime: docker
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.13"
+      - key: SECRET_KEY
+        value: mangalview2026secretkey
+      - key: DB_PATH
+        value: /data/users.db
