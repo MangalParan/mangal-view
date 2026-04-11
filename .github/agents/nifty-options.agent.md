@@ -66,7 +66,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Break of Structure (BOS)** — price breaks a previous swing high/low in trend direction (continuation). Shown as arrow markers with broken level
 - **Change of Character (CHoCH)** — price breaks structure against the prevailing trend (reversal signal). Shown as circle markers with broken level
 - **Cumulative Volume Delta (CVD)** — running total of buy vs sell volume using close position ratio. Shown as histogram series
-- **Settings Panel** (gear icon) — adjust SuperTrend, PSAR, and Bollinger Bands parameters, click Apply to recalculate
+- **Indicator Settings** — accessible via `⚙ Indicator Settings` item at the bottom of the Indicators dropdown. Opens a panel with close (×) button to adjust SuperTrend period/multiplier, PSAR AF start/increment/max, and Bollinger Bands period/std dev. Click Apply to recalculate
 
 ### Institutional Signal Engine
 - Weighted composite scoring system using 9 indicators:
@@ -82,14 +82,20 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - Signal thresholds: score >= 3.5 → BUY, >= 5.5 → STRONG BUY, <= -3.5 → SELL, <= -5.5 → STRONG SELL
 - Buy/Sell arrow markers on chart with score labels
 - **Signal Tooltip** — hover crosshair over buy/sell markers to see signal type, score, and full indicator breakdown (reasons for each contributing indicator)
-- Signal Analysis Panel (lightning bolt icon) — shows verdict, composite score, indicator breakdown, signal counts
+- **Signal Analysis Panel** — accessible via `⚡ Signal Analysis` item at the bottom of the Algo dropdown. Has close (×) button. Shows **per-algorithm breakdowns**: each selected algo gets its own section with verdict, score, and indicator rows, plus an overall composite verdict averaged across all active algos
+- **Backend returns per-algo summaries** — `signalSummary` is a dict keyed by algo name (e.g. `{trend: {...}, mstreet: {...}}`) instead of a single summary
 
-### FII Algorithm Selector
-- **FII dropdown menu** in toolbar with two algorithm options:
-  - **Default Signals** — the 9-indicator institutional signal engine described above
-  - **Janestreet** (default) — quantitative mean-reversion algorithm inspired by institutional market-making strategies
-- Switching algorithms triggers immediate signal recalculation and chart update
-- `algo` query parameter: `default` or `janestreet`
+### Algo Menu (Multi-Select)
+- **Algo dropdown menu** in toolbar with 4 algorithm options (multi-select via Set):
+  - **Trend** — the 9-indicator institutional signal engine described above
+  - **MStreet** (default, active) — quantitative mean-reversion algorithm inspired by institutional market-making strategies
+  - **MFactor** — high-accuracy signal generation algorithm
+  - **MPredict** (default, active) — ML-based candle prediction (controls prediction overlay)
+- Multi-select: clicking an algo toggles it on/off (checkmark shown). Multiple algos can be active simultaneously
+- `currentAlgo` is a JavaScript `Set` — signals from all selected algos are merged with deduplication (highest absolute score wins per timestamp)
+- `algo` query parameter: comma-separated (e.g. `algo=mstreet,mpredict`)
+- **`⚡ Signal Analysis`** item at bottom of dropdown opens the Signal Analysis panel
+- Debounced reload (300ms) on algo change to prevent flickering
 
 ### Janestreet Signal Engine
 - **Philosophy**: Mean-reversion (contrarian) — prices tend to revert to statistical means after extreme deviations. Best suited for range-bound / choppy markets.
@@ -105,11 +111,13 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Cooldown**: minimum 3 bars between signals to reduce noise
 - **Key difference from Default**: Default engine is trend-following (9 indicators, momentum-based, threshold ≥ 3.5). Janestreet is contrarian (7 indicators, mean-reversion, threshold ≥ 3.0).
 
-### Backtest (Strategy Tester)
-- **Backtest dropdown menu** in toolbar with three items:
-  - **Strategy** — opens TradingView-style Strategy Tester panel with the currently active algorithm
-  - **Janestreet** — switches to Janestreet algorithm, reloads data, and opens backtest panel with full results (also updates FII dropdown to reflect Janestreet as active)
-  - **Options** — placeholder for future options backtesting
+### Backtest (in Settings Panel)
+- **Backtest section** in the Settings panel (⚙) with 4 algo-named items:
+  - **Trend** — activates Trend algo, reloads data, opens backtest panel
+  - **MStreet** — activates MStreet algo, reloads data, opens backtest panel
+  - **MFactor** — activates MFactor algo, reloads data, opens backtest panel
+  - **MPredict** — activates MPredict algo, reloads data, opens backtest panel
+- Each item ensures the corresponding algo is added to `currentAlgo` Set before running backtest
 - **Strategy Tester Panel** with 3 tabs:
   - **Overview** — initial/final capital (₹1,00,000 default), net profit, buy & hold comparison, profit factor, win rate, Sharpe ratio, max drawdown, expectancy
   - **Performance** — detailed breakdown: gross profit/loss, profit factor, winning/losing/breakeven trades, win/loss rate, avg trade P&L, avg win/loss, payoff ratio, largest win/loss, max consecutive wins/losses, max drawdown, Sharpe ratio, expectancy, buy & hold return
@@ -118,14 +126,23 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - Backtests use the active signal engine (Default or Janestreet): BUY signals enter long, SELL signals exit
 - Metrics computed: net profit, gross profit/loss, profit factor, win rate, avg trade, payoff ratio, max drawdown, Sharpe ratio, expectancy, max consecutive wins/losses, buy & hold comparison
 
+### Settings Panel (⚙ gear icon in toolbar)
+- Consolidated panel with 4 togglable sections, each with a toggle switch:
+  - **Backtest** — 4 algo-named items (Trend, MStreet, MFactor, MPredict)
+  - **Data Source** — Yahoo Finance, TradingView (default, active), NSE India
+  - **Trade** — Stocks (disabled), Futures (expandable: Positions, Log), Options (disabled)
+  - **Real Trade** — Delta, Zerodha (disabled), Mt5 (disabled)
+- Toggle switches show/hide section bodies
+- Close button (×) in header
+
 ### Live Data Feed
-- **LIVE button** in toolbar — toggles continuous data refresh every 1 second
+- **LIVE button** in toolbar — toggles continuous data refresh every 5 seconds
 - Background updates: no loading spinner, chart zoom/scroll position preserved during refresh
 - 60-second auto-refresh when live mode is off (also background, preserves view)
 - Note: Yahoo Finance API calls take ~1-1.5s, so effective update rate may be limited by network latency
 
-### Data Source Selector
-- **Data Source dropdown menu** in toolbar with three options:
+### Data Source (in Settings Panel)
+- **Data Source section** in the Settings panel with three options:
   - **Yahoo Finance** — OHLCV via `yfinance`, ~15 min delay, supports all symbols
   - **TradingView** (default) — OHLCV via WebSocket (`wss://data.tradingview.com`), near real-time, 300 bars max, supports all symbols
   - **NSE India** — tick data aggregated into OHLC candles via `curl_cffi`, intraday only during market hours (9:15-15:30 IST), NIFTY 50 and BANK NIFTY only, no volume data
@@ -141,8 +158,8 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
   - **V −** — Vertical zoom out
   - **↺ Reset** — Fit all data to view
 
-### Trade Menu & Futures Paper Trading
-- **Trade dropdown menu** in toolbar with three items:
+### Trade (in Settings Panel)
+- **Trade section** in the Settings panel with three items:
   - **Stocks** — placeholder for future stock trading
   - **Futures** — click to expand sub-menu with:
     - **Positions** — opens draggable Futures Trading panel
@@ -224,9 +241,10 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 
 ## Defaults
 - **Data Source**: TradingView (WebSocket)
-- **Signal Algorithm**: Janestreet
+- **Signal Algorithms**: MStreet + MPredict (multi-select, both active by default)
 - **Timeframe**: 5m
 - **Indicators**: Signals only (SuperTrend, PSAR, S/R, EMA, VWAP off by default)
+- **Live refresh**: 5 seconds when LIVE mode is on
 
 ## Constraints
 - DO NOT give buy/sell recommendations or trading advice

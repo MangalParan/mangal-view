@@ -62,11 +62,22 @@ def init_db():
     db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
             mobileno TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            place TEXT DEFAULT '',
+            plan TEXT DEFAULT 'free',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migrate: add columns if they don't exist (for existing DBs)
+    cols = [r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()]
+    if "username" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN username TEXT DEFAULT ''")
+    if "place" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN place TEXT DEFAULT ''")
+    if "plan" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'")
     db.commit()
     db.close()
 
@@ -155,20 +166,27 @@ REGISTER_PAGE = """<!DOCTYPE html>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #131722; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-  .login-box { background: #1e222d; border-radius: 12px; padding: 40px; width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  .login-box { background: #1e222d; border-radius: 12px; padding: 40px; width: 420px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
   .login-box h1 { text-align: center; margin-bottom: 8px; color: #2962ff; font-size: 24px; }
   .login-box p.subtitle { text-align: center; color: #787b86; margin-bottom: 28px; font-size: 14px; }
-  .form-group { margin-bottom: 20px; }
+  .form-group { margin-bottom: 16px; }
   .form-group label { display: block; margin-bottom: 6px; color: #787b86; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .form-group input { width: 100%; padding: 12px 14px; background: #131722; border: 1px solid #363a45; border-radius: 6px; color: #d1d4dc; font-size: 15px; outline: none; transition: border-color 0.2s; }
+  .form-group input[type="text"], .form-group input[type="tel"], .form-group input[type="password"] { width: 100%; padding: 12px 14px; background: #131722; border: 1px solid #363a45; border-radius: 6px; color: #d1d4dc; font-size: 15px; outline: none; transition: border-color 0.2s; }
   .form-group input:focus { border-color: #2962ff; }
   .btn { width: 100%; padding: 12px; background: #2962ff; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
   .btn:hover { background: #1e53e5; }
-  .error { background: #ff444422; border: 1px solid #ff4444; color: #ff6b6b; padding: 10px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 13px; text-align: center; }
-  .success { background: #00c85322; border: 1px solid #00c853; color: #69f0ae; padding: 10px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 13px; text-align: center; }
+  .error { background: #ff444422; border: 1px solid #ff4444; color: #ff6b6b; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; text-align: center; }
+  .success { background: #00c85322; border: 1px solid #00c853; color: #69f0ae; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; text-align: center; }
   .signup-link { text-align: center; margin-top: 20px; font-size: 13px; color: #787b86; }
   .signup-link a { color: #2962ff; text-decoration: none; }
   .signup-link a:hover { text-decoration: underline; }
+  .plan-group { display: flex; gap: 20px; margin-top: 8px; }
+  .plan-option { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .plan-option input[type="radio"] { accent-color: #2962ff; width: 16px; height: 16px; cursor: pointer; }
+  .plan-option span { font-size: 14px; color: #d1d4dc; }
+  .plan-info { margin-top: 10px; padding: 10px 14px; border-radius: 6px; font-size: 12px; line-height: 1.5; display: none; }
+  .plan-info.free-info { background: #1b5e2022; border: 1px solid #43a047; color: #69f0ae; }
+  .plan-info.paid-info { background: #ff6d0022; border: 1px solid #ff6d00; color: #ffab40; }
 </style>
 </head>
 <body>
@@ -178,8 +196,12 @@ REGISTER_PAGE = """<!DOCTYPE html>
   {{ERROR}}
   <form method="POST" action="/register">
     <div class="form-group">
+      <label>Username</label>
+      <input type="text" name="username" placeholder="Enter your name" required autofocus>
+    </div>
+    <div class="form-group">
       <label>Mobile Number</label>
-      <input type="tel" name="mobileno" placeholder="Enter 10-digit mobile" pattern="[0-9]{10}" maxlength="10" required autofocus>
+      <input type="tel" name="mobileno" placeholder="Enter 10-digit mobile" pattern="[0-9]{10}" maxlength="10" required>
     </div>
     <div class="form-group">
       <label>Password</label>
@@ -188,6 +210,19 @@ REGISTER_PAGE = """<!DOCTYPE html>
     <div class="form-group">
       <label>Confirm Password</label>
       <input type="password" name="confirm_password" placeholder="Re-enter password" minlength="6" required>
+    </div>
+    <div class="form-group">
+      <label>Place</label>
+      <input type="text" name="place" placeholder="City / Town" required>
+    </div>
+    <div class="form-group">
+      <label>Plan</label>
+      <div class="plan-group">
+        <label class="plan-option"><input type="radio" name="plan" value="free" checked onchange="document.getElementById('freeInfo').style.display='block';document.getElementById('paidInfo').style.display='none'"><span>Free Trial</span></label>
+        <label class="plan-option"><input type="radio" name="plan" value="paid" onchange="document.getElementById('paidInfo').style.display='block';document.getElementById('freeInfo').style.display='none'"><span>Paid</span></label>
+      </div>
+      <div class="plan-info free-info" id="freeInfo" style="display:block">&#10003; 1 month free evaluation. No payment required.</div>
+      <div class="plan-info paid-info" id="paidInfo">&#8377; 100/month &mdash; Contact <b>Mangal</b> at <b>95000 90975</b></div>
     </div>
     <button class="btn" type="submit">Register</button>
   </form>
@@ -210,6 +245,16 @@ def login():
     db = get_db()
     user = db.execute("SELECT * FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
     if user and verify_password(password, user["password_hash"]):
+        # Check free tier expiry (30 days)
+        if user["plan"] == "free":
+            try:
+                created = datetime.strptime(user["created_at"], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                created = datetime.utcnow()
+            if datetime.utcnow() - created > timedelta(days=30):
+                return Response(LOGIN_PAGE.replace("{{ERROR}}",
+                    '<div class="error">Free Eval version over. <a href="/register">Re-register</a> with same name and mobile number for paid version.</div>'),
+                    content_type="text/html")
         session["user_id"] = user["id"]
         session["mobileno"] = user["mobileno"]
         return redirect("/")
@@ -220,10 +265,15 @@ def login():
 def register():
     if request.method == "GET":
         return Response(REGISTER_PAGE.replace("{{ERROR}}", ""), content_type="text/html")
+    username = request.form.get("username", "").strip()
     mobileno = request.form.get("mobileno", "").strip()
     password = request.form.get("password", "")
     confirm = request.form.get("confirm_password", "")
-    if not mobileno or not password or not confirm:
+    place = request.form.get("place", "").strip()
+    plan = request.form.get("plan", "free").strip()
+    if plan not in ("free", "paid"):
+        plan = "free"
+    if not username or not mobileno or not password or not confirm or not place:
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">All fields are required.</div>'), content_type="text/html")
     if not re.fullmatch(r"\d{10}", mobileno):
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Enter a valid 10-digit mobile number.</div>'), content_type="text/html")
@@ -232,13 +282,23 @@ def register():
     if password != confirm:
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Passwords do not match.</div>'), content_type="text/html")
     db = get_db()
-    existing = db.execute("SELECT id FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
+    existing = db.execute("SELECT id, plan FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
     if existing:
+        # Allow re-registration for paid upgrade after free expired
+        if existing["plan"] == "free" and plan == "paid":
+            pw_hash = hash_password(password)
+            db.execute("UPDATE users SET username=?, password_hash=?, place=?, plan='paid', created_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (username, pw_hash, place, existing["id"]))
+            db.commit()
+            return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Upgraded to Paid! &#8377;100/month &mdash; Contact <b>Mangal</b> at <b>95000 90975</b>. <a href="/login">Sign in now</a></div>'), content_type="text/html")
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">This mobile number is already registered.</div>'), content_type="text/html")
     pw_hash = hash_password(password)
-    db.execute("INSERT INTO users (mobileno, password_hash) VALUES (?, ?)", (mobileno, pw_hash))
+    db.execute("INSERT INTO users (username, mobileno, password_hash, place, plan) VALUES (?, ?, ?, ?, ?)",
+               (username, mobileno, pw_hash, place, plan))
     db.commit()
-    return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Registration successful! <a href="/login">Sign in now</a></div>'), content_type="text/html")
+    if plan == "paid":
+        return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Registration successful! &#8377;100/month &mdash; Contact <b>Mangal</b> at <b>95000 90975</b>. <a href="/login">Sign in now</a></div>'), content_type="text/html")
+    return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Registration successful! 1 month free trial activated. <a href="/login">Sign in now</a></div>'), content_type="text/html")
 
 
 @app.route("/logout")
@@ -3076,7 +3136,7 @@ def api_trade_start():
     data = request.get_json(force=True)
     symbol = data.get("symbol", "NIFTY50")
     capital = float(data.get("capital", 100000))
-    algo = data.get("algo", "janestreet")
+    algo = data.get("algo", "mstreet")
     sid = uuid.uuid4().hex[:12]
     paper_trades[sid] = {
         "symbol": symbol,
@@ -3360,29 +3420,49 @@ def api_candles():
     fvg = compute_fair_value_gaps(candles)
     bos_choch = compute_bos_choch(candles)
     cvd = compute_cvd(candles)
-    signals, summary = generate_signals(
-        candles, supertrend, psar, rsi_data, macd_data,
-        vwap_data, ema9, ema21, patterns, sr
-    )
 
-    algo = request.args.get("algo", "default")
-    if algo == "janestreet":
-        signals, summary = generate_janestreet_signals(
-            candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
-        )
-    elif algo == "accurate":
-        signals, summary = generate_accurate_signals(
-            candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
-        )
+    algo_param = request.args.get("algo", "trend")
+    algos = [a.strip() for a in algo_param.split(",") if a.strip()]
+    # Remove mpredict from signal algos (it only controls predictions)
+    signal_algos = [a for a in algos if a != "mpredict"]
+
+    all_signals = []
+    summaries = {}
+    for algo in signal_algos:
+        if algo == "mstreet":
+            sigs, summ = generate_janestreet_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "mfactor":
+            sigs, summ = generate_accurate_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        else:  # trend (default)
+            sigs, summ = generate_signals(
+                candles, supertrend, psar, rsi_data, macd_data,
+                vwap_data, ema9, ema21, patterns, sr
+            )
+        all_signals.extend(sigs)
+        summaries[algo] = summ
+
+    # Deduplicate signals by time — keep the one with highest absolute score
+    seen = {}
+    for s in all_signals:
+        t = s["time"]
+        if t not in seen or abs(s.get("score", 0)) > abs(seen[t].get("score", 0)):
+            seen[t] = s
+    signals = sorted(seen.values(), key=lambda x: x["time"])
 
     bt_qty = request.args.get("bt_qty", 0, type=int)
     backtest = run_backtest(candles, signals, bt_qty)
 
-    # ML Predictions
-    try:
-        predictions = predict_next_candles(candles, interval, n_predict=5)
-    except Exception:
-        predictions = []
+    # ML Predictions — only if mpredict is selected
+    predictions = []
+    if "mpredict" in algos:
+        try:
+            predictions = predict_next_candles(candles, interval, n_predict=5)
+        except Exception:
+            predictions = []
 
     return jsonify({
         "candles": candles,
@@ -3396,7 +3476,7 @@ def api_candles():
         "macd": macd_data,
         "patterns": patterns,
         "signals": signals,
-        "signalSummary": summary,
+        "signalSummary": summaries,
         "cpr": cpr,
         "bollingerBands": bb,
         "liquidityPools": liquidity_pools,
@@ -3627,6 +3707,62 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 16px; cursor: pointer; border-radius: 4px; transition: all 0.15s;
   }
   .gear-btn:hover { background: #2a2e39; color: #d1d4dc; }
+  /* Settings Config Panel */
+  .cfg-panel {
+    position: absolute; top: 44px; right: 60px; z-index: 250;
+    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    width: 280px; display: none; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+    max-height: calc(100vh - 100px); overflow-y: auto;
+  }
+  .cfg-panel.open { display: block; }
+  .cfg-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px; border-bottom: 1px solid #2a2e39; position: sticky; top: 0;
+    background: #1e222d; z-index: 1;
+  }
+  .cfg-header h3 { margin: 0; font-size: 14px; color: #d1d4dc; font-weight: 600; }
+  .cfg-close {
+    background: none; border: none; color: #787b86; font-size: 18px; cursor: pointer;
+    padding: 0 4px; line-height: 1;
+  }
+  .cfg-close:hover { color: #ef5350; }
+  .cfg-section { border-bottom: 1px solid #2a2e39; }
+  .cfg-section:last-child { border-bottom: none; }
+  .cfg-section-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 16px; cursor: default;
+  }
+  .cfg-section-header span { color: #d1d4dc; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .cfg-toggle { position: relative; width: 36px; height: 20px; display: inline-block; flex-shrink: 0; }
+  .cfg-toggle input { opacity: 0; width: 0; height: 0; }
+  .cfg-slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: #3a3e4a; border-radius: 20px; transition: 0.2s;
+  }
+  .cfg-slider::before {
+    content: ''; position: absolute; height: 14px; width: 14px; left: 3px; bottom: 3px;
+    background: #787b86; border-radius: 50%; transition: 0.2s;
+  }
+  .cfg-toggle input:checked + .cfg-slider { background: #2962ff; }
+  .cfg-toggle input:checked + .cfg-slider::before { transform: translateX(16px); background: #fff; }
+  .cfg-section-body { display: none; padding: 4px 0 8px 0; }
+  .cfg-section-body.open { display: block; }
+  .cfg-item {
+    display: block; padding: 7px 24px; color: #d1d4dc; font-size: 13px;
+    cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
+  }
+  .cfg-item:hover:not(.disabled) { background: #2a2e39; }
+  .cfg-item.disabled { color: #555; cursor: default; }
+  .cfg-item.active { color: #2962ff; font-weight: 600; }
+  .cfg-item.has-sub::after { content: '\25B6'; float: right; font-size: 10px; margin-top: 2px; }
+  .cfg-item.has-sub.expanded::after { content: '\25BC'; }
+  .cfg-sub { display: none; padding-left: 16px; background: #181c27; border-left: 2px solid #2962ff; margin-left: 16px; }
+  .cfg-sub.open { display: block; }
+  .cfg-sub-item {
+    display: block; padding: 7px 16px; color: #d1d4dc; font-size: 13px;
+    cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
+  }
+  .cfg-sub-item:hover { background: #2a2e39; }
   /* Live Data Button */
   .live-btn {
     padding: 6px 14px; border: 1px solid #2a2e39; background: transparent;
@@ -3836,24 +3972,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .ds-item:hover { background: #2a2e39; }
   .ds-item.active { color: #2962ff; font-weight: 600; }
-  /* FII Dropdown */
-  .fii-dropdown-wrapper { position: relative; }
-  .fii-dropdown {
+  /* Algo Dropdown */
+  .algo-dropdown-wrapper { position: relative; }
+  .algo-dropdown {
     position: absolute; top: 100%; left: 0; background: #1e222d; border: 1px solid #2a2e39;
     border-radius: 6px; padding: 4px 0; min-width: 180px; z-index: 300;
     box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none;
   }
-  .fii-dropdown.open { display: block; }
-  .fii-item {
+  .algo-dropdown.open { display: block; }
+  .algo-item {
     display: block; padding: 8px 16px; color: #d1d4dc; font-size: 13px;
     cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
   }
-  .fii-item:hover { background: #2a2e39; }
-  .fii-item.active { color: #2962ff; font-weight: 600; }
-  /* Predict Button */
-  #btnPredict { background: #1a3a5c; color: #64b5f6; border: 1px solid #2196F3; font-weight: 600; }
-  #btnPredict.active { background: #0d47a1; color: #fff; border-color: #42a5f5; box-shadow: 0 0 8px rgba(33,150,243,0.4); }
-  #btnPredict:hover { background: #1565c0; color: #fff; }
+  .algo-item:hover { background: #2a2e39; }
+  .algo-item.active { color: #2962ff; font-weight: 600; }
   /* Backtest Panel */
   .backtest-panel {
     position: absolute; top: 44px; right: 12px; z-index: 200;
@@ -3992,56 +4124,84 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <label class="ind-item" data-ind="CHoCH"><span class="dot" style="background:#ba68c8"></span><span>Change of Character</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="CVD"><span class="dot" style="background:#29b6f6"></span><span>Cum. Volume Delta</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="Signals"><span class="dot" style="background:#00e676"></span><span>Signals</span><input type="checkbox" checked></label>
+      <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
+      <button class="ind-item" id="btnIndSettings" style="cursor:pointer;border:none;background:none;color:#d1d4dc;padding:8px 12px;width:100%;text-align:left;font-size:13px">&#9881; Indicator Settings</button>
     </div>
   </div>
   <div class="separator"></div>
-  <div class="backtest-dropdown-wrapper">
-    <button class="ind-btn" id="btnBacktest"><span class="dot" style="background:#ff6d00"></span>Backtest &#9662;</button>
-    <div class="backtest-dropdown" id="backtestDropdown">
-      <button class="bt-item" id="btStrategy">&#9881; Strategy</button>
-      <button class="bt-item" id="btJanestreet">&#128202; Janestreet</button>
-      <button class="bt-item" id="btOptions">&#128200; Options</button>
+  <div class="algo-dropdown-wrapper">
+    <button class="ind-btn" id="btnAlgo"><span class="dot" style="background:#ff9100"></span>Algo &#9662;</button>
+    <div class="algo-dropdown" id="algoDropdown">
+      <button class="algo-item" data-algo="trend" data-label="Trend">&#8203; Trend</button>
+      <button class="algo-item active" data-algo="mstreet" data-label="MStreet">&#10004; MStreet</button>
+      <button class="algo-item" data-algo="mfactor" data-label="MFactor">&#8203; MFactor</button>
+      <button class="algo-item active" data-algo="mpredict" data-label="MPredict">&#10004; MPredict</button>
+      <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
+      <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
     </div>
   </div>
   <div class="separator"></div>
-  <div class="datasource-dropdown-wrapper">
-    <button class="ind-btn" id="btnDataSource"><span class="dot" style="background:#2196f3"></span>Data Source &#9662;</button>
-    <div class="datasource-dropdown" id="datasourceDropdown">
-      <button class="ds-item" data-source="yahoo" data-label="Yahoo Finance">&#8203; Yahoo Finance</button>
-      <button class="ds-item active" data-source="tradingview" data-label="TradingView">&#10004; TradingView</button>
-      <button class="ds-item" data-source="nse" data-label="NSE India">&#8203; NSE India</button>
-    </div>
-  </div>
-  <div class="separator"></div>
-  <div class="fii-dropdown-wrapper">
-    <button class="ind-btn" id="btnFII"><span class="dot" style="background:#ff9100"></span>FII &#9662;</button>
-    <div class="fii-dropdown" id="fiiDropdown">
-      <button class="fii-item" data-algo="default" data-label="Default Signals">&#8203; Default Signals</button>
-      <button class="fii-item active" data-algo="janestreet" data-label="Janestreet">&#10004; Janestreet</button>
-      <button class="fii-item" data-algo="accurate" data-label="Accurate">&#8203; Accurate</button>
-    </div>
-  </div>
-  <div class="separator"></div>
-  <button class="ind-btn active" id="btnPredict" title="Toggle ML Predictions"><span class="dot" style="background:#2196F3"></span>Predict</button>
-  <div class="separator"></div>
-  <div class="trade-dropdown-wrapper">
-    <button class="ind-btn" id="btnTrade"><span class="dot" style="background:#FF5722"></span>Trade &#9662;</button>
-    <div class="trade-dropdown" id="tradeDropdown">
-      <button class="trade-item disabled">&#128200; Stocks</button>
-      <button class="trade-item has-sub" id="tradeFutures">&#128202; Futures</button>
-      <div class="trade-sub" id="futuresSub">
-        <button class="trade-sub-item" id="tradePositions">&#128203; Positions</button>
-        <button class="trade-sub-item" id="tradeLog">&#128196; Log</button>
+  <button class="gear-btn" id="btnSettingsPanel" title="Settings">&#9881;</button>
+
+  <!-- Settings Panel (Backtest, Data Source, Trade, Real Trade) -->
+  <div class="cfg-panel" id="cfgPanel">
+    <div class="cfg-header"><h3>&#9881; Settings</h3><button class="cfg-close" id="cfgClose">&times;</button></div>
+
+    <!-- Backtest Section -->
+    <div class="cfg-section">
+      <div class="cfg-section-header">
+        <span><span class="dot" style="background:#ff6d00"></span> Backtest</span>
+        <label class="cfg-toggle"><input type="checkbox" id="cfgBacktestToggle"><span class="cfg-slider"></span></label>
       </div>
-      <button class="trade-item disabled">&#128176; Options</button>
+      <div class="cfg-section-body" id="cfgBacktestBody">
+        <button class="cfg-item bt-algo-item" data-bt-algo="trend">&#128202; Trend</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="mstreet">&#128202; MStreet</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="mfactor">&#128202; MFactor</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="mpredict">&#128202; MPredict</button>
+      </div>
     </div>
-  </div>
-  <div class="realtrade-dropdown-wrapper">
-    <button class="ind-btn" id="btnRealTrade"><span class="dot" style="background:#43a047"></span>Real Trade &#9662;</button>
-    <div class="realtrade-dropdown" id="realTradeDropdown">
-      <button class="realtrade-item" id="realDelta">Delta</button>
-      <button class="realtrade-item disabled">Zerodha</button>
-      <button class="realtrade-item disabled">Mt5</button>
+
+    <!-- Data Source Section -->
+    <div class="cfg-section">
+      <div class="cfg-section-header">
+        <span><span class="dot" style="background:#2196f3"></span> Data Source</span>
+        <label class="cfg-toggle"><input type="checkbox" id="cfgDataSourceToggle" checked><span class="cfg-slider"></span></label>
+      </div>
+      <div class="cfg-section-body open" id="cfgDataSourceBody">
+        <button class="cfg-item ds-cfg-item" data-source="yahoo" data-label="Yahoo Finance">&#8203; Yahoo Finance</button>
+        <button class="cfg-item ds-cfg-item active" data-source="tradingview" data-label="TradingView">&#10004; TradingView</button>
+        <button class="cfg-item ds-cfg-item" data-source="nse" data-label="NSE India">&#8203; NSE India</button>
+      </div>
+    </div>
+
+    <!-- Trade Section -->
+    <div class="cfg-section">
+      <div class="cfg-section-header">
+        <span><span class="dot" style="background:#FF5722"></span> Trade</span>
+        <label class="cfg-toggle"><input type="checkbox" id="cfgTradeToggle"><span class="cfg-slider"></span></label>
+      </div>
+      <div class="cfg-section-body" id="cfgTradeBody">
+        <button class="cfg-item disabled">&#128200; Stocks</button>
+        <button class="cfg-item has-sub" id="cfgTradeFutures">&#128202; Futures</button>
+        <div class="cfg-sub" id="cfgFuturesSub">
+          <button class="cfg-sub-item" id="cfgTradePositions">&#128203; Positions</button>
+          <button class="cfg-sub-item" id="cfgTradeLog">&#128196; Log</button>
+        </div>
+        <button class="cfg-item disabled">&#128176; Options</button>
+      </div>
+    </div>
+
+    <!-- Real Trade Section -->
+    <div class="cfg-section">
+      <div class="cfg-section-header">
+        <span><span class="dot" style="background:#43a047"></span> Real Trade</span>
+        <label class="cfg-toggle"><input type="checkbox" id="cfgRealTradeToggle"><span class="cfg-slider"></span></label>
+      </div>
+      <div class="cfg-section-body" id="cfgRealTradeBody">
+        <button class="cfg-item" id="cfgRealDelta">Delta</button>
+        <button class="cfg-item disabled">Zerodha</button>
+        <button class="cfg-item disabled">Mt5</button>
+      </div>
     </div>
   </div>
   <!-- Delta Real Trade Panel Modal -->
@@ -4123,8 +4283,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="separator"></div>
-  <button class="gear-btn" id="btnAnalysis" title="Signal Analysis Panel">&#9889;</button>
-  <button class="gear-btn" id="btnSettings" title="Indicator Settings">&#9881;</button>
+
 </div>
 
 <div id="chart-container">
@@ -4145,7 +4304,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   <!-- Signal Analysis Panel -->
   <div class="signal-panel" id="signalPanel">
-    <h3>&#9889; Signal Analysis</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">&#9889; Signal Analysis</h3><button id="signalPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button></div>
     <div class="verdict-box neutral" id="verdictBox">LOADING...<div class="verdict-score" id="verdictScore"></div></div>
     <div id="indicatorRows"></div>
     <div class="signal-count" id="signalCount"></div>
@@ -4154,7 +4313,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   <!-- Settings Panel -->
   <div class="settings-panel" id="settingsPanel">
-    <h3>Indicator Settings</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">Indicator Settings</h3><button id="settingsPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button></div>
     <div class="section-title" style="color:#ff9800">&#9650; SuperTrend</div>
     <label>Period <input type="number" id="stPeriod" value="10" min="1" max="50" step="1"></label>
     <label>Multiplier <input type="number" id="stMultiplier" value="3" min="0.1" max="10" step="0.1"></label>
@@ -4205,9 +4364,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tp-row">
         <label>Algorithm</label>
         <select id="tpAlgo">
-          <option value="default">Default Strategy</option>
-          <option value="janestreet" selected>Janestreet Strategy</option>
-          <option value="accurate">Accurate Strategy</option>
+          <option value="trend">Trend Strategy</option>
+          <option value="mstreet" selected>MStreet Strategy</option>
+          <option value="mfactor">MFactor Strategy</option>
         </select>
       </div>
       <button class="tp-start-btn start" id="tpStartBtn">Start Trading</button>
@@ -4251,7 +4410,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let lastBacktest = {};
   let currentSource = 'tradingview';
   let signalMap = {};  // time -> signal data for tooltip
-  let currentAlgo = 'janestreet';
+  let currentAlgo = new Set(['mstreet', 'mpredict']);
 
   // Indicator visibility
   let showST = false, showSAR = false, showSR = false, showEMA = false, showVWAP = false, showSignals = true;
@@ -4313,7 +4472,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     wickDownColor: 'rgba(255,152,0,0.6)', wickUpColor: 'rgba(33,150,243,0.6)',
     priceLineVisible: false, lastValueVisible: false,
   });
-  let showPredictions = true;
+  let showPredictions = true;  // controlled by mpredict algo toggle
 
 
     // ---- Delta Real Trading Logic ----
@@ -4550,19 +4709,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
   bosMarkersSeries.applyOptions({ visible: false });
   chochMarkersSeries.applyOptions({ visible: false });
 
-  // ---- Settings Panel ----
+  // ---- Settings Panel (opened from Indicators dropdown) ----
   const settingsPanel = document.getElementById('settingsPanel');
-  document.getElementById('btnSettings').addEventListener('click', () => settingsPanel.classList.toggle('open'));
+  document.getElementById('btnIndSettings').addEventListener('click', function(e) {
+    e.stopPropagation();
+    indDropdown.classList.remove('open');
+    settingsPanel.classList.toggle('open');
+  });
   document.getElementById('applySettings').addEventListener('click', () => {
     settingsPanel.classList.remove('open');
     loadData(currentTF);
   });
+  document.getElementById('settingsPanelClose').addEventListener('click', () => {
+    settingsPanel.classList.remove('open');
+  });
 
-  // ---- Signal Panel Toggle ----
+  // ---- Signal Panel (opened from Algo dropdown) ----
   const signalPanel = document.getElementById('signalPanel');
-  document.getElementById('btnAnalysis').addEventListener('click', () => {
+  document.getElementById('btnAlgoAnalysis').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
     signalPanel.classList.toggle('open');
     settingsPanel.classList.remove('open');
+  });
+  document.getElementById('signalPanelClose').addEventListener('click', () => {
+    signalPanel.classList.remove('open');
   });
 
   // ---- Indicators Dropdown ----
@@ -4572,7 +4743,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     indDropdown.classList.toggle('open');
     settingsPanel.classList.remove('open');
     signalPanel.classList.remove('open');
-    if (typeof dsDropdown !== 'undefined') dsDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
   });
   // Close dropdown on outside click
   document.addEventListener('click', function(e) {
@@ -4850,7 +5021,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         + '&bb_period=' + bbP + '&bb_stddev=' + bbSD
         + '&bt_qty=' + btQty
         + '&source=' + currentSource
-        + '&algo=' + currentAlgo;
+        + '&algo=' + Array.from(currentAlgo).join(',');
 
       const resp = await fetch(url);
       const json = await resp.json();
@@ -4875,7 +5046,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       // --- ML Predicted Candles ---
       const preds = json.predictions || [];
-      if (showPredictions && preds.length > 0) {
+      if (currentAlgo.has('mpredict') && preds.length > 0) {
         // Include the last real candle as bridge + predicted candles
         const lastReal = formatted[formatted.length - 1];
         const predFormatted = preds.map(p => ({
@@ -5064,12 +5235,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
             text: (isStrong ? '★ ' : '') + s.type.replace('_', ' ') + ' (' + s.score.toFixed(1) + ')',
           };
         });
-        // Deduplicate: max 1 signal per 5 bars to avoid clutter (skip for Accurate algo)
+        // Deduplicate: max 1 signal per 5 bars to avoid clutter (skip for MFactor algo)
         const filtered = [];
         let lastSigIdx = -10;
-        const isAccurate = (currentAlgo === 'accurate');
+        const hasMfactor = currentAlgo.has('mfactor');
         for (let m = 0; m < markers.length; m++) {
-          if (isAccurate) {
+          if (hasMfactor) {
             filtered.push(markers[m]);
           } else {
             // Find candle index for this marker time
@@ -5114,8 +5285,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (tradeLogPanel.classList.contains('open')) renderTradeLog();
       }
 
-      // Restore zoom position if this is a background update, otherwise fit
-      if (background && savedLogicalRange) {
+      // Restore zoom position - preserve view to prevent flickering
+      if (savedLogicalRange) {
+        chart.timeScale().applyOptions({ barSpacing: savedBarSpacing });
         chart.timeScale().setVisibleLogicalRange(savedLogicalRange);
       } else {
         chart.timeScale().fitContent();
@@ -5130,31 +5302,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   // ---- Signal Panel Renderer ----
-  function updateSignalPanel(summ, sigs) {
+  const algoLabels = { trend: 'Trend', mstreet: 'MStreet', mfactor: 'MFactor', mpredict: 'MPredict' };
+  function updateSignalPanel(summaries, sigs) {
     const box = document.getElementById('verdictBox');
-    const scoreEl = document.getElementById('verdictScore');
     const rowsEl = document.getElementById('indicatorRows');
     const countEl = document.getElementById('signalCount');
 
-    if (!summ || !summ.verdict) {
+    const keys = Object.keys(summaries || {});
+    if (!keys.length) {
       box.className = 'verdict-box neutral'; box.innerHTML = 'NO DATA';
+      rowsEl.innerHTML = ''; countEl.innerHTML = '';
       return;
     }
 
-    const v = summ.verdict;
-    const cls = v.includes('BUY') ? 'buy' : (v.includes('SELL') ? 'sell' : 'neutral');
+    // Composite: average scores across algos
+    let totalScore = 0; let cnt = 0;
+    keys.forEach(k => { if (summaries[k] && summaries[k].score != null) { totalScore += summaries[k].score; cnt++; } });
+    const avgScore = cnt ? totalScore / cnt : 0;
+    const overallVerdict = avgScore >= 6 ? 'STRONG BUY' : avgScore >= 4 ? 'BUY' : avgScore >= -4 ? 'NEUTRAL' : avgScore >= -6 ? 'SELL' : 'STRONG SELL';
+    const cls = overallVerdict.includes('BUY') ? 'buy' : (overallVerdict.includes('SELL') ? 'sell' : 'neutral');
     box.className = 'verdict-box ' + cls;
-    box.innerHTML = v + '<div class="verdict-score">Composite Score: ' + summ.score.toFixed(2) + ' / 10</div>';
+    box.innerHTML = overallVerdict + '<div class="verdict-score">Composite: ' + avgScore.toFixed(2) + ' / 10</div>';
 
-    // Indicator breakdown
+    // Per-algo sections
     let html = '';
-    (summ.indicators || []).forEach(ind => {
-      const iCls = ind.weight > 0 ? 'bull' : (ind.weight < 0 ? 'bear' : 'neut');
-      html += '<div class="ind-row">' +
-        '<span class="ind-name">' + ind.name + '</span>' +
-        '<span class="ind-status ' + iCls + '">' + ind.status + '</span>' +
-        '<span class="ind-weight">' + (ind.weight > 0 ? '+' : '') + ind.weight.toFixed(1) + '</span>' +
-        '</div>';
+    keys.forEach(k => {
+      const summ = summaries[k];
+      if (!summ || !summ.verdict) return;
+      const label = algoLabels[k] || k;
+      const vCls = summ.verdict.includes('BUY') ? 'buy' : (summ.verdict.includes('SELL') ? 'sell' : 'neutral');
+      html += '<div style="margin-top:8px;padding:6px 8px;background:#181c27;border-radius:6px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">';
+      html += '<span style="font-weight:700;color:#ffd600;font-size:12px">' + label + '</span>';
+      html += '<span class="verdict-box ' + vCls + '" style="font-size:11px;padding:2px 8px;border-radius:4px">' + summ.verdict + ' (' + summ.score.toFixed(1) + ')</span>';
+      html += '</div>';
+      (summ.indicators || []).forEach(ind => {
+        const iCls = ind.weight > 0 ? 'bull' : (ind.weight < 0 ? 'bear' : 'neut');
+        html += '<div class="ind-row">' +
+          '<span class="ind-name">' + ind.name + '</span>' +
+          '<span class="ind-status ' + iCls + '">' + ind.status + '</span>' +
+          '<span class="ind-weight">' + (ind.weight > 0 ? '+' : '') + ind.weight.toFixed(1) + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
     });
     rowsEl.innerHTML = html;
 
@@ -5171,9 +5361,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     e.stopPropagation();
     periodDropdown.classList.toggle('open');
     indDropdown.classList.remove('open');
-    btDropdown.classList.remove('open');
-    dsDropdown.classList.remove('open');
-    fiiDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
+    algoDropdown.classList.remove('open');
   });
   document.addEventListener('click', function(e) {
     if (!e.target.closest('.period-dropdown-wrapper')) periodDropdown.classList.remove('open');
@@ -5294,48 +5483,57 @@ HTML_PAGE = r"""<!DOCTYPE html>
     loadData(currentTF);
   }
 
-  // ---- Backtest Dropdown ----
-  const btDropdown = document.getElementById('backtestDropdown');
-  document.getElementById('btnBacktest').addEventListener('click', function(e) {
+  // ---- Settings Config Panel ----
+  const cfgPanel = document.getElementById('cfgPanel');
+  document.getElementById('btnSettingsPanel').addEventListener('click', function(e) {
     e.stopPropagation();
-    btDropdown.classList.toggle('open');
+    cfgPanel.classList.toggle('open');
     indDropdown.classList.remove('open');
-    if (typeof dsDropdown !== 'undefined') dsDropdown.classList.remove('open');
-    if (typeof fiiDropdown !== 'undefined') fiiDropdown.classList.remove('open');
+    algoDropdown.classList.remove('open');
     if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
   });
+  document.getElementById('cfgClose').addEventListener('click', function() {
+    cfgPanel.classList.remove('open');
+  });
   document.addEventListener('click', function(e) {
-    if (!e.target.closest('.backtest-dropdown-wrapper')) btDropdown.classList.remove('open');
+    if (!e.target.closest('.cfg-panel') && !e.target.closest('#btnSettingsPanel')) cfgPanel.classList.remove('open');
   });
-  document.getElementById('btStrategy').addEventListener('click', function() {
-    btDropdown.classList.remove('open');
-    const panel = document.getElementById('backtestPanel');
-    panel.classList.toggle('open');
-    if (panel.classList.contains('open')) renderBacktest(lastBacktest);
-  });
-  document.getElementById('btJanestreet').addEventListener('click', function() {
-    btDropdown.classList.remove('open');
-    // Switch algo to janestreet
-    currentAlgo = 'janestreet';
-    // Update FII dropdown to reflect janestreet as active
-    document.querySelectorAll('.fii-item').forEach(function(el) {
-      el.classList.remove('active');
-      el.textContent = '\u200B ' + el.dataset.label;
-      if (el.dataset.algo === 'janestreet') {
-        el.classList.add('active');
-        el.textContent = '\u2714 ' + el.dataset.label;
+
+  // Toggle sections open/close
+  document.querySelectorAll('.cfg-toggle input').forEach(function(toggle) {
+    toggle.addEventListener('change', function() {
+      const body = this.closest('.cfg-section').querySelector('.cfg-section-body');
+      if (this.checked) {
+        body.classList.add('open');
+      } else {
+        body.classList.remove('open');
       }
     });
-    // Reload data with janestreet algo and open backtest panel
-    loadData(currentTF).then(function() {
-      const panel = document.getElementById('backtestPanel');
-      panel.classList.add('open');
-      renderBacktest(lastBacktest);
-    });
   });
-  document.getElementById('btOptions').addEventListener('click', function() {
-    btDropdown.classList.remove('open');
-    // Options backtest placeholder
+
+  // Backtest items (algo-named)
+  document.querySelectorAll('.bt-algo-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+      cfgPanel.classList.remove('open');
+      const algo = this.dataset.btAlgo;
+      // Ensure the algo is selected
+      if (!currentAlgo.has(algo)) {
+        currentAlgo.add(algo);
+        document.querySelectorAll('.algo-item').forEach(function(el) {
+          if (el.dataset.algo === algo) {
+            el.classList.add('active');
+            el.textContent = '\u2714 ' + el.dataset.label;
+          }
+        });
+        // Sync mpredict
+        showPredictions = currentAlgo.has('mpredict');
+      }
+      loadData(currentTF, true).then(function() {
+        const panel = document.getElementById('backtestPanel');
+        panel.classList.add('open');
+        renderBacktest(lastBacktest);
+      });
+    });
   });
   document.getElementById('btClose').addEventListener('click', function() {
     document.getElementById('backtestPanel').classList.remove('open');
@@ -5344,72 +5542,56 @@ HTML_PAGE = r"""<!DOCTYPE html>
     loadData(currentTF);
   });
 
-  // ---- Data Source Dropdown ----
-  const dsDropdown = document.getElementById('datasourceDropdown');
-  document.getElementById('btnDataSource').addEventListener('click', function(e) {
-    e.stopPropagation();
-    dsDropdown.classList.toggle('open');
-    indDropdown.classList.remove('open');
-    btDropdown.classList.remove('open');
-    if (typeof fiiDropdown !== 'undefined') fiiDropdown.classList.remove('open');
-    if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
-  });
-  document.addEventListener('click', function(e) {
-    if (!e.target.closest('.datasource-dropdown-wrapper')) dsDropdown.classList.remove('open');
-  });
-  document.querySelectorAll('.ds-item').forEach(function(item) {
+  // ---- Data Source (in Settings Panel) ----
+  document.querySelectorAll('.ds-cfg-item').forEach(function(item) {
     item.addEventListener('click', function() {
       const src = this.dataset.source;
       currentSource = src;
-      document.querySelectorAll('.ds-item').forEach(function(el) {
+      document.querySelectorAll('.ds-cfg-item').forEach(function(el) {
         el.classList.remove('active');
         el.textContent = '\u200B ' + el.dataset.label;
       });
       this.classList.add('active');
       this.textContent = '\u2714 ' + this.dataset.label;
-      dsDropdown.classList.remove('open');
-      loadData(currentTF);
+      loadData(currentTF, true);
     });
   });
 
-  // ---- FII Dropdown ----
-  const fiiDropdown = document.getElementById('fiiDropdown');
-  document.getElementById('btnFII').addEventListener('click', function(e) {
+  // ---- Algo Dropdown (multi-select) ----
+  const algoDropdown = document.getElementById('algoDropdown');
+  document.getElementById('btnAlgo').addEventListener('click', function(e) {
     e.stopPropagation();
-    fiiDropdown.classList.toggle('open');
+    algoDropdown.classList.toggle('open');
     indDropdown.classList.remove('open');
-    btDropdown.classList.remove('open');
-    dsDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
   });
   document.addEventListener('click', function(e) {
-    if (!e.target.closest('.fii-dropdown-wrapper')) fiiDropdown.classList.remove('open');
+    if (!e.target.closest('.algo-dropdown-wrapper')) algoDropdown.classList.remove('open');
   });
-  document.querySelectorAll('.fii-item').forEach(function(item) {
-    item.addEventListener('click', function() {
+  document.querySelectorAll('.algo-item').forEach(function(item) {
+    item.addEventListener('click', function(e) {
+      e.stopPropagation();
       const algo = this.dataset.algo;
-      currentAlgo = algo;
-      document.querySelectorAll('.fii-item').forEach(function(el) {
-        el.classList.remove('active');
-        el.textContent = '\u200B ' + el.dataset.label;
-      });
-      this.classList.add('active');
-      this.textContent = '\u2714 ' + this.dataset.label;
-      fiiDropdown.classList.remove('open');
-      loadData(currentTF);
+      if (!algo) return; // skip non-algo items (e.g. Signal Analysis)
+      if (currentAlgo.has(algo)) {
+        currentAlgo.delete(algo);
+        this.classList.remove('active');
+        this.textContent = '\u200B ' + this.dataset.label;
+      } else {
+        currentAlgo.add(algo);
+        this.classList.add('active');
+        this.textContent = '\u2714 ' + this.dataset.label;
+      }
+      // Sync mpredict with showPredictions
+      showPredictions = currentAlgo.has('mpredict');
+      if (!showPredictions) {
+        predSeries.setData([]);
+        predSeries.applyOptions({ visible: false });
+      }
+      // Debounced background reload to prevent flickering
+      clearTimeout(window._algoDebounce);
+      window._algoDebounce = setTimeout(() => loadData(currentTF, true), 300);
     });
-  });
-
-  // Predict toggle button
-  const btnPredict = document.getElementById('btnPredict');
-  btnPredict.addEventListener('click', function() {
-    showPredictions = !showPredictions;
-    this.classList.toggle('active', showPredictions);
-    if (!showPredictions) {
-      predSeries.setData([]);
-      predSeries.applyOptions({ visible: false });
-    } else {
-      loadData(currentTF);
-    }
   });
 
   // Backtest panel tabs
@@ -5425,27 +5607,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   });
 
   // ---- Trade Dropdown ----
-    // ---- Real Trade Dropdown ----
-    const realTradeDropdown = document.getElementById('realTradeDropdown');
-    document.getElementById('btnRealTrade').addEventListener('click', function(e) {
-      e.stopPropagation();
-      realTradeDropdown.classList.toggle('open');
-      tradeDropdown.classList.remove('open');
-      indDropdown.classList.remove('open');
-      btDropdown.classList.remove('open');
-      dsDropdown.classList.remove('open');
-      fiiDropdown.classList.remove('open');
-      if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
-      if (typeof zoomDropdown !== 'undefined') zoomDropdown.classList.remove('open');
-    });
-    document.addEventListener('click', function(e) {
-      if (!e.target.closest('.realtrade-dropdown-wrapper')) realTradeDropdown.classList.remove('open');
-    });
-    // Delta panel open/close
+    // ---- Real Trade (in Settings Panel) ----
     const realTradePanel = document.getElementById('realTradePanel');
-    document.getElementById('realDelta').addEventListener('click', function(e) {
+    document.getElementById('cfgRealDelta').addEventListener('click', function(e) {
       e.stopPropagation();
-      realTradeDropdown.classList.remove('open');
+      cfgPanel.classList.remove('open');
       realTradePanel.style.display = 'block';
       setTimeout(function() { realTradePanel.classList.add('open'); }, 10);
     });
@@ -5455,7 +5621,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
     // Dismiss modal on chart click
     container.addEventListener('click', function(e) {
-      if (!e.target.closest('.realtrade-panel') && !e.target.closest('.realtrade-dropdown-wrapper')) {
+      if (!e.target.closest('.realtrade-panel') && !e.target.closest('.cfg-panel')) {
         realTradePanel.classList.remove('open');
         setTimeout(function() { realTradePanel.style.display = 'none'; }, 200);
       }
@@ -5489,7 +5655,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let paperTrading = false;
   let tradeSessionId = null;
   let lastProcessedSigTime = 0;
-  const tradeDropdown = document.getElementById('tradeDropdown');
   const tradePanel = document.getElementById('tradePanel');
   const tradeLogPanel = document.getElementById('tradeLogPanel');
 
@@ -5504,35 +5669,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     tpSymbol.appendChild(opt);
   });
 
-  document.getElementById('btnTrade').addEventListener('click', function(e) {
-    e.stopPropagation();
-    tradeDropdown.classList.toggle('open');
-    indDropdown.classList.remove('open');
-    btDropdown.classList.remove('open');
-    dsDropdown.classList.remove('open');
-    fiiDropdown.classList.remove('open');
-    if (typeof zoomDropdown !== 'undefined') zoomDropdown.classList.remove('open');
-    if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
-  });
-  document.addEventListener('click', function(e) {
-    if (!e.target.closest('.trade-dropdown-wrapper')) tradeDropdown.classList.remove('open');
-  });
-
-  document.getElementById('tradeFutures').addEventListener('click', function(e) {
+  // ---- Trade (in Settings Panel) ----
+  document.getElementById('cfgTradeFutures').addEventListener('click', function(e) {
     e.stopPropagation();
     this.classList.toggle('expanded');
-    document.getElementById('futuresSub').classList.toggle('open');
+    document.getElementById('cfgFuturesSub').classList.toggle('open');
   });
-  document.getElementById('tradePositions').addEventListener('click', function(e) {
+  document.getElementById('cfgTradePositions').addEventListener('click', function(e) {
     e.stopPropagation();
-    tradeDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
     tradeLogPanel.classList.remove('open');
     tradePanel.classList.toggle('open');
-    document.getElementById('tpAlgo').value = currentAlgo;
+    document.getElementById('tpAlgo').value = Array.from(currentAlgo).join(',');
   });
-  document.getElementById('tradeLog').addEventListener('click', function(e) {
+  document.getElementById('cfgTradeLog').addEventListener('click', function(e) {
     e.stopPropagation();
-    tradeDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
     tradePanel.classList.remove('open');
     tradeLogPanel.classList.toggle('open');
     if (tradeLogPanel.classList.contains('open')) renderTradeLog();
@@ -5546,7 +5698,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Click on chart dismisses trade panels
   container.addEventListener('click', function(e) {
-    if (!e.target.closest('.trade-panel') && !e.target.closest('.trade-log-panel') && !e.target.closest('.trade-dropdown-wrapper')) {
+    if (!e.target.closest('.trade-panel') && !e.target.closest('.trade-log-panel') && !e.target.closest('.cfg-panel')) {
       tradePanel.classList.remove('open');
       tradeLogPanel.classList.remove('open');
     }
@@ -5906,9 +6058,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     liveMode = !liveMode;
     this.classList.toggle('active');
     if (liveMode) {
-      // Start live feed: fetch every 30 seconds in background
+      // Start live feed: fetch every 10 seconds in background
       loadData(currentTF, true);
-      liveInterval = setInterval(() => loadData(currentTF, true), 1000);
+      liveInterval = setInterval(() => loadData(currentTF, true), 5000);
     } else {
       // Stop live feed
       if (liveInterval) { clearInterval(liveInterval); liveInterval = null; }
@@ -5922,9 +6074,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     zoomDropdown.classList.toggle('open');
     if (typeof periodDropdown !== 'undefined') periodDropdown.classList.remove('open');
     indDropdown.classList.remove('open');
-    btDropdown.classList.remove('open');
-    dsDropdown.classList.remove('open');
-    fiiDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
+    algoDropdown.classList.remove('open');
   });
   document.addEventListener('click', function(e) {
     if (!e.target.closest('.zoom-dropdown-wrapper')) zoomDropdown.classList.remove('open');
