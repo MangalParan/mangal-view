@@ -1,0 +1,436 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Panel - Mangal View</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#131722; color:#d1d4dc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; padding:20px; min-height:100vh; }
+  h1 { color:#2962ff; margin-bottom:6px; font-size:22px; }
+  .subtitle { color:#787b86; font-size:13px; margin-bottom:20px; }
+  .stats { display:flex; gap:16px; margin-bottom:20px; flex-wrap:wrap; }
+  .stat-card { background:#1e222d; border-radius:8px; padding:14px 20px; min-width:120px; }
+  .stat-card .num { font-size:24px; font-weight:700; color:#2962ff; }
+  .stat-card .lbl { font-size:11px; color:#787b86; text-transform:uppercase; margin-top:2px; }
+  .toolbar { display:flex; gap:10px; margin-bottom:16px; align-items:center; flex-wrap:wrap; }
+  .toolbar input { padding:8px 12px; background:#1e222d; border:1px solid #363a45; border-radius:6px; color:#d1d4dc; font-size:13px; outline:none; width:260px; transition:border-color .2s; }
+  .toolbar input:focus { border-color:#2962ff; }
+  .btn { padding:8px 16px; border:none; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; transition:background .2s, transform .1s; display:inline-flex; align-items:center; gap:5px; }
+  .btn:active { transform:scale(0.97); }
+  .btn-primary { background:#2962ff; color:#fff; }
+  .btn-primary:hover { background:#1e53e5; }
+  .btn-danger { background:#ff4444; color:#fff; }
+  .btn-danger:hover { background:#cc3333; }
+  .btn-success { background:#43a047; color:#fff; }
+  .btn-success:hover { background:#388e3c; }
+  .btn-sm { padding:5px 10px; font-size:11px; }
+  .btn-outline { background:transparent; border:1px solid #363a45; color:#787b86; }
+  .btn-outline:hover { border-color:#2962ff; color:#2962ff; }
+
+  .table-wrap { border-radius:8px; overflow:hidden; background:#1e222d; }
+  table { width:100%; border-collapse:collapse; }
+  th { background:#2a2e39; color:#787b86; font-size:11px; text-transform:uppercase; letter-spacing:.5px; padding:10px 12px; text-align:left; position:sticky; top:0; }
+  td { padding:9px 12px; font-size:13px; border-top:1px solid #2a2e39; }
+  tr:hover { background:#252a37; }
+  .plan-free { color:#ffd600; font-weight:600; }
+  .plan-paid { color:#69f0ae; font-weight:600; }
+  .days-left { font-size:11px; color:#787b86; }
+  .days-expired { color:#ff6b6b; font-weight:600; }
+  .empty-row td { text-align:center; color:#787b86; padding:40px; font-size:14px; }
+
+  .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.6); z-index:1000; justify-content:center; align-items:center; }
+  .modal-overlay.open { display:flex; }
+  .modal { background:#1e222d; border-radius:12px; padding:28px; width:420px; max-width:95vw; box-shadow:0 8px 32px rgba(0,0,0,.5); animation:slideUp .2s ease-out; }
+  @keyframes slideUp { from { transform:translateY(20px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+  .modal h2 { color:#2962ff; margin-bottom:16px; font-size:18px; }
+  .modal .form-group { margin-bottom:14px; }
+  .modal .form-group label { display:block; margin-bottom:4px; color:#787b86; font-size:12px; text-transform:uppercase; }
+  .modal .form-group input,
+  .modal .form-group select { width:100%; padding:10px 12px; background:#131722; border:1px solid #363a45; border-radius:6px; color:#d1d4dc; font-size:14px; outline:none; transition:border-color .2s; }
+  .modal .form-group input:focus,
+  .modal .form-group select:focus { border-color:#2962ff; }
+  .modal-actions { display:flex; gap:10px; margin-top:18px; }
+  .modal-actions .btn { flex:1; justify-content:center; }
+
+  .toast { position:fixed; top:20px; right:20px; padding:12px 20px; border-radius:8px; font-size:13px; font-weight:600; z-index:2000; opacity:0; transform:translateX(40px); transition:all .3s ease; pointer-events:none; }
+  .toast.show { opacity:1; transform:translateX(0); pointer-events:auto; }
+  .toast.success { background:#43a047; color:#fff; }
+  .toast.error { background:#ff4444; color:#fff; }
+
+  .confirm-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.6); z-index:1100; justify-content:center; align-items:center; }
+  .confirm-overlay.open { display:flex; }
+  .confirm-box { background:#1e222d; border-radius:12px; padding:28px; width:380px; max-width:90vw; box-shadow:0 8px 32px rgba(0,0,0,.5); text-align:center; animation:slideUp .2s ease-out; }
+  .confirm-box .icon { font-size:40px; margin-bottom:12px; }
+  .confirm-box h3 { color:#d1d4dc; font-size:16px; margin-bottom:6px; }
+  .confirm-box p { color:#787b86; font-size:13px; margin-bottom:20px; }
+  .confirm-box .actions { display:flex; gap:10px; justify-content:center; }
+
+  .back-link { position:fixed; top:16px; right:20px; color:#787b86; text-decoration:none; font-size:13px; z-index:10; }
+  .back-link:hover { color:#2962ff; }
+
+  .loading { display:flex; align-items:center; justify-content:center; padding:40px; color:#787b86; }
+  .loading .spinner { width:20px; height:20px; border:2px solid #363a45; border-top-color:#2962ff; border-radius:50%; animation:spin .6s linear infinite; margin-right:10px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  @media (max-width:600px) {
+    body { padding:12px; }
+    .toolbar input { width:100%; }
+    .modal { padding:20px; }
+    th, td { padding:7px 8px; font-size:12px; }
+  }
+</style>
+</head>
+<body>
+
+<a class="back-link" href="/">&#8592; Back to Chart</a>
+<h1>&#128736; Admin Panel</h1>
+<p class="subtitle">Manage registered users</p>
+
+<div class="stats" id="stats">
+  <div class="stat-card"><div class="num">-</div><div class="lbl">Total Users</div></div>
+</div>
+
+<div class="toolbar">
+  <input type="text" id="searchBox" placeholder="Search by name, mobile, place..." oninput="filterTable()" autocomplete="off">
+  <button type="button" class="btn btn-success" onclick="openAddModal()">&#10010; Add User</button>
+  <button type="button" class="btn btn-outline" onclick="exportCSV()">&#128196; Export CSV</button>
+  <button type="button" class="btn btn-outline" onclick="loadUsers()">&#8635; Refresh</button>
+  <button type="button" class="btn btn-danger" onclick="location.href='/logout'">Logout</button>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Username</th><th>Mobile</th><th>Place</th><th>Plan</th><th>Registered</th><th>Status</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="userTable">
+      <tr><td colspan="8"><div class="loading"><div class="spinner"></div>Loading users...</div></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- Edit User Modal -->
+<div class="modal-overlay" id="editModal" onclick="if(event.target===this)closeEditModal()">
+  <div class="modal">
+    <h2>&#9998; Edit User</h2>
+    <input type="hidden" id="editId">
+    <div class="form-group">
+      <label>Username</label>
+      <input type="text" id="editUsername" placeholder="Full name">
+    </div>
+    <div class="form-group">
+      <label>Mobile (10 digits)</label>
+      <input type="tel" id="editMobile" maxlength="10" placeholder="9876543210">
+    </div>
+    <div class="form-group">
+      <label>Place</label>
+      <input type="text" id="editPlace" placeholder="City / Town">
+    </div>
+    <div class="form-group">
+      <label>Plan</label>
+      <select id="editPlan"><option value="free">Free</option><option value="paid">Paid</option></select>
+    </div>
+    <div class="form-group">
+      <label>Reset Password (leave blank to keep)</label>
+      <input type="password" id="editPassword" placeholder="New password">
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-primary" onclick="saveUser()">Save Changes</button>
+      <button type="button" class="btn btn-outline" onclick="closeEditModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add User Modal -->
+<div class="modal-overlay" id="addModal" onclick="if(event.target===this)closeAddModal()">
+  <div class="modal">
+    <h2>&#10010; Add New User</h2>
+    <div class="form-group">
+      <label>Username</label>
+      <input type="text" id="addUsername" placeholder="Full name">
+    </div>
+    <div class="form-group">
+      <label>Mobile (10 digits)</label>
+      <input type="tel" id="addMobile" maxlength="10" placeholder="9876543210">
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" id="addPassword" placeholder="Min 6 characters">
+    </div>
+    <div class="form-group">
+      <label>Place</label>
+      <input type="text" id="addPlace" placeholder="City / Town">
+    </div>
+    <div class="form-group">
+      <label>Plan</label>
+      <select id="addPlan"><option value="free">Free</option><option value="paid">Paid</option></select>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-success" onclick="saveNewUser()">Create User</button>
+      <button type="button" class="btn btn-outline" onclick="closeAddModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Confirmation -->
+<div class="confirm-overlay" id="confirmDelete" onclick="if(event.target===this)closeConfirm()">
+  <div class="confirm-box">
+    <div class="icon">&#9888;&#65039;</div>
+    <h3>Delete User?</h3>
+    <p id="confirmMsg">This action cannot be undone.</p>
+    <div class="actions">
+      <button type="button" class="btn btn-danger" id="confirmYes">Yes, Delete</button>
+      <button type="button" class="btn btn-outline" onclick="closeConfirm()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var users = [];
+
+function showToast(msg, type) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type + ' show';
+  clearTimeout(t._timer);
+  t._timer = setTimeout(function() { t.className = 'toast'; }, 3000);
+}
+
+function daysBetween(d1, d2) {
+  return Math.floor((d2 - d1) / 86400000);
+}
+
+function escapeHtml(str) {
+  var div = document.createElement('div');
+  div.appendChild(document.createTextNode(str || ''));
+  return div.innerHTML;
+}
+
+function loadUsers() {
+  fetch('/admin/api/users')
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(data) {
+      users = data.users || [];
+      renderStats();
+      renderTable();
+    })
+    .catch(function(err) {
+      showToast('Failed to load users: ' + err.message, 'error');
+      document.getElementById('userTable').innerHTML = '<tr class="empty-row"><td colspan="8">Failed to load users. Check your connection.</td></tr>';
+    });
+}
+
+function renderStats() {
+  var total = users.length;
+  var free = 0, paid = 0, expired = 0;
+  var now = new Date();
+  for (var i = 0; i < users.length; i++) {
+    if (users[i].plan === 'paid') { paid++; }
+    else {
+      free++;
+      if (daysBetween(new Date(users[i].created_at), now) > 30) expired++;
+    }
+  }
+  document.getElementById('stats').innerHTML =
+    '<div class="stat-card"><div class="num">' + total + '</div><div class="lbl">Total Users</div></div>' +
+    '<div class="stat-card"><div class="num" style="color:#ffd600">' + free + '</div><div class="lbl">Free</div></div>' +
+    '<div class="stat-card"><div class="num" style="color:#69f0ae">' + paid + '</div><div class="lbl">Paid</div></div>' +
+    '<div class="stat-card"><div class="num" style="color:#ff6b6b">' + expired + '</div><div class="lbl">Expired</div></div>';
+}
+
+function renderTable() {
+  var q = document.getElementById('searchBox').value.toLowerCase();
+  var filtered = [];
+  for (var i = 0; i < users.length; i++) {
+    var u = users[i];
+    if (!q || (u.username || '').toLowerCase().indexOf(q) >= 0 ||
+        (u.mobileno || '').indexOf(q) >= 0 ||
+        (u.place || '').toLowerCase().indexOf(q) >= 0) {
+      filtered.push(u);
+    }
+  }
+  if (filtered.length === 0) {
+    document.getElementById('userTable').innerHTML = '<tr class="empty-row"><td colspan="8">' + (users.length ? 'No matching users found.' : 'No users yet. Click <b>Add User</b> to get started.') + '</td></tr>';
+    return;
+  }
+  var now = new Date();
+  var html = '';
+  for (var i = 0; i < filtered.length; i++) {
+    var u = filtered[i];
+    var created = new Date(u.created_at);
+    var days = daysBetween(created, now);
+    var daysLeft = 30 - days;
+    var status = '';
+    if (u.plan === 'paid') {
+      status = '<span class="plan-paid">Active</span>';
+    } else if (daysLeft > 0) {
+      status = '<span class="days-left">' + daysLeft + ' days left</span>';
+    } else {
+      status = '<span class="days-expired">EXPIRED</span>';
+    }
+    html += '<tr>' +
+      '<td>' + (i + 1) + '</td>' +
+      '<td>' + escapeHtml(u.username) + '</td>' +
+      '<td>' + escapeHtml(u.mobileno) + '</td>' +
+      '<td>' + escapeHtml(u.place) + '</td>' +
+      '<td><span class="plan-' + u.plan + '">' + escapeHtml(u.plan).toUpperCase() + '</span></td>' +
+      '<td>' + escapeHtml(u.created_at) + '</td>' +
+      '<td>' + status + '</td>' +
+      '<td>' +
+        '<button type="button" class="btn btn-primary btn-sm" onclick="editUser(' + u.id + ')">Edit</button> ' +
+        '<button type="button" class="btn btn-danger btn-sm" onclick="confirmDelete(' + u.id + ')">Delete</button>' +
+      '</td></tr>';
+  }
+  document.getElementById('userTable').innerHTML = html;
+}
+
+function filterTable() { renderTable(); }
+
+// --- Edit User ---
+function editUser(id) {
+  var u = null;
+  for (var i = 0; i < users.length; i++) {
+    if (users[i].id === id) { u = users[i]; break; }
+  }
+  if (!u) { showToast('User not found', 'error'); return; }
+  document.getElementById('editId').value = u.id;
+  document.getElementById('editUsername').value = u.username || '';
+  document.getElementById('editMobile').value = u.mobileno;
+  document.getElementById('editPlace').value = u.place || '';
+  document.getElementById('editPlan').value = u.plan;
+  document.getElementById('editPassword').value = '';
+  document.getElementById('editModal').classList.add('open');
+}
+
+function closeEditModal() { document.getElementById('editModal').classList.remove('open'); }
+
+function saveUser() {
+  var username = document.getElementById('editUsername').value.trim();
+  var mobileno = document.getElementById('editMobile').value.trim();
+  var place = document.getElementById('editPlace').value.trim();
+  if (!username || !mobileno) { showToast('Username and mobile are required', 'error'); return; }
+  if (!/^[0-9]{10}$/.test(mobileno)) { showToast('Enter valid 10-digit mobile', 'error'); return; }
+  var pwd = document.getElementById('editPassword').value;
+  if (pwd && pwd.length < 6) { showToast('Password min 6 characters', 'error'); return; }
+  var body = {
+    id: parseInt(document.getElementById('editId').value),
+    username: username,
+    mobileno: mobileno,
+    place: place,
+    plan: document.getElementById('editPlan').value,
+    password: pwd
+  };
+  fetch('/admin/api/users', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) { showToast('User updated successfully', 'success'); closeEditModal(); loadUsers(); }
+      else showToast(d.error || 'Update failed', 'error');
+    })
+    .catch(function(err) { showToast('Network error: ' + err.message, 'error'); });
+}
+
+// --- Delete User ---
+var pendingDeleteId = null;
+
+function confirmDelete(id) {
+  var u = null;
+  for (var i = 0; i < users.length; i++) {
+    if (users[i].id === id) { u = users[i]; break; }
+  }
+  if (!u) return;
+  pendingDeleteId = id;
+  document.getElementById('confirmMsg').textContent = 'Delete ' + (u.username || u.mobileno) + ' (' + u.mobileno + ')? This action cannot be undone.';
+  document.getElementById('confirmDelete').classList.add('open');
+  document.getElementById('confirmYes').onclick = function() { doDelete(); };
+}
+
+function closeConfirm() {
+  document.getElementById('confirmDelete').classList.remove('open');
+  pendingDeleteId = null;
+}
+
+function doDelete() {
+  if (!pendingDeleteId) return;
+  fetch('/admin/api/users', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id: pendingDeleteId}) })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) { showToast('User deleted', 'success'); loadUsers(); }
+      else showToast(d.error || 'Delete failed', 'error');
+    })
+    .catch(function(err) { showToast('Network error: ' + err.message, 'error'); });
+  closeConfirm();
+}
+
+// --- Add User ---
+function openAddModal() {
+  document.getElementById('addUsername').value = '';
+  document.getElementById('addMobile').value = '';
+  document.getElementById('addPassword').value = '';
+  document.getElementById('addPlace').value = '';
+  document.getElementById('addPlan').value = 'free';
+  document.getElementById('addModal').classList.add('open');
+  document.getElementById('addUsername').focus();
+}
+
+function closeAddModal() { document.getElementById('addModal').classList.remove('open'); }
+
+function saveNewUser() {
+  var body = {
+    username: document.getElementById('addUsername').value.trim(),
+    mobileno: document.getElementById('addMobile').value.trim(),
+    password: document.getElementById('addPassword').value,
+    place: document.getElementById('addPlace').value.trim(),
+    plan: document.getElementById('addPlan').value
+  };
+  if (!body.username || !body.mobileno || !body.password || !body.place) { showToast('All fields are required', 'error'); return; }
+  if (!/^[0-9]{10}$/.test(body.mobileno)) { showToast('Enter valid 10-digit mobile', 'error'); return; }
+  if (body.password.length < 6) { showToast('Password min 6 characters', 'error'); return; }
+  fetch('/admin/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) { showToast('User created successfully', 'success'); closeAddModal(); loadUsers(); }
+      else showToast(d.error || 'Create failed', 'error');
+    })
+    .catch(function(err) { showToast('Network error: ' + err.message, 'error'); });
+}
+
+// --- Export CSV ---
+function exportCSV() {
+  if (!users.length) { showToast('No users to export', 'error'); return; }
+  var csv = 'ID,Username,Mobile,Place,Plan,Registered\n';
+  for (var i = 0; i < users.length; i++) {
+    var u = users[i];
+    csv += u.id + ',"' + (u.username || '').replace(/"/g, '""') + '",' + u.mobileno + ',"' + (u.place || '').replace(/"/g, '""') + '",' + u.plan + ',"' + u.created_at + '"\n';
+  }
+  var blob = new Blob([csv], {type: 'text/csv'});
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'mangal_users_' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// --- Keyboard shortcuts ---
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    closeEditModal();
+    closeAddModal();
+    closeConfirm();
+  }
+});
+
+// --- Init ---
+document.getElementById('searchBox').value = '';
+loadUsers();
+</script>
+</body>
+</html>

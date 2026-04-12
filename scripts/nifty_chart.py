@@ -306,6 +306,101 @@ def logout():
     session.clear()
     return redirect("/login")
 
+
+# --- Admin Panel ---
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "mangal2026")
+
+
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    key = request.args.get("key", "")
+    if key != ADMIN_KEY:
+        return Response('<h3 style="color:#ff4444;font-family:sans-serif;padding:40px">Unauthorized. Use /admin?key=YOUR_ADMIN_KEY</h3>', status=403, content_type="text/html")
+    session["admin"] = True
+    admin_html_path = os.path.join(os.path.dirname(__file__), "admin.html")
+    with open(admin_html_path, "r", encoding="utf-8") as f:
+        html = f.read()
+    resp = Response(html, content_type="text/html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
+@app.route("/admin/api/users", methods=["GET"])
+def admin_list_users():
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    db = get_db()
+    rows = db.execute("SELECT id, username, mobileno, place, plan, created_at FROM users ORDER BY id DESC").fetchall()
+    return jsonify({"users": [dict(r) for r in rows]})
+
+
+@app.route("/admin/api/users", methods=["POST"])
+def admin_add_user():
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json()
+    username = (data.get("username") or "").strip()
+    mobileno = (data.get("mobileno") or "").strip()
+    password = data.get("password") or ""
+    place = (data.get("place") or "").strip()
+    plan = data.get("plan", "free")
+    if plan not in ("free", "paid"):
+        plan = "free"
+    if not username or not mobileno or not password or not place:
+        return jsonify({"error": "All fields are required"}), 400
+    if not re.fullmatch(r"\d{10}", mobileno):
+        return jsonify({"error": "Enter a valid 10-digit mobile number"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    db = get_db()
+    existing = db.execute("SELECT id FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
+    if existing:
+        return jsonify({"error": "Mobile number already registered"}), 409
+    pw_hash = hash_password(password)
+    db.execute("INSERT INTO users (username, mobileno, password_hash, place, plan) VALUES (?, ?, ?, ?, ?)",
+               (username, mobileno, pw_hash, place, plan))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/users", methods=["PUT"])
+def admin_update_user():
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json()
+    uid = data.get("id")
+    if not uid:
+        return jsonify({"error": "Missing user ID"}), 400
+    db = get_db()
+    user = db.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    db.execute("UPDATE users SET username=?, mobileno=?, place=?, plan=? WHERE id=?",
+               (data.get("username", ""), data.get("mobileno", ""), data.get("place", ""), data.get("plan", "free"), uid))
+    pwd = data.get("password", "")
+    if pwd:
+        pw_hash = hash_password(pwd)
+        db.execute("UPDATE users SET password_hash=? WHERE id=?", (pw_hash, uid))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/users", methods=["DELETE"])
+def admin_delete_user():
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json()
+    uid = data.get("id")
+    if not uid:
+        return jsonify({"error": "Missing user ID"}), 400
+    db = get_db()
+    db.execute("DELETE FROM users WHERE id = ?", (uid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
 # --- Real Trade (Delta) State ---
 delta_sessions = {}
 delta_orders = {}

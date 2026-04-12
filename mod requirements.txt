@@ -1,0 +1,13 @@
+Backtest - All 3 strategies - done
+Data source - settings icon -done
+FII rename to Algo -done
+ Default to trend -done
+Janestreet to mstreet-done
+Accurate to mfactor-done
+select multiple algos -done
+mpredict should be added as part of algo-done
+trade greyed out in settings-done
+real trade greyout in settings-done
+signal analysis panel should display in Algo based on strategy
+indicator settings should be part of indicators -done
+Add settings and add Backtest, Trade, Real trade -done
