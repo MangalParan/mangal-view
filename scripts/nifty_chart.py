@@ -2765,6 +2765,2211 @@ def generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
     return signals, summary
 
 
+# ---------------------------------------------------------------------------
+# Strategy: Sniper Entry (Breakout Detection)
+# ---------------------------------------------------------------------------
+def generate_sniper_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Sniper Entry Strategy — high-precision breakout detection engine.
+
+    Identifies exact breakout moments by combining consolidation detection,
+    volume explosion, and multi-indicator confirmation. Only fires when
+    price breaks out of a tight range with strong momentum confirmation.
+
+    Composite scoring (total ~15):
+      1. Consolidation squeeze detection     (weight 2.0)
+      2. Bollinger Band breakout             (weight 2.0)
+      3. Volume explosion (>2x avg)          (weight 2.0)
+      4. EMA 9/21 alignment + crossover      (weight 1.5)
+      5. RSI momentum thrust (>60 or <40)    (weight 1.5)
+      6. MACD histogram acceleration         (weight 1.5)
+      7. VWAP breakout confirmation          (weight 1.5)
+      8. S/R level breakout                  (weight 1.5)
+      9. Candle body strength (>70% body)    (weight 1.0)
+
+    Thresholds: BUY >= 5.0, STRONG BUY >= 7.0
+                SELL <= -5.0, STRONG SELL <= -7.0
+
+    Enforces strict alternating BUY→SELL→BUY for clean entry/exit pairs.
+    """
+    n = len(candles)
+    if n < 30:
+        return [], {}
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]] = b["middle"]
+
+    sup_levels = [s["price"] for s in sr.get("support", [])]
+    res_levels = [r["price"] for r in sr.get("resistance", [])]
+
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    signals = []
+    last_signal_type = None  # enforce alternating
+    lookback = 20
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+
+        # --- 1. Consolidation Squeeze Detection (weight 2.0) ---
+        # Measure range contraction over lookback period
+        recent_highs = highs[i - lookback:i]
+        recent_lows = lows[i - lookback:i]
+        range_width = max(recent_highs) - min(recent_lows)
+        avg_candle_range = sum(highs[j] - lows[j] for j in range(i - lookback, i)) / lookback
+        current_range = high - low
+
+        # Squeeze: range is tightening (last 5 bars narrower than lookback avg)
+        last5_range = sum(highs[j] - lows[j] for j in range(i - 5, i)) / 5
+        squeeze_ratio = last5_range / avg_candle_range if avg_candle_range > 0 else 1
+        is_squeeze = squeeze_ratio < 0.7
+
+        # Breakout: current candle breaks the consolidation range
+        consolidation_high = max(highs[i - 5:i])
+        consolidation_low = min(lows[i - 5:i])
+        breakout_up = close > consolidation_high and current_range > avg_candle_range * 1.2
+        breakout_down = close < consolidation_low and current_range > avg_candle_range * 1.2
+
+        if is_squeeze and breakout_up:
+            score += 2.0
+            reasons.append(f"Squeeze Breakout UP (ratio={squeeze_ratio:.2f})")
+        elif is_squeeze and breakout_down:
+            score -= 2.0
+            reasons.append(f"Squeeze Breakout DOWN (ratio={squeeze_ratio:.2f})")
+        elif breakout_up:
+            score += 1.0
+            reasons.append("Range Breakout UP")
+        elif breakout_down:
+            score -= 1.0
+            reasons.append("Range Breakout DOWN")
+
+        # --- 2. Bollinger Band Breakout (weight 2.0) ---
+        bb_u = bb_upper_map.get(t)
+        bb_l = bb_lower_map.get(t)
+        bb_m = bb_mid_map.get(t)
+        if bb_u and bb_l and bb_m:
+            bb_width = bb_u - bb_l
+            # Check previous BB width for squeeze detection
+            t_prev5 = candles[i - 5]["time"]
+            bb_u_p5 = bb_upper_map.get(t_prev5, bb_u)
+            bb_l_p5 = bb_lower_map.get(t_prev5, bb_l)
+            prev_bb_width = bb_u_p5 - bb_l_p5
+
+            if close > bb_u:
+                # Breakout above upper band
+                if bb_width < prev_bb_width * 0.85:  # band was squeezing
+                    score += 2.0
+                    reasons.append("BB Squeeze Breakout UP")
+                else:
+                    score += 1.0
+                    reasons.append("BB Upper Breakout")
+            elif close < bb_l:
+                if bb_width < prev_bb_width * 0.85:
+                    score -= 2.0
+                    reasons.append("BB Squeeze Breakout DOWN")
+                else:
+                    score -= 1.0
+                    reasons.append("BB Lower Breakout")
+
+        # --- 3. Volume Explosion (weight 2.0) ---
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+        if vol_avg > 0 and vol > 0:
+            vol_ratio = vol / vol_avg
+            if vol_ratio >= 3.0:
+                v_score = 2.0
+            elif vol_ratio >= 2.0:
+                v_score = 1.5
+            elif vol_ratio >= 1.5:
+                v_score = 0.8
+            else:
+                v_score = 0
+
+            if v_score > 0:
+                if close > opn:
+                    score += v_score
+                    reasons.append(f"Volume Explosion {vol_ratio:.1f}x (Bullish)")
+                elif close < opn:
+                    score -= v_score
+                    reasons.append(f"Volume Explosion {vol_ratio:.1f}x (Bearish)")
+
+        # --- 4. EMA 9/21 Alignment + Crossover (weight 1.5) ---
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        t_prev = candles[i - 1]["time"]
+        e9p = ema9_map.get(t_prev)
+        e21p = ema21_map.get(t_prev)
+        if e9 and e21 and e9p and e21p:
+            # Fresh crossover is strongest signal
+            if e9p <= e21p and e9 > e21:
+                score += 1.5
+                reasons.append("EMA 9/21 Bullish Cross")
+            elif e9p >= e21p and e9 < e21:
+                score -= 1.5
+                reasons.append("EMA 9/21 Bearish Cross")
+            elif e9 > e21 and close > e9:
+                score += 0.5
+                reasons.append("EMA Aligned Bullish")
+            elif e9 < e21 and close < e9:
+                score -= 0.5
+                reasons.append("EMA Aligned Bearish")
+
+        # --- 5. RSI Momentum Thrust (weight 1.5) ---
+        rsi_val = rsi_map.get(t, 50)
+        rsi_prev = rsi_map.get(t_prev, 50)
+        if rsi_val > 65 and rsi_prev <= 65:
+            score += 1.5
+            reasons.append(f"RSI Thrust UP ({rsi_val:.0f})")
+        elif rsi_val > 60 and rsi_val > rsi_prev:
+            score += 0.8
+            reasons.append(f"RSI Momentum UP ({rsi_val:.0f})")
+        elif rsi_val < 35 and rsi_prev >= 35:
+            score -= 1.5
+            reasons.append(f"RSI Thrust DOWN ({rsi_val:.0f})")
+        elif rsi_val < 40 and rsi_val < rsi_prev:
+            score -= 0.8
+            reasons.append(f"RSI Momentum DOWN ({rsi_val:.0f})")
+
+        # --- 6. MACD Histogram Acceleration (weight 1.5) ---
+        mc = macd_map.get(t)
+        mc_prev = macd_map.get(t_prev)
+        t_prev2 = candles[i - 2]["time"] if i >= 2 else t_prev
+        mc_prev2 = macd_map.get(t_prev2)
+        if mc and mc_prev and mc_prev2:
+            hist = mc["histogram"]
+            hist_p = mc_prev["histogram"]
+            hist_p2 = mc_prev2["histogram"]
+            accel = hist - hist_p
+            prev_accel = hist_p - hist_p2
+
+            # Histogram turning positive from negative with acceleration
+            if hist > 0 and hist_p <= 0 and accel > 0:
+                score += 1.5
+                reasons.append("MACD Hist Flip Bullish")
+            elif hist < 0 and hist_p >= 0 and accel < 0:
+                score -= 1.5
+                reasons.append("MACD Hist Flip Bearish")
+            elif hist > 0 and accel > prev_accel and accel > 0:
+                score += 0.5
+                reasons.append("MACD Accelerating UP")
+            elif hist < 0 and accel < prev_accel and accel < 0:
+                score -= 0.5
+                reasons.append("MACD Accelerating DOWN")
+
+        # --- 7. VWAP Breakout Confirmation (weight 1.5) ---
+        vw = vwap_map.get(t)
+        vw_prev = vwap_map.get(t_prev)
+        if vw and vw_prev:
+            # Price crossing above VWAP
+            if closes[i - 1] <= vw_prev and close > vw:
+                score += 1.5
+                reasons.append("VWAP Breakout UP")
+            elif closes[i - 1] >= vw_prev and close < vw:
+                score -= 1.5
+                reasons.append("VWAP Breakdown")
+            elif close > vw * 1.003:
+                score += 0.3
+                reasons.append("Above VWAP")
+            elif close < vw * 0.997:
+                score -= 0.3
+                reasons.append("Below VWAP")
+
+        # --- 8. S/R Level Breakout (weight 1.5) ---
+        for rl in res_levels:
+            prev_close = closes[i - 1]
+            if prev_close < rl and close > rl and (close - rl) / rl > 0.001:
+                score += 1.5
+                reasons.append(f"Resistance Breakout {rl:.0f}")
+                break
+        for sl in sup_levels:
+            prev_close = closes[i - 1]
+            if prev_close > sl and close < sl and (sl - close) / sl > 0.001:
+                score -= 1.5
+                reasons.append(f"Support Breakdown {sl:.0f}")
+                break
+
+        # --- 9. Candle Body Strength (weight 1.0) ---
+        body = abs(close - opn)
+        full_range = high - low
+        if full_range > 0:
+            body_ratio = body / full_range
+            if body_ratio > 0.75:
+                if close > opn:
+                    score += 1.0
+                    reasons.append(f"Strong Bullish Candle ({body_ratio:.0%})")
+                else:
+                    score -= 1.0
+                    reasons.append(f"Strong Bearish Candle ({body_ratio:.0%})")
+
+        # --- Generate signal with alternating enforcement ---
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    # --- Summary for latest bar ---
+    last_i = n - 1
+    t_last = candles[last_i]["time"]
+    summary_score = 0
+    summary_reasons = []
+
+    # Squeeze status
+    if n >= lookback + 1:
+        last5_r = sum(highs[j] - lows[j] for j in range(last_i - 5, last_i)) / 5
+        avg_r = sum(highs[j] - lows[j] for j in range(last_i - lookback, last_i)) / lookback
+        sq = last5_r / avg_r if avg_r > 0 else 1
+        d = 1.5 if sq < 0.7 else (0 if sq < 1.0 else -0.5)
+        summary_score += d
+        summary_reasons.append(("Squeeze", f"{sq:.2f}", d))
+
+    bb_u = bb_upper_map.get(t_last)
+    bb_l = bb_lower_map.get(t_last)
+    if bb_u and bb_l:
+        if closes[-1] > bb_u:
+            d = 2.0
+        elif closes[-1] < bb_l:
+            d = -2.0
+        else:
+            d = 0
+        summary_score += d
+        summary_reasons.append(("BB Position", "Above Upper" if d > 0 else ("Below Lower" if d < 0 else "Inside"), d))
+
+    vol_avg_s = sum(volumes[last_i - lookback:last_i]) / lookback if lookback > 0 else 1
+    vol_r = volumes[last_i] / vol_avg_s if vol_avg_s > 0 else 0
+    d = 1.5 if vol_r >= 2.0 else (0.5 if vol_r >= 1.5 else 0)
+    if closes[-1] < opens[-1]:
+        d = -d
+    summary_score += d
+    summary_reasons.append(("Volume", f"{vol_r:.1f}x", d))
+
+    rsi_last = rsi_map.get(t_last, 50)
+    d = 1.0 if rsi_last > 60 else (-1.0 if rsi_last < 40 else 0)
+    summary_score += d
+    summary_reasons.append(("RSI Thrust", f"{rsi_last:.0f}", d))
+
+    mc_last = macd_map.get(t_last)
+    mc_prev_s = macd_map.get(candles[last_i - 1]["time"]) if last_i > 0 else None
+    if mc_last and mc_prev_s:
+        hist_d = mc_last["histogram"] - mc_prev_s["histogram"]
+        d = 1.0 if (mc_last["histogram"] > 0 and hist_d > 0) else (-1.0 if (mc_last["histogram"] < 0 and hist_d < 0) else 0)
+        summary_score += d
+        summary_reasons.append(("MACD Accel", "Bullish" if d > 0 else ("Bearish" if d < 0 else "Flat"), d))
+
+    vw_last = vwap_map.get(t_last)
+    if vw_last:
+        d = 1.0 if closes[-1] > vw_last else -1.0
+        summary_score += d
+        summary_reasons.append(("VWAP", "Above" if d > 0 else "Below", d))
+
+    if summary_score >= 6:
+        verdict = "STRONG BUY"
+    elif summary_score >= 3:
+        verdict = "BUY"
+    elif summary_score <= -6:
+        verdict = "STRONG SELL"
+    elif summary_score <= -3:
+        verdict = "SELL"
+    else:
+        verdict = "NEUTRAL"
+
+    summary = {
+        "score": round(summary_score, 2),
+        "verdict": verdict,
+        "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in summary_reasons],
+        "rsi": rsi_last,
+        "macd": mc_last,
+        "vwap": vw_last,
+    }
+
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Order Flow Analysis
+# ---------------------------------------------------------------------------
+def generate_orderflow_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Order Flow Strategy — volume-price action analysis for institutional flow detection.
+
+    Detects institutional buying/selling pressure using volume delta analysis,
+    cumulative volume delta divergences, absorption patterns, and aggressive
+    order detection. Only fires when clear order flow imbalance is confirmed.
+
+    Composite scoring (total ~16):
+      1. Volume Delta (buy vs sell pressure)      (weight 2.0)
+      2. CVD trend & divergence                   (weight 2.0)
+      3. Absorption detection (wick + volume)     (weight 2.0)
+      4. Aggressive iceberg detection             (weight 1.5)
+      5. VWAP institutional level                 (weight 1.5)
+      6. Volume Profile POC proximity             (weight 1.5)
+      7. RSI with volume confirmation             (weight 1.5)
+      8. MACD with volume filter                  (weight 1.5)
+      9. Price rejection (wicks at levels)        (weight 1.0)
+     10. EMA trend alignment                      (weight 1.0)
+
+    Thresholds: BUY >= 5.0, STRONG BUY >= 7.0
+                SELL <= -5.0, STRONG SELL <= -7.0
+
+    Enforces strict alternating BUY→SELL→BUY for clean entry/exit pairs.
+    """
+    n = len(candles)
+    if n < 30:
+        return [], {}
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]] = b["middle"]
+
+    sup_levels = [s["price"] for s in sr.get("support", [])]
+    res_levels = [r["price"] for r in sr.get("resistance", [])]
+
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    # Precompute volume delta and CVD
+    buy_volumes = []
+    sell_volumes = []
+    deltas = []
+    cvd = [0.0]
+    for i in range(n):
+        rng = highs[i] - lows[i]
+        if rng > 0 and volumes[i] > 0:
+            buy_pct = (closes[i] - lows[i]) / rng
+            sell_pct = (highs[i] - closes[i]) / rng
+            bv = volumes[i] * buy_pct
+            sv = volumes[i] * sell_pct
+        else:
+            bv = volumes[i] * 0.5
+            sv = volumes[i] * 0.5
+        buy_volumes.append(bv)
+        sell_volumes.append(sv)
+        delta = bv - sv
+        deltas.append(delta)
+        if i > 0:
+            cvd.append(cvd[-1] + delta)
+
+    # Precompute volume profile (POC = price with highest volume in lookback)
+    lookback = 20
+
+    signals = []
+    last_signal_type = None  # enforce alternating
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+
+        t_prev = candles[i - 1]["time"]
+        t_prev2 = candles[i - 2]["time"] if i >= 2 else t_prev
+
+        # --- 1. Volume Delta Analysis (weight 2.0) ---
+        delta = deltas[i]
+        delta_prev = deltas[i - 1]
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+        delta_avg = sum(abs(deltas[j]) for j in range(i - lookback, i)) / lookback if lookback > 0 else 1
+
+        if delta_avg > 0:
+            delta_ratio = abs(delta) / delta_avg
+            if delta > 0 and delta_ratio >= 2.0:
+                score += 2.0
+                reasons.append(f"Strong Buy Delta ({delta_ratio:.1f}x)")
+            elif delta > 0 and delta_ratio >= 1.3:
+                score += 1.0
+                reasons.append(f"Buy Delta ({delta_ratio:.1f}x)")
+            elif delta < 0 and delta_ratio >= 2.0:
+                score -= 2.0
+                reasons.append(f"Strong Sell Delta ({delta_ratio:.1f}x)")
+            elif delta < 0 and delta_ratio >= 1.3:
+                score -= 1.0
+                reasons.append(f"Sell Delta ({delta_ratio:.1f}x)")
+
+        # --- 2. CVD Trend & Divergence (weight 2.0) ---
+        cvd_now = cvd[i]
+        cvd_prev5 = cvd[i - 5] if i >= 5 else cvd[0]
+        cvd_slope = cvd_now - cvd_prev5
+        price_slope = closes[i] - closes[i - 5] if i >= 5 else 0
+
+        # CVD divergence: price down but CVD up = hidden buying
+        if price_slope < 0 and cvd_slope > 0 and abs(cvd_slope) > delta_avg * 2:
+            score += 2.0
+            reasons.append("CVD Bullish Divergence (Hidden Buying)")
+        elif price_slope > 0 and cvd_slope < 0 and abs(cvd_slope) > delta_avg * 2:
+            score -= 2.0
+            reasons.append("CVD Bearish Divergence (Hidden Selling)")
+        elif cvd_slope > 0 and price_slope > 0:
+            score += 0.5
+            reasons.append("CVD Confirms Uptrend")
+        elif cvd_slope < 0 and price_slope < 0:
+            score -= 0.5
+            reasons.append("CVD Confirms Downtrend")
+
+        # --- 3. Absorption Detection (weight 2.0) ---
+        # High volume + long wick + small body = absorption (institutional limit orders)
+        body = abs(close - opn)
+        full_range = high - low
+        upper_wick = high - max(close, opn)
+        lower_wick = min(close, opn) - low
+
+        if full_range > 0 and vol_avg > 0:
+            body_ratio = body / full_range
+            vol_ratio = vol / vol_avg
+
+            # Bullish absorption: long lower wick, high volume, at support area
+            if lower_wick > body * 2 and vol_ratio >= 1.5 and body_ratio < 0.4:
+                score += 2.0
+                reasons.append(f"Bullish Absorption (wick={lower_wick:.0f}, vol={vol_ratio:.1f}x)")
+            # Bearish absorption: long upper wick, high volume, at resistance area
+            elif upper_wick > body * 2 and vol_ratio >= 1.5 and body_ratio < 0.4:
+                score -= 2.0
+                reasons.append(f"Bearish Absorption (wick={upper_wick:.0f}, vol={vol_ratio:.1f}x)")
+
+        # --- 4. Aggressive Iceberg Detection (weight 1.5) ---
+        # Consecutive candles with high volume in same direction = iceberg order
+        if i >= 3:
+            consec_buy = all(deltas[i - j] > 0 and volumes[i - j] > vol_avg * 1.2 for j in range(3))
+            consec_sell = all(deltas[i - j] < 0 and volumes[i - j] > vol_avg * 1.2 for j in range(3))
+            if consec_buy:
+                score += 1.5
+                reasons.append("Iceberg Buy Detected (3-bar)")
+            elif consec_sell:
+                score -= 1.5
+                reasons.append("Iceberg Sell Detected (3-bar)")
+
+        # --- 5. VWAP Institutional Level (weight 1.5) ---
+        vw = vwap_map.get(t)
+        vw_prev = vwap_map.get(t_prev)
+        if vw and vw_prev:
+            # Price bouncing off VWAP with volume = institutional interest
+            if closes[i - 1] <= vw_prev * 1.001 and close > vw * 1.002 and vol > vol_avg * 1.3:
+                score += 1.5
+                reasons.append("VWAP Bounce (Institutional Buy)")
+            elif closes[i - 1] >= vw_prev * 0.999 and close < vw * 0.998 and vol > vol_avg * 1.3:
+                score -= 1.5
+                reasons.append("VWAP Rejection (Institutional Sell)")
+            elif close > vw:
+                score += 0.3
+                reasons.append("Above VWAP")
+            elif close < vw:
+                score -= 0.3
+                reasons.append("Below VWAP")
+
+        # --- 6. Volume Profile POC Proximity (weight 1.5) ---
+        # Build a simple volume profile from lookback period
+        price_vol = {}
+        for j in range(i - lookback, i):
+            rounded_price = round(closes[j] / 10) * 10  # bin prices
+            price_vol[rounded_price] = price_vol.get(rounded_price, 0) + volumes[j]
+        if price_vol:
+            poc_price = max(price_vol, key=price_vol.get)
+            poc_dist = (close - poc_price) / close if close > 0 else 0
+            if abs(poc_dist) < 0.002:
+                # At POC — look at delta for direction
+                if delta > 0:
+                    score += 1.5
+                    reasons.append(f"At POC {poc_price:.0f} + Buy Delta")
+                elif delta < 0:
+                    score -= 1.5
+                    reasons.append(f"At POC {poc_price:.0f} + Sell Delta")
+            elif poc_dist > 0.005 and delta > 0:
+                score += 0.5
+                reasons.append(f"Above POC {poc_price:.0f}")
+            elif poc_dist < -0.005 and delta < 0:
+                score -= 0.5
+                reasons.append(f"Below POC {poc_price:.0f}")
+
+        # --- 7. RSI with Volume Confirmation (weight 1.5) ---
+        rsi_val = rsi_map.get(t, 50)
+        rsi_prev = rsi_map.get(t_prev, 50)
+        if rsi_val > 55 and rsi_val > rsi_prev and delta > 0:
+            score += 1.5
+            reasons.append(f"RSI Rising + Buy Volume ({rsi_val:.0f})")
+        elif rsi_val < 45 and rsi_val < rsi_prev and delta < 0:
+            score -= 1.5
+            reasons.append(f"RSI Falling + Sell Volume ({rsi_val:.0f})")
+        elif rsi_val < 30 and delta > 0:
+            # RSI oversold but buy volume = accumulation
+            score += 1.0
+            reasons.append(f"RSI Oversold + Accumulation ({rsi_val:.0f})")
+        elif rsi_val > 70 and delta < 0:
+            # RSI overbought but sell volume = distribution
+            score -= 1.0
+            reasons.append(f"RSI Overbought + Distribution ({rsi_val:.0f})")
+
+        # --- 8. MACD with Volume Filter (weight 1.5) ---
+        mc = macd_map.get(t)
+        mc_prev = macd_map.get(t_prev)
+        if mc and mc_prev:
+            hist = mc["histogram"]
+            hist_p = mc_prev["histogram"]
+            # MACD cross confirmed by volume
+            if hist > 0 and hist_p <= 0 and vol > vol_avg * 1.3:
+                score += 1.5
+                reasons.append("MACD Cross UP + Volume")
+            elif hist < 0 and hist_p >= 0 and vol > vol_avg * 1.3:
+                score -= 1.5
+                reasons.append("MACD Cross DOWN + Volume")
+            elif hist > hist_p and delta > 0:
+                score += 0.3
+                reasons.append("MACD Rising + Buy Flow")
+            elif hist < hist_p and delta < 0:
+                score -= 0.3
+                reasons.append("MACD Falling + Sell Flow")
+
+        # --- 9. Price Rejection at Levels (weight 1.0) ---
+        for sl in sup_levels:
+            if low <= sl * 1.002 and close > sl and lower_wick > body:
+                score += 1.0
+                reasons.append(f"Rejection at Support {sl:.0f}")
+                break
+        for rl in res_levels:
+            if high >= rl * 0.998 and close < rl and upper_wick > body:
+                score -= 1.0
+                reasons.append(f"Rejection at Resistance {rl:.0f}")
+                break
+
+        # --- 10. EMA Trend Alignment (weight 1.0) ---
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        if e9 and e21:
+            if e9 > e21 and close > e9 and delta > 0:
+                score += 1.0
+                reasons.append("EMA Bullish + Buy Flow")
+            elif e9 < e21 and close < e9 and delta < 0:
+                score -= 1.0
+                reasons.append("EMA Bearish + Sell Flow")
+
+        # --- Generate signal with alternating enforcement ---
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    # --- Summary for latest bar ---
+    last_i = n - 1
+    t_last = candles[last_i]["time"]
+    summary_score = 0
+    summary_reasons = []
+
+    # Delta
+    d_last = deltas[last_i]
+    d_avg = sum(abs(deltas[j]) for j in range(last_i - lookback, last_i)) / lookback if lookback > 0 else 1
+    d_r = abs(d_last) / d_avg if d_avg > 0 else 0
+    d = 2.0 if (d_last > 0 and d_r >= 2) else (1.0 if d_last > 0 else (-2.0 if (d_last < 0 and d_r >= 2) else (-1.0 if d_last < 0 else 0)))
+    summary_score += d
+    summary_reasons.append(("Delta", f"{d_last:.0f} ({d_r:.1f}x)", d))
+
+    # CVD
+    cvd_s = cvd[last_i] - cvd[last_i - 5] if last_i >= 5 else 0
+    d = 1.5 if cvd_s > 0 else (-1.5 if cvd_s < 0 else 0)
+    summary_score += d
+    summary_reasons.append(("CVD Trend", "Rising" if d > 0 else ("Falling" if d < 0 else "Flat"), d))
+
+    # Volume
+    vol_r = volumes[last_i] / (sum(volumes[last_i - lookback:last_i]) / lookback) if sum(volumes[last_i - lookback:last_i]) > 0 else 0
+    d = 1.0 if vol_r >= 1.5 else 0
+    if closes[-1] < opens[-1]:
+        d = -d
+    summary_score += d
+    summary_reasons.append(("Volume", f"{vol_r:.1f}x", d))
+
+    rsi_last = rsi_map.get(t_last, 50)
+    d = 1.0 if (rsi_last > 55 and deltas[last_i] > 0) else (-1.0 if (rsi_last < 45 and deltas[last_i] < 0) else 0)
+    summary_score += d
+    summary_reasons.append(("RSI+Flow", f"{rsi_last:.0f}", d))
+
+    mc_last = macd_map.get(t_last)
+    vw_last = vwap_map.get(t_last)
+    if vw_last:
+        d = 1.0 if closes[-1] > vw_last else -1.0
+        summary_score += d
+        summary_reasons.append(("VWAP", "Above" if d > 0 else "Below", d))
+
+    if summary_score >= 6:
+        verdict = "STRONG BUY"
+    elif summary_score >= 3:
+        verdict = "BUY"
+    elif summary_score <= -6:
+        verdict = "STRONG SELL"
+    elif summary_score <= -3:
+        verdict = "SELL"
+    else:
+        verdict = "NEUTRAL"
+
+    summary = {
+        "score": round(summary_score, 2),
+        "verdict": verdict,
+        "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in summary_reasons],
+        "rsi": rsi_last,
+        "macd": mc_last,
+        "vwap": vw_last,
+    }
+
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Price Action (Pure Chart Structure Analysis)
+# ---------------------------------------------------------------------------
+def generate_priceaction_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Price Action Strategy — pure price structure analysis without lagging indicators.
+
+    Reads raw candle formations, swing structure, trend structure, and key levels
+    to identify high-probability entries based on what price is actually doing.
+
+    Composite scoring (total ~16):
+      1. Trend Structure (HH/HL or LH/LL)          (weight 2.0)
+      2. Candlestick Reversal Patterns               (weight 2.0)
+      3. Pin Bar / Rejection at Key Levels            (weight 2.0)
+      4. Inside Bar Breakout                          (weight 1.5)
+      5. Engulfing with Momentum                      (weight 1.5)
+      6. Support / Resistance Reaction                (weight 1.5)
+      7. Higher Timeframe Candle Context              (weight 1.5)
+      8. Consecutive Candle Momentum                  (weight 1.0)
+      9. Range Contraction then Expansion             (weight 1.0)
+     10. Gap / Window Analysis                        (weight 1.0)
+     11. Swing Failure Pattern (SFP)                  (weight 1.5)
+
+    Thresholds: BUY >= 5.0, STRONG BUY >= 7.0
+                SELL <= -5.0, STRONG SELL <= -7.0
+
+    Enforces strict alternating BUY→SELL→BUY for clean entry/exit pairs.
+    """
+    n = len(candles)
+    if n < 30:
+        return [], {}
+
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+
+    bb_upper_map, bb_lower_map = {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+
+    sup_levels = [s["price"] for s in sr.get("support", [])]
+    res_levels = [r["price"] for r in sr.get("resistance", [])]
+
+    # --- Precompute swing highs and swing lows (5-bar lookback/forward) ---
+    swing_highs = []  # (index, price)
+    swing_lows = []
+    swing_lb = 5
+    for i in range(swing_lb, n - swing_lb):
+        if all(highs[i] >= highs[i - j] for j in range(1, swing_lb + 1)) and \
+           all(highs[i] >= highs[i + j] for j in range(1, swing_lb + 1)):
+            swing_highs.append((i, highs[i]))
+        if all(lows[i] <= lows[i - j] for j in range(1, swing_lb + 1)) and \
+           all(lows[i] <= lows[i + j] for j in range(1, swing_lb + 1)):
+            swing_lows.append((i, lows[i]))
+
+    signals = []
+    last_signal_type = None
+    lookback = 20
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+
+        body = abs(close - opn)
+        full_range = high - low
+        upper_wick = high - max(close, opn)
+        lower_wick = min(close, opn) - low
+        is_bullish = close > opn
+        is_bearish = close < opn
+        body_ratio = body / full_range if full_range > 0 else 0
+
+        prev_close = closes[i - 1]
+        prev_open = opens[i - 1]
+        prev_high = highs[i - 1]
+        prev_low = lows[i - 1]
+        prev_body = abs(prev_close - prev_open)
+        prev_range = prev_high - prev_low
+
+        # --- 1. Trend Structure: HH/HL or LH/LL (weight 2.0) ---
+        recent_sh = [p for idx, p in swing_highs if i - 20 <= idx < i]
+        recent_sl = [p for idx, p in swing_lows if i - 20 <= idx < i]
+        if len(recent_sh) >= 2 and len(recent_sl) >= 2:
+            # Higher Highs + Higher Lows = uptrend
+            hh = recent_sh[-1] > recent_sh[-2]
+            hl = recent_sl[-1] > recent_sl[-2]
+            lh = recent_sh[-1] < recent_sh[-2]
+            ll = recent_sl[-1] < recent_sl[-2]
+
+            if hh and hl:
+                score += 2.0
+                reasons.append("Uptrend Structure (HH+HL)")
+            elif lh and ll:
+                score -= 2.0
+                reasons.append("Downtrend Structure (LH+LL)")
+            elif hh and not hl:
+                score += 0.5
+                reasons.append("Weak Uptrend (HH only)")
+            elif ll and not lh:
+                score -= 0.5
+                reasons.append("Weak Downtrend (LL only)")
+
+        # --- 2. Candlestick Reversal Patterns (weight 2.0) ---
+        # Morning Star (3-candle bullish reversal)
+        if i >= 2:
+            c0_bear = closes[i - 2] < opens[i - 2]
+            c1_small = abs(closes[i - 1] - opens[i - 1]) < (highs[i - 1] - lows[i - 1]) * 0.3
+            c2_bull = is_bullish and body > prev_body
+            if c0_bear and c1_small and c2_bull and close > (opens[i - 2] + closes[i - 2]) / 2:
+                score += 2.0
+                reasons.append("Morning Star Reversal")
+
+            # Evening Star (3-candle bearish reversal)
+            c0_bull = closes[i - 2] > opens[i - 2]
+            c2_bear = is_bearish and body > prev_body
+            if c0_bull and c1_small and c2_bear and close < (opens[i - 2] + closes[i - 2]) / 2:
+                score -= 2.0
+                reasons.append("Evening Star Reversal")
+
+        # Hammer at lows (bullish)
+        if lower_wick > body * 2 and upper_wick < body * 0.5 and full_range > 0:
+            # Check if at recent lows
+            recent_low = min(lows[i - 10:i])
+            if low <= recent_low * 1.002:
+                score += 1.5
+                reasons.append("Hammer at Lows")
+
+        # Shooting Star at highs (bearish)
+        if upper_wick > body * 2 and lower_wick < body * 0.5 and full_range > 0:
+            recent_high = max(highs[i - 10:i])
+            if high >= recent_high * 0.998:
+                score -= 1.5
+                reasons.append("Shooting Star at Highs")
+
+        # --- 3. Pin Bar / Rejection at Key Levels (weight 2.0) ---
+        for sl in sup_levels:
+            if low <= sl * 1.003 and close > sl:
+                if lower_wick > body * 1.5:
+                    score += 2.0
+                    reasons.append(f"Pin Bar Rejection at Support {sl:.0f}")
+                    break
+                elif is_bullish:
+                    score += 0.5
+                    reasons.append(f"Bullish Close at Support {sl:.0f}")
+                    break
+
+        for rl in res_levels:
+            if high >= rl * 0.997 and close < rl:
+                if upper_wick > body * 1.5:
+                    score -= 2.0
+                    reasons.append(f"Pin Bar Rejection at Resistance {rl:.0f}")
+                    break
+                elif is_bearish:
+                    score -= 0.5
+                    reasons.append(f"Bearish Close at Resistance {rl:.0f}")
+                    break
+
+        # --- 4. Inside Bar Breakout (weight 1.5) ---
+        if i >= 1:
+            is_inside = high <= prev_high and low >= prev_low
+            if not is_inside and i >= 2:
+                # Check if previous was inside bar, and current breaks out
+                was_inside = highs[i - 1] <= highs[i - 2] and lows[i - 1] >= lows[i - 2]
+                if was_inside:
+                    if close > highs[i - 2]:
+                        score += 1.5
+                        reasons.append("Inside Bar Bullish Breakout")
+                    elif close < lows[i - 2]:
+                        score -= 1.5
+                        reasons.append("Inside Bar Bearish Breakout")
+
+        # --- 5. Engulfing with Momentum (weight 1.5) ---
+        if is_bullish and prev_close < prev_open:
+            # Bullish engulfing: current body completely covers previous
+            if opn <= prev_close and close >= prev_open and body > prev_body * 1.2:
+                score += 1.5
+                reasons.append("Bullish Engulfing")
+        elif is_bearish and prev_close > prev_open:
+            # Bearish engulfing
+            if opn >= prev_close and close <= prev_open and body > prev_body * 1.2:
+                score -= 1.5
+                reasons.append("Bearish Engulfing")
+
+        # --- 6. Support / Resistance Reaction (weight 1.5) ---
+        # Price touching and bouncing from S/R with strong candle body
+        for sl in sup_levels:
+            if abs(low - sl) / close < 0.003 and is_bullish and body_ratio > 0.6:
+                score += 1.5
+                reasons.append(f"Strong Bounce off Support {sl:.0f}")
+                break
+        for rl in res_levels:
+            if abs(high - rl) / close < 0.003 and is_bearish and body_ratio > 0.6:
+                score -= 1.5
+                reasons.append(f"Strong Rejection at Resistance {rl:.0f}")
+                break
+
+        # --- 7. Higher Timeframe Candle Context (weight 1.5) ---
+        # Use 5-bar aggregate as proxy for higher timeframe
+        if i >= 5:
+            htf_open = opens[i - 4]
+            htf_close = close
+            htf_high = max(highs[i - 4:i + 1])
+            htf_low = min(lows[i - 4:i + 1])
+            htf_body = abs(htf_close - htf_open)
+            htf_range = htf_high - htf_low
+            htf_ratio = htf_body / htf_range if htf_range > 0 else 0
+
+            if htf_close > htf_open and htf_ratio > 0.6:
+                score += 1.5
+                reasons.append("HTF Bullish Structure")
+            elif htf_close < htf_open and htf_ratio > 0.6:
+                score -= 1.5
+                reasons.append("HTF Bearish Structure")
+
+        # --- 8. Consecutive Candle Momentum (weight 1.0) ---
+        if i >= 3:
+            consec_bull = all(closes[i - j] > opens[i - j] for j in range(3))
+            consec_bear = all(closes[i - j] < opens[i - j] for j in range(3))
+            # 3 consecutive same-direction with increasing bodies
+            if consec_bull and body > abs(closes[i - 1] - opens[i - 1]):
+                score += 1.0
+                reasons.append("3-Bar Bullish Momentum")
+            elif consec_bear and body > abs(closes[i - 1] - opens[i - 1]):
+                score -= 1.0
+                reasons.append("3-Bar Bearish Momentum")
+
+        # --- 9. Range Contraction then Expansion (weight 1.0) ---
+        if i >= 5:
+            avg_range_5 = sum(highs[j] - lows[j] for j in range(i - 5, i)) / 5
+            if full_range > avg_range_5 * 1.8 and body_ratio > 0.6:
+                if is_bullish:
+                    score += 1.0
+                    reasons.append(f"Range Expansion Bullish ({full_range / avg_range_5:.1f}x)")
+                elif is_bearish:
+                    score -= 1.0
+                    reasons.append(f"Range Expansion Bearish ({full_range / avg_range_5:.1f}x)")
+
+        # --- 10. Gap / Window Analysis (weight 1.0) ---
+        if i >= 1:
+            gap_up = low > prev_high  # gap up
+            gap_down = high < prev_low  # gap down
+            if gap_up and is_bullish:
+                score += 1.0
+                reasons.append(f"Gap Up + Bullish Follow ({low - prev_high:.0f} pts)")
+            elif gap_down and is_bearish:
+                score -= 1.0
+                reasons.append(f"Gap Down + Bearish Follow ({prev_low - high:.0f} pts)")
+            # Gap fill rejection (price fills gap then reverses)
+            elif gap_up and is_bearish and close < prev_high:
+                score -= 0.5
+                reasons.append("Gap Fill Rejection (Bearish)")
+            elif gap_down and is_bullish and close > prev_low:
+                score += 0.5
+                reasons.append("Gap Fill Rejection (Bullish)")
+
+        # --- 11. Swing Failure Pattern - SFP (weight 1.5) ---
+        # Price takes out a prior swing high/low then closes back inside = trap
+        if len(recent_sh) >= 1 and high > recent_sh[-1] and close < recent_sh[-1]:
+            score -= 1.5
+            reasons.append(f"SFP Bearish (false break {recent_sh[-1]:.0f})")
+        if len(recent_sl) >= 1 and low < recent_sl[-1] and close > recent_sl[-1]:
+            score += 1.5
+            reasons.append(f"SFP Bullish (false break {recent_sl[-1]:.0f})")
+
+        # --- Generate signal with alternating enforcement ---
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score,
+                            "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    # --- Summary for latest bar ---
+    last_i = n - 1
+    t_last = candles[last_i]["time"]
+    summary_score = 0
+    summary_reasons = []
+
+    # Trend structure
+    recent_sh_s = [p for idx, p in swing_highs if last_i - 20 <= idx < last_i]
+    recent_sl_s = [p for idx, p in swing_lows if last_i - 20 <= idx < last_i]
+    if len(recent_sh_s) >= 2 and len(recent_sl_s) >= 2:
+        hh = recent_sh_s[-1] > recent_sh_s[-2]
+        hl = recent_sl_s[-1] > recent_sl_s[-2]
+        if hh and hl:
+            d = 2.0
+            summary_reasons.append(("Trend", "Uptrend (HH+HL)", d))
+        elif not hh and not hl:
+            d = -2.0
+            summary_reasons.append(("Trend", "Downtrend (LH+LL)", d))
+        else:
+            d = 0
+            summary_reasons.append(("Trend", "Ranging", d))
+        summary_score += d
+
+    # Last candle type
+    last_body = abs(closes[-1] - opens[-1])
+    last_range = highs[-1] - lows[-1]
+    last_ratio = last_body / last_range if last_range > 0 else 0
+    last_bull = closes[-1] > opens[-1]
+    d = 1.5 if (last_bull and last_ratio > 0.6) else (-1.5 if (not last_bull and last_ratio > 0.6) else 0)
+    summary_score += d
+    summary_reasons.append(("Candle", f"{'Bullish' if last_bull else 'Bearish'} ({last_ratio:.0%})", d))
+
+    # S/R proximity
+    near_sup = any(abs(lows[-1] - sl) / closes[-1] < 0.005 for sl in sup_levels)
+    near_res = any(abs(highs[-1] - rl) / closes[-1] < 0.005 for rl in res_levels)
+    if near_sup and last_bull:
+        d = 1.5
+    elif near_res and not last_bull:
+        d = -1.5
+    else:
+        d = 0
+    summary_score += d
+    summary_reasons.append(("S/R", "At Support" if near_sup else ("At Resistance" if near_res else "Clear"), d))
+
+    # Momentum (3-bar)
+    if n >= 3:
+        mom_bull = all(closes[-1 - j] > opens[-1 - j] for j in range(3))
+        mom_bear = all(closes[-1 - j] < opens[-1 - j] for j in range(3))
+        d = 1.0 if mom_bull else (-1.0 if mom_bear else 0)
+        summary_score += d
+        summary_reasons.append(("Momentum", "Bullish" if d > 0 else ("Bearish" if d < 0 else "Mixed"), d))
+
+    # EMA context
+    e9 = ema9_map.get(t_last)
+    e21 = ema21_map.get(t_last)
+    if e9 and e21:
+        d = 1.0 if (closes[-1] > e9 > e21) else (-1.0 if (closes[-1] < e9 < e21) else 0)
+        summary_score += d
+        summary_reasons.append(("EMA Context", "Bullish" if d > 0 else ("Bearish" if d < 0 else "Neutral"), d))
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    rsi_last = rsi_map.get(t_last, 50)
+    macd_map = {m["time"]: m for m in macd_data}
+    mc_last = macd_map.get(t_last)
+    vw_last = vwap_map.get(t_last)
+
+    if summary_score >= 6:
+        verdict = "STRONG BUY"
+    elif summary_score >= 3:
+        verdict = "BUY"
+    elif summary_score <= -6:
+        verdict = "STRONG SELL"
+    elif summary_score <= -3:
+        verdict = "SELL"
+    else:
+        verdict = "NEUTRAL"
+
+    summary = {
+        "score": round(summary_score, 2),
+        "verdict": verdict,
+        "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in summary_reasons],
+        "rsi": rsi_last,
+        "macd": mc_last,
+        "vwap": vw_last,
+    }
+
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Breakout (Range/Channel Breakout Detection)
+# ---------------------------------------------------------------------------
+def generate_breakout_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    n = len(candles)
+    if n < 30:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map = {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+    sup_levels = [s["price"] for s in sr.get("support", [])]
+    res_levels = [r["price"] for r in sr.get("resistance", [])]
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+        t_prev = candles[i - 1]["time"]
+        body = abs(close - opn)
+        full_range = high - low
+
+        # Donchian Channel breakout
+        dc_high = max(highs[i - lookback:i])
+        dc_low = min(lows[i - lookback:i])
+        if close > dc_high:
+            score += 2.0
+            reasons.append(f"Donchian Breakout UP ({dc_high:.0f})")
+        elif close < dc_low:
+            score -= 2.0
+            reasons.append(f"Donchian Breakout DOWN ({dc_low:.0f})")
+
+        # BB expansion breakout
+        bb_u = bb_upper_map.get(t)
+        bb_l = bb_lower_map.get(t)
+        t_p5 = candles[i - 5]["time"] if i >= 5 else candles[0]["time"]
+        bb_u5 = bb_upper_map.get(t_p5, bb_u)
+        bb_l5 = bb_lower_map.get(t_p5, bb_l)
+        if bb_u and bb_l and bb_u5 and bb_l5:
+            curr_w = bb_u - bb_l
+            prev_w = bb_u5 - bb_l5
+            expanding = curr_w > prev_w * 1.2
+            if close > bb_u and expanding:
+                score += 2.0
+                reasons.append("BB Expansion Breakout UP")
+            elif close < bb_l and expanding:
+                score -= 2.0
+                reasons.append("BB Expansion Breakout DOWN")
+
+        # Volume surge
+        vol_avg = sum(volumes[i - lookback:i]) / lookback
+        if vol_avg > 0 and vol > 0:
+            vr = vol / vol_avg
+            if vr >= 2.5:
+                vs = 2.0
+            elif vr >= 1.8:
+                vs = 1.2
+            else:
+                vs = 0
+            if vs > 0:
+                if close > opn:
+                    score += vs
+                    reasons.append(f"Volume Surge {vr:.1f}x (Bull)")
+                else:
+                    score -= vs
+                    reasons.append(f"Volume Surge {vr:.1f}x (Bear)")
+
+        # ATR expansion
+        atr_vals = []
+        for j in range(max(1, i - 14), i + 1):
+            tr = max(highs[j] - lows[j], abs(highs[j] - closes[j - 1]), abs(lows[j] - closes[j - 1]))
+            atr_vals.append(tr)
+        if len(atr_vals) >= 2:
+            cur_atr = atr_vals[-1]
+            avg_atr = sum(atr_vals[:-1]) / len(atr_vals[:-1])
+            if avg_atr > 0 and cur_atr > avg_atr * 1.5:
+                d = 1.5 if close > opn else -1.5
+                score += d
+                reasons.append(f"ATR Expansion ({cur_atr / avg_atr:.1f}x)")
+
+        # EMA alignment
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        if e9 and e21:
+            if close > e9 > e21:
+                score += 1.5
+                reasons.append("EMA Bullish Aligned")
+            elif close < e9 < e21:
+                score -= 1.5
+                reasons.append("EMA Bearish Aligned")
+
+        # RSI thrust
+        rsi_val = rsi_map.get(t, 50)
+        if rsi_val > 65:
+            score += 1.5
+            reasons.append(f"RSI Thrust UP ({rsi_val:.0f})")
+        elif rsi_val < 35:
+            score -= 1.5
+            reasons.append(f"RSI Thrust DOWN ({rsi_val:.0f})")
+
+        # MACD acceleration
+        mc = macd_map.get(t)
+        mc_p = macd_map.get(t_prev)
+        if mc and mc_p:
+            if mc["histogram"] > 0 and mc["histogram"] > mc_p["histogram"]:
+                score += 1.5
+                reasons.append("MACD Accel UP")
+            elif mc["histogram"] < 0 and mc["histogram"] < mc_p["histogram"]:
+                score -= 1.5
+                reasons.append("MACD Accel DOWN")
+
+        # S/R pierce
+        for rl in res_levels:
+            if closes[i - 1] < rl and close > rl:
+                score += 1.5
+                reasons.append(f"Resistance Pierce {rl:.0f}")
+                break
+        for sl in sup_levels:
+            if closes[i - 1] > sl and close < sl:
+                score -= 1.5
+                reasons.append(f"Support Pierce {sl:.0f}")
+                break
+
+        # Candle body strength
+        if full_range > 0 and body / full_range > 0.65:
+            d = 1.0 if close > opn else -1.0
+            score += d
+            reasons.append(f"Strong Body ({body / full_range:.0%})")
+
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    li = n - 1
+    tl = candles[li]["time"]
+    ss = 0
+    sr_list = []
+    dc_h = max(highs[li - lookback:li])
+    dc_l = min(lows[li - lookback:li])
+    d = 2.0 if closes[-1] > dc_h else (-2.0 if closes[-1] < dc_l else 0)
+    ss += d
+    sr_list.append(("Donchian", f"{'Above' if d > 0 else 'Below' if d < 0 else 'Inside'}", d))
+    vol_avg_s = sum(volumes[li - lookback:li]) / lookback
+    vr_s = volumes[li] / vol_avg_s if vol_avg_s > 0 else 0
+    d = 1.5 if vr_s >= 1.8 else 0
+    if closes[-1] < opens[-1]:
+        d = -d
+    ss += d
+    sr_list.append(("Volume", f"{vr_s:.1f}x", d))
+    rsi_l = rsi_map.get(tl, 50)
+    d = 1.0 if rsi_l > 60 else (-1.0 if rsi_l < 40 else 0)
+    ss += d
+    sr_list.append(("RSI", f"{rsi_l:.0f}", d))
+    mc_l = macd_map.get(tl)
+    vw_l = vwap_map.get(tl)
+    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Momentum (Rate of Change + Acceleration)
+# ---------------------------------------------------------------------------
+def generate_momentum_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    n = len(candles)
+    if n < 30:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    roc = [0.0] * n
+    roc_roc = [0.0] * n
+    for i in range(10, n):
+        roc[i] = (closes[i] - closes[i - 10]) / closes[i - 10] * 100 if closes[i - 10] > 0 else 0
+    for i in range(11, n):
+        roc_roc[i] = roc[i] - roc[i - 1]
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+        t_prev = candles[i - 1]["time"]
+
+        # ROC
+        if roc[i] > 1.0:
+            score += 2.0
+            reasons.append(f"ROC Strong UP ({roc[i]:.2f}%)")
+        elif roc[i] > 0.3:
+            score += 1.0
+            reasons.append(f"ROC UP ({roc[i]:.2f}%)")
+        elif roc[i] < -1.0:
+            score -= 2.0
+            reasons.append(f"ROC Strong DOWN ({roc[i]:.2f}%)")
+        elif roc[i] < -0.3:
+            score -= 1.0
+            reasons.append(f"ROC DOWN ({roc[i]:.2f}%)")
+
+        # ROC acceleration
+        if roc_roc[i] > 0.3 and roc[i] > 0:
+            score += 1.5
+            reasons.append("Momentum Accelerating UP")
+        elif roc_roc[i] < -0.3 and roc[i] < 0:
+            score -= 1.5
+            reasons.append("Momentum Accelerating DOWN")
+
+        # RSI momentum crossing 50
+        rsi_val = rsi_map.get(t, 50)
+        rsi_prev = rsi_map.get(t_prev, 50)
+        if rsi_prev <= 50 and rsi_val > 55:
+            score += 2.0
+            reasons.append(f"RSI Cross Above 50 ({rsi_val:.0f})")
+        elif rsi_prev >= 50 and rsi_val < 45:
+            score -= 2.0
+            reasons.append(f"RSI Cross Below 50 ({rsi_val:.0f})")
+
+        # MACD histogram expansion
+        mc = macd_map.get(t)
+        mc_p = macd_map.get(t_prev)
+        if mc and mc_p:
+            h_delta = mc["histogram"] - mc_p["histogram"]
+            if mc["histogram"] > 0 and h_delta > 0:
+                score += 2.0
+                reasons.append("MACD Expanding Bullish")
+            elif mc["histogram"] < 0 and h_delta < 0:
+                score -= 2.0
+                reasons.append("MACD Expanding Bearish")
+
+        # EMA spread widening
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        e9p = ema9_map.get(t_prev)
+        e21p = ema21_map.get(t_prev)
+        if e9 and e21 and e9p and e21p:
+            spread = e9 - e21
+            prev_spread = e9p - e21p
+            if spread > 0 and spread > prev_spread:
+                score += 1.5
+                reasons.append("EMA Spread Widening Bullish")
+            elif spread < 0 and spread < prev_spread:
+                score -= 1.5
+                reasons.append("EMA Spread Widening Bearish")
+
+        # ADX-like directional strength
+        if i >= 14:
+            up_moves = sum(max(0, highs[j] - highs[j - 1]) for j in range(i - 13, i + 1))
+            down_moves = sum(max(0, lows[j - 1] - lows[j]) for j in range(i - 13, i + 1))
+            total = up_moves + down_moves
+            if total > 0:
+                di_diff = abs(up_moves - down_moves) / total
+                if di_diff > 0.4:
+                    d = 1.5 if up_moves > down_moves else -1.5
+                    score += d
+                    reasons.append(f"Strong Directional Move ({di_diff:.2f})")
+
+        # VWAP momentum
+        vw = vwap_map.get(t)
+        if vw and vw > 0:
+            dev = (close - vw) / vw
+            if dev > 0.005:
+                score += 1.5
+                reasons.append(f"Above VWAP +{dev:.3f}")
+            elif dev < -0.005:
+                score -= 1.5
+                reasons.append(f"Below VWAP {dev:.3f}")
+
+        # Volume momentum
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+        if vol_avg > 0 and vol > vol_avg * 1.5:
+            if close > opn:
+                score += 1.5
+                reasons.append(f"Rising Volume Bullish ({vol / vol_avg:.1f}x)")
+            else:
+                score -= 1.5
+                reasons.append(f"Rising Volume Bearish ({vol / vol_avg:.1f}x)")
+
+        # Consecutive closes
+        if i >= 3:
+            if all(closes[i - j] > opens[i - j] for j in range(3)):
+                score += 1.0
+                reasons.append("3-Bar Bull Run")
+            elif all(closes[i - j] < opens[i - j] for j in range(3)):
+                score -= 1.0
+                reasons.append("3-Bar Bear Run")
+
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    li = n - 1
+    tl = candles[li]["time"]
+    ss = 0
+    sr_list = []
+    d = 1.5 if roc[li] > 0.5 else (-1.5 if roc[li] < -0.5 else 0)
+    ss += d
+    sr_list.append(("ROC", f"{roc[li]:.2f}%", d))
+    rsi_l = rsi_map.get(tl, 50)
+    d = 1.5 if rsi_l > 55 else (-1.5 if rsi_l < 45 else 0)
+    ss += d
+    sr_list.append(("RSI", f"{rsi_l:.0f}", d))
+    mc_l = macd_map.get(tl)
+    if mc_l:
+        d = 1.5 if mc_l["histogram"] > 0 else -1.5
+        ss += d
+        sr_list.append(("MACD", "Bullish" if d > 0 else "Bearish", d))
+    vw_l = vwap_map.get(tl)
+    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Scalping (Ultra Short-Term Mean Reversion + Micro Momentum)
+# ---------------------------------------------------------------------------
+def generate_scalping_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    n = len(candles)
+    if n < 20:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]] = b["middle"]
+
+    # Fast EMA5
+    k5 = 2.0 / 6
+    ema5 = [0.0] * n
+    ema5[4] = sum(closes[:5]) / 5 if n >= 5 else closes[0]
+    for i in range(5, n):
+        ema5[i] = closes[i] * k5 + ema5[i - 1] * (1 - k5)
+
+    lookback = 15
+    signals = []
+    last_signal_type = None
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+        t_prev = candles[i - 1]["time"]
+        body = abs(close - opn)
+        full_range = high - low
+        upper_wick = high - max(close, opn)
+        lower_wick = min(close, opn) - low
+
+        # BB bounce
+        bb_l = bb_lower_map.get(t)
+        bb_u = bb_upper_map.get(t)
+        if bb_l and bb_u:
+            if low <= bb_l and close > opn:
+                score += 2.0
+                reasons.append("BB Lower Bounce (Buy)")
+            elif high >= bb_u and close < opn:
+                score -= 2.0
+                reasons.append("BB Upper Bounce (Sell)")
+
+        # RSI extreme reversal
+        rsi_val = rsi_map.get(t, 50)
+        rsi_prev = rsi_map.get(t_prev, 50)
+        if rsi_prev < 25 and rsi_val > rsi_prev:
+            score += 2.0
+            reasons.append(f"RSI Oversold Reversal ({rsi_val:.0f})")
+        elif rsi_prev > 75 and rsi_val < rsi_prev:
+            score -= 2.0
+            reasons.append(f"RSI Overbought Reversal ({rsi_val:.0f})")
+
+        # VWAP mean reversion
+        vw = vwap_map.get(t)
+        if vw and vw > 0:
+            dev = (close - vw) / vw
+            prev_dev = (closes[i - 1] - vw) / vw
+            if prev_dev < -0.003 and dev > prev_dev:
+                score += 2.0
+                reasons.append(f"VWAP Mean Revert UP ({dev:.3f})")
+            elif prev_dev > 0.003 and dev < prev_dev:
+                score -= 2.0
+                reasons.append(f"VWAP Mean Revert DOWN ({dev:.3f})")
+
+        # Micro EMA cross: EMA5 vs EMA9
+        e9 = ema9_map.get(t)
+        e9p = ema9_map.get(t_prev)
+        if e9 and e9p and i >= 5:
+            if ema5[i - 1] <= e9p and ema5[i] > e9:
+                score += 1.5
+                reasons.append("EMA5/9 Bull Cross")
+            elif ema5[i - 1] >= e9p and ema5[i] < e9:
+                score -= 1.5
+                reasons.append("EMA5/9 Bear Cross")
+
+        # Volume spike on reversal
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+        if vol_avg > 0 and vol > vol_avg * 1.8:
+            if closes[i - 1] < opens[i - 1] and close > opn:
+                score += 1.5
+                reasons.append(f"Vol Spike + Reversal UP ({vol / vol_avg:.1f}x)")
+            elif closes[i - 1] > opens[i - 1] and close < opn:
+                score -= 1.5
+                reasons.append(f"Vol Spike + Reversal DOWN ({vol / vol_avg:.1f}x)")
+
+        # Wick rejection
+        if full_range > 0:
+            if lower_wick > body * 2 and lower_wick > full_range * 0.5:
+                score += 1.5
+                reasons.append("Pin Bar Rejection (Bull)")
+            elif upper_wick > body * 2 and upper_wick > full_range * 0.5:
+                score -= 1.5
+                reasons.append("Pin Bar Rejection (Bear)")
+
+        # MACD zero-line cross
+        mc = macd_map.get(t)
+        mc_p = macd_map.get(t_prev)
+        if mc and mc_p:
+            if mc_p["macd"] <= 0 and mc["macd"] > 0:
+                score += 1.5
+                reasons.append("MACD Zero Cross UP")
+            elif mc_p["macd"] >= 0 and mc["macd"] < 0:
+                score -= 1.5
+                reasons.append("MACD Zero Cross DOWN")
+
+        # Candle body reversal
+        if closes[i - 1] < opens[i - 1] and close > opn and body > abs(closes[i - 1] - opens[i - 1]):
+            score += 1.0
+            reasons.append("Body Reversal Bull")
+        elif closes[i - 1] > opens[i - 1] and close < opn and body > abs(closes[i - 1] - opens[i - 1]):
+            score -= 1.0
+            reasons.append("Body Reversal Bear")
+
+        # Tight range breakout NR4
+        if i >= 4:
+            ranges = [highs[i - j] - lows[i - j] for j in range(1, 5)]
+            if full_range > max(ranges) and body > full_range * 0.5:
+                d = 1.0 if close > opn else -1.0
+                score += d
+                reasons.append("NR4 Breakout")
+
+        score = round(score, 2)
+        if score >= 6.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 4.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -6.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -4.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    li = n - 1
+    tl = candles[li]["time"]
+    ss = 0
+    sr_list = []
+    rsi_l = rsi_map.get(tl, 50)
+    d = 1.5 if rsi_l < 30 else (-1.5 if rsi_l > 70 else 0)
+    ss += d
+    sr_list.append(("RSI", f"{rsi_l:.0f}", d))
+    vw_l = vwap_map.get(tl)
+    if vw_l and vw_l > 0:
+        dv = (closes[-1] - vw_l) / vw_l
+        d = 1.5 if dv < -0.003 else (-1.5 if dv > 0.003 else 0)
+        ss += d
+        sr_list.append(("VWAP Dev", f"{dv:.3f}", d))
+    mc_l = macd_map.get(tl)
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 2.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -2.5 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Smart Money (Institutional Footprint Detection)
+# ---------------------------------------------------------------------------
+def generate_smartmoney_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    n = len(candles)
+    if n < 30:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+
+    # Swing points for structure
+    swing_lb = 5
+    swing_highs = []
+    swing_lows = []
+    for i in range(swing_lb, n - min(swing_lb, n - 1)):
+        end = min(i + swing_lb + 1, n)
+        if all(highs[i] >= highs[i - j] for j in range(1, swing_lb + 1)) and \
+           all(highs[i] >= highs[j] for j in range(i + 1, end)):
+            swing_highs.append((i, highs[i]))
+        if all(lows[i] <= lows[i - j] for j in range(1, swing_lb + 1)) and \
+           all(lows[i] <= lows[j] for j in range(i + 1, end)):
+            swing_lows.append((i, lows[i]))
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        score = 0.0
+        reasons = []
+        body = abs(close - opn)
+        full_range = high - low
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+
+        # Order Block
+        if i >= 3:
+            if closes[i - 2] < opens[i - 2] and closes[i - 1] > opens[i - 1] and close > opn:
+                disp = close - opens[i - 2]
+                avg_rng = sum(highs[j] - lows[j] for j in range(i - 10, i)) / 10
+                if avg_rng > 0 and disp > avg_rng * 2:
+                    score += 2.0
+                    reasons.append("Bullish Order Block")
+            if closes[i - 2] > opens[i - 2] and closes[i - 1] < opens[i - 1] and close < opn:
+                disp = opens[i - 2] - close
+                avg_rng = sum(highs[j] - lows[j] for j in range(i - 10, i)) / 10
+                if avg_rng > 0 and disp > avg_rng * 2:
+                    score -= 2.0
+                    reasons.append("Bearish Order Block")
+
+        # Fair Value Gap
+        if i >= 2:
+            if lows[i] > highs[i - 2] and close > opn:
+                score += 2.0
+                reasons.append(f"Bullish FVG ({lows[i] - highs[i - 2]:.0f} pts)")
+            elif highs[i] < lows[i - 2] and close < opn:
+                score -= 2.0
+                reasons.append(f"Bearish FVG ({lows[i - 2] - highs[i]:.0f} pts)")
+
+        # Liquidity Sweep + Reversal
+        recent_sh = [p for idx, p in swing_highs if i - 15 <= idx < i]
+        recent_sl = [p for idx, p in swing_lows if i - 15 <= idx < i]
+        if recent_sl and low < min(recent_sl) and close > opn:
+            score += 2.0
+            reasons.append("Liquidity Sweep Below + Reversal")
+        if recent_sh and high > max(recent_sh) and close < opn:
+            score -= 2.0
+            reasons.append("Liquidity Sweep Above + Reversal")
+
+        # Displacement candle
+        if full_range > 0 and vol_avg > 0:
+            body_ratio = body / full_range
+            vol_ratio = vol / vol_avg
+            if body_ratio > 0.75 and vol_ratio > 1.5:
+                d = 1.5 if close > opn else -1.5
+                score += d
+                reasons.append(f"Displacement {'UP' if d > 0 else 'DOWN'}")
+
+        # Break of Structure
+        if recent_sh and close > max(recent_sh) and close > opn:
+            score += 1.5
+            reasons.append("BOS Bullish")
+        if recent_sl and close < min(recent_sl) and close < opn:
+            score -= 1.5
+            reasons.append("BOS Bearish")
+
+        # Change of Character
+        if len(recent_sh) >= 2 and len(recent_sl) >= 2:
+            if recent_sh[-2] < recent_sh[-1] and close < min(recent_sl):
+                score -= 1.5
+                reasons.append("CHoCH Bearish")
+            if recent_sl[-2] > recent_sl[-1] and close > max(recent_sh):
+                score += 1.5
+                reasons.append("CHoCH Bullish")
+
+        # VWAP institutional level
+        vw = vwap_map.get(t)
+        if vw:
+            if close > vw and low <= vw * 1.001:
+                score += 1.0
+                reasons.append("VWAP Institutional Hold")
+            elif close < vw and high >= vw * 0.999:
+                score -= 1.0
+                reasons.append("VWAP Institutional Reject")
+
+        # Volume imbalance
+        if full_range > 0 and vol > 0:
+            buy_pct = (close - low) / full_range
+            if buy_pct > 0.7 and vol > vol_avg * 1.3:
+                score += 1.5
+                reasons.append("Buy Imbalance")
+            elif buy_pct < 0.3 and vol > vol_avg * 1.3:
+                score -= 1.5
+                reasons.append("Sell Imbalance")
+
+        # EMA reclaim after sweep
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        if e9 and e21:
+            if closes[i - 1] < e21 and close > e9:
+                score += 1.0
+                reasons.append("EMA Reclaim After Sweep")
+            elif closes[i - 1] > e21 and close < e9:
+                score -= 1.0
+                reasons.append("EMA Lost After Sweep")
+
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    li = n - 1
+    tl = candles[li]["time"]
+    ss = 0
+    sr_list = []
+    rsi_l = rsi_map.get(tl, 50)
+    mc_l = macd_map.get(tl)
+    vw_l = vwap_map.get(tl)
+    rng = highs[li] - lows[li]
+    bp = (closes[-1] - lows[-1]) / rng if rng > 0 else 0.5
+    d = 1.5 if bp > 0.65 else (-1.5 if bp < 0.35 else 0)
+    ss += d
+    sr_list.append(("Buy Pressure", f"{bp:.0%}", d))
+    r_sh = [p for idx, p in swing_highs if li - 20 <= idx < li]
+    r_sl = [p for idx, p in swing_lows if li - 20 <= idx < li]
+    if r_sh and closes[-1] > max(r_sh):
+        d = 2.0
+    elif r_sl and closes[-1] < min(r_sl):
+        d = -2.0
+    else:
+        d = 0
+    ss += d
+    sr_list.append(("Structure", "BOS Bull" if d > 0 else ("BOS Bear" if d < 0 else "Range"), d))
+    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Quant (Statistical / Mathematical Model)
+# ---------------------------------------------------------------------------
+def generate_quant_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    n = len(candles)
+    if n < 50:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map = {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    for i in range(50, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        score = 0.0
+        reasons = []
+        t_prev = candles[i - 1]["time"]
+
+        # Z-Score
+        seg = closes[i - lookback:i + 1]
+        mu = sum(seg) / len(seg)
+        std = (sum((x - mu) ** 2 for x in seg) / len(seg)) ** 0.5
+        z = (close - mu) / std if std > 0 else 0
+        if z < -2.0:
+            score += 2.0
+            reasons.append(f"Z-Score Extreme Low ({z:.2f})")
+        elif z < -1.0:
+            score += 1.0
+            reasons.append(f"Z-Score Low ({z:.2f})")
+        elif z > 2.0:
+            score -= 2.0
+            reasons.append(f"Z-Score Extreme High ({z:.2f})")
+        elif z > 1.0:
+            score -= 1.0
+            reasons.append(f"Z-Score High ({z:.2f})")
+
+        # Linear regression deviation
+        xs = list(range(lookback + 1))
+        ys = seg
+        x_mean = sum(xs) / len(xs)
+        y_mean = sum(ys) / len(ys)
+        num = sum((xs[j] - x_mean) * (ys[j] - y_mean) for j in range(len(xs)))
+        den = sum((xs[j] - x_mean) ** 2 for j in range(len(xs)))
+        slope = num / den if den > 0 else 0
+        intercept = y_mean - slope * x_mean
+        reg_val = slope * lookback + intercept
+        reg_dev = (close - reg_val) / std if std > 0 else 0
+        if reg_dev < -1.5:
+            score += 2.0
+            reasons.append(f"Below Regression ({reg_dev:.2f}\u03c3)")
+        elif reg_dev > 1.5:
+            score -= 2.0
+            reasons.append(f"Above Regression ({reg_dev:.2f}\u03c3)")
+        elif slope > 0 and reg_dev > -0.5:
+            score += 0.5
+            reasons.append("Regression Uptrend")
+        elif slope < 0 and reg_dev < 0.5:
+            score -= 0.5
+            reasons.append("Regression Downtrend")
+
+        # Bollinger %B
+        bb_u = bb_upper_map.get(t)
+        bb_l = bb_lower_map.get(t)
+        if bb_u and bb_l and bb_u > bb_l:
+            pct_b = (close - bb_l) / (bb_u - bb_l)
+            if pct_b < 0.05:
+                score += 1.5
+                reasons.append(f"%B Oversold ({pct_b:.2f})")
+            elif pct_b > 0.95:
+                score -= 1.5
+                reasons.append(f"%B Overbought ({pct_b:.2f})")
+
+        # Stochastic RSI
+        rsi_val = rsi_map.get(t, 50)
+        rsi_window = [rsi_map.get(candles[j]["time"], 50) for j in range(max(0, i - 14), i + 1)]
+        if len(rsi_window) >= 2:
+            rsi_min = min(rsi_window)
+            rsi_max = max(rsi_window)
+            stoch_rsi = (rsi_val - rsi_min) / (rsi_max - rsi_min) * 100 if rsi_max > rsi_min else 50
+            stoch_prev_w = [rsi_map.get(candles[j]["time"], 50) for j in range(max(0, i - 15), i)]
+            stoch_prev = 50
+            if len(stoch_prev_w) >= 2:
+                pm, px = min(stoch_prev_w), max(stoch_prev_w)
+                rsi_p = rsi_map.get(t_prev, 50)
+                stoch_prev = (rsi_p - pm) / (px - pm) * 100 if px > pm else 50
+            if stoch_prev < 20 and stoch_rsi > 20:
+                score += 2.0
+                reasons.append(f"StochRSI Cross Up ({stoch_rsi:.0f})")
+            elif stoch_prev > 80 and stoch_rsi < 80:
+                score -= 2.0
+                reasons.append(f"StochRSI Cross Down ({stoch_rsi:.0f})")
+
+        # Keltner Channel position
+        atr_14 = []
+        for j in range(max(1, i - 14), i + 1):
+            tr = max(highs[j] - lows[j], abs(highs[j] - closes[j - 1]), abs(lows[j] - closes[j - 1]))
+            atr_14.append(tr)
+        avg_atr = sum(atr_14) / len(atr_14) if atr_14 else 0
+        e21 = ema21_map.get(t)
+        if e21 and avg_atr > 0:
+            kc_upper = e21 + 2 * avg_atr
+            kc_lower = e21 - 2 * avg_atr
+            if close < kc_lower:
+                score += 1.5
+                reasons.append("Below Keltner Lower")
+            elif close > kc_upper:
+                score -= 1.5
+                reasons.append("Above Keltner Upper")
+
+        # Hurst exponent proxy
+        returns = [closes[j] / closes[j - 1] - 1 for j in range(i - 20, i + 1) if closes[j - 1] > 0]
+        if len(returns) >= 10:
+            r_mean = sum(returns) / len(returns)
+            cum_dev = []
+            cum = 0
+            for r in returns:
+                cum += r - r_mean
+                cum_dev.append(cum)
+            r_std = (sum((r - r_mean) ** 2 for r in returns) / len(returns)) ** 0.5
+            rs = (max(cum_dev) - min(cum_dev)) / max(0.0001, r_std)
+            h_proxy = math.log(max(1, rs)) / math.log(len(returns)) if len(returns) > 1 else 0.5
+            if h_proxy < 0.4 and z < -1:
+                score += 1.5
+                reasons.append(f"Mean-Reverting + Oversold (H={h_proxy:.2f})")
+            elif h_proxy < 0.4 and z > 1:
+                score -= 1.5
+                reasons.append(f"Mean-Reverting + Overbought (H={h_proxy:.2f})")
+            elif h_proxy > 0.6:
+                d = 1.0 if closes[i] > closes[i - 1] else -1.0
+                score += d
+                reasons.append(f"Trending (H={h_proxy:.2f})")
+
+        # Variance ratio
+        if len(returns) >= 10:
+            var_1 = sum(r ** 2 for r in returns) / len(returns)
+            returns_2 = [closes[j] / closes[j - 2] - 1 for j in range(i - 18, i + 1, 2) if j >= 2 and closes[j - 2] > 0]
+            var_2 = sum(r ** 2 for r in returns_2) / len(returns_2) if returns_2 else var_1
+            vr = var_2 / (2 * var_1) if var_1 > 0 else 1
+            if vr < 0.7 and z < -0.5:
+                score += 1.5
+                reasons.append(f"VR Mean Revert Buy ({vr:.2f})")
+            elif vr < 0.7 and z > 0.5:
+                score -= 1.5
+                reasons.append(f"VR Mean Revert Sell ({vr:.2f})")
+
+        # Price percentile rank
+        window_50 = closes[max(0, i - 50):i + 1]
+        rank = sum(1 for p in window_50 if p <= close) / len(window_50) * 100
+        if rank < 10:
+            score += 1.0
+            reasons.append(f"Percentile Low ({rank:.0f}%)")
+        elif rank > 90:
+            score -= 1.0
+            reasons.append(f"Percentile High ({rank:.0f}%)")
+
+        # Return distribution skew
+        if len(returns) >= 10:
+            r_mean = sum(returns) / len(returns)
+            r_std = (sum((r - r_mean) ** 2 for r in returns) / len(returns)) ** 0.5
+            if r_std > 0:
+                skew = sum((r - r_mean) ** 3 for r in returns) / (len(returns) * r_std ** 3)
+                if skew > 0.5:
+                    score += 1.0
+                    reasons.append(f"Positive Skew ({skew:.2f})")
+                elif skew < -0.5:
+                    score -= 1.0
+                    reasons.append(f"Negative Skew ({skew:.2f})")
+
+        score = round(score, 2)
+        if score >= 7.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -7.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    li = n - 1
+    tl = candles[li]["time"]
+    seg = closes[li - lookback:li + 1]
+    mu = sum(seg) / len(seg)
+    std = (sum((x - mu) ** 2 for x in seg) / len(seg)) ** 0.5
+    z_l = (closes[-1] - mu) / std if std > 0 else 0
+    ss = 0
+    sr_list = []
+    d = 2.0 if z_l < -1.5 else (1.0 if z_l < -0.5 else (-2.0 if z_l > 1.5 else (-1.0 if z_l > 0.5 else 0)))
+    ss += d
+    sr_list.append(("Z-Score", f"{z_l:.2f}", d))
+    rsi_l = rsi_map.get(tl, 50)
+    d = 1.0 if rsi_l < 35 else (-1.0 if rsi_l > 65 else 0)
+    ss += d
+    sr_list.append(("RSI", f"{rsi_l:.0f}", d))
+    mc_l = macd_map.get(tl)
+    vw_l = vwap_map.get(tl)
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 2.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -2.5 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
+# ---------------------------------------------------------------------------
+# Strategy: Hybrid (Multi-Strategy Consensus Voting)
+# ---------------------------------------------------------------------------
+def generate_hybrid_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    n = len(candles)
+    if n < 30:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map = {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    for i in range(lookback, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+        t_prev = candles[i - 1]["time"]
+
+        votes = {}
+        reasons = []
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+
+        # A. Trend vote
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        vw = vwap_map.get(t)
+        if e9 and e21:
+            if close > e9 > e21 and (vw is None or close > vw):
+                votes["trend"] = 1
+                reasons.append("Trend: Bullish")
+            elif close < e9 < e21 and (vw is None or close < vw):
+                votes["trend"] = -1
+                reasons.append("Trend: Bearish")
+            else:
+                votes["trend"] = 0
+        else:
+            votes["trend"] = 0
+
+        # B. Mean Reversion vote
+        seg = closes[i - lookback:i + 1]
+        mu = sum(seg) / len(seg)
+        std = (sum((x - mu) ** 2 for x in seg) / len(seg)) ** 0.5
+        z = (close - mu) / std if std > 0 else 0
+        bb_u = bb_upper_map.get(t)
+        bb_l = bb_lower_map.get(t)
+        if z < -1.5 or (bb_l and close <= bb_l):
+            votes["meanrev"] = 1
+            reasons.append(f"MeanRev: Buy (z={z:.2f})")
+        elif z > 1.5 or (bb_u and close >= bb_u):
+            votes["meanrev"] = -1
+            reasons.append(f"MeanRev: Sell (z={z:.2f})")
+        else:
+            votes["meanrev"] = 0
+
+        # C. Momentum vote
+        mc = macd_map.get(t)
+        mc_p = macd_map.get(t_prev)
+        roc_val = (close - closes[i - 10]) / closes[i - 10] * 100 if i >= 10 and closes[i - 10] > 0 else 0
+        mom_vote = 0
+        if mc and mc_p:
+            if mc["histogram"] > 0 and mc["histogram"] > mc_p["histogram"] and roc_val > 0.3:
+                mom_vote = 1
+                reasons.append(f"Momentum: Bullish (ROC={roc_val:.2f}%)")
+            elif mc["histogram"] < 0 and mc["histogram"] < mc_p["histogram"] and roc_val < -0.3:
+                mom_vote = -1
+                reasons.append(f"Momentum: Bearish (ROC={roc_val:.2f}%)")
+        votes["momentum"] = mom_vote
+
+        # D. Volume vote
+        full_range = high - low
+        if vol_avg > 0 and vol > 0 and full_range > 0:
+            buy_pct = (close - low) / full_range
+            delta = vol * (buy_pct - 0.5) * 2
+            if delta > 0 and vol > vol_avg * 1.3:
+                votes["volume"] = 1
+                reasons.append(f"Volume: Buy Pressure ({vol / vol_avg:.1f}x)")
+            elif delta < 0 and vol > vol_avg * 1.3:
+                votes["volume"] = -1
+                reasons.append(f"Volume: Sell Pressure ({vol / vol_avg:.1f}x)")
+            else:
+                votes["volume"] = 0
+        else:
+            votes["volume"] = 0
+
+        # E. Price Action vote
+        body = abs(close - opn)
+        pa_vote = 0
+        if full_range > 0:
+            lower_wick = min(close, opn) - low
+            upper_wick = high - max(close, opn)
+            if close > opn and body > abs(closes[i - 1] - opens[i - 1]) * 1.2 and closes[i - 1] < opens[i - 1]:
+                pa_vote = 1
+                reasons.append("PA: Bullish Engulfing")
+            elif close < opn and body > abs(closes[i - 1] - opens[i - 1]) * 1.2 and closes[i - 1] > opens[i - 1]:
+                pa_vote = -1
+                reasons.append("PA: Bearish Engulfing")
+            elif lower_wick > body * 2:
+                pa_vote = 1
+                reasons.append("PA: Hammer")
+            elif upper_wick > body * 2:
+                pa_vote = -1
+                reasons.append("PA: Shooting Star")
+        votes["priceaction"] = pa_vote
+
+        # Count consensus
+        bull_count = sum(1 for v in votes.values() if v == 1)
+        bear_count = sum(1 for v in votes.values() if v == -1)
+        total_votes = len(votes)
+
+        score = 0.0
+        if bull_count >= 4:
+            score = bull_count * 2.0
+            reasons.insert(0, f"CONSENSUS: {bull_count}/{total_votes} Bullish")
+        elif bull_count >= 3:
+            score = bull_count * 1.8
+            reasons.insert(0, f"CONSENSUS: {bull_count}/{total_votes} Bullish")
+        elif bear_count >= 4:
+            score = -bear_count * 2.0
+            reasons.insert(0, f"CONSENSUS: {bear_count}/{total_votes} Bearish")
+        elif bear_count >= 3:
+            score = -bear_count * 1.8
+            reasons.insert(0, f"CONSENSUS: {bear_count}/{total_votes} Bearish")
+
+        score = round(score, 2)
+        if score >= 8.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "BUY"
+        elif score <= -8.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
+            last_signal_type = "SELL"
+
+    li = n - 1
+    tl = candles[li]["time"]
+    ss = 0
+    sr_list = []
+    e9 = ema9_map.get(tl)
+    e21 = ema21_map.get(tl)
+    trend_v = 1 if (e9 and e21 and closes[-1] > e9 > e21) else (-1 if (e9 and e21 and closes[-1] < e9 < e21) else 0)
+    seg = closes[li - lookback:li + 1]
+    mu = sum(seg) / len(seg)
+    std = (sum((x - mu) ** 2 for x in seg) / len(seg)) ** 0.5
+    z_v = (closes[-1] - mu) / std if std > 0 else 0
+    mr_v = 1 if z_v < -1.5 else (-1 if z_v > 1.5 else 0)
+    mc_l = macd_map.get(tl)
+    mom_v = 1 if (mc_l and mc_l["histogram"] > 0) else (-1 if (mc_l and mc_l["histogram"] < 0) else 0)
+    bc = sum(1 for v in [trend_v, mr_v, mom_v] if v == 1)
+    sc = sum(1 for v in [trend_v, mr_v, mom_v] if v == -1)
+    ss = bc * 2 - sc * 2
+    sr_list.append(("Trend", "Bull" if trend_v > 0 else ("Bear" if trend_v < 0 else "Flat"), trend_v * 2))
+    sr_list.append(("MeanRev", f"z={z_v:.2f}", mr_v * 2))
+    sr_list.append(("Momentum", "Bull" if mom_v > 0 else ("Bear" if mom_v < 0 else "Flat"), mom_v * 2))
+    rsi_l = rsi_map.get(tl, 50)
+    vw_l = vwap_map.get(tl)
+    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
 INTERVAL_SECONDS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "1h": 3600, "1d": 86400, "1w": 604800, "1mo": 2592000,
@@ -3532,6 +5737,42 @@ def api_candles():
             sigs, summ = generate_accurate_signals(
                 candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
             )
+        elif algo == "sniper":
+            sigs, summ = generate_sniper_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "orderflow":
+            sigs, summ = generate_orderflow_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "priceaction":
+            sigs, summ = generate_priceaction_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "breakout":
+            sigs, summ = generate_breakout_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "momentum":
+            sigs, summ = generate_momentum_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "scalping":
+            sigs, summ = generate_scalping_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "smartmoney":
+            sigs, summ = generate_smartmoney_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "quant":
+            sigs, summ = generate_quant_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "hybrid":
+            sigs, summ = generate_hybrid_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
         else:  # trend (default)
             sigs, summ = generate_signals(
                 candles, supertrend, psar, rsi_data, macd_data,
@@ -4230,6 +6471,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="algo-item" data-algo="trend" data-label="Trend">&#8203; Trend</button>
       <button class="algo-item active" data-algo="mstreet" data-label="MStreet">&#10004; MStreet</button>
       <button class="algo-item" data-algo="mfactor" data-label="MFactor">&#8203; MFactor</button>
+      <button class="algo-item" data-algo="sniper" data-label="Sniper">&#8203; Sniper</button>
+      <button class="algo-item" data-algo="orderflow" data-label="OrderFlow">&#8203; OrderFlow</button>
+      <button class="algo-item" data-algo="priceaction" data-label="PriceAction">&#8203; PriceAction</button>
+      <button class="algo-item" data-algo="breakout" data-label="Breakout">&#8203; Breakout</button>
+      <button class="algo-item" data-algo="momentum" data-label="Momentum">&#8203; Momentum</button>
+      <button class="algo-item" data-algo="scalping" data-label="Scalping">&#8203; Scalping</button>
+      <button class="algo-item" data-algo="smartmoney" data-label="SmartMoney">&#8203; SmartMoney</button>
+      <button class="algo-item" data-algo="quant" data-label="Quant">&#8203; Quant</button>
+      <button class="algo-item" data-algo="hybrid" data-label="Hybrid">&#8203; Hybrid</button>
       <button class="algo-item active" data-algo="mpredict" data-label="MPredict">&#10004; MPredict</button>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
@@ -4252,6 +6502,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="cfg-item bt-algo-item" data-bt-algo="trend">&#128202; Trend</button>
         <button class="cfg-item bt-algo-item" data-bt-algo="mstreet">&#128202; MStreet</button>
         <button class="cfg-item bt-algo-item" data-bt-algo="mfactor">&#128202; MFactor</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="sniper">&#128202; Sniper</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="orderflow">&#128202; OrderFlow</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="priceaction">&#128202; PriceAction</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="breakout">&#128202; Breakout</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="momentum">&#128202; Momentum</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="scalping">&#128202; Scalping</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="smartmoney">&#128202; SmartMoney</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="quant">&#128202; Quant</button>
+        <button class="cfg-item bt-algo-item" data-bt-algo="hybrid">&#128202; Hybrid</button>
         <button class="cfg-item bt-algo-item" data-bt-algo="mpredict">&#128202; MPredict</button>
       </div>
     </div>
@@ -4462,6 +6721,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <option value="trend">Trend Strategy</option>
           <option value="mstreet" selected>MStreet Strategy</option>
           <option value="mfactor">MFactor Strategy</option>
+          <option value="sniper">Sniper Entry Strategy</option>
+          <option value="orderflow">OrderFlow Strategy</option>
+          <option value="priceaction">Price Action Strategy</option>
+          <option value="breakout">Breakout Strategy</option>
+          <option value="momentum">Momentum Strategy</option>
+          <option value="scalping">Scalping Strategy</option>
+          <option value="smartmoney">Smart Money Strategy</option>
+          <option value="quant">Quant Strategy</option>
+          <option value="hybrid">Hybrid Strategy</option>
         </select>
       </div>
       <button class="tp-start-btn start" id="tpStartBtn">Start Trading</button>
@@ -5397,7 +7665,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   // ---- Signal Panel Renderer ----
-  const algoLabels = { trend: 'Trend', mstreet: 'MStreet', mfactor: 'MFactor', mpredict: 'MPredict' };
+  const algoLabels = { trend: 'Trend', mstreet: 'MStreet', mfactor: 'MFactor', sniper: 'Sniper', orderflow: 'OrderFlow', priceaction: 'PriceAction', breakout: 'Breakout', momentum: 'Momentum', scalping: 'Scalping', smartmoney: 'SmartMoney', quant: 'Quant', hybrid: 'Hybrid', mpredict: 'MPredict' };
   function updateSignalPanel(summaries, sigs) {
     const box = document.getElementById('verdictBox');
     const rowsEl = document.getElementById('indicatorRows');

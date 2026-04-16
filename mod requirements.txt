@@ -11,3 +11,7 @@ real trade greyout in settings-done
 signal analysis panel should display in Algo based on strategy
 indicator settings should be part of indicators -done
 Add settings and add Backtest, Trade, Real trade -done
+
+Add 10 mins 
+Add search box based on company name
+go daddy to host this onrender.com website
