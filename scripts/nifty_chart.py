@@ -70,6 +70,12 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS site_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     # Migrate: add columns if they don't exist (for existing DBs)
     cols = [r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()]
     if "username" not in cols:
@@ -78,8 +84,34 @@ def init_db():
         db.execute("ALTER TABLE users ADD COLUMN place TEXT DEFAULT ''")
     if "plan" not in cols:
         db.execute("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'")
+    # Seed default site settings
+    defaults = {
+        "maintenance_mode": "off",
+        "settings_backtest": "on",
+        "settings_datasource": "on",
+        "settings_trade": "on",
+        "settings_realtrade": "on",
+        "menu_symbols": json.dumps(["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","CRUDEOIL","NATURALGAS"]),
+        "menu_timeframes": json.dumps(["1m","2m","3m","5m","10m","15m","30m","1h","2h","4h","1d","1w","1mo"]),
+        "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
+        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","mpredict"]),
+    }
+    for k, v in defaults.items():
+        db.execute("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)", (k, v))
     db.commit()
     db.close()
+
+
+def get_site_setting(key, default="off"):
+    db = get_db()
+    row = db.execute("SELECT value FROM site_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_site_setting(key, value):
+    db = get_db()
+    db.execute("INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
 
 
 def hash_password(password):
@@ -97,6 +129,17 @@ def verify_password(password, stored_hash):
     return secrets.compare_digest(h.hex(), expected)
 
 
+MAINTENANCE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Maintenance - Mangal View</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#131722;color:#d1d4dc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
+.box{background:#1e222d;border-radius:16px;padding:48px 40px;max-width:480px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.icon{font-size:64px;margin-bottom:16px}h1{color:#ffd600;font-size:24px;margin-bottom:12px}
+p{color:#787b86;font-size:15px;line-height:1.6}</style></head>
+<body><div class="box"><div class="icon">&#128679;</div><h1>Under Maintenance</h1>
+<p>Mangal View is currently undergoing scheduled maintenance.<br>We'll be back shortly. Thank you for your patience.</p></div></body></html>"""
+
+
 def login_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
@@ -104,6 +147,15 @@ def login_required(f):
             if request.path.startswith("/api/"):
                 return jsonify({"error": "Unauthorized"}), 401
             return redirect("/login")
+        # Check maintenance mode (allow admin through)
+        if not session.get("admin"):
+            try:
+                if get_site_setting("maintenance_mode", "off") == "on":
+                    if request.path.startswith("/api/"):
+                        return jsonify({"error": "Site is under maintenance"}), 503
+                    return Response(MAINTENANCE_HTML, status=503, content_type="text/html")
+            except Exception:
+                pass
         return f(*args, **kwargs)
     return decorated
 
@@ -401,6 +453,48 @@ def admin_delete_user():
     return jsonify({"ok": True})
 
 
+# --- Admin Site Settings API ---
+@app.route("/admin/api/settings", methods=["GET"])
+def admin_get_settings():
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    db = get_db()
+    rows = db.execute("SELECT key, value FROM site_settings").fetchall()
+    settings = {r["key"]: r["value"] for r in rows}
+    return jsonify({"ok": True, "settings": settings})
+
+
+@app.route("/admin/api/settings", methods=["POST"])
+def admin_update_settings():
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json()
+    allowed_keys = {"maintenance_mode", "settings_backtest", "settings_datasource",
+                    "settings_trade", "settings_realtrade",
+                    "menu_symbols", "menu_timeframes", "menu_indicators", "menu_algos"}
+    for key, value in data.items():
+        if key in allowed_keys:
+            if key.startswith("menu_"):
+                # Menu config: value is a JSON array string
+                if isinstance(value, list):
+                    set_site_setting(key, json.dumps(value))
+                elif isinstance(value, str):
+                    set_site_setting(key, value)
+            elif value in ("on", "off"):
+                set_site_setting(key, value)
+    return jsonify({"ok": True})
+
+
+# --- User site settings API (for frontend to fetch visibility) ---
+@app.route("/api/site-settings", methods=["GET"])
+@login_required
+def user_get_site_settings():
+    db = get_db()
+    rows = db.execute("SELECT key, value FROM site_settings").fetchall()
+    settings = {r["key"]: r["value"] for r in rows}
+    return jsonify(settings)
+
+
 # --- Real Trade (Delta) State ---
 delta_sessions = {}
 delta_orders = {}
@@ -468,12 +562,16 @@ SYMBOL_MAP = {
     "DJI":        {"ticker": "^DJI",           "name": "Dow Jones",  "exchange": "NYSE"},
     "NASDAQ":     {"ticker": "^IXIC",          "name": "NASDAQ",     "exchange": "NASDAQ"},
     "SP500":      {"ticker": "^GSPC",          "name": "S&P 500",    "exchange": "NYSE"},
+    "CRUDEOIL":  {"ticker": "CL=F",           "name": "Crude Oil",   "exchange": "NYMEX"},
+    "NATURALGAS": {"ticker": "NG=F",           "name": "Natural Gas", "exchange": "NYMEX"},
 }
 
 INTERVAL_MAP = {
     "1m":  {"interval": "1m",  "period": "1d",  "label": "1 Min"},
+    "2m":  {"interval": "2m",  "period": "1d",  "label": "2 Min"},
     "3m":  {"interval": "5m",  "period": "5d",  "label": "3 Min"},
     "5m":  {"interval": "5m",  "period": "5d",  "label": "5 Min"},
+    "10m": {"interval": "15m", "period": "10d", "label": "10 Min"},
     "15m": {"interval": "15m", "period": "10d", "label": "15 Min"},
     "30m": {"interval": "30m", "period": "10d", "label": "30 Min"},
     "1h":  {"interval": "1h",  "period": "30d", "label": "1 Hour"},
@@ -499,10 +597,12 @@ TV_SYMBOL_MAP = {
     "DJI":        "DJ:DJI",
     "NASDAQ":     "NASDAQ:IXIC",
     "SP500":      "SP:SPX",
+    "CRUDEOIL":  "NYMEX:CL1!",
+    "NATURALGAS": "NYMEX:NG1!",
 }
 
 TV_INTERVAL_MAP = {
-    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1m": "1", "2m": "2", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30",
     "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W", "1mo": "M",
 }
 
@@ -1709,6 +1809,90 @@ def compute_cvd(candles):
     return result
 
 
+def compute_volume_profile(candles, num_bins=24):
+    """Compute Volume Profile — volume distributed across price levels.
+
+    Divides the price range into equal bins and aggregates volume at each level.
+    Identifies the Point of Control (POC) — the price level with highest volume,
+    and the Value Area (70% of total volume around POC).
+
+    Args:
+        candles (list[dict]): OHLCV candle dicts.
+        num_bins (int): Number of price bins (default 24).
+
+    Returns:
+        list[dict]: Dicts with 'price', 'volume', 'pct' (% of max), 'isPOC', 'isVA'.
+    """
+    n = len(candles)
+    if n < 2:
+        return []
+
+    all_high = max(c["high"] for c in candles)
+    all_low = min(c["low"] for c in candles)
+    price_range = all_high - all_low
+    if price_range <= 0:
+        return []
+
+    bin_size = price_range / num_bins
+    bins = [0.0] * num_bins
+
+    for c in candles:
+        vol = c.get("volume", 0) or 0
+        if vol <= 0:
+            continue
+        hl = c["high"] - c["low"]
+        if hl <= 0:
+            idx = int((c["close"] - all_low) / bin_size)
+            idx = min(idx, num_bins - 1)
+            bins[idx] += vol
+        else:
+            lo_bin = int((c["low"] - all_low) / bin_size)
+            hi_bin = int((c["high"] - all_low) / bin_size)
+            lo_bin = max(0, min(lo_bin, num_bins - 1))
+            hi_bin = max(0, min(hi_bin, num_bins - 1))
+            spread = hi_bin - lo_bin + 1
+            per_bin = vol / spread
+            for b in range(lo_bin, hi_bin + 1):
+                bins[b] += per_bin
+
+    max_vol = max(bins) if bins else 1
+    if max_vol <= 0:
+        return []
+
+    poc_idx = bins.index(max_vol)
+    total_vol = sum(bins)
+
+    # Value Area: expand from POC until 70% of total volume
+    va_set = {poc_idx}
+    va_vol = bins[poc_idx]
+    lo_ptr, hi_ptr = poc_idx - 1, poc_idx + 1
+    while va_vol < total_vol * 0.7 and (lo_ptr >= 0 or hi_ptr < num_bins):
+        lo_v = bins[lo_ptr] if lo_ptr >= 0 else 0
+        hi_v = bins[hi_ptr] if hi_ptr < num_bins else 0
+        if lo_v >= hi_v and lo_ptr >= 0:
+            va_set.add(lo_ptr)
+            va_vol += lo_v
+            lo_ptr -= 1
+        elif hi_ptr < num_bins:
+            va_set.add(hi_ptr)
+            va_vol += hi_v
+            hi_ptr += 1
+        else:
+            break
+
+    result = []
+    for i in range(num_bins):
+        price = round(all_low + (i + 0.5) * bin_size, 2)
+        result.append({
+            "price": price,
+            "volume": round(bins[i], 0),
+            "pct": round(bins[i] / max_vol * 100, 1),
+            "isPOC": i == poc_idx,
+            "isVA": i in va_set,
+        })
+    return result
+
+
 def generate_signals(candles, supertrend, psar, rsi_data, macd_data, vwap_data,
                      ema9, ema21, patterns, sr):
     """Institutional-grade composite signal engine using weighted multi-indicator scoring.
@@ -1917,13 +2101,13 @@ def generate_signals(candles, supertrend, psar, rsi_data, macd_data, vwap_data,
 
         # --- Generate signal if threshold met ---
         score = round(score, 2)
-        if score >= 5.5:
+        if score >= 5.0:
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons,
                             "price": candles[i]["low"]})
         elif score >= 3.5:
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons,
                             "price": candles[i]["low"]})
-        elif score <= -5.5:
+        elif score <= -5.0:
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons,
                             "price": candles[i]["high"]})
         elif score <= -3.5:
@@ -1974,13 +2158,13 @@ def generate_signals(candles, supertrend, psar, rsi_data, macd_data, vwap_data,
         summary_score += d
         summary_reasons.append(("VWAP", "Above" if d > 0 else "Below", d))
 
-    if summary_score >= 4:
+    if summary_score >= 5:
         verdict = "STRONG BUY"
-    elif summary_score >= 2:
+    elif summary_score >= 3.5:
         verdict = "BUY"
-    elif summary_score <= -4:
+    elif summary_score <= -5:
         verdict = "STRONG SELL"
-    elif summary_score <= -2:
+    elif summary_score <= -3.5:
         verdict = "SELL"
     else:
         verdict = "NEUTRAL"
@@ -2010,8 +2194,8 @@ def generate_janestreet_signals(candles, bb, rsi_data, macd_data, vwap_data, ema
       EMA spread z-score:         weight 1.0  (normalized EMA9-EMA21 spread)
       S/R mean reversion:         weight 0.5  (price near S/R = reversion opportunity)
 
-    Signal thresholds: score >= 3.0 → BUY, >= 5.0 → STRONG BUY
-                       score <= -3.0 → SELL, <= -5.0 → STRONG SELL
+    Signal thresholds: score >= 3.5 → BUY, >= 5.0 → STRONG BUY
+                       score <= -3.5 → SELL, <= -5.0 → STRONG SELL
 
     Args:
         candles: OHLCV candle dicts.
@@ -2198,13 +2382,13 @@ def generate_janestreet_signals(candles, bb, rsi_data, macd_data, vwap_data, ema
         if score >= 5.0:
             signals.append({"time": t, "type": "STRONG_BUY", "score": score,
                             "reasons": reasons, "price": candles[i]["low"]})
-        elif score >= 3.0:
+        elif score >= 3.5:
             signals.append({"time": t, "type": "BUY", "score": score,
                             "reasons": reasons, "price": candles[i]["low"]})
         elif score <= -5.0:
             signals.append({"time": t, "type": "STRONG_SELL", "score": score,
                             "reasons": reasons, "price": candles[i]["high"]})
-        elif score <= -3.0:
+        elif score <= -3.5:
             signals.append({"time": t, "type": "SELL", "score": score,
                             "reasons": reasons, "price": candles[i]["high"]})
 
@@ -2263,13 +2447,13 @@ def generate_janestreet_signals(candles, bb, rsi_data, macd_data, vwap_data, ema
         summary_score += d
         summary_reasons.append(("EMA Spread", "Negative" if d > 0 else "Positive", d))
 
-    if summary_score >= 4:
+    if summary_score >= 5:
         verdict = "STRONG BUY"
-    elif summary_score >= 2:
+    elif summary_score >= 3.5:
         verdict = "BUY"
-    elif summary_score <= -4:
+    elif summary_score <= -5:
         verdict = "STRONG SELL"
-    elif summary_score <= -2:
+    elif summary_score <= -3.5:
         verdict = "SELL"
     else:
         verdict = "NEUTRAL"
@@ -2610,17 +2794,11 @@ def generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
     last_signal_idx = -10    # index into raw_signals
     min_cooldown = 2         # minimum bars between signals
 
-    # Adaptive thresholds from score distribution
-    all_net = [s[1] for s in raw_signals]
-    if all_net:
-        score_mean = sum(all_net) / len(all_net)
-        score_std = (sum((s - score_mean) ** 2 for s in all_net) / len(all_net)) ** 0.5
-    else:
-        score_std = 3.0
-    buy_threshold = max(1.5, min(score_std * 0.5, 4.0))
-    sell_threshold = max(1.5, min(score_std * 0.5, 4.0))
-    min_indicator_count = 2  # at least 2 indicators must vote in signal direction
-    min_dominant_score = 2.0  # the dominant side must have at least this raw score
+    # Fixed thresholds: BUY >= 3.5, STRONG_BUY >= 5.0, SELL <= -3.5, STRONG_SELL <= -5.0
+    buy_threshold = 3.5
+    strong_buy_threshold = 5.0
+    sell_threshold = 3.5
+    strong_sell_threshold = 5.0
 
     for sig_idx, (i, net_score, reasons, buy_sc, sell_sc, b_cnt, s_cnt) in enumerate(raw_signals):
         # Enforce cooldown
@@ -2630,10 +2808,8 @@ def generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
         t = candles[i]["time"]
 
         # BUY signal
-        if (net_score >= buy_threshold
-                and buy_sc >= min_dominant_score
-                and b_cnt >= min_indicator_count):
-            sig_type = "STRONG_BUY" if (net_score >= buy_threshold * 2.0 and b_cnt >= 4) else "BUY"
+        if net_score >= buy_threshold:
+            sig_type = "STRONG_BUY" if net_score >= strong_buy_threshold else "BUY"
             signals.append({
                 "time": t,
                 "type": sig_type,
@@ -2644,10 +2820,8 @@ def generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
             last_signal_idx = sig_idx
 
         # SELL signal
-        elif (net_score <= -sell_threshold
-                and sell_sc >= min_dominant_score
-                and s_cnt >= min_indicator_count):
-            sig_type = "STRONG_SELL" if (net_score <= -sell_threshold * 2.0 and s_cnt >= 4) else "SELL"
+        elif net_score <= -sell_threshold:
+            sig_type = "STRONG_SELL" if net_score <= -strong_sell_threshold else "SELL"
             signals.append({
                 "time": t,
                 "type": sig_type,
@@ -2744,11 +2918,11 @@ def generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
     summary_score = round(summary_score, 2)
     if summary_score >= 5:
         verdict = "STRONG BUY"
-    elif summary_score >= 2:
+    elif summary_score >= 3.5:
         verdict = "BUY"
     elif summary_score <= -5:
         verdict = "STRONG SELL"
-    elif summary_score <= -2:
+    elif summary_score <= -3.5:
         verdict = "SELL"
     else:
         verdict = "NEUTRAL"
@@ -3021,19 +3195,19 @@ def generate_sniper_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, e
 
         # --- Generate signal with alternating enforcement ---
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "SELL"
@@ -3092,13 +3266,13 @@ def generate_sniper_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, e
         summary_score += d
         summary_reasons.append(("VWAP", "Above" if d > 0 else "Below", d))
 
-    if summary_score >= 6:
+    if summary_score >= 5:
         verdict = "STRONG BUY"
-    elif summary_score >= 3:
+    elif summary_score >= 3.5:
         verdict = "BUY"
-    elif summary_score <= -6:
+    elif summary_score <= -5:
         verdict = "STRONG SELL"
-    elif summary_score <= -3:
+    elif summary_score <= -3.5:
         verdict = "SELL"
     else:
         verdict = "NEUTRAL"
@@ -3386,19 +3560,19 @@ def generate_orderflow_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9
 
         # --- Generate signal with alternating enforcement ---
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "SELL"
@@ -3443,13 +3617,13 @@ def generate_orderflow_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9
         summary_score += d
         summary_reasons.append(("VWAP", "Above" if d > 0 else "Below", d))
 
-    if summary_score >= 6:
+    if summary_score >= 5:
         verdict = "STRONG BUY"
-    elif summary_score >= 3:
+    elif summary_score >= 3.5:
         verdict = "BUY"
-    elif summary_score <= -6:
+    elif summary_score <= -5:
         verdict = "STRONG SELL"
-    elif summary_score <= -3:
+    elif summary_score <= -3.5:
         verdict = "SELL"
     else:
         verdict = "NEUTRAL"
@@ -3743,19 +3917,19 @@ def generate_priceaction_signals(candles, bb, rsi_data, macd_data, vwap_data, em
 
         # --- Generate signal with alternating enforcement ---
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score,
                             "reasons": reasons, "price": close})
             last_signal_type = "SELL"
@@ -3826,13 +4000,13 @@ def generate_priceaction_signals(candles, bb, rsi_data, macd_data, vwap_data, em
     mc_last = macd_map.get(t_last)
     vw_last = vwap_map.get(t_last)
 
-    if summary_score >= 6:
+    if summary_score >= 5:
         verdict = "STRONG BUY"
-    elif summary_score >= 3:
+    elif summary_score >= 3.5:
         verdict = "BUY"
-    elif summary_score <= -6:
+    elif summary_score <= -5:
         verdict = "STRONG SELL"
-    elif summary_score <= -3:
+    elif summary_score <= -3.5:
         verdict = "SELL"
     else:
         verdict = "NEUTRAL"
@@ -3999,16 +4173,16 @@ def generate_breakout_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
             reasons.append(f"Strong Body ({body / full_range:.0%})")
 
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
 
@@ -4034,7 +4208,7 @@ def generate_breakout_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
     sr_list.append(("RSI", f"{rsi_l:.0f}", d))
     mc_l = macd_map.get(tl)
     vw_l = vwap_map.get(tl)
-    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
     summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
     return signals, summary
 
@@ -4180,16 +4354,16 @@ def generate_momentum_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
                 reasons.append("3-Bar Bear Run")
 
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
 
@@ -4210,7 +4384,7 @@ def generate_momentum_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
         ss += d
         sr_list.append(("MACD", "Bullish" if d > 0 else "Bearish", d))
     vw_l = vwap_map.get(tl)
-    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
     summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
     return signals, summary
 
@@ -4355,16 +4529,16 @@ def generate_scalping_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
                 reasons.append("NR4 Breakout")
 
         score = round(score, 2)
-        if score >= 6.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 4.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -6.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -4.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
 
@@ -4383,7 +4557,7 @@ def generate_scalping_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9,
         ss += d
         sr_list.append(("VWAP Dev", f"{dv:.3f}", d))
     mc_l = macd_map.get(tl)
-    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 2.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -2.5 else "NEUTRAL")))
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
     summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
     return signals, summary
 
@@ -4529,16 +4703,16 @@ def generate_smartmoney_signals(candles, bb, rsi_data, macd_data, vwap_data, ema
                 reasons.append("EMA Lost After Sweep")
 
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
 
@@ -4564,7 +4738,7 @@ def generate_smartmoney_signals(candles, bb, rsi_data, macd_data, vwap_data, ema
         d = 0
     ss += d
     sr_list.append(("Structure", "BOS Bull" if d > 0 else ("BOS Bear" if d < 0 else "Range"), d))
-    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
     summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
     return signals, summary
 
@@ -4753,16 +4927,16 @@ def generate_quant_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, em
                     reasons.append(f"Negative Skew ({skew:.2f})")
 
         score = round(score, 2)
-        if score >= 7.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -7.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
 
@@ -4783,7 +4957,7 @@ def generate_quant_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, em
     sr_list.append(("RSI", f"{rsi_l:.0f}", d))
     mc_l = macd_map.get(tl)
     vw_l = vwap_map.get(tl)
-    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 2.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -2.5 else "NEUTRAL")))
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
     summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
     return signals, summary
 
@@ -4930,16 +5104,16 @@ def generate_hybrid_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, e
             reasons.insert(0, f"CONSENSUS: {bear_count}/{total_votes} Bearish")
 
         score = round(score, 2)
-        if score >= 8.0 and last_signal_type != "BUY":
+        if score >= 5.0 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score >= 5.0 and last_signal_type != "BUY":
+        elif score >= 3.5 and last_signal_type != "BUY":
             signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "BUY"
-        elif score <= -8.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
-        elif score <= -5.0 and last_signal_type != "SELL":
+        elif score <= -3.5 and last_signal_type != "SELL":
             signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": close})
             last_signal_type = "SELL"
 
@@ -4965,7 +5139,7 @@ def generate_hybrid_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, e
     sr_list.append(("Momentum", "Bull" if mom_v > 0 else ("Bear" if mom_v < 0 else "Flat"), mom_v * 2))
     rsi_l = rsi_map.get(tl, 50)
     vw_l = vwap_map.get(tl)
-    verdict = "STRONG BUY" if ss >= 6 else ("BUY" if ss >= 3 else ("STRONG SELL" if ss <= -6 else ("SELL" if ss <= -3 else "NEUTRAL")))
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
     summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
     return signals, summary
 
@@ -5378,25 +5552,49 @@ EXCHANGE_SUFFIX_MAP = {
 @app.route("/api/search")
 @login_required
 def api_search():
-    """Search for a stock/index ticker on Yahoo Finance with Indian exchange fallbacks.
+    """Search for a stock/index ticker by name or symbol via Yahoo Finance search API.
 
-    Accepts a query string via ?q= parameter and attempts to resolve it as a
-    Yahoo Finance ticker. For queries without a dot suffix, also tries appending
-    .NS (NSE) and .BO (BSE) to handle Indian stock lookups. Returns the first
-    successful match with the properly suffixed ticker, display name, and
-    exchange identifier.
-
-    Uses EXCHANGE_SUFFIX_MAP to auto-append the correct exchange suffix based
-    on the exchange field returned by Yahoo Finance (e.g. NSI → .NS, BOM → .BO).
+    Accepts a query string via ?q= parameter. Uses Yahoo Finance's search
+    endpoint to find matches by company name or ticker symbol. Returns up to
+    6 results with properly suffixed tickers for data fetching.
 
     Returns:
-        JSON array: Single-element list with {ticker, name, exchange} on match,
-            or empty array [] if no results found.
+        JSON array: List of {ticker, name, exchange} dicts, or empty [].
     """
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify([])
-    # Try original query, then with .NS / .BO suffixes for Indian stocks
+    try:
+        resp = cffi_requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": q, "quotesCount": 6, "newsCount": 0,
+                    "enableFuzzyQuery": True, "quotesQueryId": "tss_match_phrase_query"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+            impersonate="chrome",
+        )
+        data = resp.json()
+        quotes = data.get("quotes", [])
+        results = []
+        for qt in quotes:
+            qt_type = qt.get("quoteType", "")
+            if qt_type not in ("EQUITY", "INDEX", "ETF", "MUTUALFUND", "FUTURE", "CRYPTOCURRENCY", "CURRENCY"):
+                continue
+            symbol = qt.get("symbol", "")
+            name = qt.get("shortname") or qt.get("longname") or symbol
+            exchange = qt.get("exchange", "")
+            # Apply exchange suffix for Indian stocks
+            if "." not in symbol:
+                suffix = EXCHANGE_SUFFIX_MAP.get(exchange, "")
+                ticker = symbol + suffix
+            else:
+                ticker = symbol
+            results.append({"ticker": ticker, "name": name, "exchange": exchange})
+        if results:
+            return jsonify(results)
+    except Exception:
+        pass
+    # Fallback: try direct ticker lookup
     candidates = [q]
     if "." not in q:
         candidates.append(q + ".NS")
@@ -5410,7 +5608,6 @@ def api_search():
                 continue
             exchange = info.get("exchange", "")
             raw_symbol = info.get("symbol", cand.upper())
-            # Ensure ticker has exchange suffix for data fetching
             if "." in raw_symbol:
                 ticker = raw_symbol
             elif "." in cand:
@@ -5623,6 +5820,837 @@ def _trade_summary(session):
     }
 
 
+# ---------------------------------------------------------------------------
+# Help Pages
+# ---------------------------------------------------------------------------
+HELP_PAGE_STYLE = r"""
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#131722; color:#d1d4dc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; padding:0; }
+  .help-header { background:#1e222d; padding:16px 32px; border-bottom:1px solid #2a2e39; display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; z-index:10; }
+  .help-header h1 { font-size:22px; color:#fff; }
+  .help-header a { color:#2962ff; text-decoration:none; font-size:14px; }
+  .help-header a:hover { text-decoration:underline; }
+  .download-btn { background:#2962ff; color:#fff; border:none; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600; }
+  .download-btn:hover { background:#1e53e5; }
+  .help-body { max-width:960px; margin:0 auto; padding:32px 24px 80px; }
+  h2 { color:#fff; font-size:20px; margin:32px 0 12px; padding-bottom:8px; border-bottom:1px solid #2a2e39; }
+  h3 { color:#ff9100; font-size:16px; margin:20px 0 8px; }
+  h4 { color:#2196f3; font-size:14px; margin:14px 0 6px; }
+  p, li { font-size:14px; line-height:1.7; color:#b2b5be; }
+  ul, ol { padding-left:24px; margin:8px 0; }
+  table { width:100%; border-collapse:collapse; margin:12px 0; font-size:13px; }
+  th { background:#1e222d; color:#d1d4dc; padding:10px 12px; text-align:left; border:1px solid #2a2e39; }
+  td { padding:8px 12px; border:1px solid #2a2e39; color:#b2b5be; }
+  tr:nth-child(even) td { background:#1a1e2a; }
+  code { background:#1e222d; color:#ff9100; padding:2px 6px; border-radius:3px; font-size:13px; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:3px; font-size:11px; font-weight:600; margin-right:4px; }
+  .tag-buy { background:rgba(38,166,154,0.2); color:#26a69a; }
+  .tag-sell { background:rgba(239,83,80,0.2); color:#ef5350; }
+  .tag-weight { background:rgba(41,98,255,0.15); color:#5b8def; }
+  .card { background:#1e222d; border:1px solid #2a2e39; border-radius:8px; padding:16px 20px; margin:12px 0; }
+  .score-bar { display:flex; align-items:center; gap:8px; margin:6px 0; }
+  .score-fill { height:6px; border-radius:3px; }
+</style>
+<script>
+function downloadPDF(){
+  const el = document.querySelector('.help-body');
+  const title = document.title;
+  const win = window.open('','','width=900,height=700');
+  win.document.write('<html><head><title>'+title+'</title><style>');
+  win.document.write('body{font-family:Arial,sans-serif;padding:24px;color:#222;font-size:13px}');
+  win.document.write('h1{font-size:22px;margin-bottom:16px}h2{font-size:18px;margin:20px 0 8px;border-bottom:1px solid #ccc;padding-bottom:4px}');
+  win.document.write('h3{font-size:15px;color:#e65100;margin:14px 0 6px}h4{font-size:13px;color:#1565c0;margin:10px 0 4px}');
+  win.document.write('p,li{line-height:1.6;font-size:13px}ul,ol{padding-left:20px}');
+  win.document.write('table{width:100%;border-collapse:collapse;margin:8px 0;font-size:12px}th{background:#f5f5f5;padding:6px 8px;border:1px solid #ddd;text-align:left}td{padding:6px 8px;border:1px solid #ddd}');
+  win.document.write('code{background:#f5f5f5;padding:1px 4px;font-size:12px;border-radius:2px}');
+  win.document.write('.tag{display:inline-block;padding:1px 6px;border-radius:2px;font-size:10px;font-weight:600;margin-right:3px}');
+  win.document.write('.tag-buy{background:#e8f5e9;color:#2e7d32}.tag-sell{background:#ffebee;color:#c62828}.tag-weight{background:#e3f2fd;color:#1565c0}');
+  win.document.write('.card{border:1px solid #ddd;border-radius:6px;padding:12px 16px;margin:8px 0;background:#fafafa}');
+  win.document.write('.download-btn,.help-header{display:none}');
+  win.document.write('</style></head><body>');
+  win.document.write('<h1>'+title+'</h1>');
+  win.document.write(el.innerHTML);
+  win.document.write('</body></html>');
+  win.document.close();
+  setTimeout(function(){ win.print(); }, 500);
+}
+</script>
+"""
+
+HELP_ALGOS_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mangal View - Algo Documentation</title>""" + HELP_PAGE_STYLE + r"""
+</head><body>
+<div class="help-header">
+  <div><h1>&#128202; Algorithm Documentation</h1><a href="/">&larr; Back to Chart</a></div>
+  <button class="download-btn" onclick="downloadPDF()">&#128196; Download PDF</button>
+</div>
+<div class="help-body">
+
+<p>Mangal View provides <strong>12 algorithmic signal engines</strong> plus 1 ML prediction model. Each algorithm uses a weighted scoring system — multiple technical indicators contribute directional scores that are summed into a final composite score. When the score exceeds the threshold, a BUY or SELL signal is generated.</p>
+
+<h2>Signal Scoring System</h2>
+<div class="card">
+<p>Each indicator contributes a score between <code>-weight</code> and <code>+weight</code>. The total score determines the signal:</p>
+<table>
+<tr><th>Signal</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td><span class="tag tag-buy">STRONG BUY</span></td><td>Score &ge; Strong threshold</td><td>High-confidence bullish setup, multiple confirmations aligned</td></tr>
+<tr><td><span class="tag tag-buy">BUY</span></td><td>Score &ge; Buy threshold</td><td>Moderate bullish setup</td></tr>
+<tr><td><span class="tag tag-sell">SELL</span></td><td>Score &le; -Sell threshold</td><td>Moderate bearish setup</td></tr>
+<tr><td><span class="tag tag-sell">STRONG SELL</span></td><td>Score &le; -Strong threshold</td><td>High-confidence bearish setup, multiple confirmations aligned</td></tr>
+</table>
+</div>
+
+<h2>1. Trend</h2>
+<div class="card">
+<p><strong>Style:</strong> Classic multi-indicator trend following<br>
+<strong>Thresholds:</strong> BUY &ge; 3.5 | STRONG BUY &ge; 5.5 | SELL &le; -3.5 | STRONG SELL &le; -5.5<br>
+<strong>Best for:</strong> Swing trading, position trading on trending markets</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>SuperTrend</td><td><span class="tag tag-weight">1.5</span></td><td>+1 if bullish (price above band), -1 if bearish</td></tr>
+<tr><td>Parabolic SAR</td><td><span class="tag tag-weight">1.0</span></td><td>+1 if SAR below price (bullish), -1 if above</td></tr>
+<tr><td>RSI (14)</td><td><span class="tag tag-weight">1.5</span></td><td>Overbought/oversold zones + momentum direction</td></tr>
+<tr><td>MACD</td><td><span class="tag tag-weight">2.0</span></td><td>Signal line crossover + histogram direction</td></tr>
+<tr><td>EMA 9/21</td><td><span class="tag tag-weight">1.5</span></td><td>+1 if EMA9 &gt; EMA21 (golden cross), -1 if death cross</td></tr>
+<tr><td>VWAP</td><td><span class="tag tag-weight">1.0</span></td><td>+1 if price above VWAP, -1 if below</td></tr>
+<tr><td>Volume</td><td><span class="tag tag-weight">0.5</span></td><td>Confirms signal if volume above average</td></tr>
+<tr><td>Candlestick Patterns</td><td><span class="tag tag-weight">1.0</span></td><td>Engulfing, Hammer, Shooting Star, Morning/Evening Star</td></tr>
+<tr><td>S/R Proximity</td><td><span class="tag tag-weight">0.5</span></td><td>Extra weight near support (buy) or resistance (sell)</td></tr>
+</table>
+<p><strong>Max possible score:</strong> &plusmn;10.5</p>
+</div>
+
+<h2>2. MStreet</h2>
+<div class="card">
+<p><strong>Style:</strong> Statistical mean-reversion + momentum breakout (quantitative)<br>
+<strong>Thresholds:</strong> BUY &ge; 3.0 | STRONG BUY &ge; 5.0 | SELL &le; -3.0 | STRONG SELL &le; -5.0<br>
+<strong>Best for:</strong> Range-bound markets, mean-reversion entries</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Z-Score (20-bar)</td><td><span class="tag tag-weight">2.0</span></td><td>Buy when z-score &lt; -1.5 (oversold), sell when &gt; 1.5 (overbought)</td></tr>
+<tr><td>BB Squeeze</td><td><span class="tag tag-weight">1.5</span></td><td>Detects Bollinger Band squeeze + expansion direction</td></tr>
+<tr><td>RSI Divergence</td><td><span class="tag tag-weight">1.5</span></td><td>Bullish divergence (price lower, RSI higher) and vice versa</td></tr>
+<tr><td>Volume-Weighted Momentum</td><td><span class="tag tag-weight">1.5</span></td><td>Price momentum weighted by relative volume</td></tr>
+<tr><td>MACD Histogram Momentum</td><td><span class="tag tag-weight">1.5</span></td><td>Rate of change of MACD histogram</td></tr>
+<tr><td>EMA Spread Z-Score</td><td><span class="tag tag-weight">1.0</span></td><td>Statistical deviation of EMA9-EMA21 spread</td></tr>
+<tr><td>S/R Mean Reversion</td><td><span class="tag tag-weight">0.5</span></td><td>Bounce probability near support/resistance levels</td></tr>
+</table>
+</div>
+
+<h2>3. MFactor</h2>
+<div class="card">
+<p><strong>Style:</strong> High-accuracy multi-factor model with 12 indicators<br>
+<strong>Thresholds:</strong> BUY &ge; 4.0 | STRONG BUY &ge; 6.5 | SELL &le; -4.0 | STRONG SELL &le; -6.5<br>
+<strong>Best for:</strong> Precision entries, reducing false signals<br>
+<strong>Unique:</strong> Enforces strict alternating BUY→SELL→BUY pattern to avoid repeated same-direction signals</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Z-Score</td><td><span class="tag tag-weight">2.0</span></td><td>20-bar statistical deviation from mean</td></tr>
+<tr><td>BB Position</td><td><span class="tag tag-weight">1.5</span></td><td>%B position within Bollinger Bands</td></tr>
+<tr><td>RSI + Stochastic RSI</td><td><span class="tag tag-weight">2.0</span></td><td>Double-smoothed RSI for extreme zones</td></tr>
+<tr><td>MACD Cross + Histogram</td><td><span class="tag tag-weight">2.0</span></td><td>Signal crossover + histogram direction</td></tr>
+<tr><td>VWAP Deviation</td><td><span class="tag tag-weight">1.5</span></td><td>Distance from VWAP as % of price</td></tr>
+<tr><td>EMA 9/21 Spread + Cross</td><td><span class="tag tag-weight">1.5</span></td><td>Spread magnitude + crossover detection</td></tr>
+<tr><td>ATR Volatility Regime</td><td><span class="tag tag-weight">1.0</span></td><td>High/low volatility regime filter</td></tr>
+<tr><td>S/R Proximity</td><td><span class="tag tag-weight">1.0</span></td><td>Proximity to key support/resistance levels</td></tr>
+<tr><td>Candle Body Ratio</td><td><span class="tag tag-weight">1.0</span></td><td>Strong body (&gt;70%) confirms conviction</td></tr>
+<tr><td>Price Momentum (ROC)</td><td><span class="tag tag-weight">1.5</span></td><td>10-bar Rate of Change</td></tr>
+<tr><td>Heikin-Ashi Trend</td><td><span class="tag tag-weight">1.0</span></td><td>HA candle direction filter</td></tr>
+<tr><td>OBV Volume Pressure</td><td><span class="tag tag-weight">1.0</span></td><td>On-Balance Volume delta direction</td></tr>
+</table>
+</div>
+
+<h2>4. Sniper</h2>
+<div class="card">
+<p><strong>Style:</strong> High-precision breakout detection (few but accurate signals)<br>
+<strong>Thresholds:</strong> BUY &ge; 5.0 | STRONG BUY &ge; 7.0 | SELL &le; -5.0 | STRONG SELL &le; -7.0<br>
+<strong>Best for:</strong> Breakout trading after consolidation, high-conviction entries</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Consolidation Squeeze</td><td><span class="tag tag-weight">2.0</span></td><td>Detects tight range compression before breakout</td></tr>
+<tr><td>BB Breakout</td><td><span class="tag tag-weight">2.0</span></td><td>Price breaking above upper / below lower BB</td></tr>
+<tr><td>Volume Explosion</td><td><span class="tag tag-weight">2.0</span></td><td>Volume &gt; 2x 20-bar average (institutional interest)</td></tr>
+<tr><td>EMA 9/21 Alignment</td><td><span class="tag tag-weight">1.5</span></td><td>Trend alignment + crossover confirmation</td></tr>
+<tr><td>RSI Momentum Thrust</td><td><span class="tag tag-weight">1.5</span></td><td>RSI breaking through 50-level with momentum</td></tr>
+<tr><td>MACD Histogram Accel.</td><td><span class="tag tag-weight">1.5</span></td><td>Increasing histogram bars (accelerating momentum)</td></tr>
+<tr><td>VWAP Breakout</td><td><span class="tag tag-weight">1.5</span></td><td>Price breaking above/below VWAP with volume</td></tr>
+<tr><td>S/R Level Breakout</td><td><span class="tag tag-weight">1.5</span></td><td>Breaking through key support/resistance levels</td></tr>
+<tr><td>Candle Body Strength</td><td><span class="tag tag-weight">1.0</span></td><td>Body &gt; 70% of total range (strong conviction)</td></tr>
+</table>
+</div>
+
+<h2>5. OrderFlow</h2>
+<div class="card">
+<p><strong>Style:</strong> Order flow analysis — buying vs selling pressure<br>
+<strong>Thresholds:</strong> BUY &ge; 4.0 | STRONG BUY &ge; 6.0 | SELL &le; -4.0 | STRONG SELL &le; -6.0<br>
+<strong>Best for:</strong> Reading institutional activity, volume-based entries</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Volume Delta</td><td><span class="tag tag-weight">2.0</span></td><td>Buy volume vs sell volume ratio per candle</td></tr>
+<tr><td>CVD Trend + Divergence</td><td><span class="tag tag-weight">2.0</span></td><td>Cumulative Volume Delta direction + price divergence</td></tr>
+<tr><td>Absorption Detection</td><td><span class="tag tag-weight">2.0</span></td><td>Large wick + high volume = institutional absorption</td></tr>
+<tr><td>Iceberg Orders</td><td><span class="tag tag-weight">1.5</span></td><td>Aggressive hidden order detection</td></tr>
+<tr><td>VWAP Institutional</td><td><span class="tag tag-weight">1.5</span></td><td>Institutional buying/selling around VWAP</td></tr>
+<tr><td>Volume Profile POC</td><td><span class="tag tag-weight">1.5</span></td><td>Activity near Point of Control</td></tr>
+<tr><td>RSI + Volume</td><td><span class="tag tag-weight">1.5</span></td><td>RSI extreme confirmed by volume surge</td></tr>
+<tr><td>MACD + Volume</td><td><span class="tag tag-weight">1.5</span></td><td>MACD crossover with volume confirmation</td></tr>
+<tr><td>Price Rejection</td><td><span class="tag tag-weight">1.0</span></td><td>Long wicks at key levels (rejection candles)</td></tr>
+<tr><td>EMA Trend Alignment</td><td><span class="tag tag-weight">1.0</span></td><td>Trend direction filter</td></tr>
+</table>
+</div>
+
+<h2>6. PriceAction</h2>
+<div class="card">
+<p><strong>Style:</strong> Pure price structure analysis — no lagging indicators<br>
+<strong>Thresholds:</strong> BUY &ge; 4.0 | STRONG BUY &ge; 6.0 | SELL &le; -4.0 | STRONG SELL &le; -6.0<br>
+<strong>Best for:</strong> Clean chart traders, price structure believers</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Trend Structure</td><td><span class="tag tag-weight">2.0</span></td><td>Higher Highs/Higher Lows vs Lower Highs/Lower Lows</td></tr>
+<tr><td>Candlestick Reversals</td><td><span class="tag tag-weight">2.0</span></td><td>Pin bars, engulfing, hammer, shooting star patterns</td></tr>
+<tr><td>Pin Bar Rejection</td><td><span class="tag tag-weight">2.0</span></td><td>Pin bars at key support/resistance levels</td></tr>
+<tr><td>Inside Bar Breakout</td><td><span class="tag tag-weight">1.5</span></td><td>Breakout from inside bar pattern (contraction→expansion)</td></tr>
+<tr><td>Engulfing + Momentum</td><td><span class="tag tag-weight">1.5</span></td><td>Engulfing pattern with follow-through momentum</td></tr>
+<tr><td>S/R Reaction</td><td><span class="tag tag-weight">1.5</span></td><td>Price reaction at support/resistance zones</td></tr>
+<tr><td>Higher TF Context</td><td><span class="tag tag-weight">1.5</span></td><td>Multi-candle context for trend direction</td></tr>
+<tr><td>Consecutive Momentum</td><td><span class="tag tag-weight">1.0</span></td><td>3+ consecutive directional candles</td></tr>
+<tr><td>Range Contraction→Expansion</td><td><span class="tag tag-weight">1.0</span></td><td>Volatility contraction followed by expansion</td></tr>
+<tr><td>Gap Analysis</td><td><span class="tag tag-weight">1.0</span></td><td>Gap up/down with continuation potential</td></tr>
+<tr><td>Swing Failure (SFP)</td><td><span class="tag tag-weight">1.5</span></td><td>Failed breakout beyond swing high/low = reversal signal</td></tr>
+</table>
+</div>
+
+<h2>7. Breakout</h2>
+<div class="card">
+<p><strong>Style:</strong> Channel breakout with volatility expansion<br>
+<strong>Thresholds:</strong> BUY &ge; 4.0 | STRONG BUY &ge; 6.0 | SELL &le; -4.0 | STRONG SELL &le; -6.0<br>
+<strong>Best for:</strong> Trending markets, catching new directional moves</p>
+<h4>Key Techniques</h4>
+<ul>
+<li><strong>Donchian Channel Breakout</strong> <span class="tag tag-weight">2.0</span> — Price breaking above 20-bar high / below 20-bar low</li>
+<li><strong>BB Expansion Breakout</strong> <span class="tag tag-weight">2.0</span> — Bollinger Band expansion after squeeze</li>
+<li>Standard confirmations: RSI, MACD, EMA, VWAP, Volume, S/R</li>
+</ul>
+</div>
+
+<h2>8. Momentum</h2>
+<div class="card">
+<p><strong>Style:</strong> Rate of change and momentum acceleration<br>
+<strong>Thresholds:</strong> BUY &ge; 4.0 | STRONG BUY &ge; 6.0 | SELL &le; -4.0 | STRONG SELL &le; -6.0<br>
+<strong>Best for:</strong> Fast-moving markets, riding momentum waves</p>
+<h4>Key Techniques</h4>
+<ul>
+<li><strong>ROC (10-bar)</strong> <span class="tag tag-weight">2.0</span> — Strong Rate of Change (&gt;1.5% strong, &gt;0.5% weak)</li>
+<li><strong>ROC Acceleration</strong> <span class="tag tag-weight">1.5</span> — ROC-of-ROC (momentum speeding up)</li>
+<li><strong>RSI 50-Cross</strong> <span class="tag tag-weight">2.0</span> — RSI crossing above/below 50 level</li>
+<li>Confirmations: MACD, EMA alignment, VWAP, Volume surge</li>
+</ul>
+</div>
+
+<h2>9. Scalping</h2>
+<div class="card">
+<p><strong>Style:</strong> Quick mean-reversion trades on extreme levels<br>
+<strong>Thresholds:</strong> BUY &ge; 3.5 | STRONG BUY &ge; 5.5 | SELL &le; -3.5 | STRONG SELL &le; -5.5<br>
+<strong>Best for:</strong> 1-5 min timeframes, rapid entries and exits</p>
+<h4>Key Techniques</h4>
+<ul>
+<li><strong>BB Bounce</strong> <span class="tag tag-weight">2.0</span> — Buy at lower BB, sell at upper BB</li>
+<li><strong>RSI Extreme Reversal</strong> <span class="tag tag-weight">2.0</span> — Buy when RSI &lt; 25, sell when RSI &gt; 75</li>
+<li><strong>VWAP Mean Reversion</strong> <span class="tag tag-weight">2.0</span> — Price returning to VWAP from extremes</li>
+<li><strong>Micro EMA Cross</strong> — Fast EMA5 vs EMA9 for quick momentum shifts</li>
+<li>Shorter lookback (15 bars), minimum 20 candles required</li>
+</ul>
+</div>
+
+<h2>10. SmartMoney</h2>
+<div class="card">
+<p><strong>Style:</strong> Smart Money Concepts (SMC) — institutional order flow<br>
+<strong>Thresholds:</strong> BUY &ge; 4.0 | STRONG BUY &ge; 6.0 | SELL &le; -4.0 | STRONG SELL &le; -6.0<br>
+<strong>Best for:</strong> Traders following institutional footprints</p>
+<h4>Key Techniques</h4>
+<ul>
+<li><strong>Order Block Detection</strong> <span class="tag tag-weight">2.0</span> — Identifying institutional order blocks (last opposite candle before impulsive move)</li>
+<li><strong>Fair Value Gap</strong> <span class="tag tag-weight">2.0</span> — 3-candle price imbalance zones where institutions left gaps</li>
+<li><strong>Liquidity Sweep + Reversal</strong> <span class="tag tag-weight">2.0</span> — Stop hunt beyond swing H/L followed by reversal</li>
+<li><strong>Displacement Candle</strong> <span class="tag tag-weight">1.5</span> — Large-body candle showing strong institutional intent</li>
+<li>Uses swing highs/lows computed with 5-bar lookback for structure</li>
+</ul>
+</div>
+
+<h2>11. Quant</h2>
+<div class="card">
+<p><strong>Style:</strong> Statistical/quantitative models<br>
+<strong>Thresholds:</strong> BUY &ge; 3.5 | STRONG BUY &ge; 5.5 | SELL &le; -3.5 | STRONG SELL &le; -5.5<br>
+<strong>Best for:</strong> Statistically-driven traders, mean reversion<br>
+<strong>Requires:</strong> Minimum 50 candles</p>
+<h4>Key Techniques</h4>
+<ul>
+<li><strong>Z-Score</strong> <span class="tag tag-weight">2.0</span> — Standard deviation from 20-bar mean</li>
+<li><strong>Linear Regression Deviation</strong> <span class="tag tag-weight">2.0</span> — Price deviation from regression line in sigma units</li>
+<li><strong>Bollinger %B</strong> <span class="tag tag-weight">1.5</span> — Position within BB (0 = lower, 1 = upper)</li>
+<li><strong>Stochastic RSI</strong> — Double-smoothed RSI for precise overbought/oversold zones</li>
+<li>Regression slope + deviation analysis for trend + mean-reversion combo</li>
+</ul>
+</div>
+
+<h2>12. Hybrid</h2>
+<div class="card">
+<p><strong>Style:</strong> Multi-strategy voting consensus<br>
+<strong>Thresholds:</strong> BUY &ge; 2.5 | STRONG BUY &ge; 3.5 | SELL &le; -2.5 | STRONG SELL &le; -3.5<br>
+<strong>Best for:</strong> Balanced approach, reducing false signals through consensus</p>
+<h4>Voting System</h4>
+<p>Four independent sub-strategies each cast a vote (+1, -1, or 0). The final signal = sum of all votes:</p>
+<table>
+<tr><th>Sub-Strategy</th><th>Vote Logic</th></tr>
+<tr><td><strong>Trend Vote</strong></td><td>EMA 9/21 alignment + price vs VWAP position</td></tr>
+<tr><td><strong>Mean Reversion Vote</strong></td><td>Z-score extreme + Bollinger Band position</td></tr>
+<tr><td><strong>Momentum Vote</strong></td><td>MACD histogram direction + Rate of Change</td></tr>
+<tr><td><strong>Volume Vote</strong></td><td>Volume delta direction + buying/selling pressure</td></tr>
+</table>
+</div>
+
+<h2>13. MPredict (ML Model)</h2>
+<div class="card">
+<p><strong>Style:</strong> Machine Learning prediction (not a signal engine)<br>
+<strong>Model:</strong> GradientBoostingRegressor (sklearn)<br>
+<strong>Output:</strong> Predicts next 5 candles displayed as semi-transparent overlay</p>
+<h4>Features Used</h4>
+<ul>
+<li>10 lagged returns (price changes over past 10 candles)</li>
+<li>Body/wick ratios (candle morphology)</li>
+<li>Rolling mean &amp; standard deviation (5, 10, 20 periods)</li>
+<li>RSI-like momentum indicator</li>
+<li>Range % and volume change</li>
+</ul>
+<p>4 separate models predict open/high/low/close offsets from the last real candle. Predictions are iterative — each predicted candle feeds into the next prediction.</p>
+</div>
+
+<h2>Choosing the Right Algorithm</h2>
+<div class="card">
+<table>
+<tr><th>Market Condition</th><th>Recommended Algos</th></tr>
+<tr><td>Strong Trending</td><td>Trend, Momentum, Breakout</td></tr>
+<tr><td>Range-Bound / Sideways</td><td>MStreet, Scalping, Quant</td></tr>
+<tr><td>High Volatility</td><td>Sniper, SmartMoney</td></tr>
+<tr><td>Volume-Driven</td><td>OrderFlow, SmartMoney</td></tr>
+<tr><td>Clean Charts</td><td>PriceAction</td></tr>
+<tr><td>Maximum Accuracy</td><td>MFactor, Hybrid</td></tr>
+<tr><td>Quick Scalps</td><td>Scalping</td></tr>
+</table>
+<p><strong>Tip:</strong> You can enable multiple algos simultaneously. Signals are deduplicated by time — the signal with the highest absolute score is kept.</p>
+</div>
+
+</div></body></html>"""
+
+
+HELP_INDICATORS_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mangal View - Indicator Documentation</title>""" + HELP_PAGE_STYLE + r"""
+</head><body>
+<div class="help-header">
+  <div><h1>&#128200; Indicator Documentation</h1><a href="/">&larr; Back to Chart</a></div>
+  <button class="download-btn" onclick="downloadPDF()">&#128196; Download PDF</button>
+</div>
+<div class="help-body">
+
+<p>Mangal View provides <strong>14 technical indicators</strong> that can be toggled individually from the Indicators dropdown. Each indicator is computed server-side and rendered on the chart.</p>
+
+<h2>1. SuperTrend</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; SuperTrend &nbsp;|&nbsp; <strong>Configurable:</strong> Period (default 10), Multiplier (default 3.0)</p>
+<h4>How It Works</h4>
+<p>SuperTrend uses Average True Range (ATR) to create dynamic support/resistance bands around price:</p>
+<ul>
+<li><strong>Upper Band</strong> = (High + Low) / 2 + Multiplier &times; ATR</li>
+<li><strong>Lower Band</strong> = (High + Low) / 2 - Multiplier &times; ATR</li>
+<li>When price closes <strong>above</strong> the upper band → trend flips <span class="tag tag-buy">BULLISH</span> (green line)</li>
+<li>When price closes <strong>below</strong> the lower band → trend flips <span class="tag tag-sell">BEARISH</span> (red line)</li>
+</ul>
+<h4>Usage</h4>
+<p>Trade in the direction of the SuperTrend. Green = buy bias, Red = sell bias. Higher period/multiplier = fewer whipsaws but slower signals.</p>
+</div>
+
+<h2>2. Parabolic SAR (PSAR)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; PSAR &nbsp;|&nbsp; <strong>Configurable:</strong> AF Start (0.02), AF Increment (0.02), AF Max (0.2)</p>
+<h4>How It Works</h4>
+<p>PSAR places dots above or below price that accelerate toward the price over time:</p>
+<ul>
+<li><strong>Dots below price</strong> = <span class="tag tag-buy">BULLISH</span> — trend is up, SAR acts as trailing stop</li>
+<li><strong>Dots above price</strong> = <span class="tag tag-sell">BEARISH</span> — trend is down</li>
+<li>Acceleration Factor (AF) starts at 0.02 and increases by 0.02 each bar the extreme price makes a new high/low, capped at 0.2</li>
+</ul>
+<h4>Usage</h4>
+<p>Use PSAR as a trailing stop-loss. When dots flip from above to below = potential buy entry. Best in trending markets; generates many false signals in ranges.</p>
+</div>
+
+<h2>3. Support / Resistance (S/R) Levels</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; S/R Levels</p>
+<h4>How It Works</h4>
+<ul>
+<li>Identifies <strong>swing highs</strong> (pivot highs) and <strong>swing lows</strong> (pivot lows) using 2-bar lookback</li>
+<li>Clusters nearby levels within <strong>0.3% tolerance</strong> into single zones</li>
+<li>Displays horizontal lines at clustered support and resistance levels</li>
+</ul>
+<h4>Usage</h4>
+<p>Support levels = potential bounce zones (buy). Resistance levels = potential rejection zones (sell). Breakouts through S/R levels often lead to strong moves.</p>
+</div>
+
+<h2>4. EMA 9/21</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; EMA 9/21</p>
+<h4>How It Works</h4>
+<ul>
+<li><strong>EMA 9</strong> (yellow) = fast moving average, reacts quickly to price changes</li>
+<li><strong>EMA 21</strong> (yellow, darker) = slow moving average, smooths out noise</li>
+<li>EMA formula: k = 2/(period+1); EMA = Close &times; k + EMA_prev &times; (1-k)</li>
+</ul>
+<h4>Signals</h4>
+<ul>
+<li><strong>Golden Cross</strong>: EMA 9 crosses above EMA 21 = <span class="tag tag-buy">BULLISH</span></li>
+<li><strong>Death Cross</strong>: EMA 9 crosses below EMA 21 = <span class="tag tag-sell">BEARISH</span></li>
+<li>When both EMAs are sloping up with EMA9 &gt; EMA21 = strong uptrend</li>
+</ul>
+</div>
+
+<h2>5. VWAP (Volume Weighted Average Price)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; VWAP</p>
+<h4>How It Works</h4>
+<ul>
+<li>VWAP = Cumulative (Typical Price &times; Volume) / Cumulative Volume</li>
+<li>Typical Price = (High + Low + Close) / 3</li>
+<li>Resets at the start of each trading day session</li>
+</ul>
+<h4>Usage</h4>
+<ul>
+<li>Price <strong>above VWAP</strong> = buyers in control, bullish bias</li>
+<li>Price <strong>below VWAP</strong> = sellers in control, bearish bias</li>
+<li>VWAP acts as a magnet — price tends to return to VWAP</li>
+<li>Institutional traders use VWAP as benchmark for execution quality</li>
+</ul>
+</div>
+
+<h2>6. Bollinger Bands (BB)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Bollinger Bands &nbsp;|&nbsp; <strong>Configurable:</strong> Period (20), Std Dev (2.0)</p>
+<h4>How It Works</h4>
+<ul>
+<li><strong>Middle Band</strong> = 20-period SMA</li>
+<li><strong>Upper Band</strong> = SMA + 2 &times; Standard Deviation</li>
+<li><strong>Lower Band</strong> = SMA - 2 &times; Standard Deviation</li>
+<li>~95% of price action stays within the bands</li>
+</ul>
+<h4>Signals</h4>
+<ul>
+<li><strong>BB Squeeze</strong>: Bands narrowing = low volatility, breakout imminent</li>
+<li><strong>BB Walk</strong>: Price riding upper/lower band = strong trend</li>
+<li><strong>BB Bounce</strong>: Price touching lower band then reversing = potential buy</li>
+</ul>
+</div>
+
+<h2>7. CPR (Central Pivot Range)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; CPR</p>
+<h4>How It Works</h4>
+<ul>
+<li><strong>Pivot</strong> = (Previous High + Previous Low + Previous Close) / 3</li>
+<li><strong>BC (Bottom Central)</strong> = (Previous High + Previous Low) / 2</li>
+<li><strong>TC (Top Central)</strong> = 2 &times; Pivot - BC</li>
+</ul>
+<h4>Usage</h4>
+<ul>
+<li><strong>Narrow CPR</strong> = trending day expected (price will break out)</li>
+<li><strong>Wide CPR</strong> = range-bound day expected</li>
+<li>Price above TC = bullish; Price below BC = bearish; Between TC and BC = neutral</li>
+</ul>
+</div>
+
+<h2>8. Liquidity Pools</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Liquidity Pools</p>
+<h4>How It Works (Smart Money Concept)</h4>
+<ul>
+<li>Scans for <strong>equal highs</strong> (Buy-Side Liquidity / BSL) and <strong>equal lows</strong> (Sell-Side Liquidity / SSL)</li>
+<li>Equal = within 0.2% tolerance over 10-bar lookback</li>
+<li>&ge;2 equal highs/lows forms a liquidity pool</li>
+</ul>
+<h4>Usage</h4>
+<ul>
+<li><strong>BSL</strong> (yellow dashed above) = Retail stop losses above equal highs — institutions sweep these before reversing down</li>
+<li><strong>SSL</strong> (yellow dashed below) = Retail stop losses below equal lows — institutions sweep these before reversing up</li>
+</ul>
+</div>
+
+<h2>9. Fair Value Gap (FVG)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Fair Value Gap</p>
+<h4>How It Works (Smart Money Concept)</h4>
+<ul>
+<li>A 3-candle pattern where the middle candle creates a gap between the first and third candle ranges</li>
+<li><strong>Bullish FVG</strong>: Candle[i-2].high &lt; Candle[i].low — gap up, institutions buying</li>
+<li><strong>Bearish FVG</strong>: Candle[i-2].low &gt; Candle[i].high — gap down, institutions selling</li>
+</ul>
+<h4>Usage</h4>
+<p>Price tends to return to fill FVGs. Bullish FVG = potential buy zone when price retraces. Bearish FVG = potential sell zone.</p>
+</div>
+
+<h2>10. Break of Structure (BOS)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Break of Structure</p>
+<h4>How It Works (Smart Money Concept)</h4>
+<ul>
+<li>Tracks swing highs and swing lows to determine market structure</li>
+<li><strong>Bullish BOS</strong>: Price breaks above a previous swing high → uptrend continuation</li>
+<li><strong>Bearish BOS</strong>: Price breaks below a previous swing low → downtrend continuation</li>
+</ul>
+<h4>Usage</h4>
+<p>BOS confirms the trend direction. Look for entries in pullbacks after a BOS in the trend direction.</p>
+</div>
+
+<h2>11. Change of Character (CHoCH)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Change of Character</p>
+<h4>How It Works (Smart Money Concept)</h4>
+<ul>
+<li>Detects when market structure <strong>reverses</strong> (opposite of BOS)</li>
+<li><strong>Bullish CHoCH</strong>: In a downtrend, price breaks above a swing high → potential reversal to uptrend</li>
+<li><strong>Bearish CHoCH</strong>: In an uptrend, price breaks below a swing low → potential reversal to downtrend</li>
+</ul>
+<h4>Usage</h4>
+<p>CHoCH is an early reversal signal. Wait for confirmation (pullback + continuation) before entering.</p>
+</div>
+
+<h2>12. Cumulative Volume Delta (CVD)</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Cum. Volume Delta</p>
+<h4>How It Works</h4>
+<ul>
+<li>Estimates buying vs selling volume per candle: buy_ratio = (Close - Low) / (High - Low)</li>
+<li>Buy Volume = Total Volume &times; buy_ratio; Sell Volume = Total Volume &times; (1 - buy_ratio)</li>
+<li>Delta = Buy Volume - Sell Volume; CVD = Running total of deltas</li>
+</ul>
+<h4>Usage</h4>
+<ul>
+<li><strong>Rising CVD + Rising Price</strong> = Healthy uptrend (buyers in control)</li>
+<li><strong>Falling CVD + Rising Price</strong> = Bearish divergence (hidden selling, potential reversal)</li>
+<li><strong>Rising CVD + Falling Price</strong> = Bullish divergence (hidden buying, potential reversal)</li>
+</ul>
+</div>
+
+<h2>13. Volume Profile</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Volume Profile</p>
+<h4>How It Works</h4>
+<ul>
+<li>Distributes total volume across 24 price bins covering the visible price range</li>
+<li><strong>POC (Point of Control)</strong> = Price level with the highest traded volume (solid orange line)</li>
+<li><strong>Value Area</strong> = Range of prices containing 70% of total volume (semi-transparent orange)</li>
+</ul>
+<h4>Usage</h4>
+<ul>
+<li>POC acts as a magnet — price tends to spend time around the POC</li>
+<li><strong>High Volume Nodes</strong> = Support/resistance zones (price consolidation areas)</li>
+<li><strong>Low Volume Nodes</strong> = Price moves quickly through these levels</li>
+<li>Breakout from Value Area often leads to trending moves</li>
+</ul>
+</div>
+
+<h2>14. Signals</h2>
+<div class="card">
+<p><strong>Toggle:</strong> Indicators &rarr; Signals (ON by default)</p>
+<h4>How It Works</h4>
+<ul>
+<li>Displays BUY/SELL markers on the chart generated by the selected algorithm(s)</li>
+<li>Green arrows up = BUY signals; Red arrows down = SELL signals</li>
+<li>Larger arrows = STRONG signals (higher confidence)</li>
+<li>Hover over markers to see signal details: score, type, and contributing reasons</li>
+</ul>
+</div>
+
+<h2>Indicator Settings</h2>
+<div class="card">
+<p>Click <strong>&ldquo;&#9881; Indicator Settings&rdquo;</strong> at the bottom of the Indicators dropdown to configure:</p>
+<table>
+<tr><th>Indicator</th><th>Parameter</th><th>Default</th><th>Range</th></tr>
+<tr><td>SuperTrend</td><td>Period</td><td>10</td><td>1 - 50</td></tr>
+<tr><td>SuperTrend</td><td>Multiplier</td><td>3.0</td><td>0.1 - 10</td></tr>
+<tr><td>Parabolic SAR</td><td>AF Start</td><td>0.02</td><td>0.001 - 0.1</td></tr>
+<tr><td>Parabolic SAR</td><td>AF Increment</td><td>0.02</td><td>0.001 - 0.1</td></tr>
+<tr><td>Parabolic SAR</td><td>AF Max</td><td>0.2</td><td>0.01 - 0.5</td></tr>
+<tr><td>Bollinger Bands</td><td>Period</td><td>20</td><td>5 - 100</td></tr>
+<tr><td>Bollinger Bands</td><td>Std Dev</td><td>2.0</td><td>0.5 - 5.0</td></tr>
+</table>
+<p>Click <strong>Apply</strong> to reload the chart with new settings. Click <strong>Restore Defaults</strong> to reset all parameters.</p>
+</div>
+
+</div></body></html>"""
+
+
+HELP_MANUAL_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mangal View - User Manual</title>""" + HELP_PAGE_STYLE + r"""
+</head><body>
+<div class="help-header">
+  <div><h1>&#128214; User Manual</h1><a href="/">&larr; Back to Chart</a></div>
+  <button class="download-btn" onclick="downloadPDF()">&#128196; Download PDF</button>
+</div>
+<div class="help-body">
+
+<h2>Overview</h2>
+<div class="card">
+<p><strong>Mangal View</strong> is a professional-grade, real-time charting and algorithmic signal platform for Indian and global markets. It provides:</p>
+<ul>
+<li>Interactive candlestick charts with 13 timeframes</li>
+<li>14 technical indicators (trend, SMC, volume, statistical)</li>
+<li>12 algorithmic signal engines + 1 ML prediction model</li>
+<li>Strategy backtesting with comprehensive performance metrics</li>
+<li>Paper trading simulator</li>
+<li>Real trading integration (Delta Exchange)</li>
+<li>3 data sources: Yahoo Finance, TradingView, NSE India</li>
+</ul>
+</div>
+
+<h2>Getting Started</h2>
+<h3>Registration &amp; Login</h3>
+<div class="card">
+<ol>
+<li>Visit the platform URL and click <strong>Register</strong></li>
+<li>Enter your Username, Mobile Number (10 digits), Password, Place, and select a Plan</li>
+<li>Plans: <strong>Free Trial</strong> (1 month evaluation) or <strong>Paid</strong> (&#8377;100/month)</li>
+<li>After registration, log in with your Mobile Number and Password</li>
+</ol>
+</div>
+
+<h2>Chart Interface</h2>
+<h3>Symbol Selection</h3>
+<div class="card">
+<p>The symbol dropdown (top-left) provides 16 preset symbols:</p>
+<table>
+<tr><th>Category</th><th>Symbols</th></tr>
+<tr><td>Indian Indices</td><td>NIFTY 50, BANK NIFTY, SENSEX</td></tr>
+<tr><td>Precious Metals</td><td>Gold Futures, Silver Futures, XAU/USD, XAG/USD, Gold ETF, Silver ETF</td></tr>
+<tr><td>Energy</td><td>Crude Oil, Natural Gas</td></tr>
+<tr><td>Crypto</td><td>Bitcoin, Ethereum</td></tr>
+<tr><td>US Indices</td><td>Dow Jones, NASDAQ, S&amp;P 500</td></tr>
+</table>
+</div>
+
+<h3>Search</h3>
+<div class="card">
+<p>Use the search box to find any stock, index, or ETF by <strong>company name or ticker</strong>:</p>
+<ul>
+<li>Type a company name (e.g., "Reliance", "Tata Motors", "Infosys")</li>
+<li>Or type a ticker directly (e.g., "RELIANCE.NS", "TCS.BO")</li>
+<li>Results show up to 6 matches with ticker, name, and exchange</li>
+<li>Click a result or press Enter to load the chart</li>
+<li>Indian stocks automatically get .NS (NSE) or .BO (BSE) suffix</li>
+</ul>
+</div>
+
+<h3>Timeframes</h3>
+<div class="card">
+<p>Click the <strong>Period</strong> dropdown to select from 13 timeframes:</p>
+<table>
+<tr><th>Timeframe</th><th>Data Period</th><th>Best For</th></tr>
+<tr><td>1m, 2m, 3m</td><td>1-5 days</td><td>Scalping</td></tr>
+<tr><td>5m, 10m, 15m</td><td>5-10 days</td><td>Intraday trading</td></tr>
+<tr><td>30m, 1H, 2H, 4H</td><td>10-60 days</td><td>Swing trading</td></tr>
+<tr><td>1D, 1W, 1M</td><td>1 year - max</td><td>Position trading / investing</td></tr>
+</table>
+</div>
+
+<h3>Chart Interactions</h3>
+<div class="card">
+<ul>
+<li><strong>Crosshair:</strong> Move mouse over chart to see OHLCV values in the legend</li>
+<li><strong>Zoom:</strong> Use the Zoom dropdown or mouse scroll wheel</li>
+<li><strong>Pan:</strong> Click and drag to move the chart</li>
+<li><strong>LIVE mode:</strong> Click the LIVE button to enable continuous auto-refresh (every few seconds)</li>
+</ul>
+</div>
+
+<h2>Indicators</h2>
+<div class="card">
+<p>Click the <strong>Indicators</strong> dropdown to toggle any of the 14 indicators:</p>
+<ul>
+<li><strong>Trend:</strong> SuperTrend, PSAR, EMA 9/21, VWAP</li>
+<li><strong>Volatility:</strong> Bollinger Bands</li>
+<li><strong>Levels:</strong> S/R Levels, CPR</li>
+<li><strong>Smart Money (SMC):</strong> Liquidity Pools, Fair Value Gap, Break of Structure, Change of Character</li>
+<li><strong>Volume:</strong> Cum. Volume Delta, Volume Profile</li>
+<li><strong>Signals:</strong> Buy/Sell markers from selected algo(s)</li>
+</ul>
+<p>Open <strong>&#9881; Indicator Settings</strong> to customize SuperTrend, PSAR, and Bollinger Bands parameters. Click <strong>Restore Defaults</strong> to reset.</p>
+<p>See <a href="/help/indicators">Indicator Documentation</a> for detailed explanations.</p>
+</div>
+
+<h2>Algorithms (Algos)</h2>
+<div class="card">
+<p>Click the <strong>Algo</strong> dropdown to select one or more signal algorithms. Multi-select is supported — click multiple algos to combine them.</p>
+<p>Available: Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, MPredict</p>
+<p>When multiple algos are selected, signals are combined and deduplicated — the signal with the highest absolute score is kept for each time bar.</p>
+<p>See <a href="/help/algos">Algo Documentation</a> for detailed explanations of each algorithm.</p>
+</div>
+
+<h3>Signal Analysis</h3>
+<div class="card">
+<p>Click <strong>&#9889; Signal Analysis</strong> in the Algo dropdown to open the Signal Analysis panel:</p>
+<ul>
+<li><strong>Verdict:</strong> Overall BUY / SELL / NEUTRAL recommendation</li>
+<li><strong>Score:</strong> Composite score from all contributing indicators</li>
+<li><strong>Per-Indicator Status:</strong> Individual indicator readings</li>
+<li><strong>Signal Count:</strong> Total buy/sell signals generated</li>
+</ul>
+</div>
+
+<h2>Data Sources</h2>
+<div class="card">
+<p>Click the <strong>&#9881; Settings</strong> gear icon, then expand <strong>Data Source</strong>:</p>
+<table>
+<tr><th>Source</th><th>Description</th><th>Pros</th><th>Cons</th></tr>
+<tr><td><strong>TradingView</strong> (default)</td><td>Near real-time via WebSocket</td><td>Fast, reliable, all symbols</td><td>Unofficial API</td></tr>
+<tr><td><strong>Yahoo Finance</strong></td><td>Official yfinance library</td><td>Official, all symbols</td><td>Slight delay, rate limits</td></tr>
+<tr><td><strong>NSE India</strong></td><td>Direct NSE API</td><td>Official Indian exchange data</td><td>Only NIFTY 50 &amp; BANK NIFTY, empty after 3:30 PM</td></tr>
+</table>
+</div>
+
+<h2>Backtesting</h2>
+<div class="card">
+<p>Test any algorithm's historical performance:</p>
+<ol>
+<li>Open <strong>&#9881; Settings</strong> → toggle <strong>Backtest</strong> ON</li>
+<li>Select an algorithm from the backtest list</li>
+<li>The Strategy Tester panel opens with 3 tabs:</li>
+</ol>
+<h4>Overview Tab</h4>
+<ul>
+<li>Net Profit / Loss, Total Trades, Win Rate</li>
+<li>Profit Factor, Sharpe Ratio, Max Drawdown</li>
+<li>Average Win / Loss, Payoff Ratio</li>
+</ul>
+<h4>Performance Tab</h4>
+<p>Visual equity curve showing capital growth over time</p>
+<h4>Trade List Tab</h4>
+<p>Detailed list of every trade: entry/exit time, price, P&amp;L, type</p>
+<p><strong>Qty Setting:</strong> Adjust trade quantity per signal (0 = auto-size from &#8377;1,00,000 initial capital)</p>
+</div>
+
+<h2>Paper Trading</h2>
+<div class="card">
+<p>Practice trading without real money:</p>
+<ol>
+<li>Open <strong>&#9881; Settings</strong> → expand <strong>Trade</strong> → click <strong>Futures</strong></li>
+<li>The Trading Panel opens:</li>
+</ol>
+<ul>
+<li><strong>Symbol:</strong> Select from dropdown (all 16 preset symbols)</li>
+<li><strong>Capital:</strong> Starting virtual capital</li>
+<li><strong>Algorithm:</strong> Select the signal algorithm to follow</li>
+<li><strong>Start/Stop:</strong> Begin or end the paper trading session</li>
+<li><strong>Live P&amp;L:</strong> Real-time profit/loss display</li>
+<li><strong>Positions:</strong> Current open positions</li>
+<li><strong>Trade Log:</strong> Historical trade list</li>
+</ul>
+</div>
+
+<h2>Real Trading (Delta Exchange)</h2>
+<div class="card">
+<p>Connect to Delta Exchange for automated real trading:</p>
+<ol>
+<li>Open <strong>&#9881; Settings</strong> → expand <strong>Real Trade</strong> → click <strong>Delta</strong></li>
+<li>Enter your Delta Exchange credentials:</li>
+</ol>
+<ul>
+<li><strong>Username &amp; Password:</strong> Your Delta Exchange login</li>
+<li><strong>Capital:</strong> Trading capital allocation</li>
+<li><strong>Qty:</strong> Position size per trade (0 = auto)</li>
+<li><strong>Symbol:</strong> Trading instrument</li>
+<li><strong>SL %:</strong> Stop loss percentage</li>
+<li><strong>Target %:</strong> Take profit percentage</li>
+<li><strong>Mode:</strong> Signals (auto-follow algo signals) or Manual</li>
+</ul>
+<p>&#9888; <strong>Warning:</strong> Real trading involves actual money. Use paper trading first to validate your strategy.</p>
+</div>
+
+<h2>Zoom Controls</h2>
+<div class="card">
+<ul>
+<li><strong>H+</strong> / <strong>H-</strong>: Horizontal zoom (time axis)</li>
+<li><strong>V+</strong> / <strong>V-</strong>: Vertical zoom (price axis)</li>
+<li><strong>Reset / Fit All</strong>: Reset zoom to show all data</li>
+<li>Mouse scroll wheel also zooms horizontally</li>
+</ul>
+</div>
+
+<h2>OHLC Legend</h2>
+<div class="card">
+<p>The top-left overlay shows real-time values as you move the crosshair:</p>
+<ul>
+<li><strong>O</strong> = Open price</li>
+<li><strong>H</strong> = High price</li>
+<li><strong>L</strong> = Low price</li>
+<li><strong>C</strong> = Close price</li>
+<li><strong>Vol</strong> = Volume</li>
+<li><strong>ST</strong> = SuperTrend value (when enabled)</li>
+<li><strong>PSAR</strong> = Parabolic SAR value (when enabled)</li>
+</ul>
+</div>
+
+<h2>Keyboard &amp; Mouse</h2>
+<div class="card">
+<table>
+<tr><th>Action</th><th>How</th></tr>
+<tr><td>Pan chart</td><td>Click + drag</td></tr>
+<tr><td>Zoom in/out</td><td>Mouse scroll wheel</td></tr>
+<tr><td>Search symbol</td><td>Type in search box + Enter</td></tr>
+<tr><td>Signal tooltip</td><td>Hover over buy/sell arrow markers</td></tr>
+</table>
+</div>
+
+<h2>Tips &amp; Best Practices</h2>
+<div class="card">
+<ol>
+<li><strong>Start with defaults:</strong> MStreet + MPredict on 5m TradingView gives a good starting point</li>
+<li><strong>Multi-algo:</strong> Enable 2-3 complementary algos for stronger confirmation</li>
+<li><strong>Backtest first:</strong> Always backtest an algorithm on your target symbol before trading</li>
+<li><strong>Match algo to market:</strong> Use Trend/Momentum in trending markets, MStreet/Scalping in ranges</li>
+<li><strong>Use indicators wisely:</strong> Don't enable all indicators at once — pick 2-3 relevant ones</li>
+<li><strong>Signal Analysis:</strong> Check the Signal Analysis panel for a quick verdict before taking a trade</li>
+<li><strong>Paper trade:</strong> Practice with the paper trading feature before going live</li>
+</ol>
+</div>
+
+</div></body></html>"""
+
+
+@app.route("/help/algos")
+@login_required
+def help_algos():
+    return Response(HELP_ALGOS_PAGE, content_type="text/html")
+
+
+@app.route("/help/indicators")
+@login_required
+def help_indicators():
+    return Response(HELP_INDICATORS_PAGE, content_type="text/html")
+
+
+@app.route("/help/manual")
+@login_required
+def help_manual():
+    return Response(HELP_MANUAL_PAGE, content_type="text/html")
+
+
 @app.route("/")
 @login_required
 def index():
@@ -5720,6 +6748,7 @@ def api_candles():
     fvg = compute_fair_value_gaps(candles)
     bos_choch = compute_bos_choch(candles)
     cvd = compute_cvd(candles)
+    volume_profile = compute_volume_profile(candles)
 
     algo_param = request.args.get("algo", "trend")
     algos = [a.strip() for a in algo_param.split(",") if a.strip()]
@@ -5819,6 +6848,7 @@ def api_candles():
         "fairValueGaps": fvg,
         "bosChoch": bos_choch,
         "cvd": cvd,
+        "volumeProfile": volume_profile,
         "backtest": backtest,
         "predictions": predictions,
     })
@@ -5831,10 +6861,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Nifty 50 - Live Chart</title>
 <style>
+  :root {
+    --bg-primary: #131722;
+    --bg-secondary: #1e222d;
+    --bg-tertiary: #2a2e39;
+    --text-primary: #d1d4dc;
+    --text-secondary: #787b86;
+    --text-white: #fff;
+    --border-color: #2a2e39;
+    --accent: #2962ff;
+    --chart-bg: #131722;
+    --input-bg: #131722;
+    --panel-bg: #1e222d;
+    --hover-bg: #252a37;
+  }
+  html.light-theme {
+    --bg-primary: #ffffff;
+    --bg-secondary: #f0f3fa;
+    --bg-tertiary: #e0e3eb;
+    --text-primary: #131722;
+    --text-secondary: #787b86;
+    --text-white: #131722;
+    --border-color: #e0e3eb;
+    --accent: #2962ff;
+    --chart-bg: #ffffff;
+    --input-bg: #f0f3fa;
+    --panel-bg: #f0f3fa;
+    --hover-bg: #e8ebf2;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    background: #131722;
-    color: #d1d4dc;
+    background: var(--bg-primary);
+    color: var(--text-primary);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
     overflow: hidden;
     height: 100vh;
@@ -5844,16 +6902,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     align-items: center;
     justify-content: space-between;
     padding: 10px 20px;
-    background: #1e222d;
-    border-bottom: 1px solid #2a2e39;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
   }
   .header-left { display: flex; align-items: center; gap: 16px; }
-  .ticker-name { font-size: 20px; font-weight: 700; color: #fff; letter-spacing: 0.5px; }
-  .ticker-exchange { font-size: 12px; color: #787b86; font-weight: 400; }
+  .ticker-name { font-size: 20px; font-weight: 700; color: var(--text-white); letter-spacing: 0.5px; }
+  .ticker-exchange { font-size: 12px; color: var(--text-secondary); font-weight: 400; }
   /* Symbol Selector */
   .symbol-select {
-    padding: 6px 12px; background: #131722; border: 1px solid #2a2e39;
-    border-radius: 4px; color: #fff; font-size: 14px; font-weight: 600;
+    padding: 6px 12px; background: var(--input-bg); border: 1px solid var(--border-color);
+    border-radius: 4px; color: var(--text-white); font-size: 14px; font-weight: 600;
     cursor: pointer; outline: none; appearance: none;
     -webkit-appearance: none; -moz-appearance: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23787b86'/%3E%3C/svg%3E");
@@ -5862,31 +6920,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .symbol-select:hover { border-color: #2962ff; }
   .symbol-select:focus { border-color: #2962ff; }
-  .symbol-select option { background: #1e222d; color: #d1d4dc; }
+  .symbol-select option { background: var(--bg-secondary); color: var(--text-primary); }
   /* Search Box */
   .search-wrap {
     position: relative;
   }
   .search-input {
-    padding: 6px 12px; background: #131722; border: 1px solid #2a2e39;
-    border-radius: 4px; color: #fff; font-size: 13px; font-weight: 500;
+    padding: 6px 12px; background: var(--input-bg); border: 1px solid var(--border-color);
+    border-radius: 4px; color: var(--text-white); font-size: 13px; font-weight: 500;
     outline: none; width: 180px;
   }
   .search-input::placeholder { color: #555; }
   .search-input:focus { border-color: #2962ff; }
   .search-result {
     position: absolute; top: 100%; left: 0; width: 280px; max-height: 200px;
-    overflow-y: auto; background: #1e222d; border: 1px solid #2a2e39;
+    overflow-y: auto; background: var(--bg-secondary); border: 1px solid var(--border-color);
     border-radius: 4px; z-index: 1000; margin-top: 2px; display: none;
   }
   .search-result-item {
-    padding: 8px 12px; cursor: pointer; font-size: 13px; color: #d1d4dc;
-    border-bottom: 1px solid #2a2e3944;
+    padding: 8px 12px; cursor: pointer; font-size: 13px; color: var(--text-primary);
+    border-bottom: 1px solid var(--border-color);
   }
-  .search-result-item:hover { background: #2a2e39; }
-  .search-result-item .sr-ticker { font-weight: 700; color: #fff; }
-  .search-result-item .sr-name { color: #787b86; font-size: 11px; margin-left: 8px; }
-  .search-result-item .sr-exch { color: #555; font-size: 10px; float: right; }
+  .search-result-item:hover { background: var(--bg-tertiary); }
+  .search-result-item .sr-ticker { font-weight: 700; color: var(--text-white); }
+  .search-result-item .sr-name { color: var(--text-secondary); font-size: 11px; margin-left: 8px; }
+  .search-result-item .sr-exch { color: var(--text-secondary); font-size: 10px; float: right; }
   .price-info { display: flex; align-items: baseline; gap: 10px; }
   .current-price { font-size: 22px; font-weight: 700; }
   .price-change { font-size: 14px; font-weight: 500; }
@@ -5897,15 +6955,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     align-items: center;
     gap: 4px;
     padding: 6px 20px;
-    background: #1e222d;
-    border-bottom: 1px solid #2a2e39;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
     flex-wrap: wrap;
   }
   .tf-btn, .ind-btn {
     padding: 6px 14px;
     border: none;
     background: transparent;
-    color: #787b86;
+    color: var(--text-secondary);
     font-size: 13px;
     font-weight: 500;
     cursor: pointer;
@@ -5913,40 +6971,40 @@ HTML_PAGE = r"""<!DOCTYPE html>
     transition: all 0.15s;
     letter-spacing: 0.3px;
   }
-  .tf-btn:hover, .ind-btn:hover { background: #2a2e39; color: #d1d4dc; }
+  .tf-btn:hover, .ind-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
   .tf-btn.active { background: #2962ff; color: #fff; }
   /* Period Dropdown */
   .period-dropdown-wrapper { position: relative; }
   .period-dropdown {
-    position: absolute; top: 100%; left: 0; background: #1e222d; border: 1px solid #2a2e39;
+    position: absolute; top: 100%; left: 0; background: var(--bg-secondary); border: 1px solid var(--border-color);
     border-radius: 6px; padding: 4px 0; min-width: 140px; z-index: 300;
     box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none;
   }
   .period-dropdown.open { display: block; }
   .period-item {
-    display: block; padding: 8px 16px; color: #d1d4dc; font-size: 13px;
+    display: block; padding: 8px 16px; color: var(--text-primary); font-size: 13px;
     cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
   }
-  .period-item:hover { background: #2a2e39; }
+  .period-item:hover { background: var(--bg-tertiary); }
   .period-item.active { color: #2962ff; font-weight: 600; }
   .ind-btn.active { background: #363a45; color: #fff; }
   .ind-btn .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
-  .separator { width: 1px; height: 20px; background: #2a2e39; margin: 0 8px; }
+  .separator { width: 1px; height: 20px; background: var(--border-color); margin: 0 8px; }
   /* Indicators Dropdown */
   .indicators-dropdown-wrapper { position: relative; }
   .indicators-dropdown {
     position: absolute; top: 100%; left: 0; z-index: 300;
-    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px;
     padding: 6px 0; min-width: 200px; display: none;
     box-shadow: 0 8px 32px rgba(0,0,0,0.5); margin-top: 4px;
   }
   .indicators-dropdown.open { display: block; }
   .ind-item {
     display: flex; align-items: center; gap: 8px; padding: 8px 14px;
-    cursor: pointer; font-size: 13px; color: #d1d4dc; transition: background 0.12s;
+    cursor: pointer; font-size: 13px; color: var(--text-primary); transition: background 0.12s;
     user-select: none;
   }
-  .ind-item:hover { background: #2a2e39; }
+  .ind-item:hover { background: var(--bg-tertiary); }
   .ind-item .dot { flex-shrink: 0; display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
   .ind-item span:nth-child(2) { flex: 1; }
   .ind-item input[type="checkbox"] {
@@ -5959,12 +7017,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .loading-overlay {
     position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(19, 23, 34, 0.85);
-    display: flex; align-items: center; justify-content: center;
+    background: var(--bg-primary, #131722);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
     z-index: 100; transition: opacity 0.3s;
   }
   .loading-overlay.hidden { opacity: 0; pointer-events: none; }
-  .spinner { width: 36px; height: 36px; border: 3px solid #2a2e39; border-top-color: #2962ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .loading-text { color: var(--text-secondary, #787b86); font-size: 14px; margin-top: 16px; letter-spacing: 1px; }
+  .loading-brand { color: var(--accent, #2962ff); font-size: 22px; font-weight: 700; margin-bottom: 12px; letter-spacing: 1px; }
+  .spinner { width: 36px; height: 36px; border: 3px solid var(--bg-tertiary, #2a2e39); border-top-color: #2962ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .ohlc-legend {
     position: absolute; top: 8px; left: 12px; z-index: 10;
@@ -5980,9 +7040,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .signal-tooltip {
     position: absolute; display: none; z-index: 200;
-    background: #1e222d; border: 1px solid #2a2e39; border-radius: 6px;
+    background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px;
     padding: 10px 14px; min-width: 200px; max-width: 300px;
-    color: #d1d4dc; font-size: 12px; pointer-events: none;
+    color: var(--text-primary); font-size: 12px; pointer-events: none;
     box-shadow: 0 4px 16px rgba(0,0,0,0.5);
   }
   .signal-tooltip .st-header {
@@ -6011,22 +7071,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* Settings Panel */
   .settings-panel {
     position: absolute; top: 44px; right: 12px; z-index: 200;
-    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px;
     padding: 16px; width: 280px; display: none;
     box-shadow: 0 8px 32px rgba(0,0,0,0.5);
   }
   .settings-panel.open { display: block; }
   .settings-panel h3 {
-    font-size: 14px; color: #fff; margin-bottom: 12px;
-    border-bottom: 1px solid #2a2e39; padding-bottom: 8px;
+    font-size: 14px; color: var(--text-white); margin-bottom: 12px;
+    border-bottom: 1px solid var(--border-color); padding-bottom: 8px;
   }
   .settings-panel label {
     display: flex; justify-content: space-between; align-items: center;
-    font-size: 12px; color: #787b86; margin-bottom: 8px;
+    font-size: 12px; color: var(--text-secondary); margin-bottom: 8px;
   }
   .settings-panel input[type="number"] {
-    width: 70px; padding: 4px 8px; background: #131722; border: 1px solid #2a2e39;
-    border-radius: 4px; color: #d1d4dc; font-size: 12px; text-align: right;
+    width: 70px; padding: 4px 8px; background: var(--input-bg); border: 1px solid var(--border-color);
+    border-radius: 4px; color: var(--text-primary); font-size: 12px; text-align: right;
   }
   .settings-panel input[type="number"]:focus { outline: none; border-color: #2962ff; }
   .settings-panel .apply-btn {
@@ -6036,39 +7096,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .settings-panel .apply-btn:hover { background: #1e53e5; }
   .settings-panel .section-title {
-    font-size: 12px; font-weight: 600; color: #d1d4dc; margin: 10px 0 6px 0;
+    font-size: 12px; font-weight: 600; color: var(--text-primary); margin: 10px 0 6px 0;
   }
   .gear-btn {
-    padding: 6px 10px; border: none; background: transparent; color: #787b86;
+    padding: 6px 10px; border: none; background: transparent; color: var(--text-secondary);
     font-size: 16px; cursor: pointer; border-radius: 4px; transition: all 0.15s;
   }
   .gear-btn:hover { background: #2a2e39; color: #d1d4dc; }
   /* Settings Config Panel */
   .cfg-panel {
     position: absolute; top: 44px; right: 60px; z-index: 250;
-    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px;
     width: 280px; display: none; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
     max-height: calc(100vh - 100px); overflow-y: auto;
   }
   .cfg-panel.open { display: block; }
   .cfg-header {
     display: flex; justify-content: space-between; align-items: center;
-    padding: 12px 16px; border-bottom: 1px solid #2a2e39; position: sticky; top: 0;
-    background: #1e222d; z-index: 1;
+    padding: 12px 16px; border-bottom: 1px solid var(--border-color); position: sticky; top: 0;
+    background: var(--bg-secondary); z-index: 1;
   }
-  .cfg-header h3 { margin: 0; font-size: 14px; color: #d1d4dc; font-weight: 600; }
+  .cfg-header h3 { margin: 0; font-size: 14px; color: var(--text-primary); font-weight: 600; }
   .cfg-close {
-    background: none; border: none; color: #787b86; font-size: 18px; cursor: pointer;
+    background: none; border: none; color: var(--text-secondary); font-size: 18px; cursor: pointer;
     padding: 0 4px; line-height: 1;
   }
   .cfg-close:hover { color: #ef5350; }
-  .cfg-section { border-bottom: 1px solid #2a2e39; }
+  .cfg-section { border-bottom: 1px solid var(--border-color); }
   .cfg-section:last-child { border-bottom: none; }
   .cfg-section-header {
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 16px; cursor: default;
   }
-  .cfg-section-header span { color: #d1d4dc; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .cfg-section-header span { color: var(--text-primary); font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
   .cfg-toggle { position: relative; width: 36px; height: 20px; display: inline-block; flex-shrink: 0; }
   .cfg-toggle input { opacity: 0; width: 0; height: 0; }
   .cfg-slider {
@@ -6084,10 +7144,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .cfg-section-body { display: none; padding: 4px 0 8px 0; }
   .cfg-section-body.open { display: block; }
   .cfg-item {
-    display: block; padding: 7px 24px; color: #d1d4dc; font-size: 13px;
+    display: block; padding: 7px 24px; color: var(--text-primary); font-size: 13px;
     cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
   }
-  .cfg-item:hover:not(.disabled) { background: #2a2e39; }
+  .cfg-item:hover:not(.disabled) { background: var(--bg-tertiary); }
   .cfg-item.disabled { color: #555; cursor: default; }
   .cfg-item.active { color: #2962ff; font-weight: 600; }
   .cfg-item.has-sub::after { content: '\25B6'; float: right; font-size: 10px; margin-top: 2px; }
@@ -6095,10 +7155,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .cfg-sub { display: none; padding-left: 16px; background: #181c27; border-left: 2px solid #2962ff; margin-left: 16px; }
   .cfg-sub.open { display: block; }
   .cfg-sub-item {
-    display: block; padding: 7px 16px; color: #d1d4dc; font-size: 13px;
+    display: block; padding: 7px 16px; color: var(--text-primary); font-size: 13px;
     cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
   }
-  .cfg-sub-item:hover { background: #2a2e39; }
+  .cfg-sub-item:hover { background: var(--bg-tertiary); }
   /* Live Data Button */
   .live-btn {
     padding: 6px 14px; border: 1px solid #2a2e39; background: transparent;
@@ -6136,6 +7196,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor: pointer; transition: background 0.1s; border: none; background: none; width: 100%; text-align: left;
   }
   .zm-item:hover { background: #2a2e39; }
+
+  /* Help Dropdown */
+  .help-dropdown-wrapper { position: relative; }
+  .help-dropdown {
+    position: absolute; top: 100%; right: 0; background: #1e222d; border: 1px solid #2a2e39;
+    border-radius: 6px; padding: 4px 0; min-width: 180px; z-index: 300;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none;
+  }
+  .help-dropdown.open { display: block; }
+  .help-item {
+    display: block; padding: 8px 16px; color: #d1d4dc; font-size: 13px;
+    cursor: pointer; transition: background 0.1s; text-decoration: none;
+  }
+  .help-item:hover { background: #2a2e39; }
 
   /* Trade Dropdown */
   .trade-dropdown-wrapper { position: relative; }
@@ -6411,11 +7485,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="DJI">Dow Jones</option>
         <option value="NASDAQ">NASDAQ</option>
         <option value="SP500">S&P 500</option>
+        <option value="CRUDEOIL">Crude Oil</option>
+        <option value="NATURALGAS">Natural Gas</option>
       </select>
       <span class="ticker-exchange" id="tickerExchange"> &middot; NSE</span>
     </div>
     <div class="search-wrap">
-      <input class="search-input" id="searchInput" type="text" placeholder="Search ticker (e.g. RELIANCE.NS)" autocomplete="off">
+      <input class="search-input" id="searchInput" type="text" placeholder="Search by name or ticker (e.g. Reliance, TCS)" autocomplete="off">
       <div class="search-result" id="searchResult"></div>
     </div>
   </div>
@@ -6431,8 +7507,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="ind-btn" id="btnPeriod"><span class="dot" style="background:#4caf50"></span>5m &#9662;</button>
     <div class="period-dropdown" id="periodDropdown">
       <button class="period-item" data-tf="1m" data-label="1m" data-name="1 Min">&#8203; 1 Min</button>
+      <button class="period-item" data-tf="2m" data-label="2m" data-name="2 Min">&#8203; 2 Min</button>
       <button class="period-item" data-tf="3m" data-label="3m" data-name="3 Min">&#8203; 3 Min</button>
       <button class="period-item active" data-tf="5m" data-label="5m" data-name="5 Min">&#10004; 5 Min</button>
+      <button class="period-item" data-tf="10m" data-label="10m" data-name="10 Min">&#8203; 10 Min</button>
       <button class="period-item" data-tf="15m" data-label="15m" data-name="15 Min">&#8203; 15 Min</button>
       <button class="period-item" data-tf="30m" data-label="30m" data-name="30 Min">&#8203; 30 Min</button>
       <button class="period-item" data-tf="1h" data-label="1H" data-name="1 Hour">&#8203; 1 Hour</button>
@@ -6459,6 +7537,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <label class="ind-item" data-ind="BOS"><span class="dot" style="background:#ff7043"></span><span>Break of Structure</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="CHoCH"><span class="dot" style="background:#ba68c8"></span><span>Change of Character</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="CVD"><span class="dot" style="background:#29b6f6"></span><span>Cum. Volume Delta</span><input type="checkbox"></label>
+      <label class="ind-item" data-ind="VP"><span class="dot" style="background:#ff8a65"></span><span>Volume Profile</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="Signals"><span class="dot" style="background:#00e676"></span><span>Signals</span><input type="checkbox" checked></label>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="ind-item" id="btnIndSettings" style="cursor:pointer;border:none;background:none;color:#d1d4dc;padding:8px 12px;width:100%;text-align:left;font-size:13px">&#9881; Indicator Settings</button>
@@ -6637,9 +7716,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="separator"></div>
+  <div class="help-dropdown-wrapper">
+    <button class="ind-btn" id="btnHelp"><span class="dot" style="background:#66bb6a"></span>Help &#9662;</button>
+    <div class="help-dropdown" id="helpDropdown">
+      <a class="help-item" href="/help/algos" target="_blank">&#128202; Algos</a>
+      <a class="help-item" href="/help/indicators" target="_blank">&#128200; Indicators</a>
+      <a class="help-item" href="/help/manual" target="_blank">&#128214; User Manual</a>
+    </div>
+  </div>
+  <div class="separator"></div>
+  <button class="ind-btn" id="btnTheme" title="Toggle Light/Dark Theme">&#127763; Theme</button>
+  <div class="separator"></div>
 
 </div>
-
 <div id="chart-container">
   <div class="watermark" id="watermark">NIFTY 50</div>
   <div class="ohlc-legend" id="ohlcLegend">
@@ -6653,7 +7742,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="il-st" id="legST"></span>
     <span class="il-sar" id="legSAR"></span>
   </div>
-  <div class="loading-overlay" id="loader"><div class="spinner"></div></div>
+  <div class="loading-overlay" id="loader"><div class="loading-brand">Mangal View</div><div class="spinner"></div><div class="loading-text">Loading chart data...</div></div>
   <div class="signal-tooltip" id="signalTooltip"></div>
 
   <!-- Signal Analysis Panel -->
@@ -6679,6 +7768,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <label>Period <input type="number" id="bbPeriod" value="20" min="5" max="100" step="1"></label>
     <label>Std Dev <input type="number" id="bbStdDev" value="2.0" min="0.5" max="5" step="0.1"></label>
     <button class="apply-btn" id="applySettings">Apply</button>
+    <button class="apply-btn" id="restoreDefaults" style="background:#2a2e39;color:#d1d4dc;margin-top:4px">Restore Defaults</button>
   </div>
 
   <!-- Backtest Strategy Panel -->
@@ -6759,7 +7849,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 (function() {
   const container = document.getElementById('chart-container');
@@ -6778,7 +7868,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   // Indicator visibility
   let showST = false, showSAR = false, showSR = false, showEMA = false, showVWAP = false, showSignals = true;
   let showBB = false, showCPR = false;
-  let showLP = false, showFVG = false, showBOS = false, showCHoCH = false, showCVD = false;
+  let showLP = false, showFVG = false, showBOS = false, showCHoCH = false, showCVD = false, showVP = false;
 
   // Create chart
   const chart = LightweightCharts.createChart(container, {
@@ -7072,6 +8162,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
   bosMarkersSeries.applyOptions({ visible: false });
   chochMarkersSeries.applyOptions({ visible: false });
 
+  // Volume Profile price lines
+  let vpLines = [];
+  let lastVP = null;
+  function drawVP(vpData) {
+    vpLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e){} });
+    vpLines = [];
+    if (!vpData || vpData.length === 0) return;
+    vpData.forEach(vp => {
+      if (vp.volume <= 0) return;
+      const color = vp.isPOC ? 'rgba(255,138,101,0.9)' :
+                    vp.isVA  ? 'rgba(255,138,101,0.45)' : 'rgba(255,138,101,0.2)';
+      const line = candleSeries.createPriceLine({
+        price: vp.price,
+        color: color,
+        lineWidth: vp.isPOC ? 2 : 1,
+        lineStyle: vp.isPOC ? 0 : 2,
+        axisLabelVisible: vp.isPOC,
+        title: vp.isPOC ? 'POC' : '',
+      });
+      vpLines.push(line);
+    });
+  }
+
   // ---- Settings Panel (opened from Indicators dropdown) ----
   const settingsPanel = document.getElementById('settingsPanel');
   document.getElementById('btnIndSettings').addEventListener('click', function(e) {
@@ -7080,6 +8193,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     settingsPanel.classList.toggle('open');
   });
   document.getElementById('applySettings').addEventListener('click', () => {
+    settingsPanel.classList.remove('open');
+    loadData(currentTF);
+  });
+  document.getElementById('restoreDefaults').addEventListener('click', () => {
+    document.getElementById('stPeriod').value = '10';
+    document.getElementById('stMultiplier').value = '3';
+    document.getElementById('sarStart').value = '0.02';
+    document.getElementById('sarInc').value = '0.02';
+    document.getElementById('sarMax').value = '0.2';
+    document.getElementById('bbPeriod').value = '20';
+    document.getElementById('bbStdDev').value = '2.0';
     settingsPanel.classList.remove('open');
     loadData(currentTF);
   });
@@ -7173,6 +8297,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
           showCVD = on;
           cvdSeries.applyOptions({ visible: on });
           cvdSeries.priceScale().applyOptions({ visible: on });
+          break;
+        case 'VP':
+          showVP = on;
+          vpLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e){} });
+          vpLines = [];
+          if (on && lastVP) drawVP(lastVP);
           break;
         case 'Signals':
           showSignals = on;
@@ -7521,6 +8651,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fvgLines = [];
       if (showFVG) drawFVG(fvgData);
 
+      // --- Volume Profile ---
+      const vpData = json.volumeProfile || [];
+      lastVP = vpData;
+      vpLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e){} });
+      vpLines = [];
+      if (showVP) drawVP(vpData);
+
       // --- Break of Structure / Change of Character ---
       const bosChoch = json.bosChoch || {};
       const bosList = bosChoch.bos || [];
@@ -7682,7 +8819,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let totalScore = 0; let cnt = 0;
     keys.forEach(k => { if (summaries[k] && summaries[k].score != null) { totalScore += summaries[k].score; cnt++; } });
     const avgScore = cnt ? totalScore / cnt : 0;
-    const overallVerdict = avgScore >= 6 ? 'STRONG BUY' : avgScore >= 4 ? 'BUY' : avgScore >= -4 ? 'NEUTRAL' : avgScore >= -6 ? 'SELL' : 'STRONG SELL';
+    const overallVerdict = avgScore >= 5 ? 'STRONG BUY' : avgScore >= 3.5 ? 'BUY' : avgScore >= -3.5 ? 'NEUTRAL' : avgScore >= -5 ? 'SELL' : 'STRONG SELL';
     const cls = overallVerdict.includes('BUY') ? 'buy' : (overallVerdict.includes('SELL') ? 'sell' : 'neutral');
     box.className = 'verdict-box ' + cls;
     box.innerHTML = overallVerdict + '<div class="verdict-score">Composite: ' + avgScore.toFixed(2) + ' / 10</div>';
@@ -7760,6 +8897,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     SILVERBEES: { name: 'Silver ETF', exchange: 'NSE' },
     BTC: { name: 'Bitcoin', exchange: 'CRYPTO' },
     ETH: { name: 'Ethereum', exchange: 'CRYPTO' },
+    DJI: { name: 'Dow Jones', exchange: 'NYSE' },
+    NASDAQ: { name: 'NASDAQ', exchange: 'NASDAQ' },
+    SP500: { name: 'S&P 500', exchange: 'NYSE' },
+    CRUDEOIL: { name: 'Crude Oil', exchange: 'NYMEX' },
+    NATURALGAS: { name: 'Natural Gas', exchange: 'NYMEX' },
   };
   document.getElementById('symbolSelect').addEventListener('change', function() {
     currentSymbol = this.value;
@@ -8023,7 +9165,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Populate symbol dropdown
   const tpSymbol = document.getElementById('tpSymbol');
-  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH','DJI','NASDAQ','SP500'];
+  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH','DJI','NASDAQ','SP500','CRUDEOIL','NATURALGAS'];
   symbolKeys.forEach(function(k) {
     const opt = document.createElement('option');
     opt.value = k;
@@ -8444,6 +9586,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (!e.target.closest('.zoom-dropdown-wrapper')) zoomDropdown.classList.remove('open');
   });
 
+  // ---- Help Dropdown ----
+  const helpDropdown = document.getElementById('helpDropdown');
+  document.getElementById('btnHelp').addEventListener('click', function(e) {
+    e.stopPropagation();
+    helpDropdown.classList.toggle('open');
+    zoomDropdown.classList.remove('open');
+    indDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
+    algoDropdown.classList.remove('open');
+  });
+  document.addEventListener('click', function(e) {
+    if (!e.target.closest('.help-dropdown-wrapper')) helpDropdown.classList.remove('open');
+  });
+
   // ---- Zoom Controls ----
   document.getElementById('zoomHIn').addEventListener('click', () => {
     const ts = chart.timeScale();
@@ -8490,6 +9646,93 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Auto-refresh every 60 seconds (only when not in live mode, background)
   setInterval(() => { if (!liveMode) loadData(currentTF, true); }, 60000);
+
+  // ---- Theme Toggle ----
+  function applyTheme(theme) {
+    const isLight = theme === 'light';
+    document.documentElement.classList.toggle('light-theme', isLight);
+    chart.applyOptions({
+      layout: {
+        background: { type: 'solid', color: isLight ? '#ffffff' : '#131722' },
+        textColor: isLight ? '#787b86' : '#787b86',
+      },
+      grid: {
+        vertLines: { color: isLight ? '#e0e3eb' : '#1e222d' },
+        horzLines: { color: isLight ? '#e0e3eb' : '#1e222d' },
+      },
+      rightPriceScale: { borderColor: isLight ? '#e0e3eb' : '#2a2e39' },
+      timeScale: { borderColor: isLight ? '#e0e3eb' : '#2a2e39' },
+    });
+    const btnTheme = document.getElementById('btnTheme');
+    btnTheme.innerHTML = isLight ? '&#9728; Theme' : '&#127763; Theme';
+    localStorage.setItem('mangal_theme', theme);
+  }
+  // Restore saved theme
+  const savedTheme = localStorage.getItem('mangal_theme') || 'dark';
+  if (savedTheme === 'light') applyTheme('light');
+  document.getElementById('btnTheme').addEventListener('click', function() {
+    const current = document.documentElement.classList.contains('light-theme') ? 'light' : 'dark';
+    applyTheme(current === 'light' ? 'dark' : 'light');
+  });
+
+  // ---- Site Settings (admin-controlled panel visibility) ----
+  fetch('/api/site-settings')
+    .then(r => r.json())
+    .then(settings => {
+      // Settings panel sections
+      const sectionMap = {
+        'settings_backtest': 'cfgBacktestToggle',
+        'settings_datasource': 'cfgDataSourceToggle',
+        'settings_trade': 'cfgTradeToggle',
+        'settings_realtrade': 'cfgRealTradeToggle',
+      };
+      for (const [key, toggleId] of Object.entries(sectionMap)) {
+        if (settings[key] === 'off') {
+          const toggle = document.getElementById(toggleId);
+          if (toggle) {
+            const section = toggle.closest('.cfg-section');
+            if (section) section.style.display = 'none';
+          }
+        }
+      }
+      // Menu visibility: Symbols
+      if (settings.menu_symbols) {
+        try {
+          const enabled = JSON.parse(settings.menu_symbols);
+          document.querySelectorAll('#symbolSelect option').forEach(opt => {
+            if (enabled.indexOf(opt.value) < 0) opt.style.display = 'none';
+          });
+        } catch(e) {}
+      }
+      // Menu visibility: Timeframes
+      if (settings.menu_timeframes) {
+        try {
+          const enabled = JSON.parse(settings.menu_timeframes);
+          document.querySelectorAll('.period-item[data-tf]').forEach(btn => {
+            if (enabled.indexOf(btn.dataset.tf) < 0) btn.style.display = 'none';
+          });
+        } catch(e) {}
+      }
+      // Menu visibility: Indicators
+      if (settings.menu_indicators) {
+        try {
+          const enabled = JSON.parse(settings.menu_indicators);
+          document.querySelectorAll('.ind-item[data-ind]').forEach(el => {
+            if (enabled.indexOf(el.dataset.ind) < 0) el.style.display = 'none';
+          });
+        } catch(e) {}
+      }
+      // Menu visibility: Algos
+      if (settings.menu_algos) {
+        try {
+          const enabled = JSON.parse(settings.menu_algos);
+          document.querySelectorAll('.algo-item[data-algo]').forEach(btn => {
+            if (enabled.indexOf(btn.dataset.algo) < 0) btn.style.display = 'none';
+          });
+        } catch(e) {}
+      }
+    })
+    .catch(() => {});
 })();
 </script>
 </body>

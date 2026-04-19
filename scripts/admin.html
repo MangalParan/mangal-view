@@ -80,6 +80,19 @@
     .modal { padding:20px; }
     th, td { padding:7px 8px; font-size:12px; }
   }
+  /* Toggle Switch for Maintenance */
+  .site-toggle { position: relative; width: 42px; height: 22px; display: inline-block; }
+  .site-toggle input { opacity: 0; width: 0; height: 0; }
+  .site-toggle .slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: #3a3e4a; border-radius: 20px; transition: 0.2s;
+  }
+  .site-toggle .slider::before {
+    content: ''; position: absolute; height: 16px; width: 16px; left: 3px; bottom: 3px;
+    background: #787b86; border-radius: 50%; transition: 0.2s;
+  }
+  .site-toggle input:checked + .slider { background: #ff4444; }
+  .site-toggle input:checked + .slider::before { transform: translateX(20px); background: #fff; }
 </style>
 </head>
 <body>
@@ -90,6 +103,88 @@
 
 <div class="stats" id="stats">
   <div class="stat-card"><div class="num">-</div><div class="lbl">Total Users</div></div>
+</div>
+
+<!-- Site Settings Panel -->
+<div style="background:#1e222d;border-radius:8px;padding:20px;margin-bottom:20px">
+  <h2 style="color:#2962ff;font-size:16px;margin-bottom:16px">&#9881; Site Settings</h2>
+  <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center">
+    <!-- Maintenance Mode -->
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:13px;color:#d1d4dc">&#128679; Maintenance Mode</span>
+      <label class="site-toggle">
+        <input type="checkbox" id="toggleMaintenance">
+        <span class="slider"></span>
+      </label>
+      <span id="maintenanceStatus" style="font-size:11px;color:#787b86">OFF</span>
+    </div>
+    <div style="width:1px;height:28px;background:#363a45"></div>
+    <!-- Settings Visibility -->
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:13px;color:#d1d4dc">Settings Panels:</span>
+      <label style="font-size:12px;color:#d1d4dc;display:flex;align-items:center;gap:4px;cursor:pointer">
+        <input type="checkbox" id="cfgBacktest" checked style="accent-color:#2962ff"> Backtest
+      </label>
+      <label style="font-size:12px;color:#d1d4dc;display:flex;align-items:center;gap:4px;cursor:pointer">
+        <input type="checkbox" id="cfgDatasource" checked style="accent-color:#2962ff"> Data Source
+      </label>
+      <label style="font-size:12px;color:#d1d4dc;display:flex;align-items:center;gap:4px;cursor:pointer">
+        <input type="checkbox" id="cfgTrade" checked style="accent-color:#2962ff"> Trade
+      </label>
+      <label style="font-size:12px;color:#d1d4dc;display:flex;align-items:center;gap:4px;cursor:pointer">
+        <input type="checkbox" id="cfgRealtrade" checked style="accent-color:#2962ff"> Real Trade
+      </label>
+    </div>
+    <button type="button" class="btn btn-primary btn-sm" onclick="saveSettings()">Save Settings</button>
+  </div>
+</div>
+
+<!-- Menu Configuration Panel -->
+<div style="background:#1e222d;border-radius:8px;padding:20px;margin-bottom:20px">
+  <h2 style="color:#2962ff;font-size:16px;margin-bottom:16px">&#128203; Menu Configuration</h2>
+  <p style="color:#787b86;font-size:12px;margin-bottom:14px">Uncheck items to hide them from user menus. Changes apply after saving.</p>
+
+  <!-- Symbols -->
+  <div style="margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:13px;font-weight:600;color:#d1d4dc">&#128200; Symbols</span>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuSymbols',true)" style="padding:2px 8px;font-size:10px">All</button>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuSymbols',false)" style="padding:2px 8px;font-size:10px">None</button>
+    </div>
+    <div id="menuSymbols" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  </div>
+
+  <!-- Timeframes -->
+  <div style="margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:13px;font-weight:600;color:#d1d4dc">&#9201; Timeframes</span>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuTimeframes',true)" style="padding:2px 8px;font-size:10px">All</button>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuTimeframes',false)" style="padding:2px 8px;font-size:10px">None</button>
+    </div>
+    <div id="menuTimeframes" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  </div>
+
+  <!-- Indicators -->
+  <div style="margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:13px;font-weight:600;color:#d1d4dc">&#128200; Indicators</span>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuIndicators',true)" style="padding:2px 8px;font-size:10px">All</button>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuIndicators',false)" style="padding:2px 8px;font-size:10px">None</button>
+    </div>
+    <div id="menuIndicators" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  </div>
+
+  <!-- Algos -->
+  <div style="margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:13px;font-weight:600;color:#d1d4dc">&#9889; Algos</span>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuAlgos',true)" style="padding:2px 8px;font-size:10px">All</button>
+      <button class="btn btn-sm btn-outline" onclick="toggleAllMenu('menuAlgos',false)" style="padding:2px 8px;font-size:10px">None</button>
+    </div>
+    <div id="menuAlgos" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  </div>
+
+  <button type="button" class="btn btn-primary btn-sm" onclick="saveMenuConfig()">Save Menu Config</button>
 </div>
 
 <div class="toolbar">
@@ -428,9 +523,157 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
+// --- Site Settings ---
+function loadSettings() {
+  fetch('/admin/api/settings')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d.ok) return;
+      var s = d.settings || {};
+      document.getElementById('toggleMaintenance').checked = (s.maintenance_mode === 'on');
+      document.getElementById('maintenanceStatus').textContent = s.maintenance_mode === 'on' ? 'ON' : 'OFF';
+      document.getElementById('maintenanceStatus').style.color = s.maintenance_mode === 'on' ? '#ff4444' : '#787b86';
+      document.getElementById('cfgBacktest').checked = (s.settings_backtest !== 'off');
+      document.getElementById('cfgDatasource').checked = (s.settings_datasource !== 'off');
+      document.getElementById('cfgTrade').checked = (s.settings_trade !== 'off');
+      document.getElementById('cfgRealtrade').checked = (s.settings_realtrade !== 'off');
+    })
+    .catch(function() {});
+}
+
+document.getElementById('toggleMaintenance').addEventListener('change', function() {
+  var isOn = this.checked;
+  document.getElementById('maintenanceStatus').textContent = isOn ? 'ON' : 'OFF';
+  document.getElementById('maintenanceStatus').style.color = isOn ? '#ff4444' : '#787b86';
+  fetch('/admin/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ maintenance_mode: isOn ? 'on' : 'off' })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.ok) showToast('Maintenance mode ' + (isOn ? 'enabled' : 'disabled'), isOn ? 'error' : 'success');
+  })
+  .catch(function(err) { showToast('Error: ' + err.message, 'error'); });
+});
+
+function saveSettings() {
+  var body = {
+    settings_backtest: document.getElementById('cfgBacktest').checked ? 'on' : 'off',
+    settings_datasource: document.getElementById('cfgDatasource').checked ? 'on' : 'off',
+    settings_trade: document.getElementById('cfgTrade').checked ? 'on' : 'off',
+    settings_realtrade: document.getElementById('cfgRealtrade').checked ? 'on' : 'off'
+  };
+  fetch('/admin/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.ok) showToast('Settings saved successfully', 'success');
+    else showToast('Failed to save settings', 'error');
+  })
+  .catch(function(err) { showToast('Error: ' + err.message, 'error'); });
+}
+
 // --- Init ---
 document.getElementById('searchBox').value = '';
 loadUsers();
+loadSettings();
+
+// --- Menu Configuration ---
+var ALL_SYMBOLS = [
+  {key:'NIFTY50',label:'NIFTY 50'},{key:'BANKNIFTY',label:'BANK NIFTY'},{key:'SENSEX',label:'SENSEX'},
+  {key:'GOLD',label:'Gold Futures'},{key:'SILVER',label:'Silver Futures'},{key:'XAUUSD',label:'XAU/USD'},
+  {key:'XAGUSD',label:'XAG/USD'},{key:'GOLDTEN',label:'Gold ETF (10g)'},{key:'SILVERBEES',label:'Silver ETF'},
+  {key:'BTC',label:'Bitcoin'},{key:'ETH',label:'Ethereum'},{key:'DJI',label:'Dow Jones'},
+  {key:'NASDAQ',label:'NASDAQ'},{key:'SP500',label:'S&P 500'},{key:'CRUDEOIL',label:'Crude Oil'},{key:'NATURALGAS',label:'Natural Gas'}
+];
+var ALL_TIMEFRAMES = [
+  {key:'1m',label:'1m'},{key:'2m',label:'2m'},{key:'3m',label:'3m'},{key:'5m',label:'5m'},
+  {key:'10m',label:'10m'},{key:'15m',label:'15m'},{key:'30m',label:'30m'},{key:'1h',label:'1H'},
+  {key:'2h',label:'2H'},{key:'4h',label:'4H'},{key:'1d',label:'1D'},{key:'1w',label:'1W'},{key:'1mo',label:'1M'}
+];
+var ALL_INDICATORS = [
+  {key:'ST',label:'SuperTrend'},{key:'SAR',label:'PSAR'},{key:'SR',label:'S/R Levels'},
+  {key:'EMA',label:'EMA 9/21'},{key:'VWAP',label:'VWAP'},{key:'BB',label:'Bollinger Bands'},
+  {key:'CPR',label:'CPR'},{key:'LP',label:'Liquidity Pools'},{key:'FVG',label:'Fair Value Gap'},
+  {key:'BOS',label:'BOS'},{key:'CHoCH',label:'CHoCH'},{key:'CVD',label:'CVD'},
+  {key:'VP',label:'Volume Profile'},{key:'Signals',label:'Signals'}
+];
+var ALL_ALGOS = [
+  {key:'trend',label:'Trend'},{key:'mstreet',label:'MStreet'},{key:'mfactor',label:'MFactor'},
+  {key:'sniper',label:'Sniper'},{key:'orderflow',label:'OrderFlow'},{key:'priceaction',label:'PriceAction'},
+  {key:'breakout',label:'Breakout'},{key:'momentum',label:'Momentum'},{key:'scalping',label:'Scalping'},
+  {key:'smartmoney',label:'SmartMoney'},{key:'quant',label:'Quant'},{key:'hybrid',label:'Hybrid'},
+  {key:'mpredict',label:'MPredict'}
+];
+
+function renderMenuCheckboxes(containerId, allItems, enabledKeys) {
+  var container = document.getElementById(containerId);
+  container.innerHTML = '';
+  for (var i = 0; i < allItems.length; i++) {
+    var item = allItems[i];
+    var checked = enabledKeys.indexOf(item.key) >= 0 ? 'checked' : '';
+    container.innerHTML += '<label style="font-size:12px;color:#d1d4dc;display:flex;align-items:center;gap:4px;cursor:pointer;background:#131722;padding:4px 10px;border-radius:4px;border:1px solid #363a45">' +
+      '<input type="checkbox" data-key="' + item.key + '" ' + checked + ' style="accent-color:#2962ff"> ' + escapeHtml(item.label) + '</label>';
+  }
+}
+
+function getMenuChecked(containerId) {
+  var inputs = document.getElementById(containerId).querySelectorAll('input[type="checkbox"]');
+  var result = [];
+  for (var i = 0; i < inputs.length; i++) {
+    if (inputs[i].checked) result.push(inputs[i].dataset.key);
+  }
+  return result;
+}
+
+function toggleAllMenu(containerId, state) {
+  var inputs = document.getElementById(containerId).querySelectorAll('input[type="checkbox"]');
+  for (var i = 0; i < inputs.length; i++) inputs[i].checked = state;
+}
+
+function loadMenuConfig() {
+  fetch('/admin/api/settings')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d.ok) return;
+      var s = d.settings || {};
+      var symbols = s.menu_symbols ? JSON.parse(s.menu_symbols) : ALL_SYMBOLS.map(function(x){return x.key;});
+      var timeframes = s.menu_timeframes ? JSON.parse(s.menu_timeframes) : ALL_TIMEFRAMES.map(function(x){return x.key;});
+      var indicators = s.menu_indicators ? JSON.parse(s.menu_indicators) : ALL_INDICATORS.map(function(x){return x.key;});
+      var algos = s.menu_algos ? JSON.parse(s.menu_algos) : ALL_ALGOS.map(function(x){return x.key;});
+      renderMenuCheckboxes('menuSymbols', ALL_SYMBOLS, symbols);
+      renderMenuCheckboxes('menuTimeframes', ALL_TIMEFRAMES, timeframes);
+      renderMenuCheckboxes('menuIndicators', ALL_INDICATORS, indicators);
+      renderMenuCheckboxes('menuAlgos', ALL_ALGOS, algos);
+    })
+    .catch(function() {});
+}
+
+function saveMenuConfig() {
+  var body = {
+    menu_symbols: getMenuChecked('menuSymbols'),
+    menu_timeframes: getMenuChecked('menuTimeframes'),
+    menu_indicators: getMenuChecked('menuIndicators'),
+    menu_algos: getMenuChecked('menuAlgos')
+  };
+  fetch('/admin/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.ok) showToast('Menu configuration saved', 'success');
+    else showToast('Failed to save menu config', 'error');
+  })
+  .catch(function(err) { showToast('Error: ' + err.message, 'error'); });
+}
+
+loadMenuConfig();
 </script>
 </body>
 </html>

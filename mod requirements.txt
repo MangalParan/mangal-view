@@ -15,3 +15,16 @@ Add settings and add Backtest, Trade, Real trade -done
 Add 10 mins 
 Add search box based on company name
 go daddy to host this onrender.com website
+
+Add crude, natural gas in symbols-done
+search ticker should able to find Symbol from the company name-done
+Add 2 mins, 10 mins-done
+volume profile / order flow as indicator-done
+indicator settings should be restored to default-done
+Explain each Algos and threshhold
+modify buy if threshold >3.5, strong buy >5, sell less than -3.5, sell < -5-done
+settings panel can be controlled from admin page-done
+theme can be white or black to be added-done
+Add toggle button in admin page , so entire site can be under maintenance-done
+Trendline , patterns, fibonacci , short long positions
+ 
