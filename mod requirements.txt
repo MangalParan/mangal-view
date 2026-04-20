@@ -28,3 +28,11 @@ theme can be white or black to be added-done
 Add toggle button in admin page , so entire site can be under maintenance-done
 Trendline , patterns, fibonacci , short long positions
  
+1. in tooltip for signal, provide signal name. -done
+ 2. in Admin panel, when site maintenance mode is switched on, then entire site should display "Site is under maintenance"
+ 3. IN volume profile indicator, mark POC, VAH, VAL and other markings -done
+ 4. remove mpredict as default algo.- done
+ 5. Trend and mstreet should be default algo -done
+ 6.Add stratastical arb strategy in Algo.
+ 7. Add Instituition Algo as list item and implement it.
+ 8. Update help - Algos, indicators and user manual based on current threshold implementation 

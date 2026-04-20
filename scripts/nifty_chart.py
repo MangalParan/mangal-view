@@ -94,10 +94,22 @@ def init_db():
         "menu_symbols": json.dumps(["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","CRUDEOIL","NATURALGAS"]),
         "menu_timeframes": json.dumps(["1m","2m","3m","5m","10m","15m","30m","1h","2h","4h","1d","1w","1mo"]),
         "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
-        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","mpredict"]),
+        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict"]),
     }
     for k, v in defaults.items():
         db.execute("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)", (k, v))
+    # Migrate: ensure new algos are in menu_algos for existing DBs
+    _all_algos = ["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict"]
+    _row = db.execute("SELECT value FROM site_settings WHERE key = 'menu_algos'").fetchone()
+    if _row:
+        try:
+            _existing = json.loads(_row[0])
+            _missing = [a for a in _all_algos if a not in _existing]
+            if _missing:
+                _updated = _existing + _missing
+                db.execute("UPDATE site_settings SET value = ? WHERE key = 'menu_algos'", (json.dumps(_updated),))
+        except Exception:
+            pass
     db.commit()
     db.close()
 
@@ -161,6 +173,28 @@ def login_required(f):
 
 
 init_db()
+
+
+@app.before_request
+def check_maintenance_global():
+    """Block entire site when maintenance mode is on, except admin panel access."""
+    # Allow admin panel access (with key) and admin API routes
+    if request.path.startswith("/admin"):
+        return None
+    # Allow static assets (if any)
+    if request.path.startswith("/static"):
+        return None
+    # Check maintenance mode
+    try:
+        with sqlite3.connect(DB_PATH) as _db:
+            _row = _db.execute("SELECT value FROM site_settings WHERE key = 'maintenance_mode'").fetchone()
+            if _row and _row[0] == "on":
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "Site is under maintenance"}), 503
+                return Response(MAINTENANCE_HTML, status=503, content_type="text/html")
+    except Exception:
+        pass
+    return None
 
 
 LOGIN_PAGE = """<!DOCTYPE html>
@@ -1880,6 +1914,9 @@ def compute_volume_profile(candles, num_bins=24):
         else:
             break
 
+    va_high_idx = max(va_set)
+    va_low_idx = min(va_set)
+
     result = []
     for i in range(num_bins):
         price = round(all_low + (i + 0.5) * bin_size, 2)
@@ -1889,6 +1926,8 @@ def compute_volume_profile(candles, num_bins=24):
             "pct": round(bins[i] / max_vol * 100, 1),
             "isPOC": i == poc_idx,
             "isVA": i in va_set,
+            "isVAH": i == va_high_idx,
+            "isVAL": i == va_low_idx,
         })
     return result
 
@@ -5144,6 +5183,374 @@ def generate_hybrid_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, e
     return signals, summary
 
 
+def generate_statarb_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Statistical Arbitrage strategy — pairs-style mean-reversion using z-score,
+    Bollinger %B, RSI divergence, and correlation spread analysis.
+    Thresholds: BUY >= 3.5 | STRONG BUY >= 5.0 | SELL <= -3.5 | STRONG SELL <= -5.0
+    """
+    n = len(candles)
+    if n < 40:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]] = b.get("middle", (b["upper"] + b["lower"]) / 2)
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    for i in range(lookback + 10, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+
+        score = 0.0
+        reasons = []
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+
+        # 1. Z-Score mean reversion (weight 2.5)
+        seg = closes[i - lookback:i + 1]
+        mu = sum(seg) / len(seg)
+        std = (sum((x - mu) ** 2 for x in seg) / len(seg)) ** 0.5
+        z = (close - mu) / std if std > 0 else 0
+        if z < -2.0:
+            score += 2.5
+            reasons.append(f"Z-Score: Deep Oversold (z={z:.2f})")
+        elif z < -1.2:
+            score += 1.5
+            reasons.append(f"Z-Score: Oversold (z={z:.2f})")
+        elif z > 2.0:
+            score -= 2.5
+            reasons.append(f"Z-Score: Deep Overbought (z={z:.2f})")
+        elif z > 1.2:
+            score -= 1.5
+            reasons.append(f"Z-Score: Overbought (z={z:.2f})")
+
+        # 2. Bollinger %B spread (weight 2.0)
+        bb_u = bb_upper_map.get(t)
+        bb_l = bb_lower_map.get(t)
+        if bb_u and bb_l and bb_u > bb_l:
+            pctB = (close - bb_l) / (bb_u - bb_l)
+            if pctB < 0.05:
+                score += 2.0
+                reasons.append(f"BB %B: Below lower band ({pctB:.2f})")
+            elif pctB < 0.2:
+                score += 1.0
+                reasons.append(f"BB %B: Near lower band ({pctB:.2f})")
+            elif pctB > 0.95:
+                score -= 2.0
+                reasons.append(f"BB %B: Above upper band ({pctB:.2f})")
+            elif pctB > 0.8:
+                score -= 1.0
+                reasons.append(f"BB %B: Near upper band ({pctB:.2f})")
+
+        # 3. Spread velocity — rate of deviation change (weight 1.5)
+        if i >= 5:
+            z_prev = 0
+            seg_p = closes[i - lookback - 5:i - 5 + 1]
+            if len(seg_p) >= lookback:
+                mu_p = sum(seg_p) / len(seg_p)
+                std_p = (sum((x - mu_p) ** 2 for x in seg_p) / len(seg_p)) ** 0.5
+                z_prev = (closes[i - 5] - mu_p) / std_p if std_p > 0 else 0
+            dz = z - z_prev
+            if dz < -1.0:
+                score += 1.5
+                reasons.append(f"Spread Velocity: Accelerating down (dz={dz:.2f})")
+            elif dz > 1.0:
+                score -= 1.5
+                reasons.append(f"Spread Velocity: Accelerating up (dz={dz:.2f})")
+
+        # 4. RSI divergence from z-score (weight 1.5)
+        rsi_val = rsi_map.get(t, 50)
+        if z < -1.0 and rsi_val > 40:
+            score += 1.5
+            reasons.append(f"RSI Divergence: Price low but RSI stable ({rsi_val:.0f})")
+        elif z > 1.0 and rsi_val < 60:
+            score -= 1.5
+            reasons.append(f"RSI Divergence: Price high but RSI weak ({rsi_val:.0f})")
+
+        # 5. EMA spread z-score (weight 1.5)
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        if e9 and e21 and e21 > 0:
+            ema_spread = (e9 - e21) / e21 * 100
+            ema_spreads = []
+            for j in range(max(0, i - lookback), i):
+                _e9 = ema9_map.get(candles[j]["time"])
+                _e21 = ema21_map.get(candles[j]["time"])
+                if _e9 and _e21 and _e21 > 0:
+                    ema_spreads.append((_e9 - _e21) / _e21 * 100)
+            if len(ema_spreads) >= 5:
+                es_mu = sum(ema_spreads) / len(ema_spreads)
+                es_std = (sum((x - es_mu) ** 2 for x in ema_spreads) / len(ema_spreads)) ** 0.5
+                es_z = (ema_spread - es_mu) / es_std if es_std > 0 else 0
+                if es_z < -1.5:
+                    score += 1.5
+                    reasons.append(f"EMA Spread: Compressed (z={es_z:.2f})")
+                elif es_z > 1.5:
+                    score -= 1.5
+                    reasons.append(f"EMA Spread: Extended (z={es_z:.2f})")
+
+        # 6. Volume confirmation (weight 1.0)
+        if vol_avg > 0 and vol > vol_avg * 1.5:
+            if close < opn:
+                score += 1.0
+                reasons.append(f"Volume: Capitulation selling ({vol / vol_avg:.1f}x)")
+            elif close > opn:
+                score -= 1.0
+                reasons.append(f"Volume: Euphoric buying ({vol / vol_avg:.1f}x)")
+
+        # 7. MACD histogram reversal (weight 1.5)
+        mc = macd_map.get(t)
+        mc_p = macd_map.get(candles[i - 1]["time"]) if i > 0 else None
+        if mc and mc_p:
+            if mc["histogram"] > mc_p["histogram"] and mc["histogram"] < 0:
+                score += 1.5
+                reasons.append("MACD: Histogram reversing up from negative")
+            elif mc["histogram"] < mc_p["histogram"] and mc["histogram"] > 0:
+                score -= 1.5
+                reasons.append("MACD: Histogram reversing down from positive")
+
+        score = round(score, 2)
+        if score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score >= 3.5 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+        elif score <= -3.5 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+
+    # Summary
+    li = n - 1
+    tl = candles[li]["time"]
+    seg = closes[li - lookback:li + 1]
+    mu = sum(seg) / len(seg)
+    std = (sum((x - mu) ** 2 for x in seg) / len(seg)) ** 0.5
+    z_l = (closes[-1] - mu) / std if std > 0 else 0
+    rsi_l = rsi_map.get(tl, 50)
+    mc_l = macd_map.get(tl)
+    vw_l = vwap_map.get(tl)
+    sr_list = [
+        ("Z-Score", f"{z_l:.2f}", 2.5 if abs(z_l) > 1.2 else 0),
+        ("RSI", f"{rsi_l:.0f}", 1.5 if rsi_l < 35 or rsi_l > 65 else 0),
+        ("MACD Hist", "Pos" if mc_l and mc_l["histogram"] > 0 else "Neg", 1.5),
+    ]
+    ss = sum(r[2] for r in sr_list) if z_l < -1.2 else -sum(r[2] for r in sr_list) if z_l > 1.2 else 0
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
+def generate_institution_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Institutional Algo — detects institutional accumulation/distribution patterns
+    using volume analysis, order block detection, VWAP anchoring, and dark pool footprints.
+    Thresholds: BUY >= 3.5 | STRONG BUY >= 5.0 | SELL <= -3.5 | STRONG SELL <= -5.0
+    """
+    n = len(candles)
+    if n < 40:
+        return [], {}
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    opens = [c["open"] for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map = {r["time"]: r["value"] for r in rsi_data}
+    macd_map = {m["time"]: m for m in macd_data}
+    vwap_map = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map = {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+
+    lookback = 20
+    signals = []
+    last_signal_type = None
+
+    # Pre-compute OBV
+    obv = [0.0] * n
+    for j in range(1, n):
+        if closes[j] > closes[j - 1]:
+            obv[j] = obv[j - 1] + volumes[j]
+        elif closes[j] < closes[j - 1]:
+            obv[j] = obv[j - 1] - volumes[j]
+        else:
+            obv[j] = obv[j - 1]
+
+    for i in range(lookback + 5, n):
+        t = candles[i]["time"]
+        close = closes[i]
+        high = highs[i]
+        low = lows[i]
+        opn = opens[i]
+        vol = volumes[i]
+
+        score = 0.0
+        reasons = []
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+
+        # 1. Institutional volume detection (weight 2.5)
+        # Large volume + small body = absorption (institutions accumulating/distributing)
+        body = abs(close - opn)
+        full_range = high - low
+        if full_range > 0 and vol_avg > 0:
+            body_ratio = body / full_range
+            vol_ratio = vol / vol_avg
+            if vol_ratio > 2.0 and body_ratio < 0.3:
+                # Absorption candle — direction from wick analysis
+                lower_wick = min(close, opn) - low
+                upper_wick = high - max(close, opn)
+                if lower_wick > upper_wick:
+                    score += 2.5
+                    reasons.append(f"Institutional Absorption: Buy ({vol_ratio:.1f}x vol, {body_ratio:.1%} body)")
+                else:
+                    score -= 2.5
+                    reasons.append(f"Institutional Distribution: Sell ({vol_ratio:.1f}x vol, {body_ratio:.1%} body)")
+            elif vol_ratio > 2.5 and close > opn:
+                score += 1.5
+                reasons.append(f"Aggressive Institutional Buying ({vol_ratio:.1f}x)")
+            elif vol_ratio > 2.5 and close < opn:
+                score -= 1.5
+                reasons.append(f"Aggressive Institutional Selling ({vol_ratio:.1f}x)")
+
+        # 2. Order Block detection (weight 2.0)
+        # Last opposite candle before impulsive move
+        if i >= 3:
+            move = closes[i] - closes[i - 3]
+            atr_seg = [highs[j] - lows[j] for j in range(i - lookback, i)]
+            avg_atr = sum(atr_seg) / len(atr_seg) if atr_seg else 1
+            if avg_atr > 0 and abs(move) > avg_atr * 2:
+                # Strong impulsive move — check for order block
+                if move > 0 and closes[i - 3] < opens[i - 3]:
+                    score += 2.0
+                    reasons.append("Order Block: Bullish (bearish candle before rally)")
+                elif move < 0 and closes[i - 3] > opens[i - 3]:
+                    score -= 2.0
+                    reasons.append("Order Block: Bearish (bullish candle before drop)")
+
+        # 3. VWAP institutional anchoring (weight 2.0)
+        vw = vwap_map.get(t)
+        if vw and vw > 0:
+            vwap_dev = (close - vw) / vw * 100
+            if vwap_dev < -0.5 and vol > vol_avg * 1.5 and close > opn:
+                score += 2.0
+                reasons.append(f"VWAP: Institutional buy below VWAP ({vwap_dev:.2f}%)")
+            elif vwap_dev > 0.5 and vol > vol_avg * 1.5 and close < opn:
+                score -= 2.0
+                reasons.append(f"VWAP: Institutional sell above VWAP ({vwap_dev:.2f}%)")
+
+        # 4. OBV divergence (weight 1.5)
+        if i >= 10:
+            price_change = closes[i] - closes[i - 10]
+            obv_change = obv[i] - obv[i - 10]
+            if price_change < 0 and obv_change > 0:
+                score += 1.5
+                reasons.append("OBV Divergence: Hidden accumulation")
+            elif price_change > 0 and obv_change < 0:
+                score -= 1.5
+                reasons.append("OBV Divergence: Hidden distribution")
+
+        # 5. Dark pool footprint — high volume at same price level (weight 1.5)
+        if i >= 5:
+            price_cluster = 0
+            for j in range(i - 5, i):
+                if abs(closes[j] - close) / close < 0.002 and volumes[j] > vol_avg * 1.3:
+                    price_cluster += 1
+            if price_cluster >= 3:
+                if close > opens[i]:
+                    score += 1.5
+                    reasons.append(f"Dark Pool: Repeated institutional interest at {close:.2f}")
+                else:
+                    score -= 1.5
+                    reasons.append(f"Dark Pool: Distribution at {close:.2f}")
+
+        # 6. EMA trend alignment filter (weight 1.0)
+        e9 = ema9_map.get(t)
+        e21 = ema21_map.get(t)
+        if e9 and e21:
+            if close > e9 > e21:
+                score += 1.0
+                reasons.append("Trend: Bullish alignment")
+            elif close < e9 < e21:
+                score -= 1.0
+                reasons.append("Trend: Bearish alignment")
+
+        # 7. RSI + Volume confirmation (weight 1.5)
+        rsi_val = rsi_map.get(t, 50)
+        if rsi_val < 30 and vol > vol_avg * 1.5:
+            score += 1.5
+            reasons.append(f"RSI: Oversold with volume ({rsi_val:.0f})")
+        elif rsi_val > 70 and vol > vol_avg * 1.5:
+            score -= 1.5
+            reasons.append(f"RSI: Overbought with volume ({rsi_val:.0f})")
+
+        # 8. S/R level reaction with volume (weight 1.0)
+        for lvl in sr:
+            if abs(close - lvl["price"]) / close < 0.003:
+                if lvl["type"] == "support" and close > opn and vol > vol_avg:
+                    score += 1.0
+                    reasons.append(f"S/R: Institutional support hold at {lvl['price']:.2f}")
+                elif lvl["type"] == "resistance" and close < opn and vol > vol_avg:
+                    score -= 1.0
+                    reasons.append(f"S/R: Institutional rejection at {lvl['price']:.2f}")
+                break
+
+        score = round(score, 2)
+        if score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score >= 3.5 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+        elif score <= -3.5 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+
+    # Summary
+    li = n - 1
+    tl = candles[li]["time"]
+    rsi_l = rsi_map.get(tl, 50)
+    mc_l = macd_map.get(tl)
+    vw_l = vwap_map.get(tl)
+    vol_ratio_l = volumes[-1] / (sum(volumes[-lookback:]) / lookback) if sum(volumes[-lookback:]) > 0 else 1
+    obv_trend = "Rising" if obv[-1] > obv[-10] else "Falling"
+    sr_list = [
+        ("Volume Ratio", f"{vol_ratio_l:.1f}x", 2.5 if vol_ratio_l > 2 else 0),
+        ("OBV", obv_trend, 1.5 if obv_trend == "Rising" else -1.5),
+        ("RSI", f"{rsi_l:.0f}", 1.5 if rsi_l < 35 else (-1.5 if rsi_l > 65 else 0)),
+    ]
+    ss = sum(r[2] for r in sr_list)
+    verdict = "STRONG BUY" if ss >= 5 else ("BUY" if ss >= 3.5 else ("STRONG SELL" if ss <= -5 else ("SELL" if ss <= -3.5 else "NEUTRAL")))
+    summary = {"score": round(ss, 2), "verdict": verdict, "indicators": [{"name": r[0], "status": r[1], "weight": r[2]} for r in sr_list], "rsi": rsi_l, "macd": mc_l, "vwap": vw_l}
+    return signals, summary
+
+
 INTERVAL_SECONDS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "1h": 3600, "1d": 86400, "1w": 604800, "1mo": 2592000,
@@ -5888,7 +6295,7 @@ HELP_ALGOS_PAGE = r"""<!DOCTYPE html>
 </div>
 <div class="help-body">
 
-<p>Mangal View provides <strong>12 algorithmic signal engines</strong> plus 1 ML prediction model. Each algorithm uses a weighted scoring system — multiple technical indicators contribute directional scores that are summed into a final composite score. When the score exceeds the threshold, a BUY or SELL signal is generated.</p>
+<p>Mangal View provides <strong>14 algorithmic signal engines</strong> plus 1 ML prediction model. Each algorithm uses a weighted scoring system — multiple technical indicators contribute directional scores that are summed into a final composite score. When the score exceeds the threshold, a BUY or SELL signal is generated.</p>
 
 <h2>Signal Scoring System</h2>
 <div class="card">
@@ -6117,7 +6524,48 @@ HELP_ALGOS_PAGE = r"""<!DOCTYPE html>
 </table>
 </div>
 
-<h2>13. MPredict (ML Model)</h2>
+<h2>13. StatArb (Statistical Arbitrage)</h2>
+<div class="card">
+<p><strong>Style:</strong> Statistical mean-reversion using spread analysis and z-score deviation<br>
+<strong>Thresholds:</strong> BUY &ge; 3.5 | STRONG BUY &ge; 5.0 | SELL &le; -3.5 | STRONG SELL &le; -5.0<br>
+<strong>Best for:</strong> Mean-reversion in range-bound markets, statistical edge trading<br>
+<strong>Requires:</strong> Minimum 40 candles</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Z-Score (20-bar)</td><td><span class="tag tag-weight">2.5</span></td><td>Deep oversold z &lt; -2.0 or overbought z &gt; 2.0 for max weight</td></tr>
+<tr><td>Bollinger %B</td><td><span class="tag tag-weight">2.0</span></td><td>Position within BB bands (%B &lt; 0.05 or &gt; 0.95 for extremes)</td></tr>
+<tr><td>Spread Velocity</td><td><span class="tag tag-weight">1.5</span></td><td>Rate of z-score change over 5 bars — accelerating deviation</td></tr>
+<tr><td>RSI Divergence</td><td><span class="tag tag-weight">1.5</span></td><td>Price at extreme z-score but RSI stable = reversal signal</td></tr>
+<tr><td>EMA Spread Z-Score</td><td><span class="tag tag-weight">1.5</span></td><td>EMA9-EMA21 spread deviation from its own mean</td></tr>
+<tr><td>MACD Histogram Reversal</td><td><span class="tag tag-weight">1.5</span></td><td>Histogram reversing direction from extreme = momentum shift</td></tr>
+<tr><td>Volume Confirmation</td><td><span class="tag tag-weight">1.0</span></td><td>Capitulation selling or euphoric buying at extremes</td></tr>
+</table>
+<p><strong>Max possible score:</strong> &plusmn;12.0</p>
+</div>
+
+<h2>14. Institution (Institutional Algo)</h2>
+<div class="card">
+<p><strong>Style:</strong> Institutional accumulation/distribution detection using volume footprint analysis<br>
+<strong>Thresholds:</strong> BUY &ge; 3.5 | STRONG BUY &ge; 5.0 | SELL &le; -3.5 | STRONG SELL &le; -5.0<br>
+<strong>Best for:</strong> Following institutional money flow, detecting smart money activity<br>
+<strong>Requires:</strong> Minimum 40 candles</p>
+<h4>Indicators &amp; Weights</h4>
+<table>
+<tr><th>Indicator</th><th>Weight</th><th>Logic</th></tr>
+<tr><td>Institutional Volume</td><td><span class="tag tag-weight">2.5</span></td><td>Absorption candles (high vol + small body) = institutional accumulation/distribution</td></tr>
+<tr><td>Order Block Detection</td><td><span class="tag tag-weight">2.0</span></td><td>Last opposite candle before impulsive move (3-bar lookback)</td></tr>
+<tr><td>VWAP Institutional Anchor</td><td><span class="tag tag-weight">2.0</span></td><td>Institutional buying below VWAP / selling above VWAP with volume</td></tr>
+<tr><td>OBV Divergence</td><td><span class="tag tag-weight">1.5</span></td><td>Price vs OBV divergence = hidden accumulation or distribution</td></tr>
+<tr><td>Dark Pool Footprint</td><td><span class="tag tag-weight">1.5</span></td><td>Repeated high-volume activity at same price level (5-bar cluster)</td></tr>
+<tr><td>RSI + Volume</td><td><span class="tag tag-weight">1.5</span></td><td>RSI extreme zones confirmed by institutional volume</td></tr>
+<tr><td>EMA Trend Alignment</td><td><span class="tag tag-weight">1.0</span></td><td>Trend direction confirmation filter</td></tr>
+<tr><td>S/R Level Reaction</td><td><span class="tag tag-weight">1.0</span></td><td>Institutional support holds or resistance rejections with volume</td></tr>
+</table>
+<p><strong>Max possible score:</strong> &plusmn;13.5</p>
+</div>
+
+<h2>15. MPredict (ML Model)</h2>
 <div class="card">
 <p><strong>Style:</strong> Machine Learning prediction (not a signal engine)<br>
 <strong>Model:</strong> GradientBoostingRegressor (sklearn)<br>
@@ -6138,12 +6586,14 @@ HELP_ALGOS_PAGE = r"""<!DOCTYPE html>
 <table>
 <tr><th>Market Condition</th><th>Recommended Algos</th></tr>
 <tr><td>Strong Trending</td><td>Trend, Momentum, Breakout</td></tr>
-<tr><td>Range-Bound / Sideways</td><td>MStreet, Scalping, Quant</td></tr>
+<tr><td>Range-Bound / Sideways</td><td>MStreet, Scalping, Quant, StatArb</td></tr>
 <tr><td>High Volatility</td><td>Sniper, SmartMoney</td></tr>
-<tr><td>Volume-Driven</td><td>OrderFlow, SmartMoney</td></tr>
+<tr><td>Volume-Driven</td><td>OrderFlow, SmartMoney, Institution</td></tr>
 <tr><td>Clean Charts</td><td>PriceAction</td></tr>
 <tr><td>Maximum Accuracy</td><td>MFactor, Hybrid</td></tr>
 <tr><td>Quick Scalps</td><td>Scalping</td></tr>
+<tr><td>Mean Reversion</td><td>StatArb, MStreet, Quant</td></tr>
+<tr><td>Institutional Flow</td><td>Institution, OrderFlow, SmartMoney</td></tr>
 </table>
 <p><strong>Tip:</strong> You can enable multiple algos simultaneously. Signals are deduplicated by time — the signal with the highest absolute score is kept.</p>
 </div>
@@ -6353,15 +6803,19 @@ HELP_INDICATORS_PAGE = r"""<!DOCTYPE html>
 <h4>How It Works</h4>
 <ul>
 <li>Distributes total volume across 24 price bins covering the visible price range</li>
-<li><strong>POC (Point of Control)</strong> = Price level with the highest traded volume (solid orange line)</li>
+<li><strong>POC (Point of Control)</strong> = Price level with the highest traded volume (solid orange line, labeled)</li>
+<li><strong>VAH (Value Area High)</strong> = Upper boundary of the value area (solid green line, labeled)</li>
+<li><strong>VAL (Value Area Low)</strong> = Lower boundary of the value area (solid red line, labeled)</li>
 <li><strong>Value Area</strong> = Range of prices containing 70% of total volume (semi-transparent orange)</li>
 </ul>
 <h4>Usage</h4>
 <ul>
 <li>POC acts as a magnet — price tends to spend time around the POC</li>
+<li><strong>VAH</strong> acts as resistance — price breaking above VAH often leads to upside continuation</li>
+<li><strong>VAL</strong> acts as support — price breaking below VAL often leads to downside continuation</li>
 <li><strong>High Volume Nodes</strong> = Support/resistance zones (price consolidation areas)</li>
 <li><strong>Low Volume Nodes</strong> = Price moves quickly through these levels</li>
-<li>Breakout from Value Area often leads to trending moves</li>
+<li>Breakout from Value Area (above VAH or below VAL) often leads to trending moves</li>
 </ul>
 </div>
 
@@ -6412,7 +6866,7 @@ HELP_MANUAL_PAGE = r"""<!DOCTYPE html>
 <ul>
 <li>Interactive candlestick charts with 13 timeframes</li>
 <li>14 technical indicators (trend, SMC, volume, statistical)</li>
-<li>12 algorithmic signal engines + 1 ML prediction model</li>
+<li>14 algorithmic signal engines + 1 ML prediction model</li>
 <li>Strategy backtesting with comprehensive performance metrics</li>
 <li>Paper trading simulator</li>
 <li>Real trading integration (Delta Exchange)</li>
@@ -6497,7 +6951,7 @@ HELP_MANUAL_PAGE = r"""<!DOCTYPE html>
 <h2>Algorithms (Algos)</h2>
 <div class="card">
 <p>Click the <strong>Algo</strong> dropdown to select one or more signal algorithms. Multi-select is supported — click multiple algos to combine them.</p>
-<p>Available: Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, MPredict</p>
+<p>Available: Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, StatArb, Institution, MPredict</p>
 <p>When multiple algos are selected, signals are combined and deduplicated — the signal with the highest absolute score is kept for each time bar.</p>
 <p>See <a href="/help/algos">Algo Documentation</a> for detailed explanations of each algorithm.</p>
 </div>
@@ -6620,7 +7074,7 @@ HELP_MANUAL_PAGE = r"""<!DOCTYPE html>
 <h2>Tips &amp; Best Practices</h2>
 <div class="card">
 <ol>
-<li><strong>Start with defaults:</strong> MStreet + MPredict on 5m TradingView gives a good starting point</li>
+<li><strong>Start with defaults:</strong> Trend + MStreet on 5m TradingView gives a good starting point</li>
 <li><strong>Multi-algo:</strong> Enable 2-3 complementary algos for stronger confirmation</li>
 <li><strong>Backtest first:</strong> Always backtest an algorithm on your target symbol before trading</li>
 <li><strong>Match algo to market:</strong> Use Trend/Momentum in trending markets, MStreet/Scalping in ranges</li>
@@ -6802,11 +7256,21 @@ def api_candles():
             sigs, summ = generate_hybrid_signals(
                 candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
             )
+        elif algo == "statarb":
+            sigs, summ = generate_statarb_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "institution":
+            sigs, summ = generate_institution_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
         else:  # trend (default)
             sigs, summ = generate_signals(
                 candles, supertrend, psar, rsi_data, macd_data,
                 vwap_data, ema9, ema21, patterns, sr
             )
+        for _sig in sigs:
+            _sig["algo"] = algo
         all_signals.extend(sigs)
         summaries[algo] = summ
 
@@ -7547,7 +8011,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="algo-dropdown-wrapper">
     <button class="ind-btn" id="btnAlgo"><span class="dot" style="background:#ff9100"></span>Algo &#9662;</button>
     <div class="algo-dropdown" id="algoDropdown">
-      <button class="algo-item" data-algo="trend" data-label="Trend">&#8203; Trend</button>
+      <button class="algo-item active" data-algo="trend" data-label="Trend">&#10004; Trend</button>
       <button class="algo-item active" data-algo="mstreet" data-label="MStreet">&#10004; MStreet</button>
       <button class="algo-item" data-algo="mfactor" data-label="MFactor">&#8203; MFactor</button>
       <button class="algo-item" data-algo="sniper" data-label="Sniper">&#8203; Sniper</button>
@@ -7559,7 +8023,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="algo-item" data-algo="smartmoney" data-label="SmartMoney">&#8203; SmartMoney</button>
       <button class="algo-item" data-algo="quant" data-label="Quant">&#8203; Quant</button>
       <button class="algo-item" data-algo="hybrid" data-label="Hybrid">&#8203; Hybrid</button>
-      <button class="algo-item active" data-algo="mpredict" data-label="MPredict">&#10004; MPredict</button>
+      <button class="algo-item" data-algo="statarb" data-label="StatArb">&#8203; StatArb</button>
+      <button class="algo-item" data-algo="institution" data-label="Institution">&#8203; Institution</button>
+      <button class="algo-item" data-algo="mpredict" data-label="MPredict">&#8203; MPredict</button>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
     </div>
@@ -7863,7 +8329,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let lastBacktest = {};
   let currentSource = 'tradingview';
   let signalMap = {};  // time -> signal data for tooltip
-  let currentAlgo = new Set(['mstreet', 'mpredict']);
+  let currentAlgo = new Set(['trend', 'mstreet']);
 
   // Indicator visibility
   let showST = false, showSAR = false, showSR = false, showEMA = false, showVWAP = false, showSignals = true;
@@ -8172,14 +8638,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     vpData.forEach(vp => {
       if (vp.volume <= 0) return;
       const color = vp.isPOC ? 'rgba(255,138,101,0.9)' :
+                    vp.isVAH ? 'rgba(38,166,154,0.85)' :
+                    vp.isVAL ? 'rgba(239,83,80,0.85)' :
                     vp.isVA  ? 'rgba(255,138,101,0.45)' : 'rgba(255,138,101,0.2)';
+      const title = vp.isPOC ? 'POC' : vp.isVAH ? 'VAH' : vp.isVAL ? 'VAL' : '';
+      const lw = vp.isPOC ? 2 : (vp.isVAH || vp.isVAL) ? 2 : 1;
+      const ls = vp.isPOC ? 0 : (vp.isVAH || vp.isVAL) ? 1 : 2;
       const line = candleSeries.createPriceLine({
         price: vp.price,
         color: color,
-        lineWidth: vp.isPOC ? 2 : 1,
-        lineStyle: vp.isPOC ? 0 : 2,
-        axisLabelVisible: vp.isPOC,
-        title: vp.isPOC ? 'POC' : '',
+        lineWidth: lw,
+        lineStyle: ls,
+        axisLabelVisible: vp.isPOC || vp.isVAH || vp.isVAL,
+        title: title,
       });
       vpLines.push(line);
     });
@@ -8331,8 +8802,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (sig && showSignals) {
       const isBuy = sig.type.includes('BUY');
       const reasons = sig.reasons || [];
+      const algoName = sig.algo ? sig.algo.charAt(0).toUpperCase() + sig.algo.slice(1) : '';
       let html = '<div class="st-header ' + (isBuy ? 'buy' : 'sell') + '">' +
         sig.type.replace('_', ' ') + ' <span class="st-score">Score: ' + sig.score.toFixed(1) + '</span></div>';
+      if (algoName) html += '<div class="st-row" style="color:#ffd600;font-size:11px;margin-bottom:4px"><span>Algo: ' + algoName + '</span></div>';
       reasons.forEach(r => {
         html += '<div class="st-row"><span class="st-reason">\u2022 ' + r + '</span></div>';
       });
