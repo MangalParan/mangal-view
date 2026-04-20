@@ -66,7 +66,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Break of Structure (BOS)** — price breaks a previous swing high/low in trend direction (continuation). Shown as arrow markers with broken level
 - **Change of Character (CHoCH)** — price breaks structure against the prevailing trend (reversal signal). Shown as circle markers with broken level
 - **Cumulative Volume Delta (CVD)** — running total of buy vs sell volume using close position ratio. Shown as histogram series
-- **Volume Profile** — distributes volume across 24 price bins to show Point of Control (POC) and high-volume nodes. Shown as horizontal price lines (orange). Used by OrderFlow algo for POC proximity signals
+- **Volume Profile** — distributes volume across 24 price bins to show Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL). POC shown as solid orange line, VAH as solid green line, VAL as solid red line — all labeled on price axis. Used by OrderFlow algo for POC proximity signals
 - **Indicator Settings** — accessible via `⚙ Indicator Settings` item at the bottom of the Indicators dropdown. Opens a panel with close (×) button to adjust SuperTrend period/multiplier, PSAR AF start/increment/max, and Bollinger Bands period/std dev. Click Apply to recalculate
 - **Restore Defaults** — button in indicator settings panel resets all indicator parameters to defaults (SuperTrend 10/3, PSAR 0.02/0.02/0.2, BB 20/2.0) and reloads chart
 
@@ -88,8 +88,8 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Backend returns per-algo summaries** — `signalSummary` is a dict keyed by algo name (e.g. `{trend: {...}, mstreet: {...}}`) instead of a single summary
 
 ### Algo Menu (Multi-Select)
-- **Algo dropdown menu** in toolbar with 13 algorithm options (multi-select via Set):
-  - **Trend** — 9-indicator institutional signal engine (trend-following)
+- **Algo dropdown menu** in toolbar with 15 algorithm options (multi-select via Set):
+  - **Trend** (default, active) — 9-indicator institutional signal engine (trend-following)
   - **MStreet** (default, active) — quantitative mean-reversion algorithm (7 indicators, contrarian)
   - **MFactor** — high-accuracy signal generation algorithm
   - **Sniper** — precision entry strategy for optimal trade timing
@@ -101,7 +101,9 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
   - **SmartMoney** — smart money concepts (liquidity sweeps, institutional patterns)
   - **Quant** — quantitative statistical arbitrage signals
   - **Hybrid** — hybrid multi-strategy combination
-  - **MPredict** (default, active) — ML-based candle prediction (controls prediction overlay)
+  - **StatArb** — statistical arbitrage mean-reversion using z-score, Bollinger %B, spread velocity, RSI divergence (7 indicators)
+  - **Institution** — institutional accumulation/distribution detection using volume analysis, order blocks, VWAP anchoring, OBV divergence, dark pool footprints (8 indicators)
+  - **MPredict** — ML-based candle prediction (controls prediction overlay)
 - All algos use unified thresholds: BUY >= 3.5, STRONG BUY >= 5.0, SELL <= -3.5, STRONG SELL <= -5.0
 - Multi-select: clicking an algo toggles it on/off (checkmark shown). Multiple algos can be active simultaneously
 - `currentAlgo` is a JavaScript `Set` — signals from all selected algos are merged with deduplication (highest absolute score wins per timestamp)
@@ -123,9 +125,34 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Cooldown**: minimum 3 bars between signals to reduce noise
 - **Key difference from Trend**: Trend engine is trend-following (9 indicators, momentum-based). MStreet is contrarian (7 indicators, mean-reversion). Both use unified thresholds (BUY ≥ 3.5, STRONG BUY ≥ 5.0).
 
+### StatArb Signal Engine
+- **Philosophy**: Statistical Arbitrage — pairs-style mean-reversion using z-score spread analysis, Bollinger %B, and spread velocity to detect statistically extreme deviations that tend to revert.
+- Quantitative mean-reversion algorithm using 7 weighted indicators:
+  - **Z-Score Mean Reversion** (weight 2.5) — 20-period rolling z-score. Deep oversold z < -2.0 → full weight BUY. Oversold z < -1.2 → partial BUY. Overbought mirrors.
+  - **Bollinger %B Spread** (weight 2.0) — %B position within Bollinger Bands. Below 0.05 → BUY, above 0.95 → SELL.
+  - **Spread Velocity** (weight 1.5) — rate of z-score change over 5 bars. Accelerating down (dz < -1.0) → BUY, accelerating up → SELL.
+  - **RSI Divergence from Z-Score** (weight 1.5) — price low (z < -1) but RSI stable (> 40) → hidden strength → BUY.
+  - **EMA Spread Z-Score** (weight 1.5) — z-score of EMA9-EMA21 spread. Abnormally compressed → mean-reversion BUY.
+  - **Volume Confirmation** (weight 1.0) — capitulation selling (1.5x volume + bearish candle) → contrarian BUY.
+  - **MACD Histogram Reversal** (weight 1.5) — histogram reversing up from negative → momentum shift → BUY.
+- **Signal thresholds**: score >= 3.5 → BUY, >= 5.0 → STRONG BUY, <= -3.5 → SELL, <= -5.0 → STRONG SELL
+
+### Institution Signal Engine
+- **Philosophy**: Institutional Flow Detection — identifies accumulation/distribution by large players using volume footprint analysis, order block detection, VWAP anchoring, and OBV divergence.
+- 8 weighted indicators designed to track institutional activity:
+  - **Institutional Volume Detection** (weight 2.5) — high volume + small body candles = absorption (institutions hiding orders). Wick analysis determines direction.
+  - **Order Block Detection** (weight 2.0) — last opposite candle before an impulsive 2x ATR move. Bullish = bearish candle before rally.
+  - **VWAP Institutional Anchoring** (weight 2.0) — institutions buying below VWAP with elevated volume → BUY. Selling above VWAP → SELL.
+  - **OBV Divergence** (weight 1.5) — price falling but OBV rising = hidden accumulation → BUY. Price rising but OBV falling = hidden distribution → SELL.
+  - **Dark Pool Footprint** (weight 1.5) — repeated high-volume trades at same price level (within 0.2%) over 5 bars = institutional interest.
+  - **EMA Trend Alignment** (weight 1.0) — price > EMA9 > EMA21 = bullish alignment filter.
+  - **RSI + Volume Confirmation** (weight 1.5) — oversold RSI (< 30) with elevated volume = institutional buying.
+  - **S/R Level Reaction** (weight 1.0) — institutional support holds or resistance rejections with above-average volume.
+- **Signal thresholds**: score >= 3.5 → BUY, >= 5.0 → STRONG BUY, <= -3.5 → SELL, <= -5.0 → STRONG SELL
+
 ### Backtest (in Settings Panel)
-- **Backtest section** in the Settings panel (⚙) with 13 algo-named items:
-  - **Trend**, **MStreet**, **MFactor**, **Sniper**, **OrderFlow**, **PriceAction**, **Breakout**, **Momentum**, **Scalping**, **SmartMoney**, **Quant**, **Hybrid**, **MPredict**
+- **Backtest section** in the Settings panel (⚙) with 15 algo-named items:
+  - **Trend**, **MStreet**, **MFactor**, **Sniper**, **OrderFlow**, **PriceAction**, **Breakout**, **Momentum**, **Scalping**, **SmartMoney**, **Quant**, **Hybrid**, **StatArb**, **Institution**, **MPredict**
   - Each item activates the corresponding algo, reloads data, and opens the backtest panel
 - **Strategy Tester Panel** with 3 tabs:
   - **Overview** — initial/final capital (₹1,00,000 default), net profit, buy & hold comparison, profit factor, win rate, Sharpe ratio, max drawdown, expectancy
@@ -190,9 +217,9 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 
 ### Maintenance Mode
 - Admin can toggle maintenance mode ON/OFF from the admin panel
-- When enabled, all non-admin users see a branded "Under Maintenance" page (HTTP 503)
-- Admin users bypass maintenance mode and can access the full site
-- Checked in `@login_required` decorator on every request
+- When enabled, ALL users (including admin) see a branded "Under Maintenance" page (HTTP 503) on non-admin routes
+- Only `/admin` routes are exempt from maintenance mode — admin panel remains accessible for toggling maintenance off
+- Checked in `before_request` hook on every request
 - Stored in `site_settings` database table (`maintenance_mode` key)
 
 ### Site Settings (Admin-Controlled)
@@ -299,7 +326,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 
 ## Defaults
 - **Data Source**: TradingView (WebSocket)
-- **Signal Algorithms**: MStreet + MPredict (multi-select, both active by default)
+- **Signal Algorithms**: Trend + MStreet (multi-select, both active by default)
 - **Timeframe**: 5m
 - **Indicators**: Signals only (SuperTrend, PSAR, S/R, EMA, VWAP, Volume Profile off by default)
 - **Theme**: Dark (toggleable to Light via Theme button, persisted in localStorage)
