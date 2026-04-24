@@ -3,7 +3,7 @@ import time, requests, sys
 def bench(label, source, symbol='NIFTY50', interval='5m'):
     try:
         t0 = time.time()
-        r = requests.get(f'http://localhost:5050/api/candles?interval={interval}&symbol={symbol}&source={source}', timeout=30)
+        r = requests.get(f'http://localhost:5000/api/candles?interval={interval}&symbol={symbol}&source={source}', timeout=30)
         elapsed = time.time() - t0
         d = r.json()
         n = len(d.get('candles', []))

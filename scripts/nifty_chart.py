@@ -94,12 +94,12 @@ def init_db():
         "menu_symbols": json.dumps(["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","CRUDEOIL","NATURALGAS"]),
         "menu_timeframes": json.dumps(["1m","2m","3m","5m","10m","15m","30m","1h","2h","4h","1d","1w","1mo"]),
         "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
-        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict"]),
+        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma"]),
     }
     for k, v in defaults.items():
         db.execute("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)", (k, v))
     # Migrate: ensure new algos are in menu_algos for existing DBs
-    _all_algos = ["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict"]
+    _all_algos = ["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma"]
     _row = db.execute("SELECT value FROM site_settings WHERE key = 'menu_algos'").fetchone()
     if _row:
         try:
@@ -5508,12 +5508,13 @@ def generate_institution_signals(candles, bb, rsi_data, macd_data, vwap_data, em
             reasons.append(f"RSI: Overbought with volume ({rsi_val:.0f})")
 
         # 8. S/R level reaction with volume (weight 1.0)
-        for lvl in sr:
+        _sr_levels = [(lvl, "support") for lvl in sr.get("support", [])] + [(lvl, "resistance") for lvl in sr.get("resistance", [])]
+        for lvl, lvl_type in _sr_levels:
             if abs(close - lvl["price"]) / close < 0.003:
-                if lvl["type"] == "support" and close > opn and vol > vol_avg:
+                if lvl_type == "support" and close > opn and vol > vol_avg:
                     score += 1.0
                     reasons.append(f"S/R: Institutional support hold at {lvl['price']:.2f}")
-                elif lvl["type"] == "resistance" and close < opn and vol > vol_avg:
+                elif lvl_type == "resistance" and close < opn and vol > vol_avg:
                     score -= 1.0
                     reasons.append(f"S/R: Institutional rejection at {lvl['price']:.2f}")
                 break
@@ -5555,6 +5556,640 @@ INTERVAL_SECONDS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "1h": 3600, "1d": 86400, "1w": 604800, "1mo": 2592000,
 }
+
+
+def generate_marketmaking_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Market Making Algo — identifies which market making algorithm is operating
+    and predicts today's market movement bias based on MM behavior fingerprints.
+
+    Detects: Avellaneda-Stoikov, Grid MM, Delta-Neutral, Spread Capture,
+             Predatory/Spoofing, Liquidity Provision.
+
+    Thresholds: BUY >= 3.5 | STRONG BUY >= 5.0 | SELL <= -3.5 | STRONG SELL <= -5.0
+    """
+    n = len(candles)
+    if n < 50:
+        return [], {}
+
+    closes  = [c["close"]            for c in candles]
+    highs   = [c["high"]             for c in candles]
+    lows    = [c["low"]              for c in candles]
+    opens   = [c["open"]             for c in candles]
+    volumes = [c.get("volume", 0)    for c in candles]
+
+    rsi_map   = {r["time"]: r["value"] for r in rsi_data}
+    macd_map  = {m["time"]: m          for m in macd_data}
+    vwap_map  = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map  = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]]   = b.get("middle", (b["upper"] + b["lower"]) / 2)
+
+    lookback = 30
+    signals = []
+    last_signal_type = None
+
+    # --- Pre-compute ATR ---
+    atr_list = []
+    for j in range(1, n):
+        tr = max(highs[j] - lows[j],
+                 abs(highs[j] - closes[j - 1]),
+                 abs(lows[j]  - closes[j - 1]))
+        atr_list.append(tr)
+    avg_atr_full = sum(atr_list) / len(atr_list) if atr_list else 1.0
+
+    # --- Rolling candle range ratio (body / full range) ---
+    def body_ratio(i):
+        fr = highs[i] - lows[i]
+        return abs(closes[i] - opens[i]) / fr if fr > 0 else 0
+
+    # Accumulators for MM fingerprints across the whole session
+    grid_hits         = 0   # price revisits exact level repeatedly
+    symm_count        = 0   # symmetric wicks (AS model signature)
+    spike_reversal    = 0   # vol spike + immediate price reversal (spoofing)
+    tight_range_count = 0   # candle range < 0.3x ATR (spread capture)
+    vwap_hug_count    = 0   # price within 0.1% of VWAP (delta-neutral)
+    layer_count       = 0   # repeated volume clusters at same price (layering)
+
+    price_visit_map = {}  # count candles near each round level
+
+    for i in range(lookback, n):
+        t   = candles[i]["time"]
+        close = closes[i]
+        high  = highs[i]
+        low   = lows[i]
+        opn   = opens[i]
+        vol   = volumes[i]
+
+        vol_avg = sum(volumes[i - lookback:i]) / lookback if lookback > 0 else 1
+        seg_atr = atr_list[max(0, i - lookback - 1):i - 1]
+        local_atr = sum(seg_atr) / len(seg_atr) if seg_atr else avg_atr_full
+
+        score   = 0.0
+        reasons = []
+
+        # ---- 1. Avellaneda-Stoikov: symmetric wick + VWAP hug (weight 2.5) ----
+        vw = vwap_map.get(t)
+        lower_wick = min(close, opn) - low
+        upper_wick = high - max(close, opn)
+        full_range = high - low
+        wick_sym = 1 - abs(lower_wick - upper_wick) / full_range if full_range > 0 else 0
+        if vw and abs(close - vw) / vw < 0.001 and wick_sym > 0.7:
+            symm_count += 1
+            vwap_hug_count += 1
+            if close > vw:
+                score += 2.0
+                reasons.append(f"AS-Model: Symmetric quote near VWAP (sym={wick_sym:.2f})")
+            else:
+                score -= 2.0
+                reasons.append(f"AS-Model: Inventory unwind below VWAP (sym={wick_sym:.2f})")
+
+        # ---- 2. Grid MM: repeated price at round/fixed levels (weight 2.0) ----
+        round_lvl = round(close / 50) * 50
+        price_visit_map[round_lvl] = price_visit_map.get(round_lvl, 0) + 1
+        if price_visit_map[round_lvl] >= 4:
+            grid_hits += 1
+            if close > opn:
+                score += 1.5
+                reasons.append(f"Grid-MM: Repeated price at {round_lvl} ({price_visit_map[round_lvl]}x)")
+            else:
+                score -= 1.5
+                reasons.append(f"Grid-MM: Grid resistance at {round_lvl} ({price_visit_map[round_lvl]}x)")
+
+        # ---- 3. Delta-Neutral MM: price pinned near max-pain level (weight 1.5) ----
+        # Proxy: price hovering within 0.15% of VWAP with shrinking range
+        if vw and abs(close - vw) / vw < 0.0015:
+            vwap_hug_count += 1
+            range_vs_atr = (high - low) / local_atr if local_atr > 0 else 1
+            if range_vs_atr < 0.5:
+                score += 1.5
+                reasons.append(f"Delta-Neutral: Price pinned to VWAP (range={range_vs_atr:.2f}x ATR)")
+
+        # ---- 4. Spread Capture MM: ultra-tight range candles (weight 1.5) ----
+        if local_atr > 0 and (high - low) < local_atr * 0.35:
+            tight_range_count += 1
+            # Spread capture benefits — direction from ema
+            e9 = ema9_map.get(t)
+            e21 = ema21_map.get(t)
+            if e9 and e21:
+                if e9 > e21:
+                    score += 1.0
+                    reasons.append(f"Spread-Capture: Ultra-tight range in uptrend ({high - low:.2f} vs ATR {local_atr:.2f})")
+                else:
+                    score -= 1.0
+                    reasons.append(f"Spread-Capture: Ultra-tight range in downtrend")
+
+        # ---- 5. Predatory MM / Spoofing: vol spike + full reversal (weight 2.5) ----
+        if vol_avg > 0 and vol > vol_avg * 2.5:
+            prev_dir  = closes[i - 1] - opens[i - 1]
+            curr_dir  = close - opn
+            if prev_dir * curr_dir < 0:  # direction flipped
+                spike_reversal += 1
+                if curr_dir > 0:
+                    score += 2.5
+                    reasons.append(f"Spoofing-MM: Vol spike reversal bullish ({vol / vol_avg:.1f}x)")
+                else:
+                    score -= 2.5
+                    reasons.append(f"Spoofing-MM: Vol spike reversal bearish ({vol / vol_avg:.1f}x)")
+
+        # ---- 6. Liquidity Provision: high vol at S/R + small body (weight 2.0) ----
+        _sr_levels = [(lvl, "support") for lvl in sr.get("support", [])] + [(lvl, "resistance") for lvl in sr.get("resistance", [])]
+        for lvl, lvl_type in _sr_levels:
+            if abs(close - lvl["price"]) / close < 0.003 and vol > vol_avg * 1.5:
+                layer_count += 1
+                if body_ratio(i) < 0.35:
+                    if lvl_type == "support":
+                        score += 2.0
+                        reasons.append(f"Liquidity-Provision: Absorbing sells at {lvl['price']:.2f}")
+                    else:
+                        score -= 2.0
+                        reasons.append(f"Liquidity-Provision: Absorbing buys at {lvl['price']:.2f}")
+                break
+
+        # ---- 7. OBV trend confirmation (weight 1.0) ----
+        if i >= 10:
+            obv_delta = sum(volumes[j] * (1 if closes[j] > closes[j - 1] else -1)
+                            for j in range(i - 10, i))
+            if obv_delta > 0 and score > 0:
+                score += 1.0
+                reasons.append("OBV: Accumulation supports bullish bias")
+            elif obv_delta < 0 and score < 0:
+                score -= 1.0
+                reasons.append("OBV: Distribution confirms bearish bias")
+
+        # ---- 8. RSI extremes confirm MM trap (weight 1.5) ----
+        rsi_val = rsi_map.get(t, 50)
+        if rsi_val < 28:
+            score += 1.5
+            reasons.append(f"RSI: Extreme oversold — MM likely absorbing ({rsi_val:.0f})")
+        elif rsi_val > 72:
+            score -= 1.5
+            reasons.append(f"RSI: Extreme overbought — MM likely distributing ({rsi_val:.0f})")
+
+        score = round(score, 2)
+        if score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score >= 3.5 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+        elif score <= -3.5 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+
+    # ---- Identify dominant MM algorithm ----
+    mm_scores = {
+        "Avellaneda-Stoikov":    symm_count      * 3,
+        "Grid Market Making":    grid_hits        * 2,
+        "Delta-Neutral":         vwap_hug_count   * 2,
+        "Spread Capture":        tight_range_count * 1,
+        "Predatory / Spoofing":  spike_reversal   * 4,
+        "Liquidity Provision":   layer_count      * 3,
+    }
+    best_mm = max(mm_scores, key=lambda k: mm_scores[k])
+    total_mm = sum(mm_scores.values()) or 1
+    mm_conf  = round(min(mm_scores[best_mm] / total_mm * 100, 99), 1)
+
+    # ---- Today's prediction based on dominant MM + recent signals ----
+    buy_sigs   = [s for s in signals if "BUY"  in s["type"]]
+    sell_sigs  = [s for s in signals if "SELL" in s["type"]]
+    net_score  = sum(s["score"] for s in buy_sigs) + sum(s["score"] for s in sell_sigs)
+
+    if best_mm == "Avellaneda-Stoikov":
+        pred_text = "Mean-reversion expected. Price will snap back to VWAP. Fading extremes is favoured."
+    elif best_mm == "Grid Market Making":
+        pred_text = "Range-bound day expected. Price bouncing between grid levels. Trade the range."
+    elif best_mm == "Delta-Neutral":
+        pred_text = "Options-driven pinning. Price likely to stay near VWAP / max-pain all day."
+    elif best_mm == "Spread Capture":
+        pred_text = "Low-volatility session. Tight ranges. Breakout direction after session open is key."
+    elif best_mm == "Predatory / Spoofing":
+        pred_text = "High volatility. Fake moves likely. Wait for confirmation — do not chase spikes."
+    else:  # Liquidity Provision
+        pred_text = "Large institutional flow absorbing at key levels. Trend continuation likely after accumulation."
+
+    bias = "BULLISH" if net_score > 2 else ("BEARISH" if net_score < -2 else "NEUTRAL")
+
+    # ---- Summary ----
+    li  = n - 1
+    tl  = candles[li]["time"]
+    rsi_l = rsi_map.get(tl, 50)
+    mc_l  = macd_map.get(tl)
+    vw_l  = vwap_map.get(tl)
+
+    summary = {
+        "score": round(net_score, 2),
+        "verdict": ("STRONG BUY" if net_score >= 5 else ("BUY" if net_score >= 3.5 else
+                    ("STRONG SELL" if net_score <= -5 else ("SELL" if net_score <= -3.5 else "NEUTRAL")))),
+        "indicators": [
+            {"name": "Avellaneda-Stoikov",    "status": f"{symm_count} hits",       "weight": symm_count      * 3},
+            {"name": "Grid MM",               "status": f"{grid_hits} hits",         "weight": grid_hits       * 2},
+            {"name": "Delta-Neutral",         "status": f"{vwap_hug_count} hits",    "weight": vwap_hug_count  * 2},
+            {"name": "Spread Capture",        "status": f"{tight_range_count} hits", "weight": tight_range_count},
+            {"name": "Predatory/Spoofing",    "status": f"{spike_reversal} hits",    "weight": spike_reversal  * 4},
+            {"name": "Liquidity Provision",   "status": f"{layer_count} hits",       "weight": layer_count     * 3},
+        ],
+        "rsi": rsi_l,
+        "macd": mc_l,
+        "vwap": vw_l,
+        # Extra fields for the dedicated MM panel
+        "mm_algo":       best_mm,
+        "mm_confidence": mm_conf,
+        "mm_prediction": pred_text,
+        "mm_bias":       bias,
+        "mm_scores":     {k: round(v / total_mm * 100, 1) for k, v in mm_scores.items()},
+    }
+    return signals, summary
+
+
+def generate_mma_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr):
+    """Market Makers Advanced — detects 10 advanced market making algorithms.
+
+    Algorithms detected:
+      1. HFT Latency Arbitrage (Citadel-style)
+      2. Optimal Execution TWAP/VWAP MM
+      3. Statistical Arbitrage MM
+      4. Inventory Risk MM (Ho-Stoll)
+      5. Quote Stuffing / Layering
+      6. Momentum Ignition
+      7. Cross-Asset / Passive MM
+      8. Passive Market Making (PMM)
+      9. Reinforcement Learning MM
+      10. Stochastic Control MM (Cartea-Jaimungal)
+
+    Thresholds: BUY >= 3.5 | STRONG BUY >= 5.0 | SELL <= -3.5 | STRONG SELL <= -5.0
+    """
+    n = len(candles)
+    if n < 50:
+        return [], {}
+
+    closes  = [c["close"]         for c in candles]
+    highs   = [c["high"]          for c in candles]
+    lows    = [c["low"]           for c in candles]
+    opens   = [c["open"]          for c in candles]
+    volumes = [c.get("volume", 0) for c in candles]
+
+    rsi_map   = {r["time"]: r["value"] for r in rsi_data}
+    vwap_map  = {v["time"]: v["value"] for v in vwap_data}
+    ema9_map  = {e["time"]: e["value"] for e in ema9}
+    ema21_map = {e["time"]: e["value"] for e in ema21}
+    bb_upper_map, bb_lower_map, bb_mid_map = {}, {}, {}
+    for b in bb:
+        bb_upper_map[b["time"]] = b["upper"]
+        bb_lower_map[b["time"]] = b["lower"]
+        bb_mid_map[b["time"]]   = b.get("middle", (b["upper"] + b["lower"]) / 2)
+
+    lookback = 20
+
+    # --- Pre-compute ATR ---
+    atr_list = []
+    for j in range(1, n):
+        tr = max(highs[j] - lows[j],
+                 abs(highs[j] - closes[j - 1]),
+                 abs(lows[j]  - closes[j - 1]))
+        atr_list.append(tr)
+    avg_atr = sum(atr_list) / len(atr_list) if atr_list else 1.0
+
+    # --- Pre-compute returns ---
+    returns = [0.0]
+    for j in range(1, n):
+        prev = closes[j - 1] if closes[j - 1] != 0 else 1
+        returns.append((closes[j] - prev) / prev)
+
+    # --- Algorithm hit counters ---
+    hft_hits       = 0   # 1. HFT Latency Arbitrage
+    twap_hits      = 0   # 2. TWAP/VWAP MM
+    statarb_hits   = 0   # 3. Statistical Arbitrage MM
+    hostoll_hits   = 0   # 4. Ho-Stoll Inventory Risk
+    qstuff_hits    = 0   # 5. Quote Stuffing / Layering
+    momign_hits    = 0   # 6. Momentum Ignition
+    crossasset_hits = 0  # 7. Cross-Asset MM
+    pmm_hits       = 0   # 8. Passive Market Making
+    rl_hits        = 0   # 9. Reinforcement Learning MM
+    cartea_hits    = 0   # 10. Stochastic Control (Cartea-Jaimungal)
+
+    signals = []
+    last_signal_type = None
+
+    for i in range(lookback, n):
+        t     = candles[i]["time"]
+        close = closes[i]
+        high  = highs[i]
+        low   = lows[i]
+        opn   = opens[i]
+        vol   = volumes[i]
+
+        vol_seg  = volumes[i - lookback:i]
+        vol_avg  = sum(vol_seg) / lookback if lookback > 0 else 1
+        atr_seg  = atr_list[max(0, i - lookback - 1):i - 1]
+        local_atr = sum(atr_seg) / len(atr_seg) if atr_seg else avg_atr
+
+        score   = 0.0
+        reasons = []
+
+        vw    = vwap_map.get(t)
+        e9    = ema9_map.get(t)
+        e21   = ema21_map.get(t)
+        rsi   = rsi_map.get(t, 50)
+        bb_u  = bb_upper_map.get(t)
+        bb_l  = bb_lower_map.get(t)
+        bb_m  = bb_mid_map.get(t)
+        full_range = high - low
+
+        # ================================================================
+        # 1. HFT Latency Arbitrage — ultra-tiny range + vol burst clusters
+        # Signature: extremely small candles (< 0.1x ATR) in rapid succession
+        # with volume above average (HFT filling both sides fast)
+        # ================================================================
+        tiny_run = sum(1 for j in range(max(0, i-5), i)
+                       if (highs[j] - lows[j]) < local_atr * 0.12) if i >= 5 else 0
+        if tiny_run >= 3 and vol > vol_avg * 1.3:
+            hft_hits += 1
+            direction = 1 if close > opn else -1
+            score += direction * 1.5
+            reasons.append(f"HFT-Arb: {tiny_run} micro-candles + volume burst ({vol/vol_avg:.1f}x)")
+
+        # ================================================================
+        # 2. TWAP/VWAP Optimal Execution — volume distributed evenly,
+        # price tracks VWAP closely, no large vol spikes
+        # ================================================================
+        if vw:
+            vwap_dev = abs(close - vw) / vw if vw > 0 else 1
+            vol_cv   = (max(vol_seg) - min(vol_seg)) / (vol_avg + 1e-10)
+            if vwap_dev < 0.002 and vol_cv < 1.5:
+                twap_hits += 1
+                if close > vw:
+                    score += 1.5
+                    reasons.append(f"TWAP-MM: Uniform vol execution near VWAP (dev={vwap_dev*100:.2f}%)")
+                else:
+                    score -= 1.5
+                    reasons.append(f"TWAP-MM: Sell execution tracking below VWAP")
+
+        # ================================================================
+        # 3. Statistical Arbitrage MM — mean-reverting price vs BB midline,
+        # alternating up/down candles (pairs-trade style)
+        # ================================================================
+        if bb_m:
+            alt_count = 0
+            for j in range(max(1, i-6), i):
+                if (closes[j] - opens[j]) * (closes[j-1] - opens[j-1]) < 0:
+                    alt_count += 1
+            dev_from_mid = (close - bb_m) / (bb_m + 1e-10)
+            if alt_count >= 3 and abs(dev_from_mid) < 0.005:
+                statarb_hits += 1
+                if close < bb_m:
+                    score += 1.5
+                    reasons.append(f"StatArb-MM: Mean reversion to BB-mid (alt={alt_count}, dev={dev_from_mid*100:.2f}%)")
+                else:
+                    score -= 1.5
+                    reasons.append(f"StatArb-MM: Mean reversion pullback from BB-mid")
+
+        # ================================================================
+        # 4. Inventory Risk MM (Ho-Stoll) — spread widens progressively,
+        # wick asymmetry grows as inventory builds (one-sided pressure)
+        # ================================================================
+        if i >= 10:
+            upper_wicks = [highs[j] - max(closes[j], opens[j]) for j in range(i-10, i)]
+            lower_wicks = [min(closes[j], opens[j]) - lows[j]  for j in range(i-10, i)]
+            avg_uw = sum(upper_wicks) / 10
+            avg_lw = sum(lower_wicks) / 10
+            wick_asym = (avg_uw - avg_lw) / (avg_uw + avg_lw + 1e-10)
+            if abs(wick_asym) > 0.35:
+                hostoll_hits += 1
+                if wick_asym > 0:  # upper wick dominant → sellers/distributors
+                    score -= 1.5
+                    reasons.append(f"Ho-Stoll: Inventory build (upper wick bias={wick_asym:.2f})")
+                else:
+                    score += 1.5
+                    reasons.append(f"Ho-Stoll: Inventory unwind (lower wick bias={wick_asym:.2f})")
+
+        # ================================================================
+        # 5. Quote Stuffing / Layering — volume spike with minimal price move,
+        # followed by another spike (cancel-replace pattern)
+        # ================================================================
+        if i >= 3:
+            price_move = abs(close - closes[i-1]) / (closes[i-1] + 1e-10)
+            vol_spike  = vol / (vol_avg + 1e-10)
+            prev_spike = volumes[i-1] / (vol_avg + 1e-10)
+            if vol_spike > 2.0 and price_move < 0.001 and prev_spike > 1.5:
+                qstuff_hits += 1
+                # Direction: slight bias from recent returns
+                net_ret = sum(returns[i-3:i])
+                if net_ret > 0:
+                    score += 2.0
+                    reasons.append(f"QuoteStuff: Vol cluster no-move ({vol_spike:.1f}x) — buy-side absorption")
+                else:
+                    score -= 2.0
+                    reasons.append(f"QuoteStuff: Vol cluster no-move ({vol_spike:.1f}x) — sell-side absorption")
+
+        # ================================================================
+        # 6. Momentum Ignition — sharp spike (>1.5x ATR) then full reversal
+        # within 2-3 bars (MM traps directional traders)
+        # ================================================================
+        if i >= 3:
+            spike_bar  = highs[i-2] - lows[i-2]
+            rev_dir    = (closes[i] - opens[i]) * (closes[i-2] - opens[i-2])
+            if spike_bar > local_atr * 1.5 and rev_dir < 0:
+                momign_hits += 1
+                if closes[i] > opens[i]:
+                    score += 2.5
+                    reasons.append(f"MomIgnition: Spike trap reversal bullish (spike={spike_bar/local_atr:.1f}x ATR)")
+                else:
+                    score -= 2.5
+                    reasons.append(f"MomIgnition: Spike trap reversal bearish (spike={spike_bar/local_atr:.1f}x ATR)")
+
+        # ================================================================
+        # 7. Cross-Asset MM — price stable despite high volume
+        # (hedge leg absorbing risk), vol > 2x with tiny body
+        # ================================================================
+        body    = abs(close - opn)
+        body_pct = body / (local_atr + 1e-10)
+        if vol > vol_avg * 2.0 and body_pct < 0.2:
+            crossasset_hits += 1
+            if close > vw if vw else close > opn:
+                score += 1.5
+                reasons.append(f"CrossAsset-MM: Hedged flow — high vol tiny body (body={body_pct:.2f}x ATR)")
+            else:
+                score -= 1.5
+                reasons.append(f"CrossAsset-MM: Hedged distribution — high vol tiny body")
+
+        # ================================================================
+        # 8. Passive Market Making (PMM) — doji-heavy, price near session midpoint,
+        # earning spread passively with no directional bias
+        # ================================================================
+        if i >= 10:
+            doji_count = sum(1 for j in range(i-10, i)
+                             if abs(closes[j] - opens[j]) / (highs[j] - lows[j] + 1e-10) < 0.15)
+            sess_hi = max(highs[i-10:i])
+            sess_lo = min(lows[i-10:i])
+            sess_mid = (sess_hi + sess_lo) / 2
+            near_mid = abs(close - sess_mid) / (sess_hi - sess_lo + 1e-10) < 0.25
+            if doji_count >= 4 and near_mid:
+                pmm_hits += 1
+                if rsi < 50:
+                    score += 1.0
+                    reasons.append(f"PMM: Passive spread ({doji_count} dojis at session mid)")
+                else:
+                    score -= 1.0
+                    reasons.append(f"PMM: Passive spread ({doji_count} dojis) — selling into strength")
+
+        # ================================================================
+        # 9. Reinforcement Learning MM — adaptive quoting: range narrows then
+        # expands in same direction as volatility regime shift
+        # ================================================================
+        if i >= 15:
+            ranges   = [highs[j] - lows[j] for j in range(i-15, i)]
+            early_r  = sum(ranges[:7]) / 7
+            late_r   = sum(ranges[8:]) / 7
+            vol_dir  = sum(returns[i-7:i])
+            if early_r > 0 and late_r / early_r > 1.5:
+                rl_hits += 1
+                if vol_dir > 0:
+                    score += 1.5
+                    reasons.append(f"RL-MM: Adaptive widening bullish (range x{late_r/early_r:.1f})")
+                else:
+                    score -= 1.5
+                    reasons.append(f"RL-MM: Adaptive widening bearish (range x{late_r/early_r:.1f})")
+
+        # ================================================================
+        # 10. Stochastic Control MM (Cartea-Jaimungal) — spread narrows near
+        # session end (terminal wealth constraint), VWAP pinning + vol decay
+        # ================================================================
+        session_pos = i / n  # 0 = session start, 1 = session end
+        if session_pos > 0.7 and vw:
+            vol_decay = vol / (vol_avg + 1e-10)
+            vwap_pin  = abs(close - vw) / (vw + 1e-10)
+            if vol_decay < 0.8 and vwap_pin < 0.002:
+                cartea_hits += 1
+                if close > vw:
+                    score += 1.5
+                    reasons.append(f"Cartea-J: Terminal VWAP pin (vol={vol_decay:.2f}x, dev={vwap_pin*100:.3f}%)")
+                else:
+                    score -= 1.5
+                    reasons.append(f"Cartea-J: Terminal unwind below VWAP")
+
+        # --- RSI extremes confirm (weight 1.0) ---
+        if rsi < 30:
+            score += 1.0
+            reasons.append(f"RSI: Oversold zone ({rsi:.0f}) — absorption likely")
+        elif rsi > 70:
+            score -= 1.0
+            reasons.append(f"RSI: Overbought zone ({rsi:.0f}) — distribution likely")
+
+        score = round(score, 2)
+        if score >= 5.0 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "STRONG_BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score >= 3.5 and last_signal_type != "BUY":
+            signals.append({"time": t, "type": "BUY", "score": score, "reasons": reasons, "price": low})
+            last_signal_type = "BUY"
+        elif score <= -5.0 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "STRONG_SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+        elif score <= -3.5 and last_signal_type != "SELL":
+            signals.append({"time": t, "type": "SELL", "score": score, "reasons": reasons, "price": high})
+            last_signal_type = "SELL"
+
+    # ---- Identify dominant MMA algorithm ----
+    mma_raw = {
+        "HFT Latency Arbitrage":         hft_hits    * 4,
+        "TWAP/VWAP Optimal Execution":   twap_hits   * 3,
+        "Statistical Arbitrage MM":      statarb_hits * 3,
+        "Inventory Risk (Ho-Stoll)":     hostoll_hits * 2,
+        "Quote Stuffing / Layering":     qstuff_hits  * 4,
+        "Momentum Ignition":             momign_hits  * 5,
+        "Cross-Asset MM":                crossasset_hits * 2,
+        "Passive Market Making (PMM)":   pmm_hits    * 2,
+        "Reinforcement Learning MM":     rl_hits     * 3,
+        "Stochastic Control (Cartea-J)": cartea_hits  * 3,
+    }
+    best_mma  = max(mma_raw, key=lambda k: mma_raw[k])
+    total_mma = sum(mma_raw.values()) or 1
+    mma_conf  = round(min(mma_raw[best_mma] / total_mma * 100, 99), 1)
+
+    # ---- Prediction for dominant algorithm ----
+    buy_sigs  = [s for s in signals if "BUY"  in s["type"]]
+    sell_sigs = [s for s in signals if "SELL" in s["type"]]
+    net_score = sum(s["score"] for s in buy_sigs) + sum(s["score"] for s in sell_sigs)
+
+    preds = {
+        "HFT Latency Arbitrage":
+            "Ultra-fast micro-arbitrage in play. Price direction will be set by the first 5-minute move — HFT will amplify it. Trade with momentum, not against it.",
+        "TWAP/VWAP Optimal Execution":
+            "Large institutional order executing systematically. Price will track VWAP all day. Fading extremes from VWAP is safest strategy.",
+        "Statistical Arbitrage MM":
+            "Pairs/mean-reversion strategy active. Price oscillating around BB-midline. Expect range-bound session — buy dips, sell rips near midline.",
+        "Inventory Risk (Ho-Stoll)":
+            "MM managing directional inventory risk. Wick asymmetry reveals their bias. Expect spread widening and a directional push once inventory is cleared.",
+        "Quote Stuffing / Layering":
+            "Order book manipulation detected. Do NOT trust apparent order book depth. Wait for genuine price break with volume confirmation before entering.",
+        "Momentum Ignition":
+            "Fake directional moves being engineered. Expect sharp spikes followed by immediate reversal. Fade the spike — do not chase the initial move.",
+        "Cross-Asset MM":
+            "Hedged institutional flow — large vol with no price impact. Underlying direction determined by the hedge leg. Watch the index/futures for true bias.",
+        "Passive Market Making (PMM)":
+            "Passive spread-earner dominant. Flat, doji-heavy day expected near session midpoint. Only trade on confirmed breakout with volume.",
+        "Reinforcement Learning MM":
+            "Adaptive algo adjusting to volatility regime. Expect quiet periods followed by sudden range expansions. Trade breakouts, not the flat zones.",
+        "Stochastic Control (Cartea-J)":
+            "Terminal-wealth constrained MM active. Session-end VWAP pinning expected. Price will gravitate to VWAP — avoid holding positions into close.",
+    }
+    pred_text = preds.get(best_mma, "Advanced MM activity detected. Monitor order flow carefully.")
+    bias = "BULLISH" if net_score > 2 else ("BEARISH" if net_score < -2 else "NEUTRAL")
+
+    # ---- Per-algo percentage scores for display ----
+    mma_scores_pct = {k: round(v / total_mma * 100, 1) for k, v in mma_raw.items()}
+
+    # ---- Summary ----
+    li    = n - 1
+    tl    = candles[li]["time"]
+    rsi_l = rsi_map.get(tl, 50)
+    vw_l  = vwap_map.get(tl)
+
+    summary = {
+        "score":   round(net_score, 2),
+        "verdict": ("STRONG BUY" if net_score >= 5 else ("BUY" if net_score >= 3.5 else
+                    ("STRONG SELL" if net_score <= -5 else ("SELL" if net_score <= -3.5 else "NEUTRAL")))),
+        "indicators": [
+            {"name": "HFT Latency Arbitrage",         "status": f"{hft_hits} hits",        "weight": hft_hits    * 4},
+            {"name": "TWAP/VWAP Optimal Execution",   "status": f"{twap_hits} hits",        "weight": twap_hits   * 3},
+            {"name": "Statistical Arbitrage MM",       "status": f"{statarb_hits} hits",     "weight": statarb_hits* 3},
+            {"name": "Inventory Risk (Ho-Stoll)",      "status": f"{hostoll_hits} hits",     "weight": hostoll_hits* 2},
+            {"name": "Quote Stuffing / Layering",      "status": f"{qstuff_hits} hits",      "weight": qstuff_hits * 4},
+            {"name": "Momentum Ignition",              "status": f"{momign_hits} hits",      "weight": momign_hits * 5},
+            {"name": "Cross-Asset MM",                 "status": f"{crossasset_hits} hits",  "weight": crossasset_hits*2},
+            {"name": "Passive Market Making (PMM)",    "status": f"{pmm_hits} hits",         "weight": pmm_hits    * 2},
+            {"name": "Reinforcement Learning MM",      "status": f"{rl_hits} hits",          "weight": rl_hits     * 3},
+            {"name": "Stochastic Control (Cartea-J)", "status": f"{cartea_hits} hits",      "weight": cartea_hits * 3},
+        ],
+        "rsi":  rsi_l,
+        "vwap": vw_l,
+        # MMA-specific fields for the dedicated panel
+        "mma_algo":       best_mma,
+        "mma_confidence": mma_conf,
+        "mma_prediction": pred_text,
+        "mma_bias":       bias,
+        "mma_scores":     mma_scores_pct,
+        "mma_raw_hits": {
+            "HFT Latency Arbitrage":         hft_hits,
+            "TWAP/VWAP Optimal Execution":   twap_hits,
+            "Statistical Arbitrage MM":      statarb_hits,
+            "Inventory Risk (Ho-Stoll)":     hostoll_hits,
+            "Quote Stuffing / Layering":     qstuff_hits,
+            "Momentum Ignition":             momign_hits,
+            "Cross-Asset MM":                crossasset_hits,
+            "Passive Market Making (PMM)":   pmm_hits,
+            "Reinforcement Learning MM":     rl_hits,
+            "Stochastic Control (Cartea-J)": cartea_hits,
+        },
+    }
+    return signals, summary
 
 
 def predict_next_candles(candles, interval="5m", n_predict=5):
@@ -7264,6 +7899,14 @@ def api_candles():
             sigs, summ = generate_institution_signals(
                 candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
             )
+        elif algo == "marketmaking":
+            sigs, summ = generate_marketmaking_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
+        elif algo == "mma":
+            sigs, summ = generate_mma_signals(
+                candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr
+            )
         else:  # trend (default)
             sigs, summ = generate_signals(
                 candles, supertrend, psar, rsi_data, macd_data,
@@ -7305,6 +7948,7 @@ def api_candles():
         "macd": macd_data,
         "patterns": patterns,
         "signals": signals,
+        "allSignals": sorted(all_signals, key=lambda x: x["time"]),
         "signalSummary": summaries,
         "cpr": cpr,
         "bollingerBands": bb,
@@ -7819,6 +8463,104 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .signal-count { font-size: 11px; color: #787b86; margin-top: 10px; }
   .signal-count span { font-weight: 700; }
   .disclaimer { font-size: 9px; color: #555; margin-top: 10px; line-height: 1.4; }
+  /* Score Board Panel */
+  .score-board-panel {
+    position: absolute; top: 44px; right: 300px; z-index: 200;
+    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    padding: 16px; width: 620px; display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5); max-height: calc(100vh - 160px); overflow-y: auto;
+  }
+  .score-board-panel.open { display: block; }
+  .sb-summary-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 6px; margin-bottom: 14px;
+  }
+  .sb-algo-card {
+    background: #131722; border-radius: 6px; padding: 8px 10px;
+    border: 1px solid #2a2e39; text-align: center;
+  }
+  .sb-algo-name { font-size: 11px; font-weight: 700; color: #ffd600; margin-bottom: 4px; }
+  .sb-algo-verdict { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; display: inline-block; margin-bottom: 2px; }
+  .sb-algo-score { font-size: 10px; color: #787b86; }
+  .sb-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .sb-table thead th {
+    background: #131722; color: #787b86; font-weight: 600; padding: 6px 8px;
+    text-align: left; border-bottom: 1px solid #2a2e39; position: sticky; top: 0;
+  }
+  .sb-table tbody tr { border-bottom: 1px solid #2a2e3944; }
+  .sb-table tbody tr:hover { background: #252a37; }
+  .sb-table tbody td { padding: 5px 8px; color: #d1d4dc; vertical-align: middle; }
+  .sb-sig-buy { color: #26a69a; font-weight: 700; }
+  .sb-sig-sell { color: #ef5350; font-weight: 700; }
+  .sb-score-pos { color: #26a69a; }
+  .sb-score-neg { color: #ef5350; }
+  .sb-reasons { font-size: 10px; color: #787b86; line-height: 1.3; max-width: 160px; }
+  /* Market Making Panel */
+  .mm-panel {
+    position: absolute; top: 44px; right: 300px; z-index: 200;
+    background: #1e222d; border: 1px solid #2a2e39; border-radius: 8px;
+    padding: 16px; width: 380px; display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5); max-height: calc(100vh - 160px); overflow-y: auto;
+  }
+  .mm-panel.open { display: block; }
+  .mm-algo-badge {
+    font-size: 18px; font-weight: 800; color: #69f0ae; margin-bottom: 4px; letter-spacing: 0.5px;
+  }
+  .mm-confidence {
+    display: inline-block; font-size: 11px; font-weight: 700;
+    background: rgba(105,240,174,0.12); color: #69f0ae;
+    border: 1px solid #69f0ae44; border-radius: 4px; padding: 2px 8px; margin-left: 8px;
+  }
+  .mm-bias-bull { color: #26a69a; font-weight: 700; }
+  .mm-bias-bear { color: #ef5350; font-weight: 700; }
+  .mm-bias-neut { color: #787b86; font-weight: 700; }
+  .mm-rank-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 0; border-bottom: 1px solid #2a2e3933; font-size: 11px;
+  }
+  .mm-rank-label { flex: 1; color: #d1d4dc; }
+  .mm-rank-bar-wrap { width: 100px; background: #2a2e39; border-radius: 3px; height: 6px; }
+  .mm-rank-bar { height: 6px; border-radius: 3px; background: #69f0ae; }
+  .mm-rank-pct { min-width: 34px; text-align: right; color: #787b86; }
+
+  /* Market Makers Advanced Panel */
+  .mma-panel {
+    position: absolute; top: 44px; right: 300px; z-index: 200;
+    background: #1e222d; border: 1px solid #3d2060; border-radius: 8px;
+    padding: 16px; width: 420px; display: none;
+    box-shadow: 0 8px 32px rgba(100,0,200,0.25); max-height: calc(100vh - 160px); overflow-y: auto;
+  }
+  .mma-panel.open { display: block; }
+  .mma-algo-badge {
+    font-size: 17px; font-weight: 800; color: #e040fb; margin-bottom: 4px; letter-spacing: 0.5px;
+  }
+  .mma-confidence {
+    display: inline-block; font-size: 11px; font-weight: 700;
+    background: rgba(224,64,251,0.12); color: #e040fb;
+    border: 1px solid #e040fb44; border-radius: 4px; padding: 2px 8px; margin-left: 8px;
+  }
+  .mma-bias-bull { color: #26a69a; font-weight: 700; }
+  .mma-bias-bear { color: #ef5350; font-weight: 700; }
+  .mma-bias-neut { color: #787b86; font-weight: 700; }
+  .mma-algo-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 5px; margin-bottom: 3px; font-size: 11px;
+    background: #131722; border: 1px solid #2a2e3966;
+  }
+  .mma-algo-row.top { border-color: #e040fb88; background: rgba(224,64,251,0.07); }
+  .mma-algo-icon { font-size: 14px; min-width: 20px; text-align: center; }
+  .mma-algo-name { flex: 1; color: #d1d4dc; font-weight: 500; }
+  .mma-algo-name.top { color: #e040fb; font-weight: 700; }
+  .mma-algo-hits { font-size: 10px; color: #787b86; min-width: 44px; text-align: right; }
+  .mma-rank-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 0; border-bottom: 1px solid #2a2e3933; font-size: 11px;
+  }
+  .mma-rank-label { flex: 1; color: #d1d4dc; }
+  .mma-rank-bar-wrap { width: 100px; background: #2a2e39; border-radius: 3px; height: 6px; }
+  .mma-rank-bar { height: 6px; border-radius: 3px; background: #e040fb; }
+  .mma-rank-pct { min-width: 34px; text-align: right; color: #787b86; }
+
   /* Backtest Dropdown */
   .backtest-dropdown-wrapper { position: relative; }
   .backtest-dropdown {
@@ -7852,6 +8594,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: absolute; top: 100%; left: 0; background: #1e222d; border: 1px solid #2a2e39;
     border-radius: 6px; padding: 4px 0; min-width: 180px; z-index: 300;
     box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none;
+    max-height: calc(100vh - 80px); overflow-y: auto;
   }
   .algo-dropdown.open { display: block; }
   .algo-item {
@@ -8026,8 +8769,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="algo-item" data-algo="statarb" data-label="StatArb">&#8203; StatArb</button>
       <button class="algo-item" data-algo="institution" data-label="Institution">&#8203; Institution</button>
       <button class="algo-item" data-algo="mpredict" data-label="MPredict">&#8203; MPredict</button>
+      <button class="algo-item" data-algo="marketmaking" data-label="Market Making">&#8203; Market Making</button>
+      <button class="algo-item" data-algo="mma" data-label="MM Advanced">&#8203; MM Advanced</button>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
+      <button class="algo-item" id="btnAlgoScoreboard" style="color:#69f0ae">&#127942; Score Board</button>
+      <button class="algo-item" id="btnAlgoMM" style="color:#80d8ff">&#129302; Market Making</button>
+      <button class="algo-item" id="btnAlgoMMA" style="color:#e040fb">&#128301; MM Advanced</button>
     </div>
   </div>
   <div class="separator"></div>
@@ -8218,6 +8966,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div id="indicatorRows"></div>
     <div class="signal-count" id="signalCount"></div>
     <div class="disclaimer">For informational purposes only. Not financial advice. Past signals do not guarantee future results.</div>
+  </div>
+
+  <!-- Score Board Panel -->
+  <div class="score-board-panel" id="scoreBoardPanel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:14px;color:#fff">&#127942; Score Board</h3>
+      <button id="scoreBoardClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button>
+    </div>
+    <div id="scoreBoardSummary"></div>
+    <div id="scoreBoardTable"></div>
+    <div class="disclaimer">For informational purposes only. Not financial advice.</div>
+  </div>
+
+  <!-- Market Making Panel -->
+  <div class="mm-panel" id="mmPanel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:14px;color:#fff">&#129302; Market Making Analyzer</h3>
+      <button id="mmPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button>
+    </div>
+    <div id="mmIdentified" style="background:#131722;border-radius:8px;padding:14px;margin-bottom:12px;border:1px solid #2a2e39">
+      <div style="color:#787b86;font-size:12px">Select the <strong>Market Making</strong> algo to see analysis</div>
+    </div>
+    <div id="mmPrediction" style="margin-bottom:12px"></div>
+    <div id="mmRanking"></div>
+    <div class="disclaimer">For informational purposes only. Not financial advice.</div>
+  </div>
+
+  <!-- Market Makers Advanced Panel -->
+  <div class="mma-panel" id="mmaPanel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:14px;color:#fff">&#128301; Market Makers Advanced</h3>
+      <button id="mmaPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button>
+    </div>
+    <div id="mmaIdentified" style="background:#131722;border-radius:8px;padding:14px;margin-bottom:12px;border:1px solid #2a2e39">
+      <div style="color:#787b86;font-size:12px">Select <strong>MM Advanced</strong> algo to activate analysis</div>
+    </div>
+    <div id="mmaPrediction" style="margin-bottom:12px"></div>
+    <div id="mmaAlgoList" style="margin-bottom:12px"></div>
+    <div id="mmaRanking"></div>
+    <div class="disclaimer">For informational purposes only. Not financial advice.</div>
   </div>
 
   <!-- Settings Panel -->
@@ -8682,6 +9470,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     settingsPanel.classList.remove('open');
   });
 
+  // ---- Score Board Panel (opened from Algo dropdown) ----
+  const scoreBoardPanel = document.getElementById('scoreBoardPanel');
+  document.getElementById('scoreBoardClose').addEventListener('click', () => {
+    scoreBoardPanel.classList.remove('open');
+  });
+
   // ---- Signal Panel (opened from Algo dropdown) ----
   const signalPanel = document.getElementById('signalPanel');
   document.getElementById('btnAlgoAnalysis').addEventListener('click', function(e) {
@@ -8689,9 +9483,76 @@ HTML_PAGE = r"""<!DOCTYPE html>
     algoDropdown.classList.remove('open');
     signalPanel.classList.toggle('open');
     settingsPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
   });
   document.getElementById('signalPanelClose').addEventListener('click', () => {
     signalPanel.classList.remove('open');
+  });
+
+  document.getElementById('btnAlgoScoreboard').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
+    scoreBoardPanel.classList.toggle('open');
+    signalPanel.classList.remove('open');
+    mmPanel.classList.remove('open');
+    mmaPanel.classList.remove('open');
+    settingsPanel.classList.remove('open');
+  });
+
+  // ---- Market Making Panel ----
+  const mmPanel = document.getElementById('mmPanel');
+  document.getElementById('btnAlgoMM').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
+    signalPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
+    mmaPanel.classList.remove('open');
+    settingsPanel.classList.remove('open');
+    // Auto-enable marketmaking algo if not already active
+    if (!currentAlgo.has('marketmaking')) {
+      currentAlgo.add('marketmaking');
+      document.querySelectorAll('.algo-item[data-algo="marketmaking"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'Market Making');
+      });
+      showPredictions = currentAlgo.has('mpredict');
+      loadData(currentTF, true).then(function() {
+        mmPanel.classList.add('open');
+      });
+    } else {
+      mmPanel.classList.toggle('open');
+    }
+  });
+  document.getElementById('mmPanelClose').addEventListener('click', () => {
+    mmPanel.classList.remove('open');
+  });
+
+  // ---- Market Makers Advanced Panel ----
+  const mmaPanel = document.getElementById('mmaPanel');
+  document.getElementById('btnAlgoMMA').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
+    signalPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
+    mmPanel.classList.remove('open');
+    settingsPanel.classList.remove('open');
+    // Auto-enable mma algo if not already active
+    if (!currentAlgo.has('mma')) {
+      currentAlgo.add('mma');
+      document.querySelectorAll('.algo-item[data-algo="mma"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'MM Advanced');
+      });
+      showPredictions = currentAlgo.has('mpredict');
+      loadData(currentTF, true).then(function() {
+        mmaPanel.classList.add('open');
+      });
+    } else {
+      mmaPanel.classList.toggle('open');
+    }
+  });
+  document.getElementById('mmaPanelClose').addEventListener('click', () => {
+    mmaPanel.classList.remove('open');
   });
 
   // ---- Indicators Dropdown ----
@@ -8701,6 +9562,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     indDropdown.classList.toggle('open');
     settingsPanel.classList.remove('open');
     signalPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
+    mmPanel.classList.remove('open');
+    mmaPanel.classList.remove('open');
     cfgPanel.classList.remove('open');
   });
   // Close dropdown on outside click
@@ -9235,6 +10099,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       // --- Update Signal Panel ---
       const summ = json.signalSummary || {};
       updateSignalPanel(summ, sigs);
+      updateScoreBoard(summ, json.allSignals || sigs);
+      updateMMPanel(summ);
+      updateMMAPanel(summ);
 
       // --- Update Backtest Panel ---
       lastBacktest = json.backtest || {};
@@ -9275,7 +10142,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   // ---- Signal Panel Renderer ----
-  const algoLabels = { trend: 'Trend', mstreet: 'MStreet', mfactor: 'MFactor', sniper: 'Sniper', orderflow: 'OrderFlow', priceaction: 'PriceAction', breakout: 'Breakout', momentum: 'Momentum', scalping: 'Scalping', smartmoney: 'SmartMoney', quant: 'Quant', hybrid: 'Hybrid', mpredict: 'MPredict' };
+  const algoLabels = { trend: 'Trend', mstreet: 'MStreet', mfactor: 'MFactor', sniper: 'Sniper', orderflow: 'OrderFlow', priceaction: 'PriceAction', breakout: 'Breakout', momentum: 'Momentum', scalping: 'Scalping', smartmoney: 'SmartMoney', quant: 'Quant', hybrid: 'Hybrid', mpredict: 'MPredict', institution: 'Institution', statarb: 'StatArb', marketmaking: 'Market Making' };
   function updateSignalPanel(summaries, sigs) {
     const box = document.getElementById('verdictBox');
     const rowsEl = document.getElementById('indicatorRows');
@@ -9325,6 +10192,211 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const buys = sigs.filter(s => s.type.includes('BUY')).length;
     const sells = sigs.filter(s => s.type.includes('SELL')).length;
     countEl.innerHTML = 'Signals in period: <span style="color:#26a69a">' + buys + ' Buy</span> &middot; <span style="color:#ef5350">' + sells + ' Sell</span>';
+  }
+
+  // ---- Score Board Renderer ----
+  function updateScoreBoard(summaries, allSigs) {
+    const summaryEl = document.getElementById('scoreBoardSummary');
+    const tableEl = document.getElementById('scoreBoardTable');
+
+    if (!summaries || !Object.keys(summaries).length) {
+      summaryEl.innerHTML = '<div style="color:#787b86;font-size:12px;padding:8px 0">No algo data. Select at least one Algo from the Algo menu.</div>';
+      tableEl.innerHTML = '';
+      return;
+    }
+
+    // --- Per-algo summary cards ---
+    const verdictColor = v => v.includes('BUY') ? '#26a69a' : (v.includes('SELL') ? '#ef5350' : '#787b86');
+    const verdictBg = v => v.includes('BUY') ? 'rgba(38,166,154,0.15)' : (v.includes('SELL') ? 'rgba(239,83,80,0.15)' : 'rgba(120,123,134,0.15)');
+    let summHtml = '<div class="sb-summary-grid">';
+    Object.keys(summaries).forEach(function(k) {
+      const s = summaries[k];
+      if (!s || !s.verdict) return;
+      const label = algoLabels[k] || k;
+      const col = verdictColor(s.verdict);
+      const bg = verdictBg(s.verdict);
+      summHtml += '<div class="sb-algo-card">';
+      summHtml += '<div class="sb-algo-name">' + label + '</div>';
+      summHtml += '<div class="sb-algo-verdict" style="background:' + bg + ';color:' + col + '">' + s.verdict + '</div>';
+      summHtml += '<div class="sb-algo-score">Score: ' + (s.score != null ? s.score.toFixed(2) : 'N/A') + '</div>';
+      summHtml += '</div>';
+    });
+    summHtml += '</div>';
+    summaryEl.innerHTML = summHtml;
+
+    // --- Signals table (all algos, newest first) ---
+    if (!allSigs || !allSigs.length) {
+      tableEl.innerHTML = '<div style="color:#787b86;font-size:12px;padding:8px 0">No signals in this period.</div>';
+      return;
+    }
+    const sorted = allSigs.slice().sort(function(a, b) { return b.time - a.time; });
+    let tblHtml = '<table class="sb-table"><thead><tr>';
+    tblHtml += '<th>Time</th><th>Algo</th><th>Signal</th><th>Score</th><th>Price</th><th>Reasons</th>';
+    tblHtml += '</tr></thead><tbody>';
+    sorted.forEach(function(s) {
+      const isBuy = s.type.includes('BUY');
+      const isStrong = s.type.includes('STRONG');
+      const sigCls = isBuy ? 'sb-sig-buy' : 'sb-sig-sell';
+      const scoreCls = s.score >= 0 ? 'sb-score-pos' : 'sb-score-neg';
+      const sigLabel = (isStrong ? '&#9733; ' : '') + s.type.replace('_', ' ');
+      const algoName = algoLabels[s.algo] || s.algo || '—';
+      const dt = new Date(s.time * 1000);
+      const timeStr = dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }) +
+                      ' ' + dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+      const price = s.price != null ? s.price.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
+      const reasons = Array.isArray(s.reasons) ? s.reasons.join(', ') : (s.reasons || '—');
+      tblHtml += '<tr>';
+      tblHtml += '<td style="white-space:nowrap">' + timeStr + '</td>';
+      tblHtml += '<td style="color:#ffd600;font-weight:600">' + algoName + '</td>';
+      tblHtml += '<td class="' + sigCls + '">' + sigLabel + '</td>';
+      tblHtml += '<td class="' + scoreCls + '">' + (s.score != null ? (s.score >= 0 ? '+' : '') + s.score.toFixed(2) : '—') + '</td>';
+      tblHtml += '<td>' + price + '</td>';
+      tblHtml += '<td class="sb-reasons">' + reasons + '</td>';
+      tblHtml += '</tr>';
+    });
+    tblHtml += '</tbody></table>';
+    tableEl.innerHTML = tblHtml;
+  }
+
+  // ---- Market Making Panel Renderer ----
+  function updateMMPanel(summaries) {
+    const mmSumm = summaries && summaries['marketmaking'];
+    const identEl  = document.getElementById('mmIdentified');
+    const predEl   = document.getElementById('mmPrediction');
+    const rankEl   = document.getElementById('mmRanking');
+
+    if (!mmSumm || !mmSumm.mm_algo) {
+      identEl.innerHTML = '<div style="color:#787b86;font-size:12px">Enable <strong>Market Making</strong> algo from the Algo menu to activate analysis.</div>';
+      predEl.innerHTML = '';
+      rankEl.innerHTML = '';
+      return;
+    }
+
+    const biasClass = mmSumm.mm_bias === 'BULLISH' ? 'mm-bias-bull' : (mmSumm.mm_bias === 'BEARISH' ? 'mm-bias-bear' : 'mm-bias-neut');
+    const biasIcon  = mmSumm.mm_bias === 'BULLISH' ? '&#9650;' : (mmSumm.mm_bias === 'BEARISH' ? '&#9660;' : '&#9644;');
+
+    // Identified algorithm card
+    identEl.innerHTML =
+      '<div style="font-size:10px;color:#787b86;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Identified Market Making Algorithm</div>' +
+      '<div class="mm-algo-badge">' + mmSumm.mm_algo + '<span class="mm-confidence">' + mmSumm.mm_confidence + '% confidence</span></div>' +
+      '<div style="margin-top:8px;font-size:11px;color:#d1d4dc;display:flex;gap:12px;flex-wrap:wrap">' +
+        '<span>Signals: <strong style="color:#26a69a">' + (summaries.marketmaking && summaries.marketmaking.verdict || '—') + '</strong></span>' +
+        '<span>Score: <strong>' + (mmSumm.score != null ? (mmSumm.score >= 0 ? '+' : '') + mmSumm.score.toFixed(2) : '—') + '</strong></span>' +
+        '<span>Bias: <strong class="' + biasClass + '">' + biasIcon + ' ' + mmSumm.mm_bias + '</strong></span>' +
+      '</div>';
+
+    // Today's prediction box
+    const predCls = mmSumm.mm_bias === 'BULLISH' ? 'rgba(38,166,154,0.12)' : (mmSumm.mm_bias === 'BEARISH' ? 'rgba(239,83,80,0.12)' : 'rgba(120,123,134,0.1)');
+    const predBorder = mmSumm.mm_bias === 'BULLISH' ? '#26a69a44' : (mmSumm.mm_bias === 'BEARISH' ? '#ef535044' : '#787b8644');
+    predEl.innerHTML =
+      '<div style="background:' + predCls + ';border:1px solid ' + predBorder + ';border-radius:6px;padding:10px 12px">' +
+        '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">&#128200; Today\'s Market Prediction</div>' +
+        '<div style="font-size:12px;color:#d1d4dc;line-height:1.6">' + mmSumm.mm_prediction + '</div>' +
+      '</div>';
+
+    // Algorithm ranking bars
+    if (mmSumm.mm_scores) {
+      const sorted = Object.entries(mmSumm.mm_scores).sort((a, b) => b[1] - a[1]);
+      let rHtml = '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Algorithm Detection Scores</div>';
+      sorted.forEach(function([name, pct]) {
+        const isTop = name === mmSumm.mm_algo;
+        const barColor = isTop ? '#69f0ae' : '#2962ff55';
+        rHtml +=
+          '<div class="mm-rank-row">' +
+            '<div class="mm-rank-label" style="' + (isTop ? 'color:#69f0ae;font-weight:700' : '') + '">' + (isTop ? '&#11088; ' : '') + name + '</div>' +
+            '<div class="mm-rank-bar-wrap"><div class="mm-rank-bar" style="width:' + pct + '%;background:' + barColor + '"></div></div>' +
+            '<div class="mm-rank-pct">' + pct + '%</div>' +
+          '</div>';
+      });
+      rankEl.innerHTML = rHtml;
+    } else {
+      rankEl.innerHTML = '';
+    }
+  }
+
+  // ---- updateMMAPanel — Market Makers Advanced ----
+  const MMA_ALGO_ICONS = {
+    "HFT Latency Arbitrage":         "&#9889;",
+    "TWAP/VWAP Optimal Execution":   "&#9202;",
+    "Statistical Arbitrage MM":      "&#128200;",
+    "Inventory Risk (Ho-Stoll)":     "&#9878;",
+    "Quote Stuffing / Layering":     "&#127922;",
+    "Momentum Ignition":             "&#128293;",
+    "Cross-Asset MM":                "&#128279;",
+    "Passive Market Making (PMM)":   "&#129504;",
+    "Reinforcement Learning MM":     "&#129302;",
+    "Stochastic Control (Cartea-J)": "&#8734;",
+  };
+  function updateMMAPanel(summaries) {
+    const mmaSumm  = summaries && summaries['mma'];
+    const identEl  = document.getElementById('mmaIdentified');
+    const predEl   = document.getElementById('mmaPrediction');
+    const listEl   = document.getElementById('mmaAlgoList');
+    const rankEl   = document.getElementById('mmaRanking');
+
+    if (!mmaSumm || !mmaSumm.mma_algo) {
+      identEl.innerHTML = '<div style="color:#787b86;font-size:12px">Enable <strong>MM Advanced</strong> algo from the Algo menu to activate analysis.</div>';
+      predEl.innerHTML = '';
+      listEl.innerHTML = '';
+      rankEl.innerHTML = '';
+      return;
+    }
+
+    const biasClass = mmaSumm.mma_bias === 'BULLISH' ? 'mma-bias-bull' : (mmaSumm.mma_bias === 'BEARISH' ? 'mma-bias-bear' : 'mma-bias-neut');
+    const biasIcon  = mmaSumm.mma_bias === 'BULLISH' ? '&#9650;' : (mmaSumm.mma_bias === 'BEARISH' ? '&#9660;' : '&#9644;');
+
+    // Identified algorithm card
+    identEl.innerHTML =
+      '<div style="font-size:10px;color:#787b86;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Identified Advanced Market Maker</div>' +
+      '<div class="mma-algo-badge">' + (MMA_ALGO_ICONS[mmaSumm.mma_algo] || '&#128301;') + ' ' + mmaSumm.mma_algo +
+        '<span class="mma-confidence">' + mmaSumm.mma_confidence + '% confidence</span></div>' +
+      '<div style="margin-top:8px;font-size:11px;color:#d1d4dc;display:flex;gap:12px;flex-wrap:wrap">' +
+        '<span>Score: <strong>' + (mmaSumm.score != null ? (mmaSumm.score >= 0 ? '+' : '') + mmaSumm.score.toFixed(2) : '—') + '</strong></span>' +
+        '<span>Signal: <strong style="color:#e040fb">' + (mmaSumm.verdict || '—') + '</strong></span>' +
+        '<span>Bias: <strong class="' + biasClass + '">' + biasIcon + ' ' + mmaSumm.mma_bias + '</strong></span>' +
+      '</div>';
+
+    // Today's prediction box
+    const predCls    = mmaSumm.mma_bias === 'BULLISH' ? 'rgba(38,166,154,0.12)' : (mmaSumm.mma_bias === 'BEARISH' ? 'rgba(239,83,80,0.12)' : 'rgba(120,123,134,0.1)');
+    const predBorder = mmaSumm.mma_bias === 'BULLISH' ? '#26a69a44' : (mmaSumm.mma_bias === 'BEARISH' ? '#ef535044' : '#787b8644');
+    predEl.innerHTML =
+      '<div style="background:' + predCls + ';border:1px solid ' + predBorder + ';border-radius:6px;padding:10px 12px">' +
+        '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">&#128200; Today\'s Market Prediction</div>' +
+        '<div style="font-size:12px;color:#d1d4dc;line-height:1.6">' + mmaSumm.mma_prediction + '</div>' +
+      '</div>';
+
+    // All 10 algorithms list with hit counts
+    if (mmaSumm.mma_raw_hits) {
+      let lHtml = '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">All 10 Algorithms — Detection Results</div>';
+      Object.entries(mmaSumm.mma_raw_hits).forEach(function([name, hits]) {
+        const isTop = name === mmaSumm.mma_algo;
+        const icon  = MMA_ALGO_ICONS[name] || '&#128301;';
+        lHtml +=
+          '<div class="mma-algo-row' + (isTop ? ' top' : '') + '">' +
+            '<span class="mma-algo-icon">' + icon + '</span>' +
+            '<span class="mma-algo-name' + (isTop ? ' top' : '') + '">' + (isTop ? '&#11088; ' : '') + name + '</span>' +
+            '<span class="mma-algo-hits">' + hits + ' hit' + (hits !== 1 ? 's' : '') + '</span>' +
+          '</div>';
+      });
+      listEl.innerHTML = lHtml;
+    }
+
+    // Detection score bars
+    if (mmaSumm.mma_scores) {
+      const sorted = Object.entries(mmaSumm.mma_scores).sort((a, b) => b[1] - a[1]);
+      let rHtml = '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Weighted Detection Scores</div>';
+      sorted.forEach(function([name, pct]) {
+        const isTop = name === mmaSumm.mma_algo;
+        const barColor = isTop ? '#e040fb' : '#e040fb44';
+        rHtml +=
+          '<div class="mma-rank-row">' +
+            '<div class="mma-rank-label" style="' + (isTop ? 'color:#e040fb;font-weight:700' : '') + '">' + (isTop ? '&#11088; ' : '') + name + '</div>' +
+            '<div class="mma-rank-bar-wrap"><div class="mma-rank-bar" style="width:' + pct + '%;background:' + barColor + '"></div></div>' +
+            '<div class="mma-rank-pct">' + pct + '%</div>' +
+          '</div>';
+      });
+      rankEl.innerHTML = rHtml;
+    }
   }
 
   // Timeframe dropdown
@@ -10214,7 +11286,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5050))
+    port = int(os.environ.get("PORT", 5000))
     print("Starting Mangal View Server...")
     print(f"Open http://localhost:{port} in your browser")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
