@@ -8561,6 +8561,95 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .mma-rank-bar { height: 6px; border-radius: 3px; background: #e040fb; }
   .mma-rank-pct { min-width: 34px; text-align: right; color: #787b86; }
 
+  /* MM Parameters Panel */
+  .mmparams-panel {
+    position: absolute; top: 44px; right: 300px; z-index: 200;
+    background: #1e222d; border: 1px solid #ff910055; border-radius: 8px;
+    padding: 16px; width: 520px; display: none;
+    box-shadow: 0 8px 32px rgba(255,145,0,0.18); max-height: calc(100vh - 80px); overflow-y: auto;
+  }
+  .mmparams-panel.open { display: block; }
+  /* Prediction Panel */
+  .pred-panel {
+    position: absolute; top: 44px; right: 300px; z-index: 200;
+    background: #1e222d; border: 1px solid #00e5ff44; border-radius: 8px;
+    padding: 16px; width: 560px; display: none;
+    box-shadow: 0 8px 32px rgba(0,229,255,0.15); max-height: calc(100vh - 80px); overflow-y: auto;
+  }
+  .pred-panel.open { display: block; }
+  .pred-chart-wrap { width: 100%; height: 220px; margin: 10px 0; border-radius: 6px; overflow: hidden; border: 1px solid #2a2e39; }
+  .pred-sr-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid #2a2e3933; font-size: 12px; }
+  .pred-sr-label { min-width: 36px; font-weight: 700; }
+  .pred-sr-price { flex: 1; color: #d1d4dc; font-family: monospace; }
+  .pred-sr-bar-wrap { width: 80px; background: #2a2e39; border-radius: 3px; height: 5px; }
+  .pred-sr-bar { height: 5px; border-radius: 3px; }
+  .pred-sr-strength { min-width: 30px; text-align: right; color: #787b86; font-size: 10px; }
+  .pred-dir-box { border-radius: 8px; padding: 12px 16px; margin: 10px 0; font-size: 15px; font-weight: 800; letter-spacing: 0.5px; text-align: center; }
+  .pred-dir-box.bull { background: rgba(38,166,154,0.15); color: #26a69a; border: 1px solid #26a69a55; }
+  .pred-dir-box.bear { background: rgba(239,83,80,0.15); color: #ef5350; border: 1px solid #ef535055; }
+  .pred-dir-box.neut { background: rgba(120,123,134,0.15); color: #787b86; border: 1px solid #787b8655; }
+  .pred-section-title { font-size: 11px; font-weight: 700; color: #00e5ff; text-transform: uppercase; letter-spacing: 1px; margin: 12px 0 6px; border-bottom: 1px solid #2a2e39; padding-bottom: 4px; display:flex; align-items:center; justify-content:space-between; }
+  .pred-drag-header { cursor: move; user-select: none; }
+  .pred-expand-btn { background: rgba(0,229,255,0.12); border: 1px solid #00e5ff44; border-radius: 4px; color: #00e5ff; font-size: 11px; font-weight: 700; padding: 2px 8px; cursor: pointer; line-height: 1.6; transition: background 0.15s; }
+  .pred-expand-btn:hover { background: rgba(0,229,255,0.22); }
+  .pred-chart-wrap { width: 100%; height: 220px; margin: 10px 0; border-radius: 6px; overflow: hidden; border: 1px solid #2a2e39; transition: height 0.2s; }
+  .pred-chart-wrap.expanded { height: 480px; }
+  .pred-panel.expanded { width: min(860px, 92vw); }
+  .pred-future-legend { font-size: 10px; color: #787b86; margin: 2px 0 6px; display:flex; align-items:center; gap:8px; }
+  .pred-future-legend span { display:inline-block; width:24px; height:3px; background:#4fc3f7; border-radius:2px; }
+  .mmparams-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid #2a2e39; padding-bottom: 0; }
+  .mmparams-tab {
+    padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
+    border: none; background: none; color: #787b86; border-bottom: 2px solid transparent;
+    border-radius: 4px 4px 0 0; transition: all 0.15s; margin-bottom: -1px;
+  }
+  .mmparams-tab.active { color: #ff9100; border-bottom-color: #ff9100; background: rgba(255,145,0,0.07); }
+  .mmparams-tab:hover:not(.active) { color: #d1d4dc; background: #2a2e3966; }
+  .mmparams-content { display: none; }
+  .mmparams-content.active { display: block; }
+  .mmp-algo-card {
+    background: #131722; border: 1px solid #2a2e39; border-radius: 7px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .mmp-algo-card.active-algo { border-color: #ff910066; background: rgba(255,145,0,0.05); }
+  .mmp-algo-title {
+    font-size: 13px; font-weight: 700; color: #ff9100; margin-bottom: 4px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .mmp-algo-title .mmp-hits-badge {
+    font-size: 10px; font-weight: 600; background: rgba(255,145,0,0.15);
+    color: #ff9100; border: 1px solid #ff910044; border-radius: 3px; padding: 1px 7px;
+  }
+  .mmp-weight-badge {
+    font-size: 10px; font-weight: 600; background: rgba(105,240,174,0.12);
+    color: #69f0ae; border: 1px solid #69f0ae44; border-radius: 3px; padding: 1px 7px; margin-left: auto;
+  }
+  .mmp-param-row { font-size: 11px; color: #d1d4dc; margin: 3px 0; line-height: 1.5; }
+  .mmp-param-row span { color: #787b86; min-width: 110px; display: inline-block; }
+  .mmp-desc { font-size: 11px; color: #9598a1; margin-top: 6px; line-height: 1.6; font-style: italic; }
+  .mmp-pred { font-size: 11px; color: #80d8ff; margin-top: 4px; line-height: 1.5; }
+  .mmp-section-title {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: #787b86; margin: 12px 0 8px; font-weight: 700;
+  }
+  .mmp-prediction-box {
+    background: #131722; border-radius: 7px; padding: 14px; margin-bottom: 10px;
+    border: 1px solid #2a2e39;
+  }
+  .mmp-bias-bull { color: #26a69a; font-weight: 700; }
+  .mmp-bias-bear { color: #ef5350; font-weight: 700; }
+  .mmp-bias-neut { color: #787b86; font-weight: 700; }
+  .mmp-combined-badge {
+    font-size: 22px; font-weight: 900; letter-spacing: 0.5px; margin-bottom: 6px;
+  }
+  .mmp-movement-row {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+    border-radius: 5px; margin-bottom: 6px; font-size: 12px; background: #0d1117;
+    border: 1px solid #2a2e3966;
+  }
+  .mmp-movement-label { flex: 1; color: #d1d4dc; font-weight: 600; }
+  .mmp-movement-pred { color: #9598a1; font-size: 11px; line-height: 1.5; }
+
   /* Backtest Dropdown */
   .backtest-dropdown-wrapper { position: relative; }
   .backtest-dropdown {
@@ -8776,6 +8865,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="algo-item" id="btnAlgoScoreboard" style="color:#69f0ae">&#127942; Score Board</button>
       <button class="algo-item" id="btnAlgoMM" style="color:#80d8ff">&#129302; Market Making</button>
       <button class="algo-item" id="btnAlgoMMA" style="color:#e040fb">&#128301; MM Advanced</button>
+      <button class="algo-item" id="btnAlgoMMParams" style="color:#ff9100">&#128202; MM Parameters</button>
+      <button class="algo-item" id="btnAlgoPrediction" style="color:#00e5ff">&#128302; Prediction</button>
     </div>
   </div>
   <div class="separator"></div>
@@ -9005,6 +9096,231 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div id="mmaPrediction" style="margin-bottom:12px"></div>
     <div id="mmaAlgoList" style="margin-bottom:12px"></div>
     <div id="mmaRanking"></div>
+    <div class="disclaimer">For informational purposes only. Not financial advice.</div>
+  </div>
+
+  <!-- MM Parameters Panel -->
+  <div class="mmparams-panel" id="mmParamsPanel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:14px;color:#ff9100">&#128202; Market Making Parameters</h3>
+      <button id="mmParamsPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button>
+    </div>
+    <div class="mmparams-tabs">
+      <button class="mmparams-tab active" data-tab="mm">MM Parameters</button>
+      <button class="mmparams-tab" data-tab="mma">Advanced MM</button>
+      <button class="mmparams-tab" data-tab="predict">&#127777; Prediction</button>
+    </div>
+    <!-- Tab: MM Parameters -->
+    <div class="mmparams-content active" id="mmParamsTab-mm">
+      <div id="mmParamsMMLive" style="margin-bottom:10px"></div>
+      <div class="mmp-section-title">Market Making Algorithms — Parameters &amp; Details</div>
+      <div class="mmp-algo-card" id="mmpCard-as">
+        <div class="mmp-algo-title">&#9679; Avellaneda-Stoikov (AS Model)<span class="mmp-weight-badge">Weight ×3</span></div>
+        <div class="mmp-param-row"><span>Wick Symmetry:</span> &gt; 0.70 (ratio of |lower_wick − upper_wick| / full_range)</div>
+        <div class="mmp-param-row"><span>VWAP Proximity:</span> Price within 0.10% of VWAP</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per qualifying candle hit</div>
+        <div class="mmp-param-row"><span>Trigger:</span> Both conditions met simultaneously</div>
+        <div class="mmp-desc">Detects symmetric bid-ask quoting centered on VWAP. The MM earns the spread passively while controlling inventory via mean-reversion.</div>
+        <div class="mmp-pred">&#128200; Prediction: Mean-reversion expected. Price will snap back to VWAP. Fading extremes is favoured.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-grid">
+        <div class="mmp-algo-title">&#9679; Grid Market Making<span class="mmp-weight-badge">Weight ×2</span></div>
+        <div class="mmp-param-row"><span>Grid Level:</span> Round price to nearest ₹50 interval</div>
+        <div class="mmp-param-row"><span>Visit Threshold:</span> ≥ 4 candle closes at same grid level</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per qualifying hit</div>
+        <div class="mmp-param-row"><span>Direction:</span> Bullish if close &gt; open at grid, else Bearish</div>
+        <div class="mmp-desc">Detects automated grid orders placed at fixed price intervals (₹50 steps). The MM profits from oscillations between grid lines.</div>
+        <div class="mmp-pred">&#128200; Prediction: Range-bound day. Price bouncing between grid levels — trade the range.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-dn">
+        <div class="mmp-algo-title">&#9679; Delta-Neutral MM<span class="mmp-weight-badge">Weight ×2</span></div>
+        <div class="mmp-param-row"><span>VWAP Band:</span> Price within 0.15% of VWAP</div>
+        <div class="mmp-param-row"><span>Range Filter:</span> Candle range &lt; 0.50× ATR</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per qualifying hit</div>
+        <div class="mmp-param-row"><span>Purpose:</span> Options-driven pinning near max-pain / VWAP</div>
+        <div class="mmp-desc">Identifies options market makers delta-hedging continuously, keeping price anchored near the max-pain / VWAP level to minimise their options risk.</div>
+        <div class="mmp-pred">&#128200; Prediction: Price likely to stay near VWAP / max-pain all day — options expiry pinning effect.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-sc">
+        <div class="mmp-algo-title">&#9679; Spread Capture MM<span class="mmp-weight-badge">Weight ×1</span></div>
+        <div class="mmp-param-row"><span>Range Filter:</span> Candle range &lt; 0.35× local ATR</div>
+        <div class="mmp-param-row"><span>Direction:</span> EMA-9 vs EMA-21 trend bias</div>
+        <div class="mmp-param-row"><span>Lookback ATR:</span> 30-bar rolling average</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×1 per qualifying hit</div>
+        <div class="mmp-desc">Identifies ultra-tight bid-ask spread exploitation — MMs placing orders just inside the spread to capture the difference on both sides repeatedly.</div>
+        <div class="mmp-pred">&#128200; Prediction: Low-volatility session. Breakout direction after session open is the key trade.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-ps">
+        <div class="mmp-algo-title">&#9679; Predatory / Spoofing MM<span class="mmp-weight-badge">Weight ×4</span></div>
+        <div class="mmp-param-row"><span>Volume Spike:</span> Volume &gt; 2.5× 30-bar average</div>
+        <div class="mmp-param-row"><span>Reversal:</span> Direction flips vs previous candle</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×4 per qualifying hit (highest)</div>
+        <div class="mmp-param-row"><span>Risk:</span> Highly manipulative — expect fakeouts</div>
+        <div class="mmp-desc">Detects spoofing activity: large volume spike followed by immediate price reversal, indicating fake orders placed to trigger stop-losses or retail entry.</div>
+        <div class="mmp-pred">&#128200; Prediction: High volatility. Fake moves likely — wait for confirmation before entering. Do not chase spikes.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-lp">
+        <div class="mmp-algo-title">&#9679; Liquidity Provision<span class="mmp-weight-badge">Weight ×3</span></div>
+        <div class="mmp-param-row"><span>S/R Proximity:</span> Price within 0.30% of S/R level</div>
+        <div class="mmp-param-row"><span>Volume Filter:</span> Volume &gt; 1.5× 30-bar average</div>
+        <div class="mmp-param-row"><span>Body Filter:</span> Candle body ratio &lt; 0.35 (indecision)</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per qualifying hit</div>
+        <div class="mmp-desc">Detects large institutions absorbing sell-side at support or buy-side at resistance, providing liquidity and accumulating positions ahead of a directional move.</div>
+        <div class="mmp-pred">&#128200; Prediction: Trend continuation likely after absorption completes. Strong directional move expected.</div>
+      </div>
+      <div class="mmp-section-title">Common Confirmation Signals</div>
+      <div class="mmp-algo-card">
+        <div class="mmp-algo-title" style="color:#26a69a">&#9679; OBV Confirmation<span class="mmp-weight-badge" style="background:rgba(38,166,154,0.12);color:#26a69a;border-color:#26a69a44">Weight ×1</span></div>
+        <div class="mmp-param-row"><span>Window:</span> 10-bar OBV delta (sum of signed volume)</div>
+        <div class="mmp-param-row"><span>Trigger:</span> OBV &gt; 0 confirms bullish score; OBV &lt; 0 confirms bearish</div>
+        <div class="mmp-desc">On-Balance Volume used as secondary confirmation. Only adds weight when it agrees with the primary signal direction.</div>
+      </div>
+      <div class="mmp-algo-card">
+        <div class="mmp-algo-title" style="color:#26a69a">&#9679; RSI Extremes<span class="mmp-weight-badge" style="background:rgba(38,166,154,0.12);color:#26a69a;border-color:#26a69a44">Weight ×1.5</span></div>
+        <div class="mmp-param-row"><span>Oversold:</span> RSI &lt; 28 → +1.5 (MM absorbing)</div>
+        <div class="mmp-param-row"><span>Overbought:</span> RSI &gt; 72 → −1.5 (MM distributing)</div>
+        <div class="mmp-desc">RSI extremes confirm whether the MM is in absorption (oversold) or distribution (overbought) mode.</div>
+      </div>
+      <div class="mmp-section-title">Signal Thresholds</div>
+      <div class="mmp-algo-card">
+        <div class="mmp-param-row"><span>BUY:</span> Score ≥ 3.5</div>
+        <div class="mmp-param-row"><span>STRONG BUY:</span> Score ≥ 5.0</div>
+        <div class="mmp-param-row"><span>SELL:</span> Score ≤ −3.5</div>
+        <div class="mmp-param-row"><span>STRONG SELL:</span> Score ≤ −5.0</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 30 candles rolling window</div>
+      </div>
+    </div>
+    <!-- Tab: Advanced MM Parameters -->
+    <div class="mmparams-content" id="mmParamsTab-mma">
+      <div id="mmParamsMMALive" style="margin-bottom:10px"></div>
+      <div class="mmp-section-title">Advanced Market Making Algorithms — 10 Algorithms</div>
+      <div class="mmp-algo-card" id="mmpCard-hft">
+        <div class="mmp-algo-title">&#9889; HFT Latency Arbitrage<span class="mmp-weight-badge">Weight ×4</span></div>
+        <div class="mmp-param-row"><span>Micro-candles:</span> ≥ 3 candles with range &lt; 0.12× ATR in last 5 bars</div>
+        <div class="mmp-param-row"><span>Volume Burst:</span> Volume &gt; 1.3× 20-bar average</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 5-bar sliding window</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×4 per hit (very high)</div>
+        <div class="mmp-desc">Detects high-frequency trading firms exploiting microsecond latency advantages across venues. Signature: clusters of near-zero-range candles with elevated volume bursts.</div>
+        <div class="mmp-pred">&#128200; Prediction: Ultra-fast micro-arbitrage in play. Trade with the first 5-minute momentum — HFT amplifies direction.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-twap">
+        <div class="mmp-algo-title">&#9202; TWAP/VWAP Optimal Execution<span class="mmp-weight-badge">Weight ×3</span></div>
+        <div class="mmp-param-row"><span>VWAP Deviation:</span> &lt; 0.20% of VWAP</div>
+        <div class="mmp-param-row"><span>Volume Uniformity:</span> Volume coefficient of variation &lt; 1.5</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
+        <div class="mmp-param-row"><span>Direction:</span> Bullish above VWAP, bearish below</div>
+        <div class="mmp-desc">Large institutions splitting orders over time to minimise market impact. Volume is uniformly distributed; price tracks VWAP exactly — characteristic of algorithmic block execution.</div>
+        <div class="mmp-pred">&#128200; Prediction: Price will track VWAP all day. Fading VWAP extremes is the safest strategy.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-statarb">
+        <div class="mmp-algo-title">&#128200; Statistical Arbitrage MM<span class="mmp-weight-badge">Weight ×3</span></div>
+        <div class="mmp-param-row"><span>Alternating Candles:</span> ≥ 3 direction reversals in last 6 bars</div>
+        <div class="mmp-param-row"><span>BB-Mid Deviation:</span> &lt; 0.50% from Bollinger Band midline</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 6-bar window</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
+        <div class="mmp-desc">Pairs/mean-reversion strategy where the MM profits from statistically predictable oscillations around the BB midline. Price alternates up/down in tight succession.</div>
+        <div class="mmp-pred">&#128200; Prediction: Range-bound session — buy dips, sell rips near BB midline.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-hostoll">
+        <div class="mmp-algo-title">&#9878; Inventory Risk MM (Ho-Stoll)<span class="mmp-weight-badge">Weight ×2</span></div>
+        <div class="mmp-param-row"><span>Wick Asymmetry:</span> |avg_upper_wick − avg_lower_wick| / sum &gt; 0.35</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 10-bar rolling wick averages</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per hit</div>
+        <div class="mmp-param-row"><span>Upper wick bias:</span> Bearish (MM distributing inventory)</div>
+        <div class="mmp-param-row"><span>Lower wick bias:</span> Bullish (MM unwinding short inventory)</div>
+        <div class="mmp-desc">Based on the Ho-Stoll (1981) model — MMs widen their spreads when holding excess inventory. Wick asymmetry reveals the MM's inventory lean and likely reversal direction.</div>
+        <div class="mmp-pred">&#128200; Prediction: Spread widening followed by directional push once inventory is cleared.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-qstuff">
+        <div class="mmp-algo-title">&#127922; Quote Stuffing / Layering<span class="mmp-weight-badge">Weight ×4</span></div>
+        <div class="mmp-param-row"><span>Volume Spike:</span> Current volume &gt; 2.0× average</div>
+        <div class="mmp-param-row"><span>Price Move:</span> &lt; 0.10% move despite spike</div>
+        <div class="mmp-param-row"><span>Prior Spike:</span> Previous bar volume &gt; 1.5× average</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×4 per hit (very high)</div>
+        <div class="mmp-desc">Detects market manipulation via rapid order placement and cancellation. Two consecutive volume spikes with minimal price movement indicate cancel-replace layering activity.</div>
+        <div class="mmp-pred">&#128200; Prediction: Do NOT trust apparent order book depth. Wait for genuine price break with volume confirmation.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-momign">
+        <div class="mmp-algo-title">&#128293; Momentum Ignition<span class="mmp-weight-badge">Weight ×5</span></div>
+        <div class="mmp-param-row"><span>Spike Candle:</span> Bar range &gt; 1.5× local ATR (2 bars ago)</div>
+        <div class="mmp-param-row"><span>Reversal:</span> Current close direction opposite to spike bar</div>
+        <div class="mmp-param-row"><span>Trigger Window:</span> Reversal within 2-3 bars of spike</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×5 per hit (highest weight)</div>
+        <div class="mmp-desc">The most dangerous manipulation pattern — MMs engineer sharp directional spikes to trigger stop-losses and retail orders, then immediately reverse to profit from the trapped positions.</div>
+        <div class="mmp-pred">&#128200; Prediction: Fade the spike — sharp spike is fake. Do not chase the initial move. Reversal is the real trade.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-cross">
+        <div class="mmp-algo-title">&#128279; Cross-Asset MM<span class="mmp-weight-badge">Weight ×2</span></div>
+        <div class="mmp-param-row"><span>Volume Filter:</span> Volume &gt; 2.0× 20-bar average</div>
+        <div class="mmp-param-row"><span>Body Filter:</span> Candle body &lt; 0.20× local ATR</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per hit</div>
+        <div class="mmp-param-row"><span>Interpretation:</span> Hedge leg absorbs risk — no price impact</div>
+        <div class="mmp-desc">Institutional hedged flow across correlated assets (Nifty + SGX / Bank Nifty + Nifty). High volume with near-zero price impact signals cross-asset hedging — the direction is in the other leg.</div>
+        <div class="mmp-pred">&#128200; Prediction: Watch the futures/index for true directional bias. Underlying is being hedged.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-pmm">
+        <div class="mmp-algo-title">&#129504; Passive Market Making (PMM)<span class="mmp-weight-badge">Weight ×2</span></div>
+        <div class="mmp-param-row"><span>Doji Count:</span> ≥ 4 doji candles in last 10 bars (body/range &lt; 0.15)</div>
+        <div class="mmp-param-row"><span>Session Position:</span> Price within 25% of 10-bar session range midpoint</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per hit</div>
+        <div class="mmp-param-row"><span>RSI Bias:</span> RSI &lt; 50 → bullish; RSI &gt; 50 → bearish tilt</div>
+        <div class="mmp-desc">Pure passive spread-earner — MM places resting limit orders at session midpoint and earns the spread without taking directional risk. Extremely common on low-volatility days.</div>
+        <div class="mmp-pred">&#128200; Prediction: Flat doji-heavy day near session midpoint. Only trade on confirmed breakout with strong volume.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-rl">
+        <div class="mmp-algo-title">&#129302; Reinforcement Learning MM<span class="mmp-weight-badge">Weight ×3</span></div>
+        <div class="mmp-param-row"><span>Range Expansion:</span> Late 7-bar avg range &gt; 1.5× early 7-bar avg range</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 15-bar window split into early/late halves</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
+        <div class="mmp-param-row"><span>Direction:</span> 7-bar net return determines bullish/bearish</div>
+        <div class="mmp-desc">AI-driven MMs that adapt quoting width in real-time based on volatility regime transitions. Signature: quiet consolidation followed by sudden range expansion in the current trend direction.</div>
+        <div class="mmp-pred">&#128200; Prediction: Expect quiet flat zones followed by sudden range expansions. Trade breakouts, not the flat periods.</div>
+      </div>
+      <div class="mmp-algo-card" id="mmpCard-cartea">
+        <div class="mmp-algo-title">&#8734; Stochastic Control (Cartea-Jaimungal)<span class="mmp-weight-badge">Weight ×3</span></div>
+        <div class="mmp-param-row"><span>Session Progress:</span> &gt; 70% of session elapsed</div>
+        <div class="mmp-param-row"><span>Volume Decay:</span> Current volume &lt; 0.8× average (tapering)</div>
+        <div class="mmp-param-row"><span>VWAP Pin:</span> Price deviation &lt; 0.20% from VWAP</div>
+        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
+        <div class="mmp-desc">Academically grounded MM model (Cartea &amp; Jaimungal 2015) for terminal wealth maximisation. MM narrows spreads aggressively near session end to flatten inventory before close — VWAP pinning guaranteed.</div>
+        <div class="mmp-pred">&#128200; Prediction: Session-end VWAP pinning expected. Price gravitates to VWAP — avoid holding positions into close.</div>
+      </div>
+      <div class="mmp-section-title">Signal Thresholds (Advanced)</div>
+      <div class="mmp-algo-card">
+        <div class="mmp-param-row"><span>BUY:</span> Score ≥ 3.5 | <span>STRONG BUY:</span> Score ≥ 5.0</div>
+        <div class="mmp-param-row"><span>SELL:</span> Score ≤ −3.5 | <span>STRONG SELL:</span> Score ≤ −5.0</div>
+        <div class="mmp-param-row"><span>RSI confirm:</span> &lt; 30 = +1.0 (absorption) | &gt; 70 = −1.0 (distribution)</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 20-candle rolling window</div>
+      </div>
+    </div>
+    <!-- Tab: Market Prediction -->
+    <div class="mmparams-content" id="mmParamsTab-predict">
+      <div id="mmParamsPrediction"><div style="color:#787b86;font-size:12px;padding:20px 0 0;text-align:center">Enable <strong>Market Making</strong> and/or <strong>MM Advanced</strong> from the Algo menu to see live predictions.</div></div>
+    </div>
+    <div class="disclaimer">For informational purposes only. Not financial advice.</div>
+  </div>
+
+  <!-- Prediction Panel -->
+  <div class="pred-panel" id="predPanel">
+    <div class="pred-drag-header" id="predDragHeader" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:14px;color:#00e5ff">&#128302; Prediction</h3>
+      <button id="predPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button>
+    </div>
+    <div id="predDirection" class="pred-dir-box neut">Analysing...</div>
+    <div class="pred-section-title"><span>&#9889; Signal Analysis</span></div>
+    <div id="predSignalSummary"></div>
+    <div class="pred-section-title"><span>&#129302; Market Making</span></div>
+    <div id="predMM"></div>
+    <div class="pred-section-title"><span>&#128301; MM Advanced</span></div>
+    <div id="predMMA"></div>
+    <div class="pred-section-title"><span>&#9135; Support &amp; Resistance</span></div>
+    <div id="predSRLevels"></div>
+    <div class="pred-section-title">
+      <span>&#128200; Day Chart (S/R + Signals)</span>
+      <button class="pred-expand-btn" id="predExpandBtn" title="Expand &amp; predict future candles">&#9974; Expand</button>
+    </div>
+    <div id="predFutureLegend" class="pred-future-legend" style="display:none"><span></span> Predicted future candles (client-side projection)</div>
+    <div class="pred-chart-wrap" id="predChartContainer"></div>
     <div class="disclaimer">For informational purposes only. Not financial advice.</div>
   </div>
 
@@ -9496,6 +9812,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     signalPanel.classList.remove('open');
     mmPanel.classList.remove('open');
     mmaPanel.classList.remove('open');
+    mmParamsPanel.classList.remove('open');
     settingsPanel.classList.remove('open');
   });
 
@@ -9507,6 +9824,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     signalPanel.classList.remove('open');
     scoreBoardPanel.classList.remove('open');
     mmaPanel.classList.remove('open');
+    mmParamsPanel.classList.remove('open');
     settingsPanel.classList.remove('open');
     // Auto-enable marketmaking algo if not already active
     if (!currentAlgo.has('marketmaking')) {
@@ -9535,6 +9853,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     signalPanel.classList.remove('open');
     scoreBoardPanel.classList.remove('open');
     mmPanel.classList.remove('open');
+    mmParamsPanel.classList.remove('open');
     settingsPanel.classList.remove('open');
     // Auto-enable mma algo if not already active
     if (!currentAlgo.has('mma')) {
@@ -9555,6 +9874,656 @@ HTML_PAGE = r"""<!DOCTYPE html>
     mmaPanel.classList.remove('open');
   });
 
+  // ---- MM Parameters Panel ----
+  const mmParamsPanel = document.getElementById('mmParamsPanel');
+
+  // Tab switching inside MM Parameters panel
+  document.querySelectorAll('.mmparams-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      document.querySelectorAll('.mmparams-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.mmparams-content').forEach(c => c.classList.remove('active'));
+      this.classList.add('active');
+      document.getElementById('mmParamsTab-' + this.dataset.tab).classList.add('active');
+    });
+  });
+
+  document.getElementById('btnAlgoMMParams').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
+    signalPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
+    mmPanel.classList.remove('open');
+    mmaPanel.classList.remove('open');
+    settingsPanel.classList.remove('open');
+    // Auto-enable both marketmaking & mma if neither active
+    let needsLoad = false;
+    if (!currentAlgo.has('marketmaking')) {
+      currentAlgo.add('marketmaking');
+      document.querySelectorAll('.algo-item[data-algo="marketmaking"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'Market Making');
+      });
+      needsLoad = true;
+    }
+    if (!currentAlgo.has('mma')) {
+      currentAlgo.add('mma');
+      document.querySelectorAll('.algo-item[data-algo="mma"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'MM Advanced');
+      });
+      needsLoad = true;
+    }
+    showPredictions = currentAlgo.has('mpredict');
+    if (needsLoad) {
+      loadData(currentTF, true).then(function() {
+        mmParamsPanel.classList.add('open');
+      });
+    } else {
+      mmParamsPanel.classList.toggle('open');
+    }
+  });
+
+  document.getElementById('mmParamsPanelClose').addEventListener('click', () => {
+    mmParamsPanel.classList.remove('open');
+  });
+
+  // ---- Prediction Panel ----
+  const predPanel = document.getElementById('predPanel');
+  let predChart = null;
+  let predCandleSeries = null;
+  let predFutureSeries = null;
+  let predSRLines = [];
+
+  document.getElementById('btnAlgoPrediction').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
+    signalPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
+    mmPanel.classList.remove('open');
+    mmaPanel.classList.remove('open');
+    mmParamsPanel.classList.remove('open');
+    settingsPanel.classList.remove('open');
+    let needsLoad = false;
+    if (!currentAlgo.has('marketmaking')) {
+      currentAlgo.add('marketmaking');
+      document.querySelectorAll('.algo-item[data-algo="marketmaking"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'Market Making');
+      });
+      needsLoad = true;
+    }
+    if (!currentAlgo.has('mma')) {
+      currentAlgo.add('mma');
+      document.querySelectorAll('.algo-item[data-algo="mma"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'MM Advanced');
+      });
+      needsLoad = true;
+    }
+    showPredictions = currentAlgo.has('mpredict');
+    if (needsLoad) {
+      loadData(currentTF, true).then(function() {
+        predPanel.classList.add('open');
+        initPredChart();
+      });
+    } else {
+      predPanel.classList.toggle('open');
+      if (predPanel.classList.contains('open')) initPredChart();
+    }
+  });
+
+  document.getElementById('predPanelClose').addEventListener('click', () => {
+    predPanel.classList.remove('open');
+  });
+
+  // ---- Drag logic for Prediction Panel ----
+  (function() {
+    const header = document.getElementById('predDragHeader');
+    let isDragging = false, startX, startY, origLeft, origTop;
+    header.addEventListener('mousedown', function(e) {
+      if (e.target.closest('#predPanelClose') || e.target.closest('.pred-expand-btn')) return;
+      isDragging = true;
+      const rect = predPanel.getBoundingClientRect();
+      const parentRect = predPanel.offsetParent ? predPanel.offsetParent.getBoundingClientRect() : { left: 0, top: 0 };
+      origLeft = rect.left - parentRect.left;
+      origTop  = rect.top  - parentRect.top;
+      startX = e.clientX;
+      startY = e.clientY;
+      predPanel.style.right  = 'auto';
+      predPanel.style.left   = origLeft + 'px';
+      predPanel.style.top    = origTop  + 'px';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+      if (!isDragging) return;
+      predPanel.style.left = (origLeft + e.clientX - startX) + 'px';
+      predPanel.style.top  = (origTop  + e.clientY - startY) + 'px';
+    });
+    document.addEventListener('mouseup', function() { isDragging = false; });
+  })();
+
+  // ---- Helper: linear regression slope ----
+  function linRegSlope(arr) {
+    const n = arr.length;
+    if (n < 2) return 0;
+    let sx = 0, sy = 0, sxy = 0, sx2 = 0;
+    for (let i = 0; i < n; i++) { sx += i; sy += arr[i]; sxy += i * arr[i]; sx2 += i * i; }
+    const denom = n * sx2 - sx * sx;
+    return denom === 0 ? 0 : (n * sxy - sx * sy) / denom;
+  }
+
+  // ---- Helper: Average True Range ----
+  function computeATR(candles, period) {
+    if (candles.length < 2) return (candles[0] ? (candles[0].high - candles[0].low) : 10);
+    const trs = [];
+    for (let i = 1; i < candles.length; i++) {
+      trs.push(Math.max(
+        candles[i].high - candles[i].low,
+        Math.abs(candles[i].high - candles[i - 1].close),
+        Math.abs(candles[i].low  - candles[i - 1].close)
+      ));
+    }
+    const recent = trs.slice(-period);
+    return recent.reduce(function(a, b) { return a + b; }, 0) / recent.length;
+  }
+
+  // ---- Helper: interval in seconds ----
+  function tfSeconds(tf) {
+    const map = { '1m':60,'2m':120,'3m':180,'5m':300,'10m':600,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'1d':86400,'1w':604800,'1mo':2592000 };
+    return map[tf] || 300;
+  }
+
+  // ---- Project future candles until 15:30 IST ----
+  function projectFutureCandles(dayData, tf) {
+    if (!dayData || dayData.length < 5) return [];
+    const tfSecs = tfSeconds(tf);
+    const lookback = Math.min(30, dayData.length);
+    const recent = dayData.slice(-lookback);
+    const closes = recent.map(function(c) { return c.close; });
+    const slope = linRegSlope(closes);
+    const atr = computeATR(recent, lookback);
+
+    const lastCandle = dayData[dayData.length - 1];
+    let prevClose = lastCandle.close;
+    let ts = lastCandle.time;
+
+    // Determine how many bars remain in trading session (9:15–15:30 IST)
+    // 15:30 IST = 10:00 UTC
+    const d = new Date(lastCandle.time * 1000);
+    const dayStartUtc = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / 1000;
+    const sessionEndTs = dayStartUtc + 36000;
+    const remaining = sessionEndTs - lastCandle.time;
+    const sessionBars = remaining > tfSecs ? Math.floor(remaining / tfSecs) : 0;
+    // Always project at least 20 bars for visibility (even post-market for practice)
+    const nBars = Math.min(Math.max(sessionBars, 20), 80);
+
+    // Bridge: include the last real candle so the line connects
+    const result = [{
+      time: lastCandle.time,
+      open: lastCandle.open, high: lastCandle.high,
+      low: lastCandle.low, close: lastCandle.close
+    }];
+    for (let i = 0; i < nBars; i++) {
+      const damp = 1 / (1 + i * 0.09);
+      const projClose = prevClose + slope * damp;
+      const open  = prevClose;
+      const close = projClose;
+      const high  = Math.max(open, close) + atr * 0.35 * damp;
+      const low   = Math.min(open, close) - atr * 0.35 * damp;
+      ts += tfSecs;
+      result.push({ time: ts, open: open, high: high, low: low, close: close });
+      prevClose = close;
+    }
+    return result;
+  }
+
+  // ---- Expand button for Day Chart ----
+  let predExpanded = false;
+  document.getElementById('predExpandBtn').addEventListener('click', function() {
+    predExpanded = !predExpanded;
+    const wrap = document.getElementById('predChartContainer');
+    const legend = document.getElementById('predFutureLegend');
+    if (predExpanded) {
+      wrap.classList.add('expanded');
+      predPanel.classList.add('expanded');
+      this.textContent = '\u25bc Collapse';
+      legend.style.display = 'flex';
+    } else {
+      wrap.classList.remove('expanded');
+      predPanel.classList.remove('expanded');
+      this.textContent = '\u25b6\ufe0e Expand';
+      legend.style.display = 'none';
+    }
+    // Resize chart and re-render with/without future candles
+    if (predChart) {
+      predChart.applyOptions({ height: predExpanded ? 480 : 220, width: wrap.clientWidth || 520 });
+    }
+    renderPredChart();
+  });
+
+  function initPredChart() {
+    const container = document.getElementById('predChartContainer');
+    if (!predChart) {
+      predChart = LightweightCharts.createChart(container, {
+        width: container.clientWidth || 520,
+        height: predExpanded ? 480 : 220,
+        layout: { background: { color: '#131722' }, textColor: '#787b86' },
+        grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+        rightPriceScale: { borderColor: '#2a2e39' },
+        timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false },
+        crosshair: { mode: 1 },
+      });
+      predCandleSeries = predChart.addCandlestickSeries({
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+      });
+      predFutureSeries = predChart.addCandlestickSeries({
+        upColor: 'rgba(79,195,247,0.45)', downColor: 'rgba(239,154,154,0.45)',
+        borderUpColor: '#4fc3f7', borderDownColor: '#ef9a9a',
+        wickUpColor: '#4fc3f7', wickDownColor: '#ef9a9a',
+        lastValueVisible: false, priceLineVisible: false,
+      });
+    }
+    renderPredChart();
+  }
+
+  function renderPredChart() {
+    if (!predChart || !predCandleSeries || !candleData || candleData.length === 0) return;
+    const isDaily = ['1d','1w','1mo'].includes(currentTF);
+    let dayData = candleData;
+    if (!isDaily) {
+      const lastTs = candleData[candleData.length - 1].time;
+      const lastDate = new Date((lastTs + 19800) * 1000).toISOString().slice(0, 10);
+      const filtered = candleData.filter(function(c) {
+        return new Date((c.time + 19800) * 1000).toISOString().slice(0, 10) === lastDate;
+      });
+      if (filtered.length > 0) dayData = filtered;
+    }
+    const formatted = dayData.map(function(c) {
+      return { time: formatTime(c.time, isDaily), open: c.open, high: c.high, low: c.low, close: c.close };
+    });
+    predCandleSeries.setData(formatted);
+    // --- Future candle prediction when expanded ---
+    if (predFutureSeries) {
+      if (predExpanded) {
+        const future = projectFutureCandles(dayData, currentTF);
+        if (future.length > 1) {
+          const isD = ['1d','1w','1mo'].includes(currentTF);
+          const futFormatted = future.map(function(c) {
+            return { time: formatTime(c.time, isD), open: c.open, high: c.high, low: c.low, close: c.close };
+          });
+          predFutureSeries.setData(futFormatted);
+        } else {
+          predFutureSeries.setData([]);
+        }
+      } else {
+        predFutureSeries.setData([]);
+      }
+    }
+    predSRLines.forEach(function(l) { try { predCandleSeries.removePriceLine(l); } catch(e){} });
+    predSRLines = [];
+    if (lastSR) {
+      (lastSR.support || []).forEach(function(s, i) {
+        const line = predCandleSeries.createPriceLine({
+          price: s.price, color: '#26a69a', lineWidth: 1, lineStyle: 2,
+          axisLabelVisible: true, title: 'S' + (i + 1) + (s.strength > 1 ? ' (' + s.strength + ')' : ''),
+        });
+        predSRLines.push(line);
+      });
+      (lastSR.resistance || []).forEach(function(r, i) {
+        const line = predCandleSeries.createPriceLine({
+          price: r.price, color: '#ef5350', lineWidth: 1, lineStyle: 2,
+          axisLabelVisible: true, title: 'R' + (i + 1) + (r.strength > 1 ? ' (' + r.strength + ')' : ''),
+        });
+        predSRLines.push(line);
+      });
+    }
+    predChart.timeScale().fitContent();
+    predChart.applyOptions({ width: document.getElementById('predChartContainer').clientWidth || 520 });
+  }
+
+  function updatePredictionPanel(summaries, sr, candles) {
+    if (!predPanel.classList.contains('open')) return;
+    const mmS  = summaries && summaries['marketmaking'];
+    const mmaS = summaries && summaries['mma'];
+    // Direction box
+    const mmBias  = mmS  ? (mmS.mm_bias  || 'NEUTRAL') : 'NEUTRAL';
+    const mmaBias = mmaS ? (mmaS.mma_bias || 'NEUTRAL') : 'NEUTRAL';
+    const votes = { BULLISH: 0, BEARISH: 0, NEUTRAL: 0 };
+    [mmBias, mmaBias].forEach(function(b) { if (b in votes) votes[b]++; });
+    const combined = votes.BULLISH > votes.BEARISH ? 'BULLISH' : (votes.BEARISH > votes.BULLISH ? 'BEARISH' : 'NEUTRAL');
+    const dirEl = document.getElementById('predDirection');
+    const dirIcon = combined === 'BULLISH' ? '&#9650;' : (combined === 'BEARISH' ? '&#9660;' : '&#9644;');
+    const dirCls  = combined === 'BULLISH' ? 'bull' : (combined === 'BEARISH' ? 'bear' : 'neut');
+    const mmConfStr  = mmS  ? ' MM: '  + (mmS.mm_confidence  || 0) + '%' : '';
+    const mmaConfStr = mmaS ? ' | MMA: ' + (mmaS.mma_confidence || 0) + '%' : '';
+    dirEl.className = 'pred-dir-box ' + dirCls;
+    dirEl.innerHTML = dirIcon + ' Predicted Direction: ' + combined +
+      '<div style="font-size:11px;font-weight:400;margin-top:4px;opacity:0.85">' + mmConfStr + mmaConfStr + '</div>';
+    // Signal Analysis Summary
+    const sigEl = document.getElementById('predSignalSummary');
+    const sigKeys = Object.keys(summaries || {}).filter(function(k) { return k !== 'marketmaking' && k !== 'mma'; });
+    if (sigKeys.length) {
+      let totalSc = 0; let cnt = 0;
+      sigKeys.forEach(function(k) { if (summaries[k] && summaries[k].score != null) { totalSc += summaries[k].score; cnt++; } });
+      const avgSc = cnt ? totalSc / cnt : 0;
+      const sigVerdict = avgSc >= 5 ? 'STRONG BUY' : avgSc >= 3.5 ? 'BUY' : avgSc >= -3.5 ? 'NEUTRAL' : avgSc >= -5 ? 'SELL' : 'STRONG SELL';
+      const sigCol = sigVerdict.includes('BUY') ? '#26a69a' : (sigVerdict.includes('SELL') ? '#ef5350' : '#787b86');
+      let html = '<div style="background:#131722;border-radius:6px;padding:10px 12px;border:1px solid #2a2e39">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+      html += '<span style="font-size:12px;color:#d1d4dc">Composite (' + cnt + ' algo' + (cnt !== 1 ? 's' : '') + ')</span>';
+      html += '<span style="font-size:13px;font-weight:700;color:' + sigCol + '">' + sigVerdict + ' (' + avgSc.toFixed(2) + ')</span>';
+      html += '</div>';
+      sigKeys.forEach(function(k) {
+        const s = summaries[k];
+        if (!s || !s.verdict) return;
+        const col = s.verdict.includes('BUY') ? '#26a69a' : (s.verdict.includes('SELL') ? '#ef5350' : '#787b86');
+        html += '<div class="pred-sr-row" style="border-color:#2a2e3922">';
+        html += '<span style="flex:1;color:#d1d4dc;font-size:11px">' + (algoLabels[k] || k) + '</span>';
+        html += '<span style="font-size:11px;font-weight:700;color:' + col + '">' + s.verdict + ' (' + (s.score >= 0 ? '+' : '') + s.score.toFixed(1) + ')</span>';
+        html += '</div>';
+      });
+      html += '</div>';
+      sigEl.innerHTML = html;
+    } else {
+      sigEl.innerHTML = '<div style="color:#787b86;font-size:12px">Enable signal algos from the Algo menu.</div>';
+    }
+    // Market Making
+    const mmEl = document.getElementById('predMM');
+    if (mmS && mmS.mm_algo) {
+      const biasCol = mmS.mm_bias === 'BULLISH' ? '#26a69a' : (mmS.mm_bias === 'BEARISH' ? '#ef5350' : '#787b86');
+      mmEl.innerHTML = '<div style="background:#131722;border:1px solid #ff910033;border-radius:7px;padding:10px 12px">' +
+        '<div style="font-size:13px;font-weight:700;color:#ff9100">' + mmS.mm_algo +
+          '<span style="font-size:10px;background:rgba(255,145,0,0.12);color:#ff9100;border:1px solid #ff910044;border-radius:3px;padding:1px 7px;margin-left:8px">' + (mmS.mm_confidence || 0) + '% conf</span>' +
+        '</div>' +
+        '<div style="font-size:11px;color:#d1d4dc;margin-top:4px">Bias: <strong style="color:' + biasCol + '">' + mmS.mm_bias + '</strong>' +
+          ' &nbsp;|&nbsp; Score: <strong>' + (mmS.score >= 0 ? '+' : '') + mmS.score.toFixed(2) + '</strong>' +
+          ' &nbsp;|&nbsp; Signal: <strong style="color:#26a69a">' + mmS.verdict + '</strong></div>' +
+        (mmS.mm_prediction ? '<div style="font-size:11px;color:#787b86;margin-top:6px;font-style:italic">&#128200; ' + mmS.mm_prediction + '</div>' : '') +
+      '</div>';
+    } else {
+      mmEl.innerHTML = '<div style="color:#787b86;font-size:12px">No Market Making data. Enable Market Making from Algo menu.</div>';
+    }
+    // MM Advanced
+    const mmaEl = document.getElementById('predMMA');
+    if (mmaS && mmaS.mma_algo) {
+      const biasCol = mmaS.mma_bias === 'BULLISH' ? '#26a69a' : (mmaS.mma_bias === 'BEARISH' ? '#ef5350' : '#787b86');
+      mmaEl.innerHTML = '<div style="background:#131722;border:1px solid #e040fb33;border-radius:7px;padding:10px 12px">' +
+        '<div style="font-size:13px;font-weight:700;color:#e040fb">' + mmaS.mma_algo +
+          '<span style="font-size:10px;background:rgba(224,64,251,0.12);color:#e040fb;border:1px solid #e040fb44;border-radius:3px;padding:1px 7px;margin-left:8px">' + (mmaS.mma_confidence || 0) + '% conf</span>' +
+        '</div>' +
+        '<div style="font-size:11px;color:#d1d4dc;margin-top:4px">Bias: <strong style="color:' + biasCol + '">' + mmaS.mma_bias + '</strong>' +
+          ' &nbsp;|&nbsp; Score: <strong>' + (mmaS.score >= 0 ? '+' : '') + mmaS.score.toFixed(2) + '</strong>' +
+          ' &nbsp;|&nbsp; Signal: <strong style="color:#e040fb">' + mmaS.verdict + '</strong></div>' +
+        (mmaS.mma_prediction ? '<div style="font-size:11px;color:#787b86;margin-top:6px;font-style:italic">&#128200; ' + mmaS.mma_prediction + '</div>' : '') +
+      '</div>';
+    } else {
+      mmaEl.innerHTML = '<div style="color:#787b86;font-size:12px">No MM Advanced data. Enable MM Advanced from Algo menu.</div>';
+    }
+    // S/R Levels
+    const srEl = document.getElementById('predSRLevels');
+    if (sr && ((sr.resistance && sr.resistance.length) || (sr.support && sr.support.length))) {
+      const resistances = (sr.resistance || []).slice().reverse();
+      const supports = (sr.support || []);
+      const allLvls = [
+        ...resistances.map(function(r) { return { price: r.price, strength: r.strength, type: 'R' }; }),
+        ...supports.map(function(s)    { return { price: s.price, strength: s.strength, type: 'S' }; }),
+      ];
+      const maxStr = Math.max.apply(null, allLvls.map(function(l) { return l.strength || 1; }));
+      let rIdx = 0; let sIdx = 0;
+      let html = '';
+      allLvls.forEach(function(lv) {
+        const isR = lv.type === 'R';
+        const col = isR ? '#ef5350' : '#26a69a';
+        const idx = isR ? (++rIdx) : (++sIdx);
+        const pct = Math.round(((lv.strength || 1) / maxStr) * 100);
+        html += '<div class="pred-sr-row">' +
+          '<span class="pred-sr-label" style="color:' + col + '">' + lv.type + idx + '</span>' +
+          '<span class="pred-sr-price">' + (lv.price || 0).toFixed(2) + '</span>' +
+          '<div class="pred-sr-bar-wrap"><div class="pred-sr-bar" style="width:' + pct + '%;background:' + col + '"></div></div>' +
+          '<span class="pred-sr-strength">' + (lv.strength || 1) + 'x</span>' +
+          '</div>';
+      });
+      srEl.innerHTML = html || '<div style="color:#787b86;font-size:12px">No S/R levels found.</div>';
+    } else {
+      srEl.innerHTML = '<div style="color:#787b86;font-size:12px">No S/R data. Enable S/R from Indicators menu.</div>';
+    }
+    renderPredChart();
+  }
+
+  // ---- updateMMParamsPanel — renders live data into MM Parameters panel ----
+  function updateMMParamsPanel(summaries) {
+    const mmSumm  = summaries && summaries['marketmaking'];
+    const mmaSumm = summaries && summaries['mma'];
+
+    // ---- Tab 1: highlight active MM algo card ----
+    const MM_CARD_IDS = {
+      'Avellaneda-Stoikov':   'mmpCard-as',
+      'Grid Market Making':   'mmpCard-grid',
+      'Delta-Neutral':        'mmpCard-dn',
+      'Spread Capture':       'mmpCard-sc',
+      'Predatory / Spoofing': 'mmpCard-ps',
+      'Liquidity Provision':  'mmpCard-lp',
+    };
+    // Reset all highlights
+    Object.values(MM_CARD_IDS).forEach(function(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('active-algo');
+    });
+    const liveMMEl = document.getElementById('mmParamsMMLive');
+    if (mmSumm && mmSumm.mm_algo) {
+      const cardId = MM_CARD_IDS[mmSumm.mm_algo];
+      if (cardId) {
+        const card = document.getElementById(cardId);
+        if (card) {
+          card.classList.add('active-algo');
+          // Add live hits badge if not yet added
+          const titleEl = card.querySelector('.mmp-algo-title');
+          if (titleEl) {
+            let badge = titleEl.querySelector('.mmp-hits-badge');
+            if (!badge) {
+              badge = document.createElement('span');
+              badge.className = 'mmp-hits-badge';
+              titleEl.insertBefore(badge, titleEl.querySelector('.mmp-weight-badge'));
+            }
+            // Find hit count from indicators
+            const ind = (mmSumm.indicators || []).find(x => x.name.toLowerCase().includes(mmSumm.mm_algo.toLowerCase().split(' ')[0]));
+            badge.textContent = ind ? ind.status : '';
+          }
+        }
+      }
+      const biasCol = mmSumm.mm_bias === 'BULLISH' ? '#26a69a' : (mmSumm.mm_bias === 'BEARISH' ? '#ef5350' : '#787b86');
+      const biasIcon = mmSumm.mm_bias === 'BULLISH' ? '&#9650;' : (mmSumm.mm_bias === 'BEARISH' ? '&#9660;' : '&#9644;');
+      liveMMEl.innerHTML =
+        '<div style="background:#131722;border:1px solid #ff910044;border-radius:7px;padding:10px 14px;margin-bottom:4px">' +
+          '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Live MM Detection</div>' +
+          '<div style="font-size:13px;font-weight:700;color:#ff9100">' + mmSumm.mm_algo +
+            '<span style="font-size:10px;font-weight:600;background:rgba(255,145,0,0.15);color:#ff9100;border:1px solid #ff910044;border-radius:3px;padding:1px 7px;margin-left:8px">' + mmSumm.mm_confidence + '% conf</span>' +
+          '</div>' +
+          '<div style="font-size:11px;color:#d1d4dc;margin-top:4px">Bias: <strong style="color:' + biasCol + '">' + biasIcon + ' ' + mmSumm.mm_bias + '</strong>' +
+            ' &nbsp;|&nbsp; Score: <strong>' + (mmSumm.score >= 0 ? '+' : '') + mmSumm.score.toFixed(2) + '</strong>' +
+            ' &nbsp;|&nbsp; Signal: <strong style="color:#26a69a">' + mmSumm.verdict + '</strong>' +
+          '</div>' +
+        '</div>';
+    } else {
+      liveMMEl.innerHTML = '';
+    }
+
+    // ---- Tab 2: highlight active MMA algo card ----
+    const MMA_CARD_IDS = {
+      'HFT Latency Arbitrage':         'mmpCard-hft',
+      'TWAP/VWAP Optimal Execution':   'mmpCard-twap',
+      'Statistical Arbitrage MM':      'mmpCard-statarb',
+      'Inventory Risk (Ho-Stoll)':     'mmpCard-hostoll',
+      'Quote Stuffing / Layering':     'mmpCard-qstuff',
+      'Momentum Ignition':             'mmpCard-momign',
+      'Cross-Asset MM':                'mmpCard-cross',
+      'Passive Market Making (PMM)':   'mmpCard-pmm',
+      'Reinforcement Learning MM':     'mmpCard-rl',
+      'Stochastic Control (Cartea-J)': 'mmpCard-cartea',
+    };
+    Object.values(MMA_CARD_IDS).forEach(function(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('active-algo');
+    });
+    const liveMMAEl = document.getElementById('mmParamsMMALive');
+    if (mmaSumm && mmaSumm.mma_algo) {
+      const cardId = MMA_CARD_IDS[mmaSumm.mma_algo];
+      if (cardId) {
+        const card = document.getElementById(cardId);
+        if (card) {
+          card.classList.add('active-algo');
+          const titleEl = card.querySelector('.mmp-algo-title');
+          if (titleEl) {
+            let badge = titleEl.querySelector('.mmp-hits-badge');
+            if (!badge) {
+              badge = document.createElement('span');
+              badge.className = 'mmp-hits-badge';
+              titleEl.insertBefore(badge, titleEl.querySelector('.mmp-weight-badge'));
+            }
+            const hits = mmaSumm.mma_raw_hits && mmaSumm.mma_raw_hits[mmaSumm.mma_algo];
+            badge.textContent = hits != null ? hits + ' hits' : '';
+          }
+        }
+      }
+      const biasCol = mmaSumm.mma_bias === 'BULLISH' ? '#26a69a' : (mmaSumm.mma_bias === 'BEARISH' ? '#ef5350' : '#787b86');
+      const biasIcon = mmaSumm.mma_bias === 'BULLISH' ? '&#9650;' : (mmaSumm.mma_bias === 'BEARISH' ? '&#9660;' : '&#9644;');
+      liveMMAEl.innerHTML =
+        '<div style="background:#131722;border:1px solid #e040fb44;border-radius:7px;padding:10px 14px;margin-bottom:4px">' +
+          '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Live Advanced MM Detection</div>' +
+          '<div style="font-size:13px;font-weight:700;color:#e040fb">' + mmaSumm.mma_algo +
+            '<span style="font-size:10px;font-weight:600;background:rgba(224,64,251,0.12);color:#e040fb;border:1px solid #e040fb44;border-radius:3px;padding:1px 7px;margin-left:8px">' + mmaSumm.mma_confidence + '% conf</span>' +
+          '</div>' +
+          '<div style="font-size:11px;color:#d1d4dc;margin-top:4px">Bias: <strong style="color:' + biasCol + '">' + biasIcon + ' ' + mmaSumm.mma_bias + '</strong>' +
+            ' &nbsp;|&nbsp; Score: <strong>' + (mmaSumm.score >= 0 ? '+' : '') + mmaSumm.score.toFixed(2) + '</strong>' +
+            ' &nbsp;|&nbsp; Signal: <strong style="color:#e040fb">' + mmaSumm.verdict + '</strong>' +
+          '</div>' +
+        '</div>';
+    } else {
+      liveMMAEl.innerHTML = '';
+    }
+
+    // ---- Tab 3: Combined Market Prediction ----
+    const predEl = document.getElementById('mmParamsPrediction');
+    const hasAny = (mmSumm && mmSumm.mm_algo) || (mmaSumm && mmaSumm.mma_algo);
+    if (!hasAny) {
+      predEl.innerHTML = '<div style="color:#787b86;font-size:12px;padding:20px 0 0;text-align:center">Enable <strong>Market Making</strong> and/or <strong>MM Advanced</strong> from the Algo menu to see live predictions.</div>';
+      return;
+    }
+
+    // Determine combined bias
+    const mmBias  = mmSumm  ? mmSumm.mm_bias  : 'NEUTRAL';
+    const mmaBias = mmaSumm ? mmaSumm.mma_bias : 'NEUTRAL';
+    const biasVotes = { BULLISH: 0, BEARISH: 0, NEUTRAL: 0 };
+    biasVotes[mmBias]++;
+    biasVotes[mmaBias]++;
+    const combinedBias = biasVotes.BULLISH > biasVotes.BEARISH ? 'BULLISH' :
+                         biasVotes.BEARISH > biasVotes.BULLISH ? 'BEARISH' : 'NEUTRAL';
+    const biasCol  = combinedBias === 'BULLISH' ? '#26a69a' : (combinedBias === 'BEARISH' ? '#ef5350' : '#787b86');
+    const biasIcon = combinedBias === 'BULLISH' ? '&#9650;' : (combinedBias === 'BEARISH' ? '&#9660;' : '&#9644;');
+    const predBg   = combinedBias === 'BULLISH' ? 'rgba(38,166,154,0.1)' : (combinedBias === 'BEARISH' ? 'rgba(239,83,80,0.1)' : 'rgba(120,123,134,0.08)');
+    const predBorder = combinedBias === 'BULLISH' ? '#26a69a44' : (combinedBias === 'BEARISH' ? '#ef535044' : '#787b8644');
+
+    let html = '';
+    // Combined bias badge
+    html +=
+      '<div style="background:' + predBg + ';border:1px solid ' + predBorder + ';border-radius:8px;padding:14px;margin-bottom:12px;text-align:center">' +
+        '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Combined Market Bias</div>' +
+        '<div style="font-size:28px;font-weight:900;color:' + biasCol + '">' + biasIcon + ' ' + combinedBias + '</div>' +
+      '</div>';
+
+    // Individual predictions
+    html += '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:700">Algorithm-Based Predictions</div>';
+
+    if (mmSumm && mmSumm.mm_algo) {
+      const bc = mmSumm.mm_bias === 'BULLISH' ? '#26a69a' : (mmSumm.mm_bias === 'BEARISH' ? '#ef5350' : '#787b86');
+      const bi = mmSumm.mm_bias === 'BULLISH' ? '&#9650;' : (mmSumm.mm_bias === 'BEARISH' ? '&#9660;' : '&#9644;');
+      html +=
+        '<div style="background:#131722;border:1px solid #ff910033;border-radius:7px;padding:12px;margin-bottom:8px">' +
+          '<div style="font-size:11px;font-weight:700;color:#ff9100;margin-bottom:6px">&#129302; Market Making — ' + mmSumm.mm_algo +
+            '<span style="float:right;font-size:10px;color:' + bc + '">' + bi + ' ' + mmSumm.mm_bias + '</span>' +
+          '</div>' +
+          '<div style="font-size:11px;color:#d1d4dc;line-height:1.6">' + mmSumm.mm_prediction + '</div>' +
+          // Score bar for each MM sub-algo
+          (mmSumm.mm_scores ? (function() {
+            const sorted = Object.entries(mmSumm.mm_scores).sort((a, b) => b[1] - a[1]).slice(0, 3);
+            let s = '<div style="margin-top:8px">';
+            sorted.forEach(function([name, pct]) {
+              const isTop = name === mmSumm.mm_algo;
+              s += '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px">' +
+                '<span style="flex:1;color:' + (isTop ? '#ff9100' : '#787b86') + '">' + (isTop ? '&#11088; ' : '') + name + '</span>' +
+                '<div style="width:80px;background:#2a2e39;border-radius:2px;height:4px"><div style="width:' + pct + '%;height:4px;border-radius:2px;background:' + (isTop ? '#ff9100' : '#ff910044') + '"></div></div>' +
+                '<span style="min-width:30px;text-align:right;color:#787b86">' + pct + '%</span>' +
+              '</div>';
+            });
+            s += '</div>';
+            return s;
+          })() : '') +
+        '</div>';
+    }
+
+    if (mmaSumm && mmaSumm.mma_algo) {
+      const bc = mmaSumm.mma_bias === 'BULLISH' ? '#26a69a' : (mmaSumm.mma_bias === 'BEARISH' ? '#ef5350' : '#787b86');
+      const bi = mmaSumm.mma_bias === 'BULLISH' ? '&#9650;' : (mmaSumm.mma_bias === 'BEARISH' ? '&#9660;' : '&#9644;');
+      html +=
+        '<div style="background:#131722;border:1px solid #e040fb33;border-radius:7px;padding:12px;margin-bottom:8px">' +
+          '<div style="font-size:11px;font-weight:700;color:#e040fb;margin-bottom:6px">&#128301; MM Advanced — ' + mmaSumm.mma_algo +
+            '<span style="float:right;font-size:10px;color:' + bc + '">' + bi + ' ' + mmaSumm.mma_bias + '</span>' +
+          '</div>' +
+          '<div style="font-size:11px;color:#d1d4dc;line-height:1.6">' + mmaSumm.mma_prediction + '</div>' +
+          // Top 3 MMA scores
+          (mmaSumm.mma_scores ? (function() {
+            const sorted = Object.entries(mmaSumm.mma_scores).sort((a, b) => b[1] - a[1]).slice(0, 3);
+            let s = '<div style="margin-top:8px">';
+            sorted.forEach(function([name, pct]) {
+              const isTop = name === mmaSumm.mma_algo;
+              s += '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px">' +
+                '<span style="flex:1;color:' + (isTop ? '#e040fb' : '#787b86') + '">' + (isTop ? '&#11088; ' : '') + name + '</span>' +
+                '<div style="width:80px;background:#2a2e39;border-radius:2px;height:4px"><div style="width:' + pct + '%;height:4px;border-radius:2px;background:' + (isTop ? '#e040fb' : '#e040fb44') + '"></div></div>' +
+                '<span style="min-width:30px;text-align:right;color:#787b86">' + pct + '%</span>' +
+              '</div>';
+            });
+            s += '</div>';
+            return s;
+          })() : '') +
+        '</div>';
+    }
+
+    // All algos score summary table
+    html += '<div style="font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:1px;margin:12px 0 8px;font-weight:700">All Algorithm Detection Summary</div>';
+
+    // MM algorithms summary
+    if (mmSumm && mmSumm.indicators) {
+      html += '<div style="font-size:10px;color:#ff9100;font-weight:700;margin-bottom:4px">&#129302; Market Making</div>';
+      mmSumm.indicators.forEach(function(ind) {
+        const w = ind.weight || 0;
+        const bar = Math.min(100, Math.round(w / (mmSumm.mm_scores ? Math.max(...Object.values(mmSumm.mm_scores).map(v => v)) * 0.01 : 1)));
+        html +=
+          '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px;border-bottom:1px solid #2a2e3933">' +
+            '<span style="flex:1;color:#d1d4dc">' + ind.name + '</span>' +
+            '<span style="color:#787b86;min-width:46px;text-align:right">' + ind.status + '</span>' +
+            '<span style="color:#ff9100;font-weight:600;min-width:36px;text-align:right">wt: ' + w + '</span>' +
+          '</div>';
+      });
+    }
+
+    // MMA algorithms summary
+    if (mmaSumm && mmaSumm.indicators) {
+      html += '<div style="font-size:10px;color:#e040fb;font-weight:700;margin:8px 0 4px">&#128301; MM Advanced</div>';
+      mmaSumm.indicators.forEach(function(ind) {
+        html +=
+          '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px;border-bottom:1px solid #2a2e3933">' +
+            '<span style="flex:1;color:#d1d4dc">' + ind.name + '</span>' +
+            '<span style="color:#787b86;min-width:46px;text-align:right">' + ind.status + '</span>' +
+            '<span style="color:#e040fb;font-weight:600;min-width:36px;text-align:right">wt: ' + ind.weight + '</span>' +
+          '</div>';
+      });
+    }
+
+    predEl.innerHTML = html;
+  }
+
   // ---- Indicators Dropdown ----
   const indDropdown = document.getElementById('indicatorsDropdown');
   document.getElementById('btnIndicators').addEventListener('click', function(e) {
@@ -9565,6 +10534,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     scoreBoardPanel.classList.remove('open');
     mmPanel.classList.remove('open');
     mmaPanel.classList.remove('open');
+    mmParamsPanel.classList.remove('open');
     cfgPanel.classList.remove('open');
   });
   // Close dropdown on outside click
@@ -10102,6 +11072,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       updateScoreBoard(summ, json.allSignals || sigs);
       updateMMPanel(summ);
       updateMMAPanel(summ);
+      updateMMParamsPanel(summ);
+      updatePredictionPanel(summ, lastSR, candleData);
 
       // --- Update Backtest Panel ---
       lastBacktest = json.backtest || {};

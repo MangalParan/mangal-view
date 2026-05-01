@@ -1,5 +1,5 @@
 ---
-description: "Use when checking Nifty options chain, NSE options data, open interest analysis, options Greeks, PCR ratio, max pain, Nifty CE PE prices, strike-wise OI, Indian stock market derivatives analysis, Nifty candlestick chart, technical indicators, buy sell signals, live data, backtest strategy, multi-symbol chart, crypto chart."
+description: "Use when checking Nifty options chain, NSE options data, open interest analysis, options Greeks, PCR ratio, max pain, Nifty CE PE prices, strike-wise OI, Indian stock market derivatives analysis, Nifty candlestick chart, technical indicators, buy sell signals, live data, backtest strategy, multi-symbol chart, crypto chart, algo signals (Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, StatArb, Institution, MPredict), signal analysis panel, indicator settings, SuperTrend, Parabolic SAR, support/resistance levels, EMA 9/21 crossover, VWAP, Bollinger Bands, CPR Central Pivot Range, liquidity pools, Fair Value Gap FVG, Break of Structure BOS, Change of Character CHoCH, Cumulative Volume Delta CVD, volume profile POC VAH VAL, backtest performance overview trade list, futures paper trading, trade log, data source Yahoo Finance TradingView NSE India, theme dark light toggle, zoom controls, admin panel user management, site settings maintenance mode, help pages algos indicators manual."
 tools: [execute, read, edit, search, web]
 ---
 
@@ -104,11 +104,13 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
   - **StatArb** — statistical arbitrage mean-reversion using z-score, Bollinger %B, spread velocity, RSI divergence (7 indicators)
   - **Institution** — institutional accumulation/distribution detection using volume analysis, order blocks, VWAP anchoring, OBV divergence, dark pool footprints (8 indicators)
   - **MPredict** — ML-based candle prediction (controls prediction overlay)
+  - **Prediction** *(panel-only)* — opens Prediction panel combining S/R levels, Market Making signal, MM Advanced signal, composite signal analysis, and a full-day candlestick chart with S/R lines drawn. Auto-enables Market Making + MM Advanced algos when clicked
 - All algos use unified thresholds: BUY >= 3.5, STRONG BUY >= 5.0, SELL <= -3.5, STRONG SELL <= -5.0
 - Multi-select: clicking an algo toggles it on/off (checkmark shown). Multiple algos can be active simultaneously
 - `currentAlgo` is a JavaScript `Set` — signals from all selected algos are merged with deduplication (highest absolute score wins per timestamp)
 - `algo` query parameter: comma-separated (e.g. `algo=mstreet,mpredict`)
 - **`⚡ Signal Analysis`** item at bottom of dropdown opens the Signal Analysis panel
+- **`🔮 Prediction`** item at bottom of dropdown opens the Prediction panel
 - Debounced reload (300ms) on algo change to prevent flickering
 
 ### Janestreet Signal Engine
@@ -150,7 +152,18 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
   - **S/R Level Reaction** (weight 1.0) — institutional support holds or resistance rejections with above-average volume.
 - **Signal thresholds**: score >= 3.5 → BUY, >= 5.0 → STRONG BUY, <= -3.5 → SELL, <= -5.0 → STRONG SELL
 
-### Backtest (in Settings Panel)
+### Prediction Panel (🔮 Prediction in Algo dropdown)
+- Opens when **Prediction** is clicked in the Algo dropdown special items section (cyan color)
+- Automatically enables **Market Making** + **MM Advanced** algos if not already active, then loads data
+- **Predicted Direction box** — combined BULLISH / BEARISH / NEUTRAL verdict derived from MM + MMA bias votes (majority wins), showing confidence percentages for each
+- **Signal Analysis section** — composite verdict averaged across all active signal algos (excludes MM/MMA); shows per-algo verdict and score rows
+- **Market Making section** — live dominant MM algo, bias, confidence %, score, signal, and today's market prediction text from the MM engine
+- **MM Advanced section** — live dominant MMA algo, bias, confidence %, score, signal, and prediction text from the MMA engine
+- **Support & Resistance table** — lists all R and S levels from highest resistance down to deepest support, with strength bar and multiplier
+- **Day Chart** — embedded LightweightCharts candlestick chart filtered to the current trading day (IST), with S/R horizontal lines drawn (green dashed = support, red dashed = resistance). Fits full day session automatically
+- All sections refresh automatically on every data reload while the panel is open
+
+
 - **Backtest section** in the Settings panel (⚙) with 15 algo-named items:
   - **Trend**, **MStreet**, **MFactor**, **Sniper**, **OrderFlow**, **PriceAction**, **Breakout**, **Momentum**, **Scalping**, **SmartMoney**, **Quant**, **Hybrid**, **StatArb**, **Institution**, **MPredict**
   - Each item activates the corresponding algo, reloads data, and opens the backtest panel
