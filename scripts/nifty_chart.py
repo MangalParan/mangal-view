@@ -67,7 +67,8 @@ def init_db():
             password_hash TEXT NOT NULL,
             place TEXT DEFAULT '',
             plan TEXT DEFAULT 'free',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            validity_until TEXT DEFAULT NULL
         )
     """)
     db.execute("""
@@ -84,22 +85,25 @@ def init_db():
         db.execute("ALTER TABLE users ADD COLUMN place TEXT DEFAULT ''")
     if "plan" not in cols:
         db.execute("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'")
+    if "validity_until" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN validity_until TEXT DEFAULT NULL")
     # Seed default site settings
     defaults = {
         "maintenance_mode": "off",
+        "registration_enabled": "on",
         "settings_backtest": "on",
         "settings_datasource": "on",
         "settings_trade": "on",
         "settings_realtrade": "on",
         "menu_symbols": json.dumps(["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","CRUDEOIL","NATURALGAS"]),
         "menu_timeframes": json.dumps(["1m","2m","3m","5m","10m","15m","30m","1h","2h","4h","1d","1w","1mo"]),
-        "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
-        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma"]),
+        "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
+        "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]),
     }
     for k, v in defaults.items():
         db.execute("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)", (k, v))
     # Migrate: ensure new algos are in menu_algos for existing DBs
-    _all_algos = ["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma"]
+    _all_algos = ["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]
     _row = db.execute("SELECT value FROM site_settings WHERE key = 'menu_algos'").fetchone()
     if _row:
         try:
@@ -108,6 +112,24 @@ def init_db():
             if _missing:
                 _updated = _existing + _missing
                 db.execute("UPDATE site_settings SET value = ? WHERE key = 'menu_algos'", (json.dumps(_updated),))
+        except Exception:
+            pass
+    # Migrate: ensure new indicators are in menu_indicators for existing DBs
+    _all_indicators = ["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]
+    _ind_row = db.execute("SELECT value FROM site_settings WHERE key = 'menu_indicators'").fetchone()
+    if _ind_row:
+        try:
+            _existing_ind = json.loads(_ind_row[0])
+            _missing_ind = [i for i in _all_indicators if i not in _existing_ind]
+            if _missing_ind:
+                # Insert ORB after CPR if present, else append
+                if "ORB" in _missing_ind and "CPR" in _existing_ind:
+                    idx = _existing_ind.index("CPR") + 1
+                    for item in reversed([i for i in _missing_ind]):
+                        _existing_ind.insert(idx, item)
+                else:
+                    _existing_ind.extend(_missing_ind)
+                db.execute("UPDATE site_settings SET value = ? WHERE key = 'menu_indicators'", (json.dumps(_existing_ind),))
         except Exception:
             pass
     db.commit()
@@ -349,6 +371,16 @@ def login():
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    # Check if registration is enabled
+    try:
+        with sqlite3.connect(DB_PATH) as _db:
+            _row = _db.execute("SELECT value FROM site_settings WHERE key = 'registration_enabled'").fetchone()
+            if _row and _row[0] == "off":
+                disabled_msg = '<div class="error">Registration cannot be done now. Please contact administrator.</div>'
+                return Response(REGISTER_PAGE.replace("{{ERROR}}", disabled_msg), content_type="text/html")
+    except Exception:
+        pass
+    
     if request.method == "GET":
         return Response(REGISTER_PAGE.replace("{{ERROR}}", ""), content_type="text/html")
     username = request.form.get("username", "").strip()
@@ -367,20 +399,25 @@ def register():
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Password must be at least 6 characters.</div>'), content_type="text/html")
     if password != confirm:
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">Passwords do not match.</div>'), content_type="text/html")
+    
+    # Calculate validity period: 1 month from now
+    from datetime import datetime, timedelta
+    validity_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    
     db = get_db()
     existing = db.execute("SELECT id, plan FROM users WHERE mobileno = ?", (mobileno,)).fetchone()
     if existing:
         # Allow re-registration for paid upgrade after free expired
         if existing["plan"] == "free" and plan == "paid":
             pw_hash = hash_password(password)
-            db.execute("UPDATE users SET username=?, password_hash=?, place=?, plan='paid', created_at=CURRENT_TIMESTAMP WHERE id=?",
-                       (username, pw_hash, place, existing["id"]))
+            db.execute("UPDATE users SET username=?, password_hash=?, place=?, plan='paid', validity_until=?, created_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (username, pw_hash, place, validity_date, existing["id"]))
             db.commit()
             return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Upgraded to Paid! &#8377;100/month &mdash; Contact <b>Mangal</b> at <b>95000 90975</b>. <a href="/login">Sign in now</a></div>'), content_type="text/html")
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="error">This mobile number is already registered.</div>'), content_type="text/html")
     pw_hash = hash_password(password)
-    db.execute("INSERT INTO users (username, mobileno, password_hash, place, plan) VALUES (?, ?, ?, ?, ?)",
-               (username, mobileno, pw_hash, place, plan))
+    db.execute("INSERT INTO users (username, mobileno, password_hash, place, plan, validity_until) VALUES (?, ?, ?, ?, ?, ?)",
+               (username, mobileno, pw_hash, place, plan, validity_date))
     db.commit()
     if plan == "paid":
         return Response(REGISTER_PAGE.replace("{{ERROR}}", '<div class="success">Registration successful! &#8377;100/month &mdash; Contact <b>Mangal</b> at <b>95000 90975</b>. <a href="/login">Sign in now</a></div>'), content_type="text/html")
@@ -418,7 +455,7 @@ def admin_list_users():
     if not session.get("admin"):
         return jsonify({"error": "Unauthorized"}), 401
     db = get_db()
-    rows = db.execute("SELECT id, username, mobileno, place, plan, created_at FROM users ORDER BY id DESC").fetchall()
+    rows = db.execute("SELECT id, username, mobileno, place, plan, created_at, validity_until FROM users ORDER BY id DESC").fetchall()
     return jsonify({"users": [dict(r) for r in rows]})
 
 
@@ -432,6 +469,7 @@ def admin_add_user():
     password = data.get("password") or ""
     place = (data.get("place") or "").strip()
     plan = data.get("plan", "free")
+    validity_until = data.get("validity_until", None)
     if plan not in ("free", "paid"):
         plan = "free"
     if not username or not mobileno or not password or not place:
@@ -445,8 +483,8 @@ def admin_add_user():
     if existing:
         return jsonify({"error": "Mobile number already registered"}), 409
     pw_hash = hash_password(password)
-    db.execute("INSERT INTO users (username, mobileno, password_hash, place, plan) VALUES (?, ?, ?, ?, ?)",
-               (username, mobileno, pw_hash, place, plan))
+    db.execute("INSERT INTO users (username, mobileno, password_hash, place, plan, validity_until) VALUES (?, ?, ?, ?, ?, ?)",
+               (username, mobileno, pw_hash, place, plan, validity_until))
     db.commit()
     return jsonify({"ok": True})
 
@@ -463,8 +501,9 @@ def admin_update_user():
     user = db.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone()
     if not user:
         return jsonify({"error": "User not found"}), 404
-    db.execute("UPDATE users SET username=?, mobileno=?, place=?, plan=? WHERE id=?",
-               (data.get("username", ""), data.get("mobileno", ""), data.get("place", ""), data.get("plan", "free"), uid))
+    validity_until = data.get("validity_until", None)
+    db.execute("UPDATE users SET username=?, mobileno=?, place=?, plan=?, validity_until=? WHERE id=?",
+               (data.get("username", ""), data.get("mobileno", ""), data.get("place", ""), data.get("plan", "free"), validity_until, uid))
     pwd = data.get("password", "")
     if pwd:
         pw_hash = hash_password(pwd)
@@ -503,7 +542,7 @@ def admin_update_settings():
     if not session.get("admin"):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.get_json()
-    allowed_keys = {"maintenance_mode", "settings_backtest", "settings_datasource",
+    allowed_keys = {"maintenance_mode", "registration_enabled", "settings_backtest", "settings_datasource",
                     "settings_trade", "settings_realtrade",
                     "menu_symbols", "menu_timeframes", "menu_indicators", "menu_algos"}
     for key, value in data.items():
@@ -1491,6 +1530,60 @@ def compute_cpr(candles):
     tc = round(2 * pivot - bc, 2)
 
     return {"pivot": pivot, "tc": tc, "bc": bc}
+
+
+def compute_orb(candles, orb_minutes=15):
+    """Compute Opening Range Breakout (ORB) levels for each trading session.
+
+    The ORB identifies the highest high and lowest low formed during the first
+    `orb_minutes` of each trading day. These levels act as breakout reference
+    zones — a price move above ORB high suggests a bullish breakout; below
+    ORB low suggests a bearish breakdown. Only candles after the opening range
+    closes are returned.
+
+    Args:
+        candles (list[dict]): OHLCV candle dicts with 'time' (Unix seconds).
+        orb_minutes (int): Duration of the opening range in minutes (default 15).
+
+    Returns:
+        list[dict]: Dicts with 'time', 'high' (ORB high), 'low' (ORB low)
+            for candles falling after the opening range on each day.
+    """
+    if not candles:
+        return []
+
+    from collections import defaultdict
+    day_candles = defaultdict(list)
+    for c in candles:
+        date = datetime.fromtimestamp(c["time"]).strftime("%Y-%m-%d")
+        day_candles[date].append(c)
+
+    result = []
+    for date in sorted(day_candles.keys()):
+        day_sorted = sorted(day_candles[date], key=lambda x: x["time"])
+        if not day_sorted:
+            continue
+
+        session_start = day_sorted[0]["time"]
+        orb_end_ts = session_start + orb_minutes * 60
+
+        orb_candles = [c for c in day_sorted if c["time"] < orb_end_ts]
+        post_orb = [c for c in day_sorted if c["time"] >= orb_end_ts]
+
+        if not orb_candles or not post_orb:
+            continue
+
+        orb_high = round(max(c["high"] for c in orb_candles), 2)
+        orb_low = round(min(c["low"] for c in orb_candles), 2)
+
+        for c in post_orb:
+            result.append({
+                "time": c["time"],
+                "high": orb_high,
+                "low": orb_low,
+            })
+
+    return result
 
 
 def compute_bollinger_bands(candles, period=20, std_dev=2.0):
@@ -7838,6 +7931,7 @@ def api_candles():
     bos_choch = compute_bos_choch(candles)
     cvd = compute_cvd(candles)
     volume_profile = compute_volume_profile(candles)
+    orb = compute_orb(candles)
 
     algo_param = request.args.get("algo", "trend")
     algos = [a.strip() for a in algo_param.split(",") if a.strip()]
@@ -7957,6 +8051,7 @@ def api_candles():
         "bosChoch": bos_choch,
         "cvd": cvd,
         "volumeProfile": volume_profile,
+        "orb": orb,
         "backtest": backtest,
         "predictions": predictions,
     })
@@ -8105,7 +8200,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px;
     padding: 6px 0; min-width: 200px; display: none;
     box-shadow: 0 8px 32px rgba(0,0,0,0.5); margin-top: 4px;
+    max-height: 70vh; overflow-y: auto;
   }
+  .indicators-dropdown::-webkit-scrollbar { width: 5px; }
+  .indicators-dropdown::-webkit-scrollbar-track { background: transparent; }
+  .indicators-dropdown::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 4px; }
   .indicators-dropdown.open { display: block; }
   .ind-item {
     display: flex; align-items: center; gap: 8px; padding: 8px 14px;
@@ -8597,6 +8696,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .pred-panel.expanded { width: min(860px, 92vw); }
   .pred-future-legend { font-size: 10px; color: #787b86; margin: 2px 0 6px; display:flex; align-items:center; gap:8px; }
   .pred-future-legend span { display:inline-block; width:24px; height:3px; background:#4fc3f7; border-radius:2px; }
+  
+  /* Pattern Panel */
+  .pattern-panel {
+    position: absolute; top: 44px; right: 300px; z-index: 200;
+    background: #1e222d; border: 1px solid #ff6ec766; border-radius: 8px;
+    padding: 16px; width: 480px; display: none;
+    box-shadow: 0 8px 32px rgba(255,110,199,0.20); max-height: calc(100vh - 80px); overflow-y: auto;
+  }
+  .pattern-panel.open { display: block; }
+  .pattern-timeline-item {
+    padding: 8px 0;
+    border-bottom: 1px solid #2a2e3944;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .pattern-timeline-item:last-child {
+    border-bottom: none;
+  }
+  .pattern-time {
+    display: inline-block;
+    font-weight: 700;
+    color: #ffd600;
+    min-width: 80px;
+  }
+  .pattern-trend {
+    display: inline-block;
+    font-weight: 600;
+  }
+  .pattern-trend.bullish { color: #26a69a; }
+  .pattern-trend.bearish { color: #ef5350; }
+  .pattern-trend.neutral { color: #787b86; }
+  .pattern-drag-header { cursor: move; user-select: none; }
+  
   .mmparams-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid #2a2e39; padding-bottom: 0; }
   .mmparams-tab {
     padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
@@ -8828,6 +8960,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <label class="ind-item" data-ind="VWAP"><span class="dot" style="background:#ff6d00"></span><span>VWAP</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="BB"><span class="dot" style="background:#2196f3"></span><span>Bollinger Bands</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="CPR"><span class="dot" style="background:#ab47bc"></span><span>CPR</span><input type="checkbox"></label>
+      <label class="ind-item" data-ind="ORB"><span class="dot" style="background:#ff9800"></span><span>ORB (15m)</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="LP"><span class="dot" style="background:#ffd600"></span><span>Liquidity Pools</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="FVG"><span class="dot" style="background:#80cbc4"></span><span>Fair Value Gap</span><input type="checkbox"></label>
       <label class="ind-item" data-ind="BOS"><span class="dot" style="background:#ff7043"></span><span>Break of Structure</span><input type="checkbox"></label>
@@ -8860,9 +8993,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="algo-item" data-algo="mpredict" data-label="MPredict">&#8203; MPredict</button>
       <button class="algo-item" data-algo="marketmaking" data-label="Market Making">&#8203; Market Making</button>
       <button class="algo-item" data-algo="mma" data-label="MM Advanced">&#8203; MM Advanced</button>
+      <button class="algo-item" data-algo="pattern" data-label="Pattern">&#8203; Pattern</button>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
       <button class="algo-item" id="btnAlgoScoreboard" style="color:#69f0ae">&#127942; Score Board</button>
+      <button class="algo-item" id="btnAlgoPattern" style="color:#ff6ec7">&#128200; Pattern Panel</button>
       <button class="algo-item" id="btnAlgoMM" style="color:#80d8ff">&#129302; Market Making</button>
       <button class="algo-item" id="btnAlgoMMA" style="color:#e040fb">&#128301; MM Advanced</button>
       <button class="algo-item" id="btnAlgoMMParams" style="color:#ff9100">&#128202; MM Parameters</button>
@@ -9115,79 +9250,88 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="mmParamsMMLive" style="margin-bottom:10px"></div>
       <div class="mmp-section-title">Market Making Algorithms — Parameters &amp; Details</div>
       <div class="mmp-algo-card" id="mmpCard-as">
-        <div class="mmp-algo-title">&#9679; Avellaneda-Stoikov (AS Model)<span class="mmp-weight-badge">Weight ×3</span></div>
-        <div class="mmp-param-row"><span>Wick Symmetry:</span> &gt; 0.70 (ratio of |lower_wick − upper_wick| / full_range)</div>
-        <div class="mmp-param-row"><span>VWAP Proximity:</span> Price within 0.10% of VWAP</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per qualifying candle hit</div>
-        <div class="mmp-param-row"><span>Trigger:</span> Both conditions met simultaneously</div>
+        <div class="mmp-algo-title">&#9679; Avellaneda-Stoikov (AS Model)<span class="mmp-weight-badge">Dominance ×3</span></div>
+        <div class="mmp-param-row"><span>Wick Symmetry:</span> 1 − |lower_wick − upper_wick| / full_range &gt; 0.70</div>
+        <div class="mmp-param-row"><span>VWAP Proximity:</span> |close − VWAP| / VWAP &lt; 0.001 (0.10%)</div>
+        <div class="mmp-param-row"><span>Trigger:</span> Both conditions must be met on the same candle</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +2.0 (close &gt; VWAP) / −2.0 (close &lt; VWAP)</div>
+        <div class="mmp-param-row"><span>Lookback Window:</span> 30 candles rolling</div>
         <div class="mmp-desc">Detects symmetric bid-ask quoting centered on VWAP. The MM earns the spread passively while controlling inventory via mean-reversion.</div>
         <div class="mmp-pred">&#128200; Prediction: Mean-reversion expected. Price will snap back to VWAP. Fading extremes is favoured.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-grid">
-        <div class="mmp-algo-title">&#9679; Grid Market Making<span class="mmp-weight-badge">Weight ×2</span></div>
-        <div class="mmp-param-row"><span>Grid Level:</span> Round price to nearest ₹50 interval</div>
-        <div class="mmp-param-row"><span>Visit Threshold:</span> ≥ 4 candle closes at same grid level</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per qualifying hit</div>
-        <div class="mmp-param-row"><span>Direction:</span> Bullish if close &gt; open at grid, else Bearish</div>
+        <div class="mmp-algo-title">&#9679; Grid Market Making<span class="mmp-weight-badge">Dominance ×2</span></div>
+        <div class="mmp-param-row"><span>Grid Step:</span> round(close / 50) × 50 → nearest ₹50 level</div>
+        <div class="mmp-param-row"><span>Visit Threshold:</span> price_visit_map[grid_level] ≥ 4 candle closes</div>
+        <div class="mmp-param-row"><span>Direction:</span> close &gt; open → +1.5 (bullish) | close &lt; open → −1.5 (bearish)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> ±1.5 per qualifying grid revisit</div>
+        <div class="mmp-param-row"><span>Lookback Window:</span> 30 candles rolling</div>
         <div class="mmp-desc">Detects automated grid orders placed at fixed price intervals (₹50 steps). The MM profits from oscillations between grid lines.</div>
         <div class="mmp-pred">&#128200; Prediction: Range-bound day. Price bouncing between grid levels — trade the range.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-dn">
-        <div class="mmp-algo-title">&#9679; Delta-Neutral MM<span class="mmp-weight-badge">Weight ×2</span></div>
-        <div class="mmp-param-row"><span>VWAP Band:</span> Price within 0.15% of VWAP</div>
-        <div class="mmp-param-row"><span>Range Filter:</span> Candle range &lt; 0.50× ATR</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per qualifying hit</div>
+        <div class="mmp-algo-title">&#9679; Delta-Neutral MM<span class="mmp-weight-badge">Dominance ×2</span></div>
+        <div class="mmp-param-row"><span>VWAP Band:</span> |close − VWAP| / VWAP &lt; 0.0015 (0.15%)</div>
+        <div class="mmp-param-row"><span>Range Filter:</span> (high − low) / local_ATR &lt; 0.50</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +1.5 (bullish, price above or at VWAP)</div>
+        <div class="mmp-param-row"><span>ATR Lookback:</span> 30-bar rolling average</div>
         <div class="mmp-param-row"><span>Purpose:</span> Options-driven pinning near max-pain / VWAP</div>
         <div class="mmp-desc">Identifies options market makers delta-hedging continuously, keeping price anchored near the max-pain / VWAP level to minimise their options risk.</div>
         <div class="mmp-pred">&#128200; Prediction: Price likely to stay near VWAP / max-pain all day — options expiry pinning effect.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-sc">
-        <div class="mmp-algo-title">&#9679; Spread Capture MM<span class="mmp-weight-badge">Weight ×1</span></div>
-        <div class="mmp-param-row"><span>Range Filter:</span> Candle range &lt; 0.35× local ATR</div>
-        <div class="mmp-param-row"><span>Direction:</span> EMA-9 vs EMA-21 trend bias</div>
-        <div class="mmp-param-row"><span>Lookback ATR:</span> 30-bar rolling average</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×1 per qualifying hit</div>
+        <div class="mmp-algo-title">&#9679; Spread Capture MM<span class="mmp-weight-badge">Dominance ×1</span></div>
+        <div class="mmp-param-row"><span>Range Filter:</span> (high − low) &lt; local_ATR × 0.35</div>
+        <div class="mmp-param-row"><span>Direction:</span> EMA-9 &gt; EMA-21 → +1.0 (bull) | EMA-9 &lt; EMA-21 → −1.0 (bear)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> ±1.0 per qualifying tight-range candle</div>
+        <div class="mmp-param-row"><span>ATR Lookback:</span> 30-bar rolling average</div>
+        <div class="mmp-param-row"><span>Requires:</span> Both EMA-9 and EMA-21 present on same candle</div>
         <div class="mmp-desc">Identifies ultra-tight bid-ask spread exploitation — MMs placing orders just inside the spread to capture the difference on both sides repeatedly.</div>
         <div class="mmp-pred">&#128200; Prediction: Low-volatility session. Breakout direction after session open is the key trade.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-ps">
-        <div class="mmp-algo-title">&#9679; Predatory / Spoofing MM<span class="mmp-weight-badge">Weight ×4</span></div>
-        <div class="mmp-param-row"><span>Volume Spike:</span> Volume &gt; 2.5× 30-bar average</div>
-        <div class="mmp-param-row"><span>Reversal:</span> Direction flips vs previous candle</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×4 per qualifying hit (highest)</div>
-        <div class="mmp-param-row"><span>Risk:</span> Highly manipulative — expect fakeouts</div>
+        <div class="mmp-algo-title">&#9679; Predatory / Spoofing MM<span class="mmp-weight-badge">Dominance ×4</span></div>
+        <div class="mmp-param-row"><span>Volume Spike:</span> vol &gt; vol_avg × 2.5 (30-bar rolling average)</div>
+        <div class="mmp-param-row"><span>Reversal Check:</span> (prev_close − prev_open) × (curr_close − curr_open) &lt; 0</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +2.5 (spike reversal bullish) / −2.5 (spike reversal bearish)</div>
+        <div class="mmp-param-row"><span>Lookback Window:</span> 30 candles rolling volume average</div>
+        <div class="mmp-param-row"><span>Risk:</span> Highly manipulative — expect stop-hunt fakeouts</div>
         <div class="mmp-desc">Detects spoofing activity: large volume spike followed by immediate price reversal, indicating fake orders placed to trigger stop-losses or retail entry.</div>
         <div class="mmp-pred">&#128200; Prediction: High volatility. Fake moves likely — wait for confirmation before entering. Do not chase spikes.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-lp">
-        <div class="mmp-algo-title">&#9679; Liquidity Provision<span class="mmp-weight-badge">Weight ×3</span></div>
-        <div class="mmp-param-row"><span>S/R Proximity:</span> Price within 0.30% of S/R level</div>
-        <div class="mmp-param-row"><span>Volume Filter:</span> Volume &gt; 1.5× 30-bar average</div>
-        <div class="mmp-param-row"><span>Body Filter:</span> Candle body ratio &lt; 0.35 (indecision)</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per qualifying hit</div>
+        <div class="mmp-algo-title">&#9679; Liquidity Provision<span class="mmp-weight-badge">Dominance ×3</span></div>
+        <div class="mmp-param-row"><span>S/R Proximity:</span> |close − S/R level| / close &lt; 0.003 (0.30%)</div>
+        <div class="mmp-param-row"><span>Volume Filter:</span> vol &gt; vol_avg × 1.5 (30-bar rolling)</div>
+        <div class="mmp-param-row"><span>Body Filter:</span> |close − open| / (high − low) &lt; 0.35 (indecision candle)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +2.0 (absorbing at support) / −2.0 (absorbing at resistance)</div>
+        <div class="mmp-param-row"><span>Lookback Window:</span> 30 candles rolling</div>
         <div class="mmp-desc">Detects large institutions absorbing sell-side at support or buy-side at resistance, providing liquidity and accumulating positions ahead of a directional move.</div>
         <div class="mmp-pred">&#128200; Prediction: Trend continuation likely after absorption completes. Strong directional move expected.</div>
       </div>
       <div class="mmp-section-title">Common Confirmation Signals</div>
       <div class="mmp-algo-card">
-        <div class="mmp-algo-title" style="color:#26a69a">&#9679; OBV Confirmation<span class="mmp-weight-badge" style="background:rgba(38,166,154,0.12);color:#26a69a;border-color:#26a69a44">Weight ×1</span></div>
-        <div class="mmp-param-row"><span>Window:</span> 10-bar OBV delta (sum of signed volume)</div>
-        <div class="mmp-param-row"><span>Trigger:</span> OBV &gt; 0 confirms bullish score; OBV &lt; 0 confirms bearish</div>
+        <div class="mmp-algo-title" style="color:#26a69a">&#9679; OBV Confirmation<span class="mmp-weight-badge" style="background:rgba(38,166,154,0.12);color:#26a69a;border-color:#26a69a44">+1.0 score</span></div>
+        <div class="mmp-param-row"><span>Window:</span> Last 10 bars: Σ vol×sign(close−prev_close)</div>
+        <div class="mmp-param-row"><span>Trigger:</span> OBV_delta &gt; 0 and net score &gt; 0 → +1.0 | OBV_delta &lt; 0 and net score &lt; 0 → −1.0</div>
+        <div class="mmp-param-row"><span>Condition:</span> Only adds weight when OBV agrees with primary signal direction</div>
         <div class="mmp-desc">On-Balance Volume used as secondary confirmation. Only adds weight when it agrees with the primary signal direction.</div>
       </div>
       <div class="mmp-algo-card">
-        <div class="mmp-algo-title" style="color:#26a69a">&#9679; RSI Extremes<span class="mmp-weight-badge" style="background:rgba(38,166,154,0.12);color:#26a69a;border-color:#26a69a44">Weight ×1.5</span></div>
-        <div class="mmp-param-row"><span>Oversold:</span> RSI &lt; 28 → +1.5 (MM absorbing)</div>
-        <div class="mmp-param-row"><span>Overbought:</span> RSI &gt; 72 → −1.5 (MM distributing)</div>
+        <div class="mmp-algo-title" style="color:#26a69a">&#9679; RSI Extremes<span class="mmp-weight-badge" style="background:rgba(38,166,154,0.12);color:#26a69a;border-color:#26a69a44">±1.5 score</span></div>
+        <div class="mmp-param-row"><span>Oversold:</span> RSI &lt; 28 → +1.5 (MM absorbing at lows)</div>
+        <div class="mmp-param-row"><span>Overbought:</span> RSI &gt; 72 → −1.5 (MM distributing at highs)</div>
+        <div class="mmp-param-row"><span>Neutral Zone:</span> 28 ≤ RSI ≤ 72 → no RSI contribution</div>
         <div class="mmp-desc">RSI extremes confirm whether the MM is in absorption (oversold) or distribution (overbought) mode.</div>
       </div>
       <div class="mmp-section-title">Signal Thresholds</div>
       <div class="mmp-algo-card">
-        <div class="mmp-param-row"><span>BUY:</span> Score ≥ 3.5</div>
-        <div class="mmp-param-row"><span>STRONG BUY:</span> Score ≥ 5.0</div>
-        <div class="mmp-param-row"><span>SELL:</span> Score ≤ −3.5</div>
-        <div class="mmp-param-row"><span>STRONG SELL:</span> Score ≤ −5.0</div>
+        <div class="mmp-param-row"><span>BUY:</span> Net score ≥ 3.5</div>
+        <div class="mmp-param-row"><span>STRONG BUY:</span> Net score ≥ 5.0</div>
+        <div class="mmp-param-row"><span>SELL:</span> Net score ≤ −3.5</div>
+        <div class="mmp-param-row"><span>STRONG SELL:</span> Net score ≤ −5.0</div>
         <div class="mmp-param-row"><span>Lookback:</span> 30 candles rolling window</div>
+        <div class="mmp-param-row"><span>Dedup:</span> Consecutive same-direction signals suppressed</div>
       </div>
     </div>
     <!-- Tab: Advanced MM Parameters -->
@@ -9195,102 +9339,107 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="mmParamsMMALive" style="margin-bottom:10px"></div>
       <div class="mmp-section-title">Advanced Market Making Algorithms — 10 Algorithms</div>
       <div class="mmp-algo-card" id="mmpCard-hft">
-        <div class="mmp-algo-title">&#9889; HFT Latency Arbitrage<span class="mmp-weight-badge">Weight ×4</span></div>
-        <div class="mmp-param-row"><span>Micro-candles:</span> ≥ 3 candles with range &lt; 0.12× ATR in last 5 bars</div>
-        <div class="mmp-param-row"><span>Volume Burst:</span> Volume &gt; 1.3× 20-bar average</div>
-        <div class="mmp-param-row"><span>Lookback:</span> 5-bar sliding window</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×4 per hit (very high)</div>
+        <div class="mmp-algo-title">&#9889; HFT Latency Arbitrage<span class="mmp-weight-badge">Dominance ×4</span></div>
+        <div class="mmp-param-row"><span>Micro-candles:</span> Σ(bars where range &lt; ATR × 0.12) ≥ 3 in last 5 bars</div>
+        <div class="mmp-param-row"><span>Volume Burst:</span> vol &gt; vol_avg × 1.3 (20-bar rolling)</div>
+        <div class="mmp-param-row"><span>Scan Window:</span> 5-bar sliding window, requires i ≥ 5</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> ±1.5 (direction = sign of close − open)</div>
         <div class="mmp-desc">Detects high-frequency trading firms exploiting microsecond latency advantages across venues. Signature: clusters of near-zero-range candles with elevated volume bursts.</div>
         <div class="mmp-pred">&#128200; Prediction: Ultra-fast micro-arbitrage in play. Trade with the first 5-minute momentum — HFT amplifies direction.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-twap">
-        <div class="mmp-algo-title">&#9202; TWAP/VWAP Optimal Execution<span class="mmp-weight-badge">Weight ×3</span></div>
-        <div class="mmp-param-row"><span>VWAP Deviation:</span> &lt; 0.20% of VWAP</div>
-        <div class="mmp-param-row"><span>Volume Uniformity:</span> Volume coefficient of variation &lt; 1.5</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
-        <div class="mmp-param-row"><span>Direction:</span> Bullish above VWAP, bearish below</div>
+        <div class="mmp-algo-title">&#9202; TWAP/VWAP Optimal Execution<span class="mmp-weight-badge">Dominance ×3</span></div>
+        <div class="mmp-param-row"><span>VWAP Deviation:</span> |close − VWAP| / VWAP &lt; 0.002 (0.20%)</div>
+        <div class="mmp-param-row"><span>Volume Uniformity:</span> (max(vol_seg) − min(vol_seg)) / vol_avg &lt; 1.5</div>
+        <div class="mmp-param-row"><span>Vol Segment:</span> 20-bar rolling window</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +1.5 (close &gt; VWAP) / −1.5 (close &lt; VWAP)</div>
         <div class="mmp-desc">Large institutions splitting orders over time to minimise market impact. Volume is uniformly distributed; price tracks VWAP exactly — characteristic of algorithmic block execution.</div>
         <div class="mmp-pred">&#128200; Prediction: Price will track VWAP all day. Fading VWAP extremes is the safest strategy.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-statarb">
-        <div class="mmp-algo-title">&#128200; Statistical Arbitrage MM<span class="mmp-weight-badge">Weight ×3</span></div>
-        <div class="mmp-param-row"><span>Alternating Candles:</span> ≥ 3 direction reversals in last 6 bars</div>
-        <div class="mmp-param-row"><span>BB-Mid Deviation:</span> &lt; 0.50% from Bollinger Band midline</div>
-        <div class="mmp-param-row"><span>Lookback:</span> 6-bar window</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
+        <div class="mmp-algo-title">&#128200; Statistical Arbitrage MM<span class="mmp-weight-badge">Dominance ×3</span></div>
+        <div class="mmp-param-row"><span>Alternating Candles:</span> Σ(sign-flips in last 6 bars) ≥ 3 direction reversals</div>
+        <div class="mmp-param-row"><span>BB-Mid Deviation:</span> |close − BB_mid| / BB_mid &lt; 0.005 (0.50%)</div>
+        <div class="mmp-param-row"><span>Scan Window:</span> 6-bar window for alternation count</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +1.5 (close &lt; BB_mid) / −1.5 (close &gt; BB_mid)</div>
         <div class="mmp-desc">Pairs/mean-reversion strategy where the MM profits from statistically predictable oscillations around the BB midline. Price alternates up/down in tight succession.</div>
         <div class="mmp-pred">&#128200; Prediction: Range-bound session — buy dips, sell rips near BB midline.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-hostoll">
-        <div class="mmp-algo-title">&#9878; Inventory Risk MM (Ho-Stoll)<span class="mmp-weight-badge">Weight ×2</span></div>
-        <div class="mmp-param-row"><span>Wick Asymmetry:</span> |avg_upper_wick − avg_lower_wick| / sum &gt; 0.35</div>
-        <div class="mmp-param-row"><span>Lookback:</span> 10-bar rolling wick averages</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per hit</div>
-        <div class="mmp-param-row"><span>Upper wick bias:</span> Bearish (MM distributing inventory)</div>
-        <div class="mmp-param-row"><span>Lower wick bias:</span> Bullish (MM unwinding short inventory)</div>
+        <div class="mmp-algo-title">&#9878; Inventory Risk MM (Ho-Stoll)<span class="mmp-weight-badge">Dominance ×2</span></div>
+        <div class="mmp-param-row"><span>Wick Asymmetry:</span> (avg_upper − avg_lower) / (avg_upper + avg_lower) → |asym| &gt; 0.35</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 10-bar rolling upper/lower wick averages</div>
+        <div class="mmp-param-row"><span>Upper wick bias (asym &gt; 0):</span> −1.5 bearish (MM distributing inventory)</div>
+        <div class="mmp-param-row"><span>Lower wick bias (asym &lt; 0):</span> +1.5 bullish (MM unwinding shorts)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> ±1.5 depending on wick direction</div>
         <div class="mmp-desc">Based on the Ho-Stoll (1981) model — MMs widen their spreads when holding excess inventory. Wick asymmetry reveals the MM's inventory lean and likely reversal direction.</div>
         <div class="mmp-pred">&#128200; Prediction: Spread widening followed by directional push once inventory is cleared.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-qstuff">
-        <div class="mmp-algo-title">&#127922; Quote Stuffing / Layering<span class="mmp-weight-badge">Weight ×4</span></div>
-        <div class="mmp-param-row"><span>Volume Spike:</span> Current volume &gt; 2.0× average</div>
-        <div class="mmp-param-row"><span>Price Move:</span> &lt; 0.10% move despite spike</div>
-        <div class="mmp-param-row"><span>Prior Spike:</span> Previous bar volume &gt; 1.5× average</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×4 per hit (very high)</div>
+        <div class="mmp-algo-title">&#127922; Quote Stuffing / Layering<span class="mmp-weight-badge">Dominance ×4</span></div>
+        <div class="mmp-param-row"><span>Volume Spike:</span> vol / vol_avg &gt; 2.0 (20-bar rolling)</div>
+        <div class="mmp-param-row"><span>Price Move:</span> |close − prev_close| / prev_close &lt; 0.001 (0.10%)</div>
+        <div class="mmp-param-row"><span>Prior Spike:</span> vol[i−1] / vol_avg &gt; 1.5 (consecutive spike)</div>
+        <div class="mmp-param-row"><span>Requires:</span> All 3 conditions met simultaneously, i ≥ 3</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +2.0 (net_ret &gt; 0, buy absorption) / −2.0 (sell absorption)</div>
         <div class="mmp-desc">Detects market manipulation via rapid order placement and cancellation. Two consecutive volume spikes with minimal price movement indicate cancel-replace layering activity.</div>
         <div class="mmp-pred">&#128200; Prediction: Do NOT trust apparent order book depth. Wait for genuine price break with volume confirmation.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-momign">
-        <div class="mmp-algo-title">&#128293; Momentum Ignition<span class="mmp-weight-badge">Weight ×5</span></div>
-        <div class="mmp-param-row"><span>Spike Candle:</span> Bar range &gt; 1.5× local ATR (2 bars ago)</div>
-        <div class="mmp-param-row"><span>Reversal:</span> Current close direction opposite to spike bar</div>
-        <div class="mmp-param-row"><span>Trigger Window:</span> Reversal within 2-3 bars of spike</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×5 per hit (highest weight)</div>
+        <div class="mmp-algo-title">&#128293; Momentum Ignition<span class="mmp-weight-badge">Dominance ×5</span></div>
+        <div class="mmp-param-row"><span>Spike Candle:</span> (high[i−2] − low[i−2]) &gt; local_ATR × 1.5</div>
+        <div class="mmp-param-row"><span>Reversal Check:</span> (close[i] − open[i]) × (close[i−2] − open[i−2]) &lt; 0</div>
+        <div class="mmp-param-row"><span>Trigger Window:</span> Current candle reverses within 2 bars of spike (i vs i−2)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +2.5 (bullish reversal) / −2.5 (bearish reversal)</div>
+        <div class="mmp-param-row"><span>Requires:</span> i ≥ 3; ATR computed over 20-bar rolling window</div>
         <div class="mmp-desc">The most dangerous manipulation pattern — MMs engineer sharp directional spikes to trigger stop-losses and retail orders, then immediately reverse to profit from the trapped positions.</div>
         <div class="mmp-pred">&#128200; Prediction: Fade the spike — sharp spike is fake. Do not chase the initial move. Reversal is the real trade.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-cross">
-        <div class="mmp-algo-title">&#128279; Cross-Asset MM<span class="mmp-weight-badge">Weight ×2</span></div>
-        <div class="mmp-param-row"><span>Volume Filter:</span> Volume &gt; 2.0× 20-bar average</div>
-        <div class="mmp-param-row"><span>Body Filter:</span> Candle body &lt; 0.20× local ATR</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per hit</div>
-        <div class="mmp-param-row"><span>Interpretation:</span> Hedge leg absorbs risk — no price impact</div>
+        <div class="mmp-algo-title">&#128279; Cross-Asset MM<span class="mmp-weight-badge">Dominance ×2</span></div>
+        <div class="mmp-param-row"><span>Volume Filter:</span> vol &gt; vol_avg × 2.0 (20-bar rolling)</div>
+        <div class="mmp-param-row"><span>Body Filter:</span> |close − open| / local_ATR &lt; 0.20 (tiny body)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +1.5 (close &gt; VWAP or close &gt; open) / −1.5 otherwise</div>
+        <div class="mmp-param-row"><span>Interpretation:</span> High vol + tiny body = hedge leg absorbing risk, no directional impact</div>
         <div class="mmp-desc">Institutional hedged flow across correlated assets (Nifty + SGX / Bank Nifty + Nifty). High volume with near-zero price impact signals cross-asset hedging — the direction is in the other leg.</div>
         <div class="mmp-pred">&#128200; Prediction: Watch the futures/index for true directional bias. Underlying is being hedged.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-pmm">
-        <div class="mmp-algo-title">&#129504; Passive Market Making (PMM)<span class="mmp-weight-badge">Weight ×2</span></div>
-        <div class="mmp-param-row"><span>Doji Count:</span> ≥ 4 doji candles in last 10 bars (body/range &lt; 0.15)</div>
-        <div class="mmp-param-row"><span>Session Position:</span> Price within 25% of 10-bar session range midpoint</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×2 per hit</div>
-        <div class="mmp-param-row"><span>RSI Bias:</span> RSI &lt; 50 → bullish; RSI &gt; 50 → bearish tilt</div>
+        <div class="mmp-algo-title">&#129504; Passive Market Making (PMM)<span class="mmp-weight-badge">Dominance ×2</span></div>
+        <div class="mmp-param-row"><span>Doji Count:</span> Σ(|close−open|/(high−low) &lt; 0.15) ≥ 4 in last 10 bars</div>
+        <div class="mmp-param-row"><span>Session Mid Check:</span> |close − sess_mid| / (sess_hi − sess_lo) &lt; 0.25</div>
+        <div class="mmp-param-row"><span>Session Range:</span> max/min of high/low over last 10 bars</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +1.0 (RSI &lt; 50) / −1.0 (RSI &gt; 50)</div>
+        <div class="mmp-param-row"><span>Requires:</span> i ≥ 10 for session range calculation</div>
         <div class="mmp-desc">Pure passive spread-earner — MM places resting limit orders at session midpoint and earns the spread without taking directional risk. Extremely common on low-volatility days.</div>
         <div class="mmp-pred">&#128200; Prediction: Flat doji-heavy day near session midpoint. Only trade on confirmed breakout with strong volume.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-rl">
-        <div class="mmp-algo-title">&#129302; Reinforcement Learning MM<span class="mmp-weight-badge">Weight ×3</span></div>
-        <div class="mmp-param-row"><span>Range Expansion:</span> Late 7-bar avg range &gt; 1.5× early 7-bar avg range</div>
-        <div class="mmp-param-row"><span>Lookback:</span> 15-bar window split into early/late halves</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
-        <div class="mmp-param-row"><span>Direction:</span> 7-bar net return determines bullish/bearish</div>
+        <div class="mmp-algo-title">&#129302; Reinforcement Learning MM<span class="mmp-weight-badge">Dominance ×3</span></div>
+        <div class="mmp-param-row"><span>Range Expansion:</span> avg(ranges[8:15]) / avg(ranges[0:7]) &gt; 1.5</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 15-bar window: bars[0..6] = early, bars[8..14] = late</div>
+        <div class="mmp-param-row"><span>Direction:</span> Σ returns[i−7:i] &gt; 0 → bullish | &lt; 0 → bearish</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> ±1.5 (requires i ≥ 15)</div>
         <div class="mmp-desc">AI-driven MMs that adapt quoting width in real-time based on volatility regime transitions. Signature: quiet consolidation followed by sudden range expansion in the current trend direction.</div>
         <div class="mmp-pred">&#128200; Prediction: Expect quiet flat zones followed by sudden range expansions. Trade breakouts, not the flat periods.</div>
       </div>
       <div class="mmp-algo-card" id="mmpCard-cartea">
-        <div class="mmp-algo-title">&#8734; Stochastic Control (Cartea-Jaimungal)<span class="mmp-weight-badge">Weight ×3</span></div>
-        <div class="mmp-param-row"><span>Session Progress:</span> &gt; 70% of session elapsed</div>
-        <div class="mmp-param-row"><span>Volume Decay:</span> Current volume &lt; 0.8× average (tapering)</div>
-        <div class="mmp-param-row"><span>VWAP Pin:</span> Price deviation &lt; 0.20% from VWAP</div>
-        <div class="mmp-param-row"><span>Signal Weight:</span> ×3 per hit</div>
+        <div class="mmp-algo-title">&#8734; Stochastic Control (Cartea-Jaimungal)<span class="mmp-weight-badge">Dominance ×3</span></div>
+        <div class="mmp-param-row"><span>Session Progress:</span> i / n &gt; 0.70 (last 30% of session candles)</div>
+        <div class="mmp-param-row"><span>Volume Decay:</span> vol / vol_avg &lt; 0.80 (volume tapering off)</div>
+        <div class="mmp-param-row"><span>VWAP Pin:</span> |close − VWAP| / VWAP &lt; 0.002 (0.20%)</div>
+        <div class="mmp-param-row"><span>Score per Hit:</span> +1.5 (close &gt; VWAP) / −1.5 (close &lt; VWAP)</div>
+        <div class="mmp-param-row"><span>Requires:</span> All 3 conditions met; vol_avg from 20-bar rolling window</div>
         <div class="mmp-desc">Academically grounded MM model (Cartea &amp; Jaimungal 2015) for terminal wealth maximisation. MM narrows spreads aggressively near session end to flatten inventory before close — VWAP pinning guaranteed.</div>
         <div class="mmp-pred">&#128200; Prediction: Session-end VWAP pinning expected. Price gravitates to VWAP — avoid holding positions into close.</div>
       </div>
       <div class="mmp-section-title">Signal Thresholds (Advanced)</div>
       <div class="mmp-algo-card">
-        <div class="mmp-param-row"><span>BUY:</span> Score ≥ 3.5 | <span>STRONG BUY:</span> Score ≥ 5.0</div>
-        <div class="mmp-param-row"><span>SELL:</span> Score ≤ −3.5 | <span>STRONG SELL:</span> Score ≤ −5.0</div>
-        <div class="mmp-param-row"><span>RSI confirm:</span> &lt; 30 = +1.0 (absorption) | &gt; 70 = −1.0 (distribution)</div>
-        <div class="mmp-param-row"><span>Lookback:</span> 20-candle rolling window</div>
+        <div class="mmp-param-row"><span>BUY:</span> Net score ≥ 3.5 | <span>STRONG BUY:</span> Net score ≥ 5.0</div>
+        <div class="mmp-param-row"><span>SELL:</span> Net score ≤ −3.5 | <span>STRONG SELL:</span> Net score ≤ −5.0</div>
+        <div class="mmp-param-row"><span>RSI confirm:</span> RSI &lt; 30 → +1.0 (absorption) | RSI &gt; 70 → −1.0 (distribution)</div>
+        <div class="mmp-param-row"><span>Lookback:</span> 20-candle rolling window for vol/ATR</div>
+        <div class="mmp-param-row"><span>Dedup:</span> Consecutive same-direction signals suppressed</div>
       </div>
     </div>
     <!-- Tab: Market Prediction -->
@@ -9321,6 +9470,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div id="predFutureLegend" class="pred-future-legend" style="display:none"><span></span> Predicted future candles (client-side projection)</div>
     <div class="pred-chart-wrap" id="predChartContainer"></div>
+    <div class="disclaimer">For informational purposes only. Not financial advice.</div>
+  </div>
+
+  <!-- Pattern Panel -->
+  <div class="pattern-panel" id="patternPanel">
+    <div class="pattern-drag-header" id="patternDragHeader" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:14px;color:#ff6ec7">&#128200; Pattern Analysis</h3>
+      <button id="patternPanelClose" style="background:none;border:none;color:#787b86;font-size:18px;cursor:pointer;padding:0 4px;line-height:1" title="Close">&times;</button>
+    </div>
+    <div id="patternDayInfo" style="background:#131722;border-radius:8px;padding:14px;margin-bottom:12px;border:1px solid #2a2e39">
+      <div style="color:#ffd600;font-weight:bold;margin-bottom:8px">&#128197; Today's Pattern</div>
+      <div id="patternIdentified" style="color:#d1d4dc;font-size:13px">Analyzing pattern...</div>
+    </div>
+    <div id="patternTrend" style="background:#1e222d;border-radius:8px;padding:14px;margin-bottom:12px;border:1px solid #2a2e39">
+      <div style="color:#ff6ec7;font-weight:bold;margin-bottom:8px">&#9650; Predicted Trend (from 9:30 AM)</div>
+      <div id="patternTrendPrediction" style="color:#d1d4dc;font-size:13px">Loading...</div>
+    </div>
+    <div id="patternTimeline" style="background:#131722;border-radius:8px;padding:14px;border:1px solid #2a2e39">
+      <div style="color:#80d8ff;font-weight:bold;margin-bottom:8px">&#128337; Trend Timeline (1.5hr intervals)</div>
+      <div id="patternTimelineData" style="color:#d1d4dc;font-size:13px">
+        <div class="pattern-timeline-item"></div>
+      </div>
+    </div>
     <div class="disclaimer">For informational purposes only. Not financial advice.</div>
   </div>
 
@@ -9437,7 +9609,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Indicator visibility
   let showST = false, showSAR = false, showSR = false, showEMA = false, showVWAP = false, showSignals = true;
-  let showBB = false, showCPR = false;
+  let showBB = false, showCPR = false, showORB = false;
   let showLP = false, showFVG = false, showBOS = false, showCHoCH = false, showCVD = false, showVP = false;
 
   // Create chart
@@ -9710,6 +9882,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   bbMiddleSeries.applyOptions({ visible: false });
   bbLowerSeries.applyOptions({ visible: false });
 
+  // ORB (Opening Range Breakout)
+  const orbHighSeries = chart.addLineSeries({ color: '#ff9800', lineWidth: 1, priceLineVisible: false, lastValueVisible: true, lineStyle: 2, title: 'ORB H' });
+  const orbLowSeries = chart.addLineSeries({ color: '#ef5350', lineWidth: 1, priceLineVisible: false, lastValueVisible: true, lineStyle: 2, title: 'ORB L' });
+  orbHighSeries.applyOptions({ visible: false });
+  orbLowSeries.applyOptions({ visible: false });
+
   // S/R: horizontal price lines on the candleSeries
   let srLines = [];
   // CPR: horizontal price lines
@@ -9975,6 +10153,69 @@ HTML_PAGE = r"""<!DOCTYPE html>
   document.getElementById('predPanelClose').addEventListener('click', () => {
     predPanel.classList.remove('open');
   });
+
+  // ---- Pattern Panel ----
+  const patternPanel = document.getElementById('patternPanel');
+  document.getElementById('btnAlgoPattern').addEventListener('click', function(e) {
+    e.stopPropagation();
+    algoDropdown.classList.remove('open');
+    signalPanel.classList.remove('open');
+    scoreBoardPanel.classList.remove('open');
+    mmPanel.classList.remove('open');
+    mmaPanel.classList.remove('open');
+    mmParamsPanel.classList.remove('open');
+    predPanel.classList.remove('open');
+    settingsPanel.classList.remove('open');
+    
+    // Auto-enable pattern algo if not already active
+    if (!currentAlgo.has('pattern')) {
+      currentAlgo.add('pattern');
+      document.querySelectorAll('.algo-item[data-algo="pattern"]').forEach(function(el) {
+        el.classList.add('active');
+        el.textContent = '\u2714 ' + (el.dataset.label || 'Pattern');
+      });
+      showPredictions = currentAlgo.has('mpredict');
+      loadData(currentTF, true).then(function() {
+        patternPanel.classList.add('open');
+        updatePatternPanel();
+      });
+    } else {
+      patternPanel.classList.toggle('open');
+      if (patternPanel.classList.contains('open')) {
+        updatePatternPanel();
+      }
+    }
+  });
+  
+  document.getElementById('patternPanelClose').addEventListener('click', () => {
+    patternPanel.classList.remove('open');
+  });
+
+  // ---- Drag logic for Pattern Panel ----
+  (function() {
+    const header = document.getElementById('patternDragHeader');
+    let isDragging = false, startX, startY, origLeft, origTop;
+    header.addEventListener('mousedown', function(e) {
+      if (e.target.closest('#patternPanelClose')) return;
+      isDragging = true;
+      const rect = patternPanel.getBoundingClientRect();
+      const parentRect = patternPanel.offsetParent ? patternPanel.offsetParent.getBoundingClientRect() : { left: 0, top: 0 };
+      origLeft = rect.left - parentRect.left;
+      origTop  = rect.top  - parentRect.top;
+      startX = e.clientX;
+      startY = e.clientY;
+      patternPanel.style.right  = 'auto';
+      patternPanel.style.left   = origLeft + 'px';
+      patternPanel.style.top    = origTop  + 'px';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+      if (!isDragging) return;
+      patternPanel.style.left = (origLeft + e.clientX - startX) + 'px';
+      patternPanel.style.top  = (origTop  + e.clientY - startY) + 'px';
+    });
+    document.addEventListener('mouseup', function() { isDragging = false; });
+  })();
 
   // ---- Drag logic for Prediction Panel ----
   (function() {
@@ -10578,6 +10819,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
           cprLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e){} });
           if (on && lastCPR) drawCPR(lastCPR);
           break;
+        case 'ORB':
+          showORB = on;
+          orbHighSeries.applyOptions({ visible: on });
+          orbLowSeries.applyOptions({ visible: on });
+          break;
         case 'LP':
           showLP = on;
           lpLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e){} });
@@ -10937,6 +11183,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       bbMiddleSeries.applyOptions({ visible: showBB });
       bbLowerSeries.applyOptions({ visible: showBB });
 
+      // --- ORB (Opening Range Breakout) ---
+      const orbData = json.orb || [];
+      const orbHighData = orbData.map(o => ({ time: formatTime(o.time, isDaily), value: o.high }));
+      const orbLowData = orbData.map(o => ({ time: formatTime(o.time, isDaily), value: o.low }));
+      orbHighSeries.setData(orbHighData);
+      orbLowSeries.setData(orbLowData);
+      orbHighSeries.applyOptions({ visible: showORB });
+      orbLowSeries.applyOptions({ visible: showORB });
+
       // --- CPR ---
       const cpr = json.cpr || {};
       lastCPR = cpr;
@@ -11074,6 +11329,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       updateMMAPanel(summ);
       updateMMParamsPanel(summ);
       updatePredictionPanel(summ, lastSR, candleData);
+      
+      // --- Update Pattern Panel (if pattern algo is enabled) ---
+      if (currentAlgo.has('pattern')) {
+        updatePatternPanel();
+      }
 
       // --- Update Backtest Panel ---
       lastBacktest = json.backtest || {};
@@ -11369,6 +11629,213 @@ HTML_PAGE = r"""<!DOCTYPE html>
       });
       rankEl.innerHTML = rHtml;
     }
+  }
+
+  // ---- updatePatternPanel — Pattern Analysis ----
+  function updatePatternPanel() {
+    const patternIdentifiedEl = document.getElementById('patternIdentified');
+    const patternTrendPredictionEl = document.getElementById('patternTrendPrediction');
+    const patternTimelineDataEl = document.getElementById('patternTimelineData');
+
+    if (!candles || candles.length < 20) {
+      patternIdentifiedEl.innerHTML = 'Insufficient data for pattern analysis.';
+      patternTrendPredictionEl.innerHTML = 'Need more data...';
+      patternTimelineDataEl.innerHTML = '<div class="pattern-timeline-item">No timeline available yet.</div>';
+      return;
+    }
+
+    // Identify today's pattern
+    const pattern = identifyDailyPattern(candles);
+    patternIdentifiedEl.innerHTML = '<strong>' + pattern.name + '</strong><br><span style="color:#787b86;font-size:12px">' + pattern.description + '</span>';
+
+    // Predict trend from 9:30 AM
+    const trendPrediction = predictTrendFrom930AM(candles);
+    const trendClass = trendPrediction.direction === 'BULLISH' ? '#26a69a' : (trendPrediction.direction === 'BEARISH' ? '#ef5350' : '#787b86');
+    patternTrendPredictionEl.innerHTML = 
+      '<div style="color:' + trendClass + ';font-weight:bold;font-size:14px;margin-bottom:4px">' + 
+      (trendPrediction.direction === 'BULLISH' ? '&#9650;' : (trendPrediction.direction === 'BEARISH' ? '&#9660;' : '&#9644;')) + 
+      ' ' + trendPrediction.direction + '</div>' +
+      '<div style="color:#787b86;font-size:12px">' + trendPrediction.details + '</div>';
+
+    // Generate trend timeline (every 1.5 hours from market open)
+    const timeline = generateTrendTimeline(candles);
+    let timelineHtml = '';
+    timeline.forEach(function(item) {
+      const trendCls = item.trend === 'BULLISH' ? 'bullish' : (item.trend === 'BEARISH' ? 'bearish' : 'neutral');
+      const trendIcon = item.trend === 'BULLISH' ? '&#9650;' : (item.trend === 'BEARISH' ? '&#9660;' : '&#9644;');
+      timelineHtml += 
+        '<div class="pattern-timeline-item">' +
+        '<span class="pattern-time">' + item.time + '</span>' +
+        '<span class="pattern-trend ' + trendCls + '">' + trendIcon + ' ' + item.trend + '</span>' +
+        '<span style="color:#787b86;font-size:11px;margin-left:10px">' + item.note + '</span>' +
+        '</div>';
+    });
+    patternTimelineDataEl.innerHTML = timelineHtml || '<div class="pattern-timeline-item">No timeline data available.</div>';
+  }
+
+  // Helper: Identify daily pattern
+  function identifyDailyPattern(candles) {
+    if (!candles || candles.length < 10) return { name: 'Unknown', description: 'Insufficient data' };
+    
+    const recent = candles.slice(-50);
+    const closes = recent.map(c => c.close);
+    const highs = recent.map(c => c.high);
+    const lows = recent.map(c => c.low);
+    
+    const avgClose = closes.reduce((a, b) => a + b, 0) / closes.length;
+    const maxHigh = Math.max(...highs);
+    const minLow = Math.min(...lows);
+    const range = maxHigh - minLow;
+    const currentClose = closes[closes.length - 1];
+    const volatility = range / avgClose;
+    
+    // Count bullish vs bearish candles
+    let bullish = 0, bearish = 0;
+    for (let i = 0; i < recent.length; i++) {
+      if (recent[i].close > recent[i].open) bullish++;
+      else if (recent[i].close < recent[i].open) bearish++;
+    }
+    
+    // Pattern detection logic
+    if (volatility < 0.01) {
+      return { name: 'Consolidation', description: 'Low volatility, range-bound movement. Expect breakout soon.' };
+    } else if (bullish > bearish * 1.5) {
+      return { name: 'Uptrend', description: 'Strong bullish momentum. Higher highs and higher lows pattern.' };
+    } else if (bearish > bullish * 1.5) {
+      return { name: 'Downtrend', description: 'Strong bearish momentum. Lower lows and lower highs pattern.' };
+    } else if (currentClose > avgClose * 1.005) {
+      return { name: 'Bullish Reversal', description: 'Price moving above average. Potential trend reversal to upside.' };
+    } else if (currentClose < avgClose * 0.995) {
+      return { name: 'Bearish Reversal', description: 'Price moving below average. Potential trend reversal to downside.' };
+    } else {
+      return { name: 'Sideways Market', description: 'Mixed signals. No clear directional bias. Wait for confirmation.' };
+    }
+  }
+
+  // Helper: Predict trend from 9:30 AM
+  function predictTrendFrom930AM(candles) {
+    if (!candles || candles.length < 5) return { direction: 'NEUTRAL', details: 'Not enough data' };
+    
+    // Find 9:30 AM candle (market open) - 9:30 IST = 4:00 UTC
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const marketOpenTime = today.getTime() / 1000 + 4 * 3600; // 4:00 UTC
+    
+    // Get candles from market open onwards
+    const openCandles = candles.filter(c => c.time >= marketOpenTime - 3600); // 1hr before open
+    if (openCandles.length < 5) {
+      // Fallback: use recent candles
+      const recentCandles = candles.slice(-20);
+      const firstPrice = recentCandles[0].close;
+      const lastPrice = recentCandles[recentCandles.length - 1].close;
+      const change = ((lastPrice - firstPrice) / firstPrice) * 100;
+      
+      if (change > 0.5) {
+        return { 
+          direction: 'BULLISH', 
+          details: 'Upward momentum detected (+' + change.toFixed(2) + '%). Expect continued strength.' 
+        };
+      } else if (change < -0.5) {
+        return { 
+          direction: 'BEARISH', 
+          details: 'Downward pressure detected (' + change.toFixed(2) + '%). Expect weakness.' 
+        };
+      } else {
+        return { 
+          direction: 'NEUTRAL', 
+          details: 'Minimal change (' + change.toFixed(2) + '%). Range-bound session likely.' 
+        };
+      }
+    }
+    
+    const openPrice = openCandles[0].open;
+    const currentPrice = openCandles[openCandles.length - 1].close;
+    const change = ((currentPrice - openPrice) / openPrice) * 100;
+    const highOfDay = Math.max(...openCandles.map(c => c.high));
+    const lowOfDay = Math.min(...openCandles.map(c => c.low));
+    const rangePercent = ((highOfDay - lowOfDay) / openPrice) * 100;
+    
+    if (change > 0.3) {
+      return { 
+        direction: 'BULLISH', 
+        details: 'Strong opening momentum (+' + change.toFixed(2) + '%). Day range: ' + rangePercent.toFixed(2) + '%. Buyers in control.' 
+      };
+    } else if (change < -0.3) {
+      return { 
+        direction: 'BEARISH', 
+        details: 'Weak opening (' + change.toFixed(2) + '%). Day range: ' + rangePercent.toFixed(2) + '%. Sellers dominating.' 
+      };
+    } else {
+      return { 
+        direction: 'NEUTRAL', 
+        details: 'Flat start (' + change.toFixed(2) + '%). Day range: ' + rangePercent.toFixed(2) + '%. Waiting for direction.' 
+      };
+    }
+  }
+
+  // Helper: Generate trend timeline (every 1.5 hours)
+  function generateTrendTimeline(candles) {
+    if (!candles || candles.length < 10) return [];
+    
+    const timeline = [];
+    const intervals = [
+      { time: '09:30', label: 'Market Open' },
+      { time: '11:00', label: 'Mid-Morning' },
+      { time: '12:30', label: 'Pre-Lunch' },
+      { time: '14:00', label: 'Afternoon' },
+      { time: '15:30', label: 'Market Close' }
+    ];
+    
+    // Calculate trend for each interval
+    const avgPrice = candles.reduce((sum, c) => sum + c.close, 0) / candles.length;
+    const recentCandles = candles.slice(-Math.min(30, candles.length));
+    
+    intervals.forEach(function(interval, idx) {
+      // Simulate trend based on price movement patterns
+      const segmentSize = Math.floor(recentCandles.length / intervals.length);
+      const startIdx = idx * segmentSize;
+      const endIdx = Math.min(startIdx + segmentSize, recentCandles.length - 1);
+      
+      if (startIdx < recentCandles.length && endIdx < recentCandles.length) {
+        const segmentCandles = recentCandles.slice(startIdx, endIdx + 1);
+        if (segmentCandles.length > 0) {
+          const segmentStart = segmentCandles[0].close;
+          const segmentEnd = segmentCandles[segmentCandles.length - 1].close;
+          const change = ((segmentEnd - segmentStart) / segmentStart) * 100;
+          
+          let trend, note;
+          if (change > 0.2) {
+            trend = 'BULLISH';
+            note = 'Price up +' + change.toFixed(2) + '%';
+          } else if (change < -0.2) {
+            trend = 'BEARISH';
+            note = 'Price down ' + change.toFixed(2) + '%';
+          } else {
+            trend = 'NEUTRAL';
+            note = 'Consolidation ±' + Math.abs(change).toFixed(2) + '%';
+          }
+          
+          timeline.push({
+            time: interval.time,
+            trend: trend,
+            note: interval.label + ' - ' + note
+          });
+        }
+      } else {
+        // Forecast future intervals
+        const lastPrice = recentCandles[recentCandles.length - 1].close;
+        const priceVsAvg = ((lastPrice - avgPrice) / avgPrice) * 100;
+        
+        let trend = priceVsAvg > 0.3 ? 'BULLISH' : (priceVsAvg < -0.3 ? 'BEARISH' : 'NEUTRAL');
+        timeline.push({
+          time: interval.time,
+          trend: trend,
+          note: interval.label + ' - Forecast: ' + trend.toLowerCase()
+        });
+      }
+    });
+    
+    return timeline;
   }
 
   // Timeframe dropdown

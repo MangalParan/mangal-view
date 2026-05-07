@@ -93,6 +93,9 @@
   }
   .site-toggle input:checked + .slider { background: #ff4444; }
   .site-toggle input:checked + .slider::before { transform: translateX(20px); background: #fff; }
+  /* Green slider for registration toggle */
+  .site-toggle input:checked + .slider.slider-green { background: #43a047; }
+  .site-toggle input:not(:checked) + .slider.slider-green { background: #3a3e4a; }
 </style>
 </head>
 <body>
@@ -117,6 +120,16 @@
         <span class="slider"></span>
       </label>
       <span id="maintenanceStatus" style="font-size:11px;color:#787b86">OFF</span>
+    </div>
+    <div style="width:1px;height:28px;background:#363a45"></div>
+    <!-- Registration Toggle -->
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:13px;color:#d1d4dc">&#128100; Registration</span>
+      <label class="site-toggle">
+        <input type="checkbox" id="toggleRegistration" checked>
+        <span class="slider slider-green"></span>
+      </label>
+      <span id="registrationStatus" style="font-size:11px;color:#787b86">ON</span>
     </div>
     <div style="width:1px;height:28px;background:#363a45"></div>
     <!-- Settings Visibility -->
@@ -199,7 +212,7 @@
   <table>
     <thead>
       <tr>
-        <th>#</th><th>Username</th><th>Mobile</th><th>Place</th><th>Plan</th><th>Registered</th><th>Status</th><th>Actions</th>
+        <th>#</th><th>Username</th><th>Mobile</th><th>Place</th><th>Plan</th><th>Registered</th><th>Valid Until</th><th>Status</th><th>Actions</th>
       </tr>
     </thead>
     <tbody id="userTable">
@@ -228,6 +241,10 @@
     <div class="form-group">
       <label>Plan</label>
       <select id="editPlan"><option value="free">Free</option><option value="paid">Paid</option></select>
+    </div>
+    <div class="form-group">
+      <label>Valid Until (YYYY-MM-DD)</label>
+      <input type="date" id="editValidUntil" placeholder="2026-06-01">
     </div>
     <div class="form-group">
       <label>Reset Password (leave blank to keep)</label>
@@ -263,6 +280,10 @@
     <div class="form-group">
       <label>Plan</label>
       <select id="addPlan"><option value="free">Free</option><option value="paid">Paid</option></select>
+    </div>
+    <div class="form-group">
+      <label>Valid Until (YYYY-MM-DD)</label>
+      <input type="date" id="addValidUntil" placeholder="2026-06-01">
     </div>
     <div class="modal-actions">
       <button type="button" class="btn btn-success" onclick="saveNewUser()">Create User</button>
@@ -354,24 +375,38 @@ function renderTable() {
     }
   }
   if (filtered.length === 0) {
-    document.getElementById('userTable').innerHTML = '<tr class="empty-row"><td colspan="8">' + (users.length ? 'No matching users found.' : 'No users yet. Click <b>Add User</b> to get started.') + '</td></tr>';
+    document.getElementById('userTable').innerHTML = '<tr class="empty-row"><td colspan="9">' + (users.length ? 'No matching users found.' : 'No users yet. Click <b>Add User</b> to get started.') + '</td></tr>';
     return;
   }
   var now = new Date();
   var html = '';
   for (var i = 0; i < filtered.length; i++) {
     var u = filtered[i];
-    var created = new Date(u.created_at);
-    var days = daysBetween(created, now);
-    var daysLeft = 30 - days;
+    var validUntil = u.validity_until ? new Date(u.validity_until) : null;
+    var validUntilStr = validUntil ? u.validity_until : 'Not set';
     var status = '';
+    
     if (u.plan === 'paid') {
-      status = '<span class="plan-paid">Active</span>';
-    } else if (daysLeft > 0) {
-      status = '<span class="days-left">' + daysLeft + ' days left</span>';
+      if (validUntil && validUntil < now) {
+        status = '<span class="days-expired">EXPIRED</span>';
+      } else if (validUntil) {
+        var daysLeft = Math.ceil((validUntil - now) / (1000 * 60 * 60 * 24));
+        status = '<span class="days-left">' + daysLeft + ' days left</span>';
+      } else {
+        status = '<span class="plan-paid">Active</span>';
+      }
     } else {
-      status = '<span class="days-expired">EXPIRED</span>';
+      // Free plan
+      if (validUntil && validUntil < now) {
+        status = '<span class="days-expired">EXPIRED</span>';
+      } else if (validUntil) {
+        var daysLeft = Math.ceil((validUntil - now) / (1000 * 60 * 60 * 24));
+        status = '<span class="days-left">' + daysLeft + ' days left</span>';
+      } else {
+        status = '<span class="days-expired">No validity</span>';
+      }
     }
+    
     html += '<tr>' +
       '<td>' + (i + 1) + '</td>' +
       '<td>' + escapeHtml(u.username) + '</td>' +
@@ -379,6 +414,7 @@ function renderTable() {
       '<td>' + escapeHtml(u.place) + '</td>' +
       '<td><span class="plan-' + u.plan + '">' + escapeHtml(u.plan).toUpperCase() + '</span></td>' +
       '<td>' + escapeHtml(u.created_at) + '</td>' +
+      '<td>' + escapeHtml(validUntilStr) + '</td>' +
       '<td>' + status + '</td>' +
       '<td>' +
         '<button type="button" class="btn btn-primary btn-sm" onclick="editUser(' + u.id + ')">Edit</button> ' +
@@ -402,6 +438,7 @@ function editUser(id) {
   document.getElementById('editMobile').value = u.mobileno;
   document.getElementById('editPlace').value = u.place || '';
   document.getElementById('editPlan').value = u.plan;
+  document.getElementById('editValidUntil').value = u.validity_until || '';
   document.getElementById('editPassword').value = '';
   document.getElementById('editModal').classList.add('open');
 }
@@ -412,6 +449,7 @@ function saveUser() {
   var username = document.getElementById('editUsername').value.trim();
   var mobileno = document.getElementById('editMobile').value.trim();
   var place = document.getElementById('editPlace').value.trim();
+  var validUntil = document.getElementById('editValidUntil').value.trim();
   if (!username || !mobileno) { showToast('Username and mobile are required', 'error'); return; }
   if (!/^[0-9]{10}$/.test(mobileno)) { showToast('Enter valid 10-digit mobile', 'error'); return; }
   var pwd = document.getElementById('editPassword').value;
@@ -422,6 +460,7 @@ function saveUser() {
     mobileno: mobileno,
     place: place,
     plan: document.getElementById('editPlan').value,
+    validity_until: validUntil || null,
     password: pwd
   };
   fetch('/admin/api/users', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
@@ -479,12 +518,20 @@ function openAddModal() {
 function closeAddModal() { document.getElementById('addModal').classList.remove('open'); }
 
 function saveNewUser() {
+  var validUntil = document.getElementById('addValidUntil').value.trim();
+  // If no validity date is provided, default to 1 month from today
+  if (!validUntil) {
+    var d = new Date();
+    d.setMonth(d.getMonth() + 1);
+    validUntil = d.toISOString().split('T')[0];
+  }
   var body = {
     username: document.getElementById('addUsername').value.trim(),
     mobileno: document.getElementById('addMobile').value.trim(),
     password: document.getElementById('addPassword').value,
     place: document.getElementById('addPlace').value.trim(),
-    plan: document.getElementById('addPlan').value
+    plan: document.getElementById('addPlan').value,
+    validity_until: validUntil
   };
   if (!body.username || !body.mobileno || !body.password || !body.place) { showToast('All fields are required', 'error'); return; }
   if (!/^[0-9]{10}$/.test(body.mobileno)) { showToast('Enter valid 10-digit mobile', 'error'); return; }
@@ -501,10 +548,10 @@ function saveNewUser() {
 // --- Export CSV ---
 function exportCSV() {
   if (!users.length) { showToast('No users to export', 'error'); return; }
-  var csv = 'ID,Username,Mobile,Place,Plan,Registered\n';
+  var csv = 'ID,Username,Mobile,Place,Plan,Registered,Valid Until\n';
   for (var i = 0; i < users.length; i++) {
     var u = users[i];
-    csv += u.id + ',"' + (u.username || '').replace(/"/g, '""') + '",' + u.mobileno + ',"' + (u.place || '').replace(/"/g, '""') + '",' + u.plan + ',"' + u.created_at + '"\n';
+    csv += u.id + ',"' + (u.username || '').replace(/"/g, '""') + '",' + u.mobileno + ',"' + (u.place || '').replace(/"/g, '""') + '",' + u.plan + ',"' + u.created_at + '","' + (u.validity_until || '') + '"\n';
   }
   var blob = new Blob([csv], {type: 'text/csv'});
   var a = document.createElement('a');
@@ -533,6 +580,9 @@ function loadSettings() {
       document.getElementById('toggleMaintenance').checked = (s.maintenance_mode === 'on');
       document.getElementById('maintenanceStatus').textContent = s.maintenance_mode === 'on' ? 'ON' : 'OFF';
       document.getElementById('maintenanceStatus').style.color = s.maintenance_mode === 'on' ? '#ff4444' : '#787b86';
+      document.getElementById('toggleRegistration').checked = (s.registration_enabled !== 'off');
+      document.getElementById('registrationStatus').textContent = s.registration_enabled === 'off' ? 'OFF' : 'ON';
+      document.getElementById('registrationStatus').style.color = s.registration_enabled === 'off' ? '#ff6b6b' : '#43a047';
       document.getElementById('cfgBacktest').checked = (s.settings_backtest !== 'off');
       document.getElementById('cfgDatasource').checked = (s.settings_datasource !== 'off');
       document.getElementById('cfgTrade').checked = (s.settings_trade !== 'off');
@@ -553,6 +603,22 @@ document.getElementById('toggleMaintenance').addEventListener('change', function
   .then(function(r) { return r.json(); })
   .then(function(d) {
     if (d.ok) showToast('Maintenance mode ' + (isOn ? 'enabled' : 'disabled'), isOn ? 'error' : 'success');
+  })
+  .catch(function(err) { showToast('Error: ' + err.message, 'error'); });
+});
+
+document.getElementById('toggleRegistration').addEventListener('change', function() {
+  var isOn = this.checked;
+  document.getElementById('registrationStatus').textContent = isOn ? 'ON' : 'OFF';
+  document.getElementById('registrationStatus').style.color = isOn ? '#43a047' : '#ff6b6b';
+  fetch('/admin/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ registration_enabled: isOn ? 'on' : 'off' })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.ok) showToast('Registration ' + (isOn ? 'enabled' : 'disabled'), 'success');
   })
   .catch(function(err) { showToast('Error: ' + err.message, 'error'); });
 });

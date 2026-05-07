@@ -1,5 +1,5 @@
 ---
-description: "Use when checking Nifty options chain, NSE options data, open interest analysis, options Greeks, PCR ratio, max pain, Nifty CE PE prices, strike-wise OI, Indian stock market derivatives analysis, Nifty candlestick chart, technical indicators, buy sell signals, live data, backtest strategy, multi-symbol chart, crypto chart, algo signals (Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, StatArb, Institution, MPredict), signal analysis panel, indicator settings, SuperTrend, Parabolic SAR, support/resistance levels, EMA 9/21 crossover, VWAP, Bollinger Bands, CPR Central Pivot Range, liquidity pools, Fair Value Gap FVG, Break of Structure BOS, Change of Character CHoCH, Cumulative Volume Delta CVD, volume profile POC VAH VAL, backtest performance overview trade list, futures paper trading, trade log, data source Yahoo Finance TradingView NSE India, theme dark light toggle, zoom controls, admin panel user management, site settings maintenance mode, help pages algos indicators manual."
+description: "Use when checking Nifty options chain, NSE options data, open interest analysis, options Greeks, PCR ratio, max pain, Nifty CE PE prices, strike-wise OI, Indian stock market derivatives analysis, Nifty candlestick chart, technical indicators, buy sell signals, live data, backtest strategy, multi-symbol chart, crypto chart, algo signals (Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, StatArb, Institution, MPredict), signal analysis panel, indicator settings, SuperTrend, Parabolic SAR, support/resistance levels, EMA 9/21 crossover, VWAP, Bollinger Bands, CPR Central Pivot Range, ORB Opening Range Breakout, liquidity pools, Fair Value Gap FVG, Break of Structure BOS, Change of Character CHoCH, Cumulative Volume Delta CVD, volume profile POC VAH VAL, backtest performance overview trade list, futures paper trading, trade log, data source Yahoo Finance TradingView NSE India, theme dark light toggle, zoom controls, admin panel user management, site settings maintenance mode, help pages algos indicators manual."
 tools: [execute, read, edit, search, web]
 ---
 
@@ -61,13 +61,14 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **VWAP** — Volume Weighted Average Price with daily session reset (dashed orange line)
 - **Bollinger Bands** — customizable period and std dev (default: 20, 2.0). Upper/Middle/Lower bands in blue
 - **CPR (Central Pivot Range)** — Pivot, Top Central (TC), Bottom Central (BC) levels from previous day's H/L/C. Drawn as purple horizontal lines
+- **ORB (Opening Range Breakout)** — Highest high and lowest low of the first 15 minutes of each trading session. Computed per day: candles before `session_start + 15min` define the range; all post-range candles carry the ORB High (orange dashed) and ORB Low (red dashed) as horizontal reference lines. Best on intraday timeframes (1m–30m). `compute_orb()` in `nifty_chart.py`. Returned in API JSON as `orb` list of `{time, high, low}`. Dropdown label: **ORB (15m)**
 - **Liquidity Pools** — clusters of equal highs (BSL) / equal lows (SSL) where stop losses accumulate. Drawn as yellow dashed horizontal lines
 - **Fair Value Gap (FVG)** — 3-candle imbalance zones. Bullish FVG (teal) = gap up, Bearish FVG (red) = gap down. Shown as paired horizontal lines
 - **Break of Structure (BOS)** — price breaks a previous swing high/low in trend direction (continuation). Shown as arrow markers with broken level
 - **Change of Character (CHoCH)** — price breaks structure against the prevailing trend (reversal signal). Shown as circle markers with broken level
 - **Cumulative Volume Delta (CVD)** — running total of buy vs sell volume using close position ratio. Shown as histogram series
 - **Volume Profile** — distributes volume across 24 price bins to show Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL). POC shown as solid orange line, VAH as solid green line, VAL as solid red line — all labeled on price axis. Used by OrderFlow algo for POC proximity signals
-- **Indicator Settings** — accessible via `⚙ Indicator Settings` item at the bottom of the Indicators dropdown. Opens a panel with close (×) button to adjust SuperTrend period/multiplier, PSAR AF start/increment/max, and Bollinger Bands period/std dev. Click Apply to recalculate
+- **Indicator Settings** — accessible via `⚙ Indicator Settings` item at the bottom of the Indicators dropdown (visible by scrolling down the dropdown). Opens a panel with close (×) button to adjust SuperTrend period/multiplier, PSAR AF start/increment/max, and Bollinger Bands period/std dev. Click Apply to recalculate
 - **Restore Defaults** — button in indicator settings panel resets all indicator parameters to defaults (SuperTrend 10/3, PSAR 0.02/0.02/0.2, BB 20/2.0) and reloads chart
 
 ### Institutional Signal Engine
@@ -243,7 +244,16 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
   - `settings_datasource` — show/hide Data Source section (default: on)
   - `settings_trade` — show/hide Trade section (default: on)
   - `settings_realtrade` — show/hide Real Trade section (default: on)
-- Frontend fetches settings via `GET /api/site-settings` on page load and hides disabled sections
+  - `menu_indicators` — JSON array of indicator keys visible in the Indicators dropdown (default: all 15). Used to hide indicators per deployment
+  - `menu_algos` — JSON array of algo keys visible in the Algo dropdown (default: all 18)
+  - `menu_symbols` — JSON array of symbol keys in the Symbol dropdown
+  - `menu_timeframes` — JSON array of timeframe keys in the Period dropdown
+- Frontend fetches settings via `GET /api/site-settings` on page load and hides disabled menu items
+- **DB Migration on startup**: `init_db()` automatically adds missing algos to `menu_algos` and missing indicators (e.g. `ORB`) to `menu_indicators` for existing databases — no manual DB update needed
+
+### Indicator Dropdown UX
+- **Scrollable dropdown** — the Indicators dropdown has `max-height: 70vh` with `overflow-y: auto`, so all items including **ORB (15m)** and **⚙ Indicator Settings** at the bottom are always reachable by scrolling
+- Thin custom scrollbar styled to match the dark/light theme
 
 ### Zoom Controls
 - **Zoom dropdown menu** in toolbar with 5 items:
@@ -293,7 +303,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **API endpoint**: `GET /api/candles?interval=5m&symbol=NIFTY50&source=tradingview&algo=janestreet&st_period=10&st_multiplier=3&sar_start=0.02&sar_inc=0.02&sar_max=0.2&bb_period=20&bb_stddev=2.0&bt_qty=0`
 - **Search endpoint**: `GET /api/search?q=reliance` — searches Yahoo Finance, auto-resolves `.NS`/`.BO` suffixes for Indian stocks
 - **Trade endpoints**: `POST /api/trade/start`, `POST /api/trade/execute`, `POST /api/trade/stop`, `GET /api/trade/status?sessionId=...`
-- Returns JSON: `{candles, supertrend, parabolicSAR, supportResistance, ema9, ema21, vwap, rsi, macd, patterns, signals, signalSummary, cpr, bollingerBands, liquidityPools, fairValueGaps, bosChoch, cvd, volumeProfile, backtest}`
+- Returns JSON: `{candles, supertrend, parabolicSAR, supportResistance, ema9, ema21, vwap, rsi, macd, patterns, signals, signalSummary, cpr, bollingerBands, liquidityPools, fairValueGaps, bosChoch, cvd, volumeProfile, orb, backtest, predictions}`
 - **Admin endpoints**: `GET /admin?key=mangal2026`, `GET/POST /admin/api/settings`, `GET/POST/PUT/DELETE /admin/api/users`
 - **Site settings endpoint**: `GET /api/site-settings` — returns admin-controlled visibility flags
 - **Help endpoints**: `GET /help/algos`, `GET /help/indicators`, `GET /help/manual`
@@ -341,7 +351,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Data Source**: TradingView (WebSocket)
 - **Signal Algorithms**: Trend + MStreet (multi-select, both active by default)
 - **Timeframe**: 5m
-- **Indicators**: Signals only (SuperTrend, PSAR, S/R, EMA, VWAP, Volume Profile off by default)
+- **Indicators**: Signals only (SuperTrend, PSAR, S/R, EMA, VWAP, BB, CPR, ORB, LP, FVG, BOS, CHoCH, CVD, VP off by default)
 - **Theme**: Dark (toggleable to Light via Theme button, persisted in localStorage)
 - **Live refresh**: 5 seconds when LIVE mode is on
 - **Loading Screen**: Branded "Mangal View" with spinner and "Loading chart data..." text
