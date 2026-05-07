@@ -36,3 +36,7 @@ Trendline , patterns, fibonacci , short long positions
  6.Add stratastical arb strategy in Algo.
  7. Add Instituition Algo as list item and implement it.
  8. Update help - Algos, indicators and user manual based on current threshold implementation 
+
+ Default loading of algos 
+ implement Basic a table indicators and Algos for basic free, basic paid, Pro version. 
+ 

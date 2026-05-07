@@ -8980,19 +8980,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="algo-item active" data-algo="mstreet" data-label="MStreet">&#10004; MStreet</button>
       <button class="algo-item" data-algo="mfactor" data-label="MFactor">&#8203; MFactor</button>
       <button class="algo-item" data-algo="sniper" data-label="Sniper">&#8203; Sniper</button>
-      <button class="algo-item" data-algo="orderflow" data-label="OrderFlow">&#8203; OrderFlow</button>
-      <button class="algo-item" data-algo="priceaction" data-label="PriceAction">&#8203; PriceAction</button>
-      <button class="algo-item" data-algo="breakout" data-label="Breakout">&#8203; Breakout</button>
-      <button class="algo-item" data-algo="momentum" data-label="Momentum">&#8203; Momentum</button>
+      <button class="algo-item active" data-algo="orderflow" data-label="OrderFlow">&#10004; OrderFlow</button>
+      <button class="algo-item active" data-algo="priceaction" data-label="PriceAction">&#10004; PriceAction</button>
+      <button class="algo-item active" data-algo="breakout" data-label="Breakout">&#10004; Breakout</button>
+      <button class="algo-item active" data-algo="momentum" data-label="Momentum">&#10004; Momentum</button>
       <button class="algo-item" data-algo="scalping" data-label="Scalping">&#8203; Scalping</button>
-      <button class="algo-item" data-algo="smartmoney" data-label="SmartMoney">&#8203; SmartMoney</button>
+      <button class="algo-item active" data-algo="smartmoney" data-label="SmartMoney">&#10004; SmartMoney</button>
       <button class="algo-item" data-algo="quant" data-label="Quant">&#8203; Quant</button>
-      <button class="algo-item" data-algo="hybrid" data-label="Hybrid">&#8203; Hybrid</button>
+      <button class="algo-item active" data-algo="hybrid" data-label="Hybrid">&#10004; Hybrid</button>
       <button class="algo-item" data-algo="statarb" data-label="StatArb">&#8203; StatArb</button>
       <button class="algo-item" data-algo="institution" data-label="Institution">&#8203; Institution</button>
       <button class="algo-item" data-algo="mpredict" data-label="MPredict">&#8203; MPredict</button>
-      <button class="algo-item" data-algo="marketmaking" data-label="Market Making">&#8203; Market Making</button>
-      <button class="algo-item" data-algo="mma" data-label="MM Advanced">&#8203; MM Advanced</button>
+      <button class="algo-item active" data-algo="marketmaking" data-label="Market Making">&#10004; Market Making</button>
+      <button class="algo-item active" data-algo="mma" data-label="MM Advanced">&#10004; MM Advanced</button>
       <button class="algo-item" data-algo="pattern" data-label="Pattern">&#8203; Pattern</button>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
@@ -9605,7 +9605,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let lastBacktest = {};
   let currentSource = 'tradingview';
   let signalMap = {};  // time -> signal data for tooltip
-  let currentAlgo = new Set(['trend', 'mstreet']);
+  let currentAlgo = new Set(['trend', 'mstreet', 'orderflow', 'priceaction', 'breakout', 'momentum', 'smartmoney', 'hybrid', 'marketmaking', 'mma']);
 
   // Indicator visibility
   let showST = false, showSAR = false, showSR = false, showEMA = false, showVWAP = false, showSignals = true;

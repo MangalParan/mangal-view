@@ -349,7 +349,7 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 
 ## Defaults
 - **Data Source**: TradingView (WebSocket)
-- **Signal Algorithms**: Trend + MStreet (multi-select, both active by default)
+- **Signal Algorithms**: Trend, MStreet, OrderFlow, PriceAction, Breakout, Momentum, SmartMoney, Hybrid, Market Making, MM Advanced (10 algos active by default)
 - **Timeframe**: 5m
 - **Indicators**: Signals only (SuperTrend, PSAR, S/R, EMA, VWAP, BB, CPR, ORB, LP, FVG, BOS, CHoCH, CVD, VP off by default)
 - **Theme**: Dark (toggleable to Light via Theme button, persisted in localStorage)
