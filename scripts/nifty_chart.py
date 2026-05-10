@@ -99,6 +99,13 @@ def init_db():
         "menu_timeframes": json.dumps(["1m","2m","3m","5m","10m","15m","30m","1h","2h","4h","1d","1w","1mo"]),
         "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
         "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]),
+        # Tier access control defaults (all items available to all tiers by default)
+        "tier_indicators_free": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
+        "tier_indicators_basic_paid": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
+        "tier_indicators_pro_paid": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
+        "tier_algos_free": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]),
+        "tier_algos_basic_paid": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]),
+        "tier_algos_pro_paid": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]),
     }
     for k, v in defaults.items():
         db.execute("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)", (k, v))
@@ -544,11 +551,13 @@ def admin_update_settings():
     data = request.get_json()
     allowed_keys = {"maintenance_mode", "registration_enabled", "settings_backtest", "settings_datasource",
                     "settings_trade", "settings_realtrade",
-                    "menu_symbols", "menu_timeframes", "menu_indicators", "menu_algos"}
+                    "menu_symbols", "menu_timeframes", "menu_indicators", "menu_algos",
+                    "tier_indicators_free", "tier_indicators_basic_paid", "tier_indicators_pro_paid",
+                    "tier_algos_free", "tier_algos_basic_paid", "tier_algos_pro_paid"}
     for key, value in data.items():
         if key in allowed_keys:
-            if key.startswith("menu_"):
-                # Menu config: value is a JSON array string
+            if key.startswith("menu_") or key.startswith("tier_"):
+                # Menu/tier config: value is a JSON array string
                 if isinstance(value, list):
                     set_site_setting(key, json.dumps(value))
                 elif isinstance(value, str):
@@ -565,6 +574,12 @@ def user_get_site_settings():
     db = get_db()
     rows = db.execute("SELECT key, value FROM site_settings").fetchall()
     settings = {r["key"]: r["value"] for r in rows}
+    # Include current user's plan for tier-based access control
+    user_id = session.get("user_id")
+    if user_id:
+        user_row = db.execute("SELECT plan FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user_row:
+            settings["user_plan"] = user_row["plan"]
     return jsonify(settings)
 
 
@@ -670,7 +685,7 @@ TV_SYMBOL_MAP = {
     "DJI":        "DJ:DJI",
     "NASDAQ":     "NASDAQ:IXIC",
     "SP500":      "SP:SPX",
-    "CRUDEOIL":  "NYMEX:CL1!",
+    "CRUDEOIL":  "OANDA:USOIL",
     "NATURALGAS": "NYMEX:NG1!",
 }
 
@@ -7906,9 +7921,9 @@ def api_candles():
     bb_period = max(5, min(bb_period, 100))
     bb_stddev = max(0.5, min(bb_stddev, 5.0))
 
-    # Data source
+    # Data source — CRUDEOIL always uses TradingView CFD (OANDA:USOIL)
     source = request.args.get("source", "yahoo")
-    if source == "tradingview":
+    if symbol == "CRUDEOIL" or source == "tradingview":
         candles = fetch_tradingview_data(interval, symbol)
     elif source == "nse":
         candles = fetch_nse_data(interval, symbol)
@@ -12712,6 +12727,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
           const enabled = JSON.parse(settings.menu_algos);
           document.querySelectorAll('.algo-item[data-algo]').forEach(btn => {
             if (enabled.indexOf(btn.dataset.algo) < 0) btn.style.display = 'none';
+          });
+        } catch(e) {}
+      }
+      // Tier access: filter indicators and algos by user's plan
+      const userPlan = settings.user_plan || 'free';
+      const tierIndKey = 'tier_indicators_' + userPlan;
+      const tierAlgoKey = 'tier_algos_' + userPlan;
+      if (settings[tierIndKey]) {
+        try {
+          const allowed = JSON.parse(settings[tierIndKey]);
+          document.querySelectorAll('.ind-item[data-ind]').forEach(el => {
+            if (allowed.indexOf(el.dataset.ind) < 0) el.style.display = 'none';
+          });
+        } catch(e) {}
+      }
+      if (settings[tierAlgoKey]) {
+        try {
+          const allowed = JSON.parse(settings[tierAlgoKey]);
+          document.querySelectorAll('.algo-item[data-algo]').forEach(btn => {
+            if (allowed.indexOf(btn.dataset.algo) < 0) btn.style.display = 'none';
           });
         } catch(e) {}
       }

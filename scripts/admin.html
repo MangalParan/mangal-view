@@ -36,6 +36,8 @@
   tr:hover { background:#252a37; }
   .plan-free { color:#ffd600; font-weight:600; }
   .plan-paid { color:#69f0ae; font-weight:600; }
+  .plan-basic_paid { color:#69f0ae; font-weight:600; }
+  .plan-pro_paid { color:#64b5f6; font-weight:600; }
   .days-left { font-size:11px; color:#787b86; }
   .days-expired { color:#ff6b6b; font-weight:600; }
   .empty-row td { text-align:center; color:#787b86; padding:40px; font-size:14px; }
@@ -200,6 +202,28 @@
   <button type="button" class="btn btn-primary btn-sm" onclick="saveMenuConfig()">Save Menu Config</button>
 </div>
 
+<!-- Tier Access Control -->
+<div class="card" id="tierCard" style="margin-bottom:24px">
+  <h3 style="color:#2962ff;margin:0 0 16px">&#128274; Tier Access Control</h3>
+  <p style="color:#888;font-size:12px;margin:0 0 12px">Select which indicators and algos are visible for each user tier. Uncheck to hide from that tier.</p>
+  <div style="overflow-x:auto">
+    <table id="tierTable" style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead>
+        <tr style="background:#1e222d">
+          <th style="text-align:left;padding:8px 12px;color:#d1d4dc;border:1px solid #363a45">Item</th>
+          <th style="text-align:center;padding:8px 12px;color:#ffd600;border:1px solid #363a45">Basic Free</th>
+          <th style="text-align:center;padding:8px 12px;color:#69f0ae;border:1px solid #363a45">Basic Paid</th>
+          <th style="text-align:center;padding:8px 12px;color:#64b5f6;border:1px solid #363a45">Pro Paid</th>
+        </tr>
+      </thead>
+      <tbody id="tierTableBody">
+        <tr><td colspan="4" style="text-align:center;padding:16px;color:#888">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <button type="button" class="btn btn-primary btn-sm" onclick="saveTierConfig()" style="margin-top:12px">Save Tier Config</button>
+</div>
+
 <div class="toolbar">
   <input type="text" id="searchBox" placeholder="Search by name, mobile, place..." oninput="filterTable()" autocomplete="off">
   <button type="button" class="btn btn-success" onclick="openAddModal()">&#10010; Add User</button>
@@ -240,7 +264,7 @@
     </div>
     <div class="form-group">
       <label>Plan</label>
-      <select id="editPlan"><option value="free">Free</option><option value="paid">Paid</option></select>
+      <select id="editPlan"><option value="free">Basic Free</option><option value="basic_paid">Basic Paid</option><option value="pro_paid">Pro Paid</option></select>
     </div>
     <div class="form-group">
       <label>Valid Until (YYYY-MM-DD)</label>
@@ -279,7 +303,7 @@
     </div>
     <div class="form-group">
       <label>Plan</label>
-      <select id="addPlan"><option value="free">Free</option><option value="paid">Paid</option></select>
+      <select id="addPlan"><option value="free">Basic Free</option><option value="basic_paid">Basic Paid</option><option value="pro_paid">Pro Paid</option></select>
     </div>
     <div class="form-group">
       <label>Valid Until (YYYY-MM-DD)</label>
@@ -664,7 +688,7 @@ var ALL_TIMEFRAMES = [
 var ALL_INDICATORS = [
   {key:'ST',label:'SuperTrend'},{key:'SAR',label:'PSAR'},{key:'SR',label:'S/R Levels'},
   {key:'EMA',label:'EMA 9/21'},{key:'VWAP',label:'VWAP'},{key:'BB',label:'Bollinger Bands'},
-  {key:'CPR',label:'CPR'},{key:'LP',label:'Liquidity Pools'},{key:'FVG',label:'Fair Value Gap'},
+  {key:'CPR',label:'CPR'},{key:'ORB',label:'ORB (15m)'},{key:'LP',label:'Liquidity Pools'},{key:'FVG',label:'Fair Value Gap'},
   {key:'BOS',label:'BOS'},{key:'CHoCH',label:'CHoCH'},{key:'CVD',label:'CVD'},
   {key:'VP',label:'Volume Profile'},{key:'Signals',label:'Signals'}
 ];
@@ -674,7 +698,7 @@ var ALL_ALGOS = [
   {key:'breakout',label:'Breakout'},{key:'momentum',label:'Momentum'},{key:'scalping',label:'Scalping'},
   {key:'smartmoney',label:'SmartMoney'},{key:'quant',label:'Quant'},{key:'hybrid',label:'Hybrid'},
   {key:'statarb',label:'StatArb'},{key:'institution',label:'Institution'},{key:'mpredict',label:'MPredict'},
-  {key:'marketmaking',label:'Market Making'}
+  {key:'marketmaking',label:'Market Making'},{key:'mma',label:'MM Advanced'}
 ];
 
 function renderMenuCheckboxes(containerId, allItems, enabledKeys) {
@@ -741,6 +765,91 @@ function saveMenuConfig() {
 }
 
 loadMenuConfig();
+
+// --- Tier Access Control ---
+var TIER_KEYS = ['free', 'basic_paid', 'pro_paid'];
+var TIER_LABELS = {'free': 'Basic Free', 'basic_paid': 'Basic Paid', 'pro_paid': 'Pro Paid'};
+
+function renderTierTable(settings) {
+  var tbody = document.getElementById('tierTableBody');
+  tbody.innerHTML = '';
+  // Section header: Indicators
+  tbody.innerHTML += '<tr><td colspan="4" style="background:#1a1d2e;color:#2962ff;font-weight:700;padding:6px 12px;border:1px solid #363a45;font-size:11px;letter-spacing:1px">INDICATORS</td></tr>';
+  for (var i = 0; i < ALL_INDICATORS.length; i++) {
+    var ind = ALL_INDICATORS[i];
+    var row = '<tr style="border-bottom:1px solid #1e222d">';
+    row += '<td style="padding:6px 12px;color:#d1d4dc;border:1px solid #363a45">' + escapeHtml(ind.label) + '</td>';
+    for (var t = 0; t < TIER_KEYS.length; t++) {
+      var tk = TIER_KEYS[t];
+      var arr = [];
+      try { arr = JSON.parse(settings['tier_indicators_' + tk] || '[]'); } catch(e) {}
+      var checked = arr.indexOf(ind.key) >= 0 ? 'checked' : '';
+      row += '<td style="text-align:center;border:1px solid #363a45"><input type="checkbox" data-type="indicator" data-key="' + ind.key + '" data-tier="' + tk + '" ' + checked + ' style="accent-color:#2962ff;width:16px;height:16px"></td>';
+    }
+    row += '</tr>';
+    tbody.innerHTML += row;
+  }
+  // Section header: Algos
+  tbody.innerHTML += '<tr><td colspan="4" style="background:#1a1d2e;color:#2962ff;font-weight:700;padding:6px 12px;border:1px solid #363a45;font-size:11px;letter-spacing:1px">ALGOS / SIGNALS</td></tr>';
+  for (var j = 0; j < ALL_ALGOS.length; j++) {
+    var algo = ALL_ALGOS[j];
+    var row2 = '<tr style="border-bottom:1px solid #1e222d">';
+    row2 += '<td style="padding:6px 12px;color:#d1d4dc;border:1px solid #363a45">' + escapeHtml(algo.label) + '</td>';
+    for (var t2 = 0; t2 < TIER_KEYS.length; t2++) {
+      var tk2 = TIER_KEYS[t2];
+      var arr2 = [];
+      try { arr2 = JSON.parse(settings['tier_algos_' + tk2] || '[]'); } catch(e) {}
+      var checked2 = arr2.indexOf(algo.key) >= 0 ? 'checked' : '';
+      row2 += '<td style="text-align:center;border:1px solid #363a45"><input type="checkbox" data-type="algo" data-key="' + algo.key + '" data-tier="' + tk2 + '" ' + checked2 + ' style="accent-color:#2962ff;width:16px;height:16px"></td>';
+    }
+    row2 += '</tr>';
+    tbody.innerHTML += row2;
+  }
+}
+
+function loadTierConfig() {
+  fetch('/admin/api/settings')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d.ok) return;
+      renderTierTable(d.settings || {});
+    })
+    .catch(function() {});
+}
+
+function saveTierConfig() {
+  var body = {};
+  // Build per-tier arrays
+  var indMap = {};
+  var algoMap = {};
+  for (var t = 0; t < TIER_KEYS.length; t++) {
+    indMap[TIER_KEYS[t]] = [];
+    algoMap[TIER_KEYS[t]] = [];
+  }
+  document.querySelectorAll('#tierTableBody input[type="checkbox"]').forEach(function(cb) {
+    if (cb.checked) {
+      if (cb.dataset.type === 'indicator') indMap[cb.dataset.tier].push(cb.dataset.key);
+      else algoMap[cb.dataset.tier].push(cb.dataset.key);
+    }
+  });
+  for (var t2 = 0; t2 < TIER_KEYS.length; t2++) {
+    body['tier_indicators_' + TIER_KEYS[t2]] = indMap[TIER_KEYS[t2]];
+    body['tier_algos_' + TIER_KEYS[t2]] = algoMap[TIER_KEYS[t2]];
+  }
+  fetch('/admin/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.ok) showToast('Tier config saved', 'success');
+    else showToast('Failed to save tier config', 'error');
+  })
+  .catch(function(err) { showToast('Error: ' + err.message, 'error'); });
+}
+
+loadTierConfig();
 </script>
 </body>
 </html>
