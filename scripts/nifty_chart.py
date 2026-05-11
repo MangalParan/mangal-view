@@ -95,7 +95,7 @@ def init_db():
         "settings_datasource": "on",
         "settings_trade": "on",
         "settings_realtrade": "on",
-        "menu_symbols": json.dumps(["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","CRUDEOIL","NATURALGAS"]),
+        "menu_symbols": json.dumps(["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","USOIL","CRUDEOILMCX","NATURALGAS"]),
         "menu_timeframes": json.dumps(["1m","2m","3m","5m","10m","15m","30m","1h","2h","4h","1d","1w","1mo"]),
         "menu_indicators": json.dumps(["ST","SAR","SR","EMA","VWAP","BB","CPR","ORB","LP","FVG","BOS","CHoCH","CVD","VP","Signals"]),
         "menu_algos": json.dumps(["trend","mstreet","mfactor","sniper","orderflow","priceaction","breakout","momentum","scalping","smartmoney","quant","hybrid","statarb","institution","mpredict","marketmaking","mma","pattern"]),
@@ -119,6 +119,19 @@ def init_db():
             if _missing:
                 _updated = _existing + _missing
                 db.execute("UPDATE site_settings SET value = ? WHERE key = 'menu_algos'", (json.dumps(_updated),))
+        except Exception:
+            pass
+    # Migrate: ensure new symbols are in menu_symbols and CRUDEOIL is removed for existing DBs
+    _all_symbols = ["NIFTY50","BANKNIFTY","SENSEX","GOLD","SILVER","XAUUSD","XAGUSD","GOLDTEN","SILVERBEES","BTC","ETH","DJI","NASDAQ","SP500","USOIL","CRUDEOILMCX","NATURALGAS"]
+    _sym_row = db.execute("SELECT value FROM site_settings WHERE key = 'menu_symbols'").fetchone()
+    if _sym_row:
+        try:
+            _existing_sym = json.loads(_sym_row[0])
+            _existing_sym = [s for s in _existing_sym if s != "CRUDEOIL"]  # remove CRUDEOIL
+            _missing_sym = [s for s in _all_symbols if s not in _existing_sym]
+            if _missing_sym:
+                _existing_sym.extend(_missing_sym)
+            db.execute("UPDATE site_settings SET value = ? WHERE key = 'menu_symbols'", (json.dumps(_existing_sym),))
         except Exception:
             pass
     # Migrate: ensure new indicators are in menu_indicators for existing DBs
@@ -650,8 +663,9 @@ SYMBOL_MAP = {
     "DJI":        {"ticker": "^DJI",           "name": "Dow Jones",  "exchange": "NYSE"},
     "NASDAQ":     {"ticker": "^IXIC",          "name": "NASDAQ",     "exchange": "NASDAQ"},
     "SP500":      {"ticker": "^GSPC",          "name": "S&P 500",    "exchange": "NYSE"},
-    "CRUDEOIL":  {"ticker": "CL=F",           "name": "Crude Oil",   "exchange": "NYMEX"},
-    "NATURALGAS": {"ticker": "NG=F",           "name": "Natural Gas", "exchange": "NYMEX"},
+    "USOIL":       {"ticker": "CL=F",           "name": "US Oil (WTI)",          "exchange": "NYMEX"},
+    "CRUDEOILMCX": {"ticker": "CL=F",           "name": "Crude Oil Futures (MCX)", "exchange": "MCX"},
+    "NATURALGAS":  {"ticker": "NG=F",             "name": "Natural Gas",             "exchange": "NYMEX"},
 }
 
 INTERVAL_MAP = {
@@ -685,8 +699,9 @@ TV_SYMBOL_MAP = {
     "DJI":        "DJ:DJI",
     "NASDAQ":     "NASDAQ:IXIC",
     "SP500":      "SP:SPX",
-    "CRUDEOIL":  "OANDA:USOIL",
-    "NATURALGAS": "NYMEX:NG1!",
+    "USOIL":       "TVC:USOIL",
+    "CRUDEOILMCX": "NYMEX:CL1!",
+    "NATURALGAS":  "NYMEX:NG1!",
 }
 
 TV_INTERVAL_MAP = {
@@ -811,8 +826,11 @@ def fetch_tradingview_data(interval_key, symbol_key="NIFTY50"):
         )
         ws.send(_msg("set_auth_token", ["unauthorized_user_token"]))
         ws.send(_msg("chart_create_session", [cs, ""]))
+        # Futures/commodities use 'none' adjustment; equities use 'splits'
+        is_futures = tv_symbol.endswith("1!") or tv_symbol.startswith(("MCX:", "NYMEX:", "COMEX:", "TVC:", "OANDA:"))
+        adj = "none" if is_futures else "splits"
         sym_str = json.dumps(
-            {"symbol": tv_symbol, "adjustment": "splits"}, separators=(",", ":")
+            {"symbol": tv_symbol, "adjustment": adj}, separators=(",", ":")
         )
         ws.send(_msg("resolve_symbol", [cs, "sds_sym_1", "=" + sym_str]))
         ws.send(_msg("create_series", [cs, "sds_1", "s1", "sds_sym_1", tv_interval, 300]))
@@ -7921,9 +7939,9 @@ def api_candles():
     bb_period = max(5, min(bb_period, 100))
     bb_stddev = max(0.5, min(bb_stddev, 5.0))
 
-    # Data source — CRUDEOIL always uses TradingView CFD (OANDA:USOIL)
+    # Data source — USOIL/CRUDEOILMCX always use TradingView only
     source = request.args.get("source", "yahoo")
-    if symbol == "CRUDEOIL" or source == "tradingview":
+    if symbol in ("USOIL", "CRUDEOILMCX") or source == "tradingview":
         candles = fetch_tradingview_data(interval, symbol)
     elif source == "nse":
         candles = fetch_nse_data(interval, symbol)
@@ -8928,7 +8946,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="DJI">Dow Jones</option>
         <option value="NASDAQ">NASDAQ</option>
         <option value="SP500">S&P 500</option>
-        <option value="CRUDEOIL">Crude Oil</option>
+        <option value="USOIL">US Oil (WTI)</option>
+        <option value="CRUDEOILMCX">Crude Oil Futures (MCX)</option>
         <option value="NATURALGAS">Natural Gas</option>
       </select>
       <span class="ticker-exchange" id="tickerExchange"> &middot; NSE</span>
@@ -8991,23 +9010,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="algo-dropdown-wrapper">
     <button class="ind-btn" id="btnAlgo"><span class="dot" style="background:#ff9100"></span>Algo &#9662;</button>
     <div class="algo-dropdown" id="algoDropdown">
-      <button class="algo-item active" data-algo="trend" data-label="Trend">&#10004; Trend</button>
-      <button class="algo-item active" data-algo="mstreet" data-label="MStreet">&#10004; MStreet</button>
+      <button class="algo-item" data-algo="trend" data-label="Trend">&#8203; Trend</button>
+      <button class="algo-item" data-algo="mstreet" data-label="MStreet">&#8203; MStreet</button>
       <button class="algo-item" data-algo="mfactor" data-label="MFactor">&#8203; MFactor</button>
       <button class="algo-item" data-algo="sniper" data-label="Sniper">&#8203; Sniper</button>
-      <button class="algo-item active" data-algo="orderflow" data-label="OrderFlow">&#10004; OrderFlow</button>
-      <button class="algo-item active" data-algo="priceaction" data-label="PriceAction">&#10004; PriceAction</button>
-      <button class="algo-item active" data-algo="breakout" data-label="Breakout">&#10004; Breakout</button>
-      <button class="algo-item active" data-algo="momentum" data-label="Momentum">&#10004; Momentum</button>
+      <button class="algo-item" data-algo="orderflow" data-label="OrderFlow">&#8203; OrderFlow</button>
+      <button class="algo-item" data-algo="priceaction" data-label="PriceAction">&#8203; PriceAction</button>
+      <button class="algo-item" data-algo="breakout" data-label="Breakout">&#8203; Breakout</button>
+      <button class="algo-item" data-algo="momentum" data-label="Momentum">&#8203; Momentum</button>
       <button class="algo-item" data-algo="scalping" data-label="Scalping">&#8203; Scalping</button>
-      <button class="algo-item active" data-algo="smartmoney" data-label="SmartMoney">&#10004; SmartMoney</button>
+      <button class="algo-item" data-algo="smartmoney" data-label="SmartMoney">&#8203; SmartMoney</button>
       <button class="algo-item" data-algo="quant" data-label="Quant">&#8203; Quant</button>
-      <button class="algo-item active" data-algo="hybrid" data-label="Hybrid">&#10004; Hybrid</button>
+      <button class="algo-item" data-algo="hybrid" data-label="Hybrid">&#8203; Hybrid</button>
       <button class="algo-item" data-algo="statarb" data-label="StatArb">&#8203; StatArb</button>
       <button class="algo-item" data-algo="institution" data-label="Institution">&#8203; Institution</button>
       <button class="algo-item" data-algo="mpredict" data-label="MPredict">&#8203; MPredict</button>
-      <button class="algo-item active" data-algo="marketmaking" data-label="Market Making">&#10004; Market Making</button>
-      <button class="algo-item active" data-algo="mma" data-label="MM Advanced">&#10004; MM Advanced</button>
+      <button class="algo-item" data-algo="marketmaking" data-label="Market Making">&#8203; Market Making</button>
+      <button class="algo-item" data-algo="mma" data-label="MM Advanced">&#8203; MM Advanced</button>
       <button class="algo-item" data-algo="pattern" data-label="Pattern">&#8203; Pattern</button>
       <div style="border-top:1px solid #2a2e39;margin:6px 0"></div>
       <button class="algo-item" id="btnAlgoAnalysis" style="color:#ffd600">&#9889; Signal Analysis</button>
@@ -9620,7 +9639,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let lastBacktest = {};
   let currentSource = 'tradingview';
   let signalMap = {};  // time -> signal data for tooltip
-  let currentAlgo = new Set(['trend', 'mstreet', 'orderflow', 'priceaction', 'breakout', 'momentum', 'smartmoney', 'hybrid', 'marketmaking', 'mma']);
+  let currentAlgo = new Set();
 
   // Indicator visibility
   let showST = false, showSAR = false, showSR = false, showEMA = false, showVWAP = false, showSignals = true;
@@ -11899,7 +11918,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     DJI: { name: 'Dow Jones', exchange: 'NYSE' },
     NASDAQ: { name: 'NASDAQ', exchange: 'NASDAQ' },
     SP500: { name: 'S&P 500', exchange: 'NYSE' },
-    CRUDEOIL: { name: 'Crude Oil', exchange: 'NYMEX' },
+    USOIL: { name: 'US Oil (WTI)', exchange: 'NYMEX' },
+    CRUDEOILMCX: { name: 'Crude Oil Futures (MCX)', exchange: 'MCX' },
     NATURALGAS: { name: 'Natural Gas', exchange: 'NYMEX' },
   };
   document.getElementById('symbolSelect').addEventListener('change', function() {
@@ -12164,7 +12184,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Populate symbol dropdown
   const tpSymbol = document.getElementById('tpSymbol');
-  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH','DJI','NASDAQ','SP500','CRUDEOIL','NATURALGAS'];
+  const symbolKeys = ['NIFTY50','BANKNIFTY','SENSEX','GOLD','SILVER','XAUUSD','XAGUSD','GOLDTEN','SILVERBEES','BTC','ETH','DJI','NASDAQ','SP500','USOIL','CRUDEOILMCX','NATURALGAS'];
   symbolKeys.forEach(function(k) {
     const opt = document.createElement('option');
     opt.value = k;
