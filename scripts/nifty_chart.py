@@ -690,11 +690,18 @@ def zerodha_order():
     data = request.json or {}
     api_key      = data.get('api_key', '').strip()
     symbol       = data.get('symbol', '').strip()
-    exchange     = (data.get('exchange') or '').strip().upper() or 'NSE'
+    exchange     = (data.get('exchange') or '').strip().upper()
     side         = data.get('side', '').upper()
     qty          = int(data.get('qty', 1) or 1)
     order_type   = (data.get('order_type') or 'MARKET').strip().upper()
     product      = (data.get('product') or '').strip().upper()
+    # Slippage cap for MARKET orders, in % of LTP. Kite Connect rejects MARKET
+    # orders without this set (the API won't let bots fire blind market orders).
+    # Default 3% — narrow enough to be safe, wide enough to fill in normal
+    # market conditions. User can override per-order via the request body.
+    market_protection = float(data.get('market_protection', 3.0) or 3.0)
+    limit_price  = data.get('price')   # for LIMIT/SL orders
+    trigger_price = data.get('trigger_price')   # for SL/SL-M
     algo         = data.get('algo', '')
     score        = data.get('score', 0)
     dry_run      = data.get('dry_run', True)  # default to dry-run for safety
@@ -706,9 +713,29 @@ def zerodha_order():
     if not symbol:
         return jsonify({'success': False, 'error': 'Missing symbol'}), 400
 
+    # Auto-derive exchange from instrument lookup when missing.
+    # Common case: rules created before the Kite-tab metadata wiring don't
+    # carry an exchange, so we'd default to NSE and get back Kite's
+    # "instrument has expired or does not exist" 400 for any MCX/NFO contract.
+    if not exchange:
+        sym_u = symbol.upper()
+        candidates = []
+        for src in (_load_kite_all_instruments() or [], _load_csv_instruments() or []):
+            candidates.extend([r for r in src if (r.get('symbol') or '').upper() == sym_u])
+            if candidates:
+                break
+        # Prefer established exchanges first (so duplicate MCX/NCO listings
+        # snap to MCX, NFO over BFO, etc.)
+        _prio = {'NSE':0, 'BSE':1, 'NFO':2, 'BFO':3, 'MCX':4, 'CDS':5, 'BCD':6, 'NCO':7}
+        candidates.sort(key=lambda r: _prio.get((r.get('exchange') or '').strip().upper(), 99))
+        if candidates:
+            exchange = (candidates[0].get('exchange') or '').strip().upper()
+        if not exchange:
+            exchange = 'NSE'   # final fallback
+
     # Default product: derivatives use NRML, equities use MIS
     if not product:
-        product = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD') else 'MIS'
+        product = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
 
     # Dry-run: log only, return a fake order id
     if dry_run:
@@ -727,7 +754,7 @@ def zerodha_order():
     if not access_token:
         return jsonify({'success': False, 'error': 'No access_token in server session — re-Connect'}), 403
 
-    payload = _up.urlencode({
+    payload_d = {
         'tradingsymbol':    symbol,
         'exchange':         exchange,
         'transaction_type': side,
@@ -735,7 +762,16 @@ def zerodha_order():
         'product':          product,
         'order_type':       order_type,
         'validity':         'DAY',
-    }).encode('utf-8')
+    }
+    # MARKET orders need an explicit market_protection % (Kite API requirement).
+    if order_type == 'MARKET':
+        payload_d['market_protection'] = market_protection
+    # LIMIT / SL orders need a price; SL / SL-M need a trigger
+    if order_type in ('LIMIT', 'SL') and limit_price is not None:
+        payload_d['price'] = limit_price
+    if order_type in ('SL', 'SL-M') and trigger_price is not None:
+        payload_d['trigger_price'] = trigger_price
+    payload = _up.urlencode(payload_d).encode('utf-8')
     req = _zd_urllib.Request(
         'https://api.kite.trade/orders/regular',
         data=payload,
@@ -748,7 +784,7 @@ def zerodha_order():
         method='POST'
     )
     try:
-        with _zd_urllib.urlopen(req, timeout=15) as resp:
+        with _kite_urlopen(req, timeout=15) as resp:
             body = resp.read().decode('utf-8')
         resp_data = _json.loads(body) if body else {}
     except _ue.HTTPError as e:
@@ -763,7 +799,16 @@ def zerodha_order():
             err_msg  = err_data.get('message', err_body[:300])
         except Exception:
             err_msg = err_body[:300] or str(e)
-        return jsonify({'success': False, 'error': 'Kite HTTP {}: {}'.format(e.code, err_msg)})
+        # Include the order context so the user can see what was actually sent
+        ctx_parts = ['{} {} qty={} exch={} prod={}'.format(side, symbol, qty, exchange, product),
+                     'type=' + order_type]
+        if order_type == 'MARKET':
+            ctx_parts.append('mp={}%'.format(market_protection))
+        return jsonify({
+            'success': False,
+            'error':   'Kite HTTP {}: {} (sent: {})'.format(e.code, err_msg, ' '.join(ctx_parts)),
+            'sent':    payload_d
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': 'Kite request failed: {}'.format(e)})
 
@@ -1008,7 +1053,7 @@ def _load_nfo_instruments():
             'https://api.kite.trade/instruments/NFO',
             headers={'User-Agent': 'Mozilla/5.0'}
         )
-        with _zd_urllib.urlopen(req, timeout=20) as resp:
+        with _kite_urlopen(req, timeout=20) as resp:
             content = resp.read().decode('utf-8')
         reader = _csv.DictReader(_io.StringIO(content))
         rows = []
@@ -1161,6 +1206,7 @@ def _load_csv_instruments():
                 if not sym:
                     continue
                 rows.append({
+                    'instrument_token': (row.get('instrument_token') or '').strip(),
                     'symbol':       sym,
                     'name':         (row.get('name') or '').strip(),
                     'expiry':       (row.get('expiry') or '').strip(),
@@ -1205,6 +1251,61 @@ def zerodha_csv_search():
         rows_out = rows[:200]
     return jsonify({'success': True, 'results': rows_out, 'total': len(rows)})
 
+# ---- Force IPv4 for all Kite Connect API calls ----
+# Kite Connect's IP whitelist accepts IPv4 only. Dual-stack hosts (e.g.,
+# residential connections with IPv6) tend to prefer IPv6 by default, which
+# Kite then rejects with HTTP 403 even when the IPv4 is correctly whitelisted.
+# We build a dedicated urllib opener that pins HTTPS connections to IPv4.
+import http.client as _zd_hc, socket as _zd_socket
+
+class _IPv4HTTPSConnection(_zd_hc.HTTPSConnection):
+    def connect(self):
+        infos = _zd_socket.getaddrinfo(
+            self.host, self.port, _zd_socket.AF_INET, _zd_socket.SOCK_STREAM
+        )
+        last_err = None
+        for af, st, pr, _cn, sa in infos:
+            sock = None
+            try:
+                sock = _zd_socket.socket(af, st, pr)
+                if self.timeout is not None:
+                    sock.settimeout(self.timeout)
+                if self.source_address:
+                    sock.bind(self.source_address)
+                sock.connect(sa)
+                self.sock = sock
+                if self._tunnel_host:
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(
+                    self.sock, server_hostname=self._tunnel_host or self.host
+                )
+                return
+            except OSError as e:
+                last_err = e
+                try:
+                    if sock is not None:
+                        sock.close()
+                except Exception:
+                    pass
+        raise last_err if last_err else OSError('IPv4 connect failed')
+
+class _IPv4HTTPSHandler(_zd_urllib.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_IPv4HTTPSConnection, req)
+
+_KITE_IPV4_OPENER = _zd_urllib.build_opener(_IPv4HTTPSHandler())
+
+def _kite_urlopen(req_or_url, data=None, headers=None, method=None, timeout=15):
+    """urlopen replacement that forces IPv4 — use for every api.kite.trade call.
+
+    Accepts either a urllib.request.Request or a URL string. Returns the
+    response context manager (use within `with`)."""
+    if isinstance(req_or_url, _zd_urllib.Request):
+        req = req_or_url
+    else:
+        req = _zd_urllib.Request(req_or_url, data=data, headers=headers or {}, method=method or 'GET')
+    return _KITE_IPV4_OPENER.open(req, timeout=timeout)
+
 # ---- Live Kite API: full instruments dump (api.kite.trade/instruments) ----
 _ZD_KITE_CACHE = {'ts': 0.0, 'data': []}
 _ZD_KITE_TTL   = 3600  # 1 hour
@@ -1219,7 +1320,7 @@ def _load_kite_all_instruments():
             'https://api.kite.trade/instruments',
             headers={'User-Agent': 'Mozilla/5.0'}
         )
-        with _zd_urllib.urlopen(req, timeout=30) as resp:
+        with _kite_urlopen(req, timeout=30) as resp:
             content = resp.read().decode('utf-8')
         reader = _csv.DictReader(_io.StringIO(content))
         rows = []
@@ -1238,6 +1339,7 @@ def _load_kite_all_instruments():
             except Exception:
                 expiry_short = expiry_raw
             rows.append({
+                'instrument_token': (row.get('instrument_token') or '').strip(),
                 'symbol':       sym,
                 'name':         (row.get('name') or '').strip(),
                 'expiry':       expiry_raw,
@@ -1382,7 +1484,7 @@ def zerodha_generate_token():
             data=payload, method='POST',
             headers={'X-Kite-Version': '3', 'Content-Type': 'application/x-www-form-urlencoded'}
         )
-        with _ur.urlopen(req, timeout=15) as resp:
+        with _kite_urlopen(req, timeout=15) as resp:
             import json as _json
             result = _json.loads(resp.read())
         access_token = result.get('data', {}).get('access_token', '')
@@ -1615,6 +1717,153 @@ def fetch_tradingview_data(interval_key, symbol_key="NIFTY50"):
         })
 
     return candles
+
+
+def fetch_kite_data(interval_key, symbol, api_key=None):
+    """Fetch OHLCV candles for a Zerodha tradingsymbol straight from the Kite
+    historical-data REST endpoint.
+
+    Looks up the instrument_token from the live Kite instruments dump
+    (`_load_kite_all_instruments`, falling back to the local CSV cache), then
+    calls https://api.kite.trade/instruments/historical/{token}/{interval}
+    using the user's active session (`zerodha_sessions[api_key]`).
+
+    Args:
+        interval_key (str): App timeframe key (3m/5m/15m/1h/1d/...).
+        symbol (str):        Kite tradingsymbol (e.g. CRUDEOILM26JUNFUT).
+        api_key (str|None):  Identifies the Zerodha session. If None, picks the
+            first connected session (single-user/localhost case).
+
+    Returns:
+        list[dict]: same shape as fetch_nifty_data — empty list if not
+        connected, IP not whitelisted, token not found, or any API error.
+    """
+    import urllib.parse as _up, json as _json
+    # Resolve session
+    if not api_key or api_key not in zerodha_sessions:
+        if zerodha_sessions:
+            api_key = next(iter(zerodha_sessions))
+        else:
+            return []
+    access_token = zerodha_sessions.get(api_key, {}).get('access_token', '')
+    if not access_token:
+        return []
+
+    # Map our interval keys to Kite's interval names
+    kite_interval_map = {
+        '1m':  'minute',
+        '3m':  '3minute',
+        '5m':  '5minute',
+        '10m': '10minute',
+        '15m': '15minute',
+        '30m': '30minute',
+        '1h':  '60minute',
+        '2h':  '60minute',   # Kite has no 2h; aggregate after
+        '4h':  '60minute',   # same — aggregate after
+        '1d':  'day',
+    }
+    k_int = kite_interval_map.get(interval_key, '5minute')
+
+    # Find the instrument_token (live dump first, then local CSV)
+    sym_u = (symbol or '').upper().strip()
+    if not sym_u:
+        return []
+    inst_token = None
+    for rows in (_load_kite_all_instruments() or [], _load_csv_instruments() or []):
+        for r in rows:
+            if (r.get('symbol') or '').upper() == sym_u:
+                inst_token = (r.get('instrument_token') or '').strip()
+                if inst_token:
+                    break
+        if inst_token:
+            break
+    if not inst_token:
+        return []
+
+    # Date range: keep payload small but enough for indicators
+    # - daily:    last 200 days
+    # - hourly:   last 30 days
+    # - minutes:  last 5 days (Kite's historical limit for minute data is ~60 days but capped to ~30 per request)
+    if k_int == 'day':
+        days_back = 200
+    elif k_int == '60minute':
+        days_back = 30
+    else:
+        days_back = 5
+    now    = datetime.now()
+    fr_dt  = (now - _td_safe(days=days_back)).strftime('%Y-%m-%d %H:%M:%S')
+    to_dt  = now.strftime('%Y-%m-%d %H:%M:%S')
+
+    url = ('https://api.kite.trade/instruments/historical/'
+           + str(inst_token) + '/' + k_int
+           + '?from=' + _up.quote(fr_dt) + '&to=' + _up.quote(to_dt))
+    req = _zd_urllib.Request(
+        url,
+        headers={
+            'X-Kite-Version': '3',
+            'Authorization':  'token {}:{}'.format(api_key, access_token),
+            'User-Agent':     'Mozilla/5.0',
+        },
+        method='GET'
+    )
+    try:
+        with _kite_urlopen(req, timeout=20) as resp:
+            body = resp.read().decode('utf-8')
+        data = _json.loads(body) if body else {}
+    except Exception:
+        return []
+    if data.get('status') != 'success':
+        return []
+    rows = data.get('data', {}).get('candles', [])
+
+    candles = []
+    for row in rows:
+        # Kite candle: [timestamp_iso_str, open, high, low, close, volume, oi?]
+        try:
+            ts_str = row[0]
+            # Kite returns e.g. "2025-05-28T15:25:00+0530"
+            if isinstance(ts_str, str):
+                ts_clean = ts_str.replace('+0530', '+05:30').replace('+0000', '+00:00')
+                dt = datetime.fromisoformat(ts_clean)
+                ts = int(dt.timestamp())
+            else:
+                continue
+            candles.append({
+                'time':   ts,
+                'open':   round(float(row[1]), 2),
+                'high':   round(float(row[2]), 2),
+                'low':    round(float(row[3]), 2),
+                'close':  round(float(row[4]), 2),
+                'volume': int(row[5]) if row[5] else 0,
+            })
+        except Exception:
+            continue
+
+    # Aggregate 60minute -> 2h/4h if requested
+    if interval_key in ('2h', '4h') and candles:
+        n = 2 if interval_key == '2h' else 4
+        agg = []
+        for i in range(0, len(candles), n):
+            grp = candles[i:i + n]
+            if not grp:
+                continue
+            agg.append({
+                'time':   grp[0]['time'],
+                'open':   grp[0]['open'],
+                'high':   max(c['high'] for c in grp),
+                'low':    min(c['low']  for c in grp),
+                'close':  grp[-1]['close'],
+                'volume': sum(c['volume'] for c in grp),
+            })
+        candles = agg
+
+    return candles
+
+
+def _td_safe(days=0):
+    """Tiny shim — import timedelta lazily so this function file stays import-clean."""
+    from datetime import timedelta as _td
+    return _td(days=days)
 
 
 def fetch_nse_data(interval_key, symbol_key="NIFTY50"):
@@ -8686,9 +8935,22 @@ def api_candles():
     bb_period = max(5, min(bb_period, 100))
     bb_stddev = max(0.5, min(bb_stddev, 5.0))
 
-    # Data source — USOIL/CRUDEOILMCX always use TradingView only
+    # Data source — kite fetches actual contract candles via Kite historical API;
+    # USOIL/CRUDEOILMCX always use TradingView (continuous proxy).
     source = request.args.get("source", "yahoo")
-    if symbol in ("USOIL", "CRUDEOILMCX") or source == "tradingview":
+    if source == "kite":
+        api_key_q = request.args.get("api_key", "").strip()
+        candles = fetch_kite_data(interval, symbol, api_key=api_key_q or None)
+        # If Kite fetch returned nothing (not connected, IP not whitelisted,
+        # token unknown), fall back to the next best source so the rule
+        # doesn't go silent — and so the user sees indicator values from
+        # SOMETHING while they sort out IP whitelisting.
+        if not candles:
+            if symbol in ("USOIL", "CRUDEOILMCX"):
+                candles = fetch_tradingview_data(interval, symbol)
+            else:
+                candles = fetch_nifty_data(interval, symbol)
+    elif symbol in ("USOIL", "CRUDEOILMCX") or source == "tradingview":
         candles = fetch_tradingview_data(interval, symbol)
     elif source == "nse":
         candles = fetch_nse_data(interval, symbol)
@@ -14655,9 +14917,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!zdConnected) { zdLog('Please connect to Zerodha first.', 'info'); return; }
       if (zdRules.length === 0) { zdLog('Add at least one rule.', 'info'); return; }
       setRunningState(true);
-      zdLog('Automation started. Checking signals every 60s.', 'info');
+      zdLog('Automation started. Checking signals every 15s.', 'info');
       runAutomation();
-      zdTimer = setInterval(runAutomation, 60000);
+      zdTimer = setInterval(runAutomation, 15000);
     });
 
     stopBtn.addEventListener('click', function() {
@@ -14667,6 +14929,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
       zdLog('Automation stopped.', 'info');
     });
 
+    // Underlying-name -> curated chart symbol. Used to back-fill chartSymbol
+    // for rules added before the Kite-symbol mapping was introduced, and for
+    // symbols the user typed manually that look like Kite tradingsymbols.
+    const _ZD_RUN_UNDERLYING_MAP = {
+      'NIFTY':'NIFTY50','NIFTYNXT50':'NIFTYNXT50','BANKNIFTY':'BANKNIFTY',
+      'FINNIFTY':'BANKNIFTY','MIDCPNIFTY':'NIFTY50','SENSEX':'SENSEX','BANKEX':'BANKNIFTY',
+      'CRUDEOIL':'CRUDEOILMCX','CRUDEOILM':'CRUDEOILMCX',
+      'GOLD':'GOLD','GOLDM':'GOLD','GOLDPETAL':'GOLD',
+      'SILVER':'SILVER','SILVERM':'SILVER','SILVERMIC':'SILVER',
+      'NATURALGAS':'NATURALGAS','NATGASMINI':'NATURALGAS'
+    };
+    // Auto-derive chart symbol from a Kite-style tradingsymbol when the rule
+    // doesn't already carry one. Matches the longest known-underlying prefix
+    // (so NIFTYNXT50 beats NIFTY, CRUDEOILM beats CRUDE, etc.) on any symbol
+    // that ends in FUT/CE/PE. Returns null if nothing matches.
+    const _ZD_NAMES_SORTED = Object.keys(_ZD_RUN_UNDERLYING_MAP)
+      .sort((a, b) => b.length - a.length);
+    function _inferChartFromSym(sym) {
+      const s = String(sym || '').toUpperCase();
+      if (s.length < 4) return null;
+      // Curated chart symbol typed directly (e.g., the rule symbol IS CRUDEOILMCX)
+      if (_ZD_RUN_UNDERLYING_MAP[s]) return _ZD_RUN_UNDERLYING_MAP[s];
+      // Otherwise must look like a derivative tradingsymbol
+      if (!/(FUT|CE|PE)$/.test(s)) return null;
+      // Longest matching underlying prefix wins
+      for (const name of _ZD_NAMES_SORTED) {
+        if (s.startsWith(name)) return _ZD_RUN_UNDERLYING_MAP[name];
+      }
+      return null;
+    }
+
     function runAutomation() {
       const liveTradesChk = document.getElementById('zdLiveTradesChk');
       const liveTrades = !!(liveTradesChk && liveTradesChk.checked);
@@ -14674,43 +14967,149 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // Use rule's own timeframe; fall back to chart TF
         const useTF  = rule.tf || currentTF;
         const useAlgo = (rule.algo && rule.algo !== 'NA') ? rule.algo : '';
-        // Use chartSymbol for the signal fetch (Kite tradingsymbols aren't
-        // recognised by yfinance/tradingview), fall back to symbol for old rules.
-        const dataSym  = rule.chartSymbol || rule.symbol;
         const tradeSym = rule.tradeSymbol || rule.symbol;
+        // Choose data source. Rules with a Kite exchange (added from the Kite
+        // tab) fetch directly from Kite's historical-data API — the actual
+        // contract, not a proxy. Everything else uses the chart-symbol path.
+        const kiteExchanges = ['NSE','BSE','NFO','BFO','MCX','CDS','BCD'];
+        const useKite = zdConnected && rule.exchange && kiteExchanges.indexOf(rule.exchange) !== -1;
+        let dataSym, useSource;
+        if (useKite) {
+          // Fetch the actual Kite tradingsymbol via source=kite
+          dataSym   = tradeSym;
+          useSource = 'kite';
+        } else {
+          // Resolve a chart-symbol for yfinance/tradingview. Re-run inference
+          // when chartSymbol is missing OR identical to the trade symbol
+          // (which happens for manually-typed rules pre-Kite-mapping).
+          let cs = rule.chartSymbol;
+          if (!cs || cs === rule.symbol) {
+            const inferred = _inferChartFromSym(rule.symbol);
+            if (inferred && inferred !== rule.symbol) {
+              cs = inferred;
+              rule.chartSymbol = cs;   // back-fill + persist for future ticks
+              saveRulesToStore();
+            }
+          }
+          dataSym   = cs || rule.symbol;
+          useSource = currentSource;
+        }
         const url = '/api/candles?symbol=' + encodeURIComponent(dataSym)
           + '&interval=' + encodeURIComponent(useTF)
-          + '&source=' + encodeURIComponent(currentSource)
+          + '&source=' + encodeURIComponent(useSource)
+          + (useKite && zdApiKey ? '&api_key=' + encodeURIComponent(zdApiKey) : '')
           + (useAlgo ? '&algo=' + encodeURIComponent(useAlgo) : '');
         fetch(url)
         .then(r => r.json())
         .then(function(data) {
           const signals = (data.signals || []);
-          if (!signals.length) return;
-          const last  = signals[signals.length - 1];
-          const score = last.score !== undefined ? last.score
-                      : last.buy_score !== undefined ? last.buy_score : null;
-          const sig   = (last.signal || '').toUpperCase();
+          const last  = signals.length ? signals[signals.length - 1] : null;
+          const score = last && (last.score !== undefined ? last.score
+                      : last.buy_score !== undefined ? last.buy_score : null);
+          const sig   = last ? (last.signal || '').toUpperCase() : '';
+          const candles = data.candles || [];
+          const lastCandle = candles.length ? candles[candles.length - 1] : null;
 
-          // Check if the signal matches the rule's configured side
+          // Evaluate ONE indicator at the latest candle vs an expected condition
+          // ('bullish' / 'bearish'). Returns true/false, or null if unsupported.
+          function evalIndicator(name, expected) {
+            const want = (expected || '').toLowerCase();
+            const close = lastCandle && lastCandle.close;
+            const tail = arr => (Array.isArray(arr) && arr.length ? arr[arr.length - 1] : null);
+            let isBullish = null;
+            switch (name) {
+              case 'SuperTrend': {
+                const v = tail(data.supertrend);
+                if (v && v.direction != null) isBullish = v.direction === 1;
+                break;
+              }
+              case 'RSI': {
+                const v = tail(data.rsi);
+                if (v && v.value != null) isBullish = v.value > 50;
+                break;
+              }
+              case 'MACD': {
+                const v = tail(data.macd);
+                if (v && v.histogram != null) isBullish = v.histogram > 0;
+                break;
+              }
+              case 'EMA9':
+              case 'EMA21': {
+                const v = tail(name === 'EMA9' ? data.ema9 : data.ema21);
+                if (v && v.value != null && close != null) isBullish = close > v.value;
+                break;
+              }
+              case 'VWAP': {
+                const v = tail(data.vwap);
+                if (v && v.value != null && close != null) isBullish = close > v.value;
+                break;
+              }
+              case 'BB': {
+                const v = tail(data.bollingerBands);
+                if (v && v.middle != null && close != null) isBullish = close > v.middle;
+                break;
+              }
+              // SMA, ADX, Stochastic, CCI, ATR, OBV, Ichimoku — not in /api/candles
+              // response at this point. Return null so the user knows it's a no-op.
+              default:
+                return null;
+            }
+            if (isBullish == null) return null;
+            return want === 'bullish' ? isBullish : !isBullish;
+          }
+
+          // Decide whether this rule triggers
           let triggered = false;
-          if (rule.ruleType === 'mm') {
-            // Market Making rule: check buy/sell score thresholds
+          let reason    = '';
+
+          if (rule.ruleType === 'indicator') {
+            // ALL selected indicators must match their conditions
+            const inds  = rule.indicators || [];
+            const conds = rule.conditions || [];
+            if (!inds.length) {
+              reason = 'no indicators on rule';
+            } else {
+              const evals = inds.map((ind, i) => ({
+                ind, cond: conds[i] || 'bullish', pass: evalIndicator(ind, conds[i] || 'bullish')
+              }));
+              const unsupported = evals.filter(e => e.pass === null).map(e => e.ind);
+              const allPass     = evals.every(e => e.pass === true);
+              triggered = allPass;
+              reason = evals.map(e => e.ind + '(' + e.cond + ')=' + (e.pass===null?'?':e.pass?'✓':'✗')).join(' ');
+              if (unsupported.length) reason += ' [unsupported: ' + unsupported.join(',') + ']';
+            }
+          } else if (rule.ruleType === 'mm') {
             if (sig === 'BUY' && score !== null) {
               triggered = score >= (rule.buyScore || 0);
+              reason = 'sig=BUY score=' + score + ' >=' + (rule.buyScore || 0) + ': ' + (triggered?'✓':'✗');
             } else if (sig === 'SELL' && score !== null) {
               triggered = score >= (rule.sellScore || 0);
+              reason = 'sig=SELL score=' + score + ' >=' + (rule.sellScore || 0) + ': ' + (triggered?'✓':'✗');
+            } else {
+              reason = 'sig=' + (sig||'none') + ' score=' + (score==null?'-':score) + ': no thresholds met';
             }
-          } else if (score !== null) {
-            triggered = score >= (rule.score || 0);
-          } else {
-            triggered = (sig === rule.side);
+          } else {  // algo
+            if (score !== null) {
+              triggered = score >= (rule.score || 0);
+              reason = 'sig=' + (sig||'none') + ' score=' + score + ' >=' + (rule.score || 0) + ': ' + (triggered?'✓':'✗');
+            } else if (last) {
+              triggered = (sig === rule.side);
+              reason = 'sig=' + (sig||'none') + ' ==rule.side(' + rule.side + '): ' + (triggered?'✓':'✗');
+            } else {
+              reason = 'no signal in /api/candles response';
+            }
           }
+
+          // Per-tick visibility — always log so the user can see what's happening
+          const srcTag = useKite ? '[KITE]' : '[' + useSource + ']';
+          zdLog('[Tick] ' + srcTag + ' ' + dataSym + ' #' + rule.id + ' ' + reason, 'info');
+
           if (!triggered) return;
 
           // Avoid duplicate orders on same candle
-          if (rule.lastOrder === last.time) return;
-          rule.lastOrder = last.time;
+          const candleKey = (last && last.time) || (lastCandle && lastCandle.time) || Date.now();
+          if (rule.lastOrder === candleKey) return;
+          rule.lastOrder = candleKey;
           
           // For MM rules, use the actual signal direction; otherwise use configured side
           const orderSide = (rule.ruleType === 'mm' && sig) ? sig : rule.side;
