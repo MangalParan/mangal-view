@@ -645,6 +645,638 @@ def delta_status():
         return jsonify({'success': True, 'position': 'FLAT', 'pnl': 0, 'orders': list(delta_orders.values())})
     return jsonify({'success': False, 'error': 'Invalid session'}), 403
 
+# --- Zerodha Automation API ---
+zerodha_sessions = {}   # api_key -> {connected, token}
+zerodha_orders   = []   # order log
+
+@app.route('/api/zerodha/connect', methods=['POST'])
+@login_required
+def zerodha_connect():
+    data = request.json or {}
+    api_key      = data.get('api_key', '').strip()
+    api_secret   = data.get('api_secret', '').strip()
+    access_token = data.get('access_token', '').strip()
+    if not (api_key and access_token):
+        return jsonify({'success': False, 'error': 'API key and access token required'}), 400
+    # Store credentials (actual KiteConnect integration goes here)
+    zerodha_sessions[api_key] = {
+        'api_secret': api_secret,
+        'access_token': access_token,
+        'connected': True
+    }
+    return jsonify({'success': True, 'message': 'Connected to Zerodha'})
+
+@app.route('/api/zerodha/order', methods=['POST'])
+@login_required
+def zerodha_order():
+    data = request.json or {}
+    api_key      = data.get('api_key', '').strip()
+    symbol       = data.get('symbol', '').strip()
+    side         = data.get('side', '').upper()   # BUY or SELL
+    qty          = data.get('qty', 1)
+    algo         = data.get('algo', '')
+    score        = data.get('score', 0)
+    if api_key not in zerodha_sessions:
+        return jsonify({'success': False, 'error': 'Not connected'}), 403
+    if side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'Invalid side'}), 400
+    # TODO: Place real order via KiteConnect:
+    #   from kiteconnect import KiteConnect
+    #   kite = KiteConnect(api_key=api_key)
+    #   kite.set_access_token(zerodha_sessions[api_key]['access_token'])
+    #   kite.place_order(tradingsymbol=symbol, exchange='NSE', transaction_type=side,
+    #                    quantity=qty, order_type='MARKET', product='MIS', variety='regular')
+    order_id = str(uuid.uuid4())[:8]
+    entry = {
+        'order_id': order_id, 'symbol': symbol, 'side': side, 'qty': qty,
+        'algo': algo, 'score': score, 'status': 'PLACED',
+        'timestamp': datetime.utcnow().isoformat()
+    }
+    zerodha_orders.append(entry)
+    return jsonify({'success': True, 'orderId': order_id, 'order': entry})
+
+@app.route('/api/zerodha/orders', methods=['GET'])
+@login_required
+def zerodha_orders_list():
+    return jsonify({'success': True, 'orders': zerodha_orders[-50:]})
+
+# ---- Instrument search list ----
+_ZD_INSTRUMENTS = [
+    # Indices (all have options)
+    {"symbol":"NIFTY50",    "name":"NIFTY 50",                "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"options index derivatives weekly"},
+    {"symbol":"BANKNIFTY",  "name":"BANK NIFTY",              "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"options index derivatives weekly"},
+    {"symbol":"FINNIFTY",   "name":"NIFTY FIN SERVICE",       "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"options index derivatives weekly"},
+    {"symbol":"MIDCPNIFTY", "name":"NIFTY MIDCAP SELECT",     "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"options index derivatives weekly"},
+    {"symbol":"SENSEX",     "name":"S&P BSE SENSEX",          "exchange":"BSE","type":"INDEX","seg":"INDICES","tags":"options index derivatives weekly"},
+    {"symbol":"NIFTYIT",    "name":"NIFTY IT",                "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"index sector"},
+    {"symbol":"NIFTYAUTO",  "name":"NIFTY AUTO",              "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"index sector"},
+    {"symbol":"NIFTYPHARMA","name":"NIFTY PHARMA",            "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"index sector"},
+    {"symbol":"NIFTYMETAL", "name":"NIFTY METAL",             "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"index sector"},
+    {"symbol":"NIFTYFMCG",  "name":"NIFTY FMCG",             "exchange":"NSE","type":"INDEX","seg":"INDICES","tags":"index sector"},
+    # NIFTY 50 stocks (all have options)
+    {"symbol":"ADANIENT",   "name":"Adani Enterprises Ltd",   "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"ADANIPORTS", "name":"Adani Ports & SEZ Ltd",   "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"APOLLOHOSP", "name":"Apollo Hospitals Ent Ltd","exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"ASIANPAINT", "name":"Asian Paints Ltd",        "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"AXISBANK",   "name":"Axis Bank Ltd",           "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity banking"},
+    {"symbol":"BAJAJ-AUTO", "name":"Bajaj Auto Ltd",          "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"BAJAJFINSV", "name":"Bajaj Finserv Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity finance"},
+    {"symbol":"BAJFINANCE", "name":"Bajaj Finance Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity finance"},
+    {"symbol":"BHARTIARTL", "name":"Bharti Airtel Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity telecom"},
+    {"symbol":"BPCL",       "name":"Bharat Petroleum Corp",   "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity energy"},
+    {"symbol":"BRITANNIA",  "name":"Britannia Industries Ltd","exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"CIPLA",      "name":"Cipla Ltd",               "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity pharma"},
+    {"symbol":"COALINDIA",  "name":"Coal India Ltd",          "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity energy"},
+    {"symbol":"DIVISLAB",   "name":"Divi's Laboratories Ltd", "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity pharma"},
+    {"symbol":"DRREDDY",    "name":"Dr Reddy's Laboratories", "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity pharma"},
+    {"symbol":"EICHERMOT",  "name":"Eicher Motors Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity auto"},
+    {"symbol":"GRASIM",     "name":"Grasim Industries Ltd",   "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"HCLTECH",    "name":"HCL Technologies Ltd",    "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity it tech"},
+    {"symbol":"HDFCBANK",   "name":"HDFC Bank Ltd",           "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity banking finance"},
+    {"symbol":"HDFCLIFE",   "name":"HDFC Life Insurance Co",  "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity insurance"},
+    {"symbol":"HEROMOTOCO", "name":"Hero MotoCorp Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity auto"},
+    {"symbol":"HINDALCO",   "name":"Hindalco Industries Ltd",  "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity metal"},
+    {"symbol":"HINDUNILVR", "name":"Hindustan Unilever Ltd",  "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"ICICIBANK",  "name":"ICICI Bank Ltd",          "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity banking"},
+    {"symbol":"INDUSINDBK", "name":"IndusInd Bank Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity banking"},
+    {"symbol":"INFY",       "name":"Infosys Ltd",             "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity it tech"},
+    {"symbol":"ITC",        "name":"ITC Ltd",                 "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"JSWSTEEL",   "name":"JSW Steel Ltd",           "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity metal"},
+    {"symbol":"KOTAKBANK",  "name":"Kotak Mahindra Bank Ltd", "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity banking"},
+    {"symbol":"LT",         "name":"Larsen & Toubro Ltd",     "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity infra"},
+    {"symbol":"MM",         "name":"Mahindra & Mahindra Ltd", "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity auto"},
+    {"symbol":"MARUTI",     "name":"Maruti Suzuki India Ltd", "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity auto"},
+    {"symbol":"NESTLEIND",  "name":"Nestle India Ltd",        "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"NTPC",       "name":"NTPC Ltd",                "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity energy power"},
+    {"symbol":"ONGC",       "name":"Oil & Natural Gas Corp",  "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity energy oil"},
+    {"symbol":"POWERGRID",  "name":"Power Grid Corp of India","exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity energy power"},
+    {"symbol":"RELIANCE",   "name":"Reliance Industries Ltd", "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity energy"},
+    {"symbol":"SBILIFE",    "name":"SBI Life Insurance Co",   "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity insurance"},
+    {"symbol":"SBIN",       "name":"State Bank of India",     "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity banking"},
+    {"symbol":"SHRIRAMFIN", "name":"Shriram Finance Ltd",     "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity finance"},
+    {"symbol":"SUNPHARMA",  "name":"Sun Pharmaceutical Ind",  "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity pharma"},
+    {"symbol":"TATACONSUM", "name":"Tata Consumer Products",  "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"TATAMOTORS", "name":"Tata Motors Ltd",         "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity auto"},
+    {"symbol":"TATASTEEL",  "name":"Tata Steel Ltd",          "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity metal"},
+    {"symbol":"TCS",        "name":"Tata Consultancy Services","exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity it tech"},
+    {"symbol":"TECHM",      "name":"Tech Mahindra Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity it tech"},
+    {"symbol":"TITAN",      "name":"Titan Company Ltd",       "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"TRENT",      "name":"Trent Ltd",               "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity"},
+    {"symbol":"ULTRACEMCO", "name":"UltraTech Cement Ltd",    "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity cement"},
+    {"symbol":"WIPRO",      "name":"Wipro Ltd",               "exchange":"NSE","type":"EQ","seg":"NIFTY50","tags":"options fno derivatives equity it tech"},
+    # Bank NIFTY extras (all have options)
+    {"symbol":"AUBANK",     "name":"AU Small Finance Bank",   "exchange":"NSE","type":"EQ","seg":"BANKNIFTY","tags":"options fno derivatives equity banking"},
+    {"symbol":"BANDHANBNK", "name":"Bandhan Bank Ltd",        "exchange":"NSE","type":"EQ","seg":"BANKNIFTY","tags":"options fno derivatives equity banking"},
+    {"symbol":"FEDERALBNK", "name":"Federal Bank Ltd",        "exchange":"NSE","type":"EQ","seg":"BANKNIFTY","tags":"options fno derivatives equity banking"},
+    {"symbol":"IDFCFIRSTB", "name":"IDFC First Bank Ltd",     "exchange":"NSE","type":"EQ","seg":"BANKNIFTY","tags":"options fno derivatives equity banking"},
+    {"symbol":"PNB",        "name":"Punjab National Bank",    "exchange":"NSE","type":"EQ","seg":"BANKNIFTY","tags":"options fno derivatives equity banking"},
+    {"symbol":"BANKBARODA", "name":"Bank of Baroda",          "exchange":"NSE","type":"EQ","seg":"BANKNIFTY","tags":"options fno derivatives equity banking"},
+    # Mid/Small cap FNO (all have options)
+    {"symbol":"ABCAPITAL",  "name":"Aditya Birla Capital",    "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity finance"},
+    {"symbol":"ALKEM",      "name":"Alkem Laboratories",      "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity pharma"},
+    {"symbol":"AMBUJACEM",  "name":"Ambuja Cements Ltd",      "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity cement"},
+    {"symbol":"APOLLOTYRE", "name":"Apollo Tyres Ltd",        "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity auto"},
+    {"symbol":"AUROPHARMA", "name":"Aurobindo Pharma Ltd",    "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity pharma"},
+    {"symbol":"BALKRISIND", "name":"Balkrishna Industries",   "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity auto"},
+    {"symbol":"BATAINDIA",  "name":"Bata India Ltd",          "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"BERGEPAINT", "name":"Berger Paints India",     "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"BIOCON",     "name":"Biocon Ltd",              "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity pharma"},
+    {"symbol":"CANBK",      "name":"Canara Bank",             "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity banking"},
+    {"symbol":"CHOLAFIN",   "name":"Cholamandalam Investment","exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity finance"},
+    {"symbol":"DABUR",      "name":"Dabur India Ltd",         "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"DLF",        "name":"DLF Ltd",                 "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity realty"},
+    {"symbol":"ESCORTS",    "name":"Escorts Kubota Ltd",      "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity auto"},
+    {"symbol":"GAIL",       "name":"GAIL India Ltd",          "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity energy"},
+    {"symbol":"GODREJCP",   "name":"Godrej Consumer Products","exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"HAVELLS",    "name":"Havells India Ltd",       "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"HDFC",       "name":"Housing Dev Finance Corp","exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity finance"},
+    {"symbol":"HINDPETRO",  "name":"Hindustan Petroleum Corp","exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity energy oil"},
+    {"symbol":"IOCL",       "name":"Indian Oil Corporation",  "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity energy oil"},
+    {"symbol":"IRCTC",      "name":"Indian Railway Catering", "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"LUPIN",      "name":"Lupin Ltd",               "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity pharma"},
+    {"symbol":"MCDOWELL-N", "name":"United Spirits Ltd",      "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity fmcg"},
+    {"symbol":"MFSL",       "name":"Max Financial Services",  "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity insurance finance"},
+    {"symbol":"MOTHERSON",  "name":"Samvardhana Motherson",   "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity auto"},
+    {"symbol":"MPHASIS",    "name":"Mphasis Ltd",             "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity it tech"},
+    {"symbol":"NAUKRI",     "name":"Info Edge (India) Ltd",   "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity it tech"},
+    {"symbol":"PAGEIND",    "name":"Page Industries Ltd",     "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"PERSISTENT", "name":"Persistent Systems Ltd",  "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity it tech"},
+    {"symbol":"PETRONET",   "name":"Petronet LNG Ltd",        "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity energy"},
+    {"symbol":"PIIND",      "name":"PI Industries Ltd",       "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"POLYCAB",    "name":"Polycab India Ltd",       "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"SAIL",       "name":"Steel Authority of India","exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity metal"},
+    {"symbol":"SIEMENS",    "name":"Siemens Ltd",             "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"TATAPOWER",  "name":"Tata Power Company Ltd",  "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity energy power"},
+    {"symbol":"TORNTPHARM","name":"Torrent Pharmaceuticals",  "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity pharma"},
+    {"symbol":"ZOMATO",     "name":"Zomato Ltd",              "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity tech"},
+    {"symbol":"PAYTM",      "name":"One97 Communications",    "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity fintech"},
+    {"symbol":"NYKAA",      "name":"FSN E-Commerce Ventures", "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity"},
+    {"symbol":"POLICYBZR",  "name":"PB Fintech Ltd",          "exchange":"NSE","type":"EQ","seg":"FNO","tags":"options fno derivatives equity fintech insurance"},
+    # ETFs
+    {"symbol":"NIFTYBEES",  "name":"Nippon India ETF NIFTY",  "exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf nifty index fund"},
+    {"symbol":"BANKBEES",   "name":"Nippon India ETF Bank NF","exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf bank nifty index fund"},
+    {"symbol":"GOLDBEES",   "name":"Nippon India ETF Gold",   "exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf gold commodity fund"},
+    {"symbol":"SILVERBEES", "name":"Nippon India ETF Silver",  "exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf silver commodity fund"},
+    {"symbol":"LIQUIDBEES", "name":"Nippon India ETF Liquid",  "exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf liquid fund debt"},
+    {"symbol":"JUNIORBEES", "name":"Nippon India ETF Junior",  "exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf nifty junior index fund"},
+    {"symbol":"ICICINIFTY", "name":"ICICI Pru Nifty ETF",     "exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf nifty index fund"},
+    {"symbol":"MOM100",     "name":"Motilal Oswal Nasdaq 100","exchange":"NSE","type":"ETF","seg":"ETF","tags":"etf nasdaq us international fund"},
+    # Commodities/Futures
+    {"symbol":"USOIL",      "name":"US Oil (WTI)",            "exchange":"NYMEX","type":"FUTURES","seg":"COMM","tags":"commodity crude oil futures energy wti"},
+    {"symbol":"CRUDEOILMCX","name":"Crude Oil Futures (MCX)", "exchange":"MCX","type":"FUTURES","seg":"COMM","tags":"commodity crude oil futures energy mcx"},
+    {"symbol":"NATURALGAS", "name":"Natural Gas",             "exchange":"NYMEX","type":"FUTURES","seg":"COMM","tags":"commodity natural gas futures energy"},
+    {"symbol":"GOLD",       "name":"Gold Futures",            "exchange":"COMEX","type":"FUTURES","seg":"COMM","tags":"commodity gold futures precious metal"},
+    {"symbol":"SILVER",     "name":"Silver Futures",          "exchange":"COMEX","type":"FUTURES","seg":"COMM","tags":"commodity silver futures precious metal"},
+    {"symbol":"XAUUSD",     "name":"Gold / US Dollar",        "exchange":"FX","type":"FX","seg":"COMM","tags":"forex gold xauusd fx currency"},
+    {"symbol":"BTC",        "name":"Bitcoin / USD",           "exchange":"CRYPTO","type":"CRYPTO","seg":"CRYPTO","tags":"crypto bitcoin btc digital currency"},
+    {"symbol":"ETH",        "name":"Ethereum / USD",          "exchange":"CRYPTO","type":"CRYPTO","seg":"CRYPTO","tags":"crypto ethereum eth digital currency"},
+]
+
+@app.route('/api/zerodha/instruments/search')
+@login_required
+def zerodha_instrument_search():
+    q   = request.args.get('q', '').strip().upper()
+    seg = request.args.get('seg', '').strip()       # optional filter: NIFTY50, BANKNIFTY, etc.
+    results = list(_ZD_INSTRUMENTS)
+    # Special virtual segment for OPTIONS tab
+    if seg == 'OPTIONS':
+        results = [r for r in results if 'options' in r.get('tags', '').lower()]
+    elif seg:
+        results = [r for r in results if r['seg'] == seg]
+    if q:
+        results = [r for r in results if
+            q in r['symbol'] or
+            q in r['name'].upper() or
+            q in r.get('tags', '').upper() or
+            q in r['type'].upper() or
+            q in r['exchange'].upper()
+        ]
+    # On the "All" tab with a query, also pull matches from the full Kite instruments
+    # dump (instruments.csv) so any tradingsymbol Kite knows about can be found here.
+    # Curated entries above keep priority (added first, deduped by symbol).
+    if seg == '' and q:
+        seen = {r['symbol'].upper() for r in results}
+        for r in _load_csv_instruments():
+            sym = r['symbol'].upper()
+            if sym in seen:
+                continue
+            if (q in sym
+                or q in r['name'].upper()
+                or q in r['exchange'].upper()
+                or q in r['type'].upper()
+                or q in r['segment'].upper()):
+                results.append({
+                    'symbol':   r['symbol'],
+                    'name':     r['name'],
+                    'exchange': r['exchange'],
+                    'type':     r['type'] or r['segment'],
+                    'seg':      r['seg'],
+                    'tags':     '',
+                })
+                seen.add(sym)
+                if len(results) >= 200:
+                    break
+        return jsonify({'success': True, 'results': results[:200]})
+    return jsonify({'success': True, 'results': results[:50]})
+
+# ---- Zerodha NFO instruments cache ----
+import csv as _csv, io as _io, time as _zd_time, urllib.request as _zd_urllib
+_ZD_NFO_CACHE = {'ts': 0, 'data': []}
+_ZD_NFO_TTL   = 3600  # 1 hour
+
+def _load_nfo_instruments():
+    now = _zd_time.time()
+    if now - _ZD_NFO_CACHE['ts'] < _ZD_NFO_TTL and _ZD_NFO_CACHE['data']:
+        return _ZD_NFO_CACHE['data']
+    try:
+        req = _zd_urllib.Request(
+            'https://api.kite.trade/instruments/NFO',
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with _zd_urllib.urlopen(req, timeout=20) as resp:
+            content = resp.read().decode('utf-8')
+        reader = _csv.DictReader(_io.StringIO(content))
+        rows = []
+        for row in reader:
+            itype = row.get('instrument_type', '')
+            if itype not in ('CE', 'PE'):
+                continue
+            expiry_raw = row.get('expiry', '')
+            try:
+                exp_dt     = datetime.strptime(expiry_raw, '%Y-%m-%d')
+                expiry_short = exp_dt.strftime('%d%b%y').upper()
+            except Exception:
+                expiry_short = expiry_raw
+            rows.append({
+                'symbol':       row.get('tradingsymbol', ''),
+                'name':         row.get('name', ''),
+                'expiry':       expiry_raw,
+                'expiry_short': expiry_short,
+                'strike':       float(row.get('strike') or 0),
+                'type':         itype,
+                'lot_size':     row.get('lot_size', ''),
+                'exchange':     'NFO',
+                'seg':          'OPTIONS',
+                'tags':         f"options fno derivatives {row.get('name','').lower()}"
+            })
+        _ZD_NFO_CACHE['ts']   = now
+        _ZD_NFO_CACHE['data'] = rows
+        return rows
+    except Exception:
+        return _ZD_NFO_CACHE.get('data', [])
+
+@app.route('/api/zerodha/nfo/refresh', methods=['POST'])
+@login_required
+def zerodha_nfo_refresh():
+    _ZD_NFO_CACHE['ts'] = 0   # force reload on next search
+    instruments = _load_nfo_instruments()
+    return jsonify({'success': True, 'count': len(instruments)})
+
+@app.route('/api/zerodha/nfo/search')
+@login_required
+def zerodha_nfo_search():
+    import re as _re
+    q = request.args.get('q', '').strip().upper()
+
+    instruments = _load_nfo_instruments()
+    if not instruments:
+        return jsonify({'success': False,
+                        'error': 'Could not load NFO instruments from Zerodha. Check internet.',
+                        'results': []})
+
+    # Parse underlying from query (longest match first)
+    _underlyings = ['BANKNIFTY','MIDCPNIFTY','FINNIFTY','NIFTYNXT50','SENSEX','BANKEX','NIFTY']
+    underlying = None
+    q_nospace = q.replace(' ', '')
+    for _u in _underlyings:
+        if _u in q_nospace:
+            underlying = _u
+            break
+
+    # Extract strike (4–6 digit number)
+    _sm = _re.search(r'\b(\d{4,6})\b', q)
+    target_strike = float(_sm.group(1)) if _sm else None
+
+    # Extract CE / PE side (must be standalone word or at end)
+    target_side = None
+    if _re.search(r'\bCE\b|CALL', q):
+        target_side = 'CE'
+    elif _re.search(r'\bPE\b|PUT', q):
+        target_side = 'PE'
+
+    # Extract month
+    _months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
+    target_month = next((_m for _m in _months if _m in q), None)
+
+    results = []
+    for inst in instruments:
+        name   = inst['name'].upper()
+        itype  = inst['type']
+        strike = inst['strike']
+        expiry = inst['expiry']   # "2026-05-22"
+
+        # Filter by underlying
+        if underlying:
+            if name != underlying:
+                continue
+        elif q:
+            # If no known underlying, do loose text match on tradingsymbol
+            if q not in inst['symbol'].upper() and q not in name:
+                continue
+
+        # Filter by side
+        if target_side and itype != target_side:
+            continue
+
+        # Filter by strike (±2000 range to keep results useful)
+        if target_strike is not None and abs(strike - target_strike) > 2000:
+            continue
+
+        # Filter by month
+        if target_month:
+            try:
+                if datetime.strptime(expiry, '%Y-%m-%d').strftime('%b').upper() != target_month:
+                    continue
+            except Exception:
+                pass
+
+        results.append(inst)
+
+    # Sort: expiry asc, then by strike proximity if a target given
+    if target_strike is not None:
+        results.sort(key=lambda x: (x['expiry'], abs(x['strike'] - target_strike)))
+    else:
+        results.sort(key=lambda x: (x['expiry'], x['strike']))
+
+    # Build response with display name
+    out = []
+    for inst in results[:100]:
+        out.append({
+            'symbol':       inst['symbol'],
+            'name':         f"{inst['name']} {inst['expiry']} {int(inst['strike'])} {inst['type']}",
+            'exchange':     inst['exchange'],
+            'type':         inst['type'],
+            'seg':          'OPTIONS',
+            'strike':       inst['strike'],
+            'expiry':       inst['expiry'],
+            'expiry_short': inst['expiry_short'],
+            'lot_size':     inst['lot_size'],
+            'tags':         inst['tags'],
+        })
+    return jsonify({'success': True, 'results': out})
+
+# ---- Zerodha instruments.csv (local) — cached loader + search ----
+_ZD_CSV_PATH  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'instruments.csv')
+_ZD_CSV_CACHE = {'mtime': 0.0, 'data': []}
+
+def _load_csv_instruments():
+    """Lazily load instruments.csv into memory; reload if file mtime changes."""
+    try:
+        mtime = os.path.getmtime(_ZD_CSV_PATH)
+    except OSError:
+        return []
+    if mtime == _ZD_CSV_CACHE['mtime'] and _ZD_CSV_CACHE['data']:
+        return _ZD_CSV_CACHE['data']
+    rows = []
+    try:
+        with open(_ZD_CSV_PATH, 'r', encoding='utf-8', newline='') as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                sym = (row.get('tradingsymbol') or '').strip()
+                if not sym:
+                    continue
+                rows.append({
+                    'symbol':       sym,
+                    'name':         (row.get('name') or '').strip(),
+                    'expiry':       (row.get('expiry') or '').strip(),
+                    'strike':       (row.get('strike') or '').strip(),
+                    'type':         (row.get('instrument_type') or '').strip(),
+                    'lot_size':     (row.get('lot_size') or '').strip(),
+                    'segment':      (row.get('segment') or '').strip(),
+                    'exchange':     (row.get('exchange') or '').strip(),
+                    'seg':          'ZERODHA_CSV',
+                })
+    except Exception:
+        return _ZD_CSV_CACHE.get('data', [])
+    _ZD_CSV_CACHE['mtime'] = mtime
+    _ZD_CSV_CACHE['data']  = rows
+    return rows
+
+@app.route('/api/zerodha/csv/search')
+@login_required
+def zerodha_csv_search():
+    """Search the locally-bundled instruments.csv. Returns up to 200 matches."""
+    q = request.args.get('q', '').strip().upper()
+    rows = _load_csv_instruments()
+    if not rows:
+        return jsonify({
+            'success': False,
+            'error':   'instruments.csv could not be loaded (file missing or empty).',
+            'results': []
+        })
+    if q:
+        filtered = []
+        for r in rows:
+            if (q in r['symbol'].upper()
+                or q in r['name'].upper()
+                or q in r['exchange'].upper()
+                or q in r['type'].upper()
+                or q in r['segment'].upper()):
+                filtered.append(r)
+                if len(filtered) >= 200:
+                    break
+        rows_out = filtered
+    else:
+        rows_out = rows[:200]
+    return jsonify({'success': True, 'results': rows_out, 'total': len(rows)})
+
+# ---- Live Kite API: full instruments dump (api.kite.trade/instruments) ----
+_ZD_KITE_CACHE = {'ts': 0.0, 'data': []}
+_ZD_KITE_TTL   = 3600  # 1 hour
+
+def _load_kite_all_instruments():
+    """Fetch the live Kite master instruments dump (all exchanges). Cached for 1 hour."""
+    now = _zd_time.time()
+    if now - _ZD_KITE_CACHE['ts'] < _ZD_KITE_TTL and _ZD_KITE_CACHE['data']:
+        return _ZD_KITE_CACHE['data']
+    try:
+        req = _zd_urllib.Request(
+            'https://api.kite.trade/instruments',
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with _zd_urllib.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode('utf-8')
+        reader = _csv.DictReader(_io.StringIO(content))
+        rows = []
+        for row in reader:
+            sym = (row.get('tradingsymbol') or '').strip()
+            if not sym:
+                continue
+            try:
+                strike_val = float(row.get('strike') or 0)
+            except ValueError:
+                strike_val = 0.0
+            expiry_raw = (row.get('expiry') or '').strip()
+            try:
+                exp_dt       = datetime.strptime(expiry_raw, '%Y-%m-%d')
+                expiry_short = exp_dt.strftime('%d%b%y').upper()
+            except Exception:
+                expiry_short = expiry_raw
+            rows.append({
+                'symbol':       sym,
+                'name':         (row.get('name') or '').strip(),
+                'expiry':       expiry_raw,
+                'expiry_short': expiry_short,
+                'strike':       strike_val,
+                'type':         (row.get('instrument_type') or '').strip(),
+                'lot_size':     (row.get('lot_size') or '').strip(),
+                'segment':      (row.get('segment') or '').strip(),
+                'exchange':     (row.get('exchange') or '').strip(),
+                'seg':          'KITE',
+                'tags':         '',
+            })
+        _ZD_KITE_CACHE['ts']   = now
+        _ZD_KITE_CACHE['data'] = rows
+        return rows
+    except Exception:
+        return _ZD_KITE_CACHE.get('data', [])
+
+@app.route('/api/zerodha/kite/search')
+@login_required
+def zerodha_kite_search():
+    """Live Kite API instrument search.
+
+    Smart-parses queries to support patterns like:
+      - 'NIFTY 24000'          -> all NIFTY options at strike 24000 across expiries
+      - 'BANKNIFTY 52000 CE'   -> BANKNIFTY 52000 CALLs across expiries
+      - 'NIFTY JUN 24000'      -> NIFTY June options at strike 24000
+      - 'RELIANCE'             -> all RELIANCE instruments (EQ / FUT / options)
+      - any plain substring    -> generic match against symbol / name / exchange / type
+    """
+    import re as _re
+    q = request.args.get('q', '').strip().upper()
+    rows = _load_kite_all_instruments()
+    if not rows:
+        return jsonify({
+            'success': False,
+            'error':   'Could not fetch Kite instruments from api.kite.trade. Check internet.',
+            'results': []
+        })
+
+    if not q:
+        return jsonify({'success': True, 'results': rows[:200], 'total': len(rows)})
+
+    # Parse underlying (longest match first to avoid 'NIFTY' eating 'BANKNIFTY')
+    _underlyings = ['BANKNIFTY','MIDCPNIFTY','FINNIFTY','NIFTYNXT50','SENSEX','BANKEX','NIFTY']
+    q_nospace = q.replace(' ', '')
+    underlying = next((u for u in _underlyings if u in q_nospace), None)
+
+    # Strike (4–6 digit number)
+    _sm = _re.search(r'\b(\d{4,6})\b', q)
+    target_strike = float(_sm.group(1)) if _sm else None
+
+    # Side
+    target_side = None
+    if _re.search(r'\bCE\b|CALL', q):
+        target_side = 'CE'
+    elif _re.search(r'\bPE\b|PUT', q):
+        target_side = 'PE'
+
+    # Month
+    _months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
+    target_month = next((m for m in _months if m in q), None)
+
+    results = []
+    for r in rows:
+        sym  = r['symbol'].upper()
+        name = r['name'].upper()
+        rtype = r['type'].upper()
+
+        if underlying and target_strike is not None:
+            # Strike-based query for a known underlying — show all expiries at that strike
+            if name != underlying:
+                continue
+            if abs(r['strike'] - target_strike) > 0.01:
+                continue
+            if target_side and rtype != target_side:
+                continue
+            if target_month:
+                try:
+                    if datetime.strptime(r['expiry'], '%Y-%m-%d').strftime('%b').upper() != target_month:
+                        continue
+                except Exception:
+                    pass
+            results.append(r)
+        elif underlying:
+            # Underlying-only query — all contracts (futures + options) for that underlying
+            if name != underlying:
+                continue
+            if target_side and rtype not in ('CE','PE'):
+                # only filter side if user actually asked for CE/PE
+                continue
+            if target_side and rtype != target_side:
+                continue
+            if target_month:
+                try:
+                    if datetime.strptime(r['expiry'], '%Y-%m-%d').strftime('%b').upper() != target_month:
+                        continue
+                except Exception:
+                    pass
+            results.append(r)
+        else:
+            # Generic substring search
+            if (q in sym
+                or q in name
+                or q in r['exchange'].upper()
+                or q in rtype
+                or q in r['segment'].upper()):
+                results.append(r)
+
+        if len(results) >= 300:
+            break
+
+    # Sort: expiry asc, then strike proximity to target (if any), then symbol
+    if underlying:
+        if target_strike is not None:
+            results.sort(key=lambda x: (x['expiry'], abs(x['strike'] - target_strike), x['symbol']))
+        else:
+            results.sort(key=lambda x: (x['expiry'], x['strike'], x['symbol']))
+
+    return jsonify({'success': True, 'results': results[:200], 'total': len(rows)})
+
+@app.route('/api/zerodha/generate_token', methods=['POST'])
+@login_required
+def zerodha_generate_token():
+    """Exchange request_token + api_secret for an access_token via Kite Connect v3."""
+    import hashlib, urllib.request as _ur, urllib.parse as _up
+    data = request.json or {}
+    api_key       = data.get('api_key', '').strip()
+    api_secret    = data.get('api_secret', '').strip()
+    request_token = data.get('request_token', '').strip()
+    if not (api_key and api_secret and request_token):
+        return jsonify({'success': False, 'error': 'api_key, api_secret and request_token are required'}), 400
+    try:
+        checksum = hashlib.sha256((api_key + request_token + api_secret).encode()).hexdigest()
+        payload  = _up.urlencode({
+            'api_key':       api_key,
+            'request_token': request_token,
+            'checksum':      checksum,
+        }).encode()
+        req = _ur.Request(
+            'https://api.kite.trade/session/token',
+            data=payload, method='POST',
+            headers={'X-Kite-Version': '3', 'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+        with _ur.urlopen(req, timeout=15) as resp:
+            import json as _json
+            result = _json.loads(resp.read())
+        access_token = result.get('data', {}).get('access_token', '')
+        if not access_token:
+            return jsonify({'success': False, 'error': 'No access_token in response', 'raw': result}), 400
+        return jsonify({'success': True, 'access_token': access_token})
+    except Exception as ex:
+        return jsonify({'success': False, 'error': str(ex)}), 500
+
 TICKER = "^NSEI"
 IST_OFFSET = 19800  # UTC+5:30 in seconds
 
@@ -8524,6 +9156,301 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tp-status-row .val.positive { color: #26a69a; }
   .tp-status-row .val.negative { color: #ef5350; }
 
+  /* Automation Menu */
+  .automation-dropdown-wrapper { position: relative; display: inline-block; }
+  .automation-dropdown {
+    position: absolute; top: 36px; left: 0; background: #23273a; border: 1px solid #2a2e39; border-radius: 8px;
+    min-width: 160px; z-index: 210; display: none; box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  .automation-dropdown.open { display: block; }
+  .automation-item { width: 100%; background: none; border: none; color: #d1d4dc; padding: 10px 18px; text-align: left; font-size: 14px; cursor: pointer; transition: background 0.2s; }
+  .automation-item:hover { background: #2a2e39; }
+
+  /* Zerodha Automation Panel */
+  .zerodha-panel {
+    position: absolute; top: 80px; left: 50%; transform: translateX(-50%);
+    z-index: 300; background: #1e222d; border: 1px solid #2a2e39; border-radius: 10px;
+    width: 960px; max-width: 98vw; display: none; box-shadow: 0 12px 48px rgba(0,0,0,0.7);
+    max-height: calc(100vh - 100px); overflow-y: auto;
+  }
+  .zerodha-panel.open { display: block; }
+  .zd-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 13px 18px; border-bottom: 1px solid #2a2e39; cursor: move; user-select: none;
+    background: #23273a; border-radius: 10px 10px 0 0;
+  }
+  .zd-header h3 { font-size: 15px; color: #fff; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .zd-close { background: none; border: none; color: #787b86; font-size: 22px; cursor: pointer; }
+  .zd-close:hover { color: #fff; }
+  .zd-header-actions { display: flex; align-items: center; gap: 2px; }
+  .zd-header-btn {
+    background: none; border: none; color: #787b86; cursor: pointer;
+    font-size: 14px; padding: 4px 9px; border-radius: 3px;
+    transition: background 0.15s, color 0.15s; font-family: inherit;
+  }
+  .zd-header-btn:hover { color: #fff; background: rgba(255,255,255,0.08); }
+  /* Maximised panel — fills the entire viewport */
+  .zerodha-panel.maximized {
+    top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+    transform: none !important; width: 100vw !important; max-width: 100vw !important;
+    height: 100vh !important; max-height: 100vh !important; border-radius: 0 !important;
+  }
+  .zerodha-panel.maximized .zd-header { border-radius: 0 !important; cursor: default !important; }
+  /* Popped-out — when this page was opened as the Zerodha popout window, the panel fills it */
+  body.zerodha-popout-window .zerodha-panel.open {
+    top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+    transform: none !important; width: 100vw !important; max-width: 100vw !important;
+    height: 100vh !important; max-height: 100vh !important; border-radius: 0 !important;
+  }
+  body.zerodha-popout-window .zerodha-panel.open .zd-header { border-radius: 0 !important; cursor: default !important; }
+  .zd-body { padding: 16px 18px; }
+  .zd-credentials { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+  .zd-cred-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .zd-cred-group { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 120px; }
+  .zd-cred-group label { color: #787b86; font-size: 11px; }
+  .zd-cred-group input {
+    padding: 7px 10px; background: #131722; border: 1px solid #2a2e39; border-radius: 4px;
+    color: #d1d4dc; font-size: 13px; width: 100%; box-sizing: border-box;
+  }
+  .zd-cred-group input:focus { outline: none; border-color: #2962ff; }
+  .zd-login-url-btn {
+    padding: 7px 14px; background: #ff9100; border: none; border-radius: 5px; color: #fff;
+    font-size: 13px; cursor: pointer; font-weight: 600; white-space: nowrap; flex-shrink: 0;
+  }
+  .zd-login-url-btn:hover { background: #ffb300; }
+  .zd-get-token-btn {
+    padding: 7px 14px; background: #7b1fa2; border: none; border-radius: 5px; color: #fff;
+    font-size: 13px; cursor: pointer; font-weight: 600; white-space: nowrap; flex-shrink: 0;
+  }
+  .zd-get-token-btn:hover { background: #9c27b0; }
+  .zd-connect-btn {
+    padding: 7px 16px; background: #1e6ec8; border: none; border-radius: 5px; color: #fff;
+    font-size: 13px; cursor: pointer; font-weight: 600; white-space: nowrap; flex-shrink: 0;
+  }
+  .zd-connect-btn:hover { background: #2962ff; }
+  .zd-connect-btn.connected { background: #2e7d32; }
+  .zd-status-bar { font-size: 12px; color: #787b86; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .zd-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #787b86; display: inline-block; }
+  .zd-status-dot.connected { background: #26a69a; }
+  .zd-status-dot.running { background: #ff9100; animation: livePulse 1s ease-in-out infinite; }
+  .zd-section-title { font-size: 12px; color: #787b86; text-transform: uppercase; letter-spacing: 0.08em; margin: 14px 0 8px; }
+  /* Shared symbol/qty bar */
+  .zd-rule-shared { display: flex; gap: 10px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap; }
+  .zd-rule-shared .zd-cred-group { min-width: 80px; }
+  /* Row type label */
+  .zd-row-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; margin: 8px 0 5px; display: flex; align-items: center; gap: 6px; }
+  .zd-row-label.algo-label { color: #2962ff; }
+  .zd-row-label.ind-label  { color: #9c27b0; }
+  /* Add rows */
+  .zd-add-row {
+    display: flex; gap: 7px; align-items: flex-end; flex-wrap: wrap;
+    margin-bottom: 10px; padding: 10px 12px;
+    background: rgba(41,98,255,0.05); border: 1px solid rgba(41,98,255,0.18);
+    border-radius: 7px;
+  }
+  .zd-add-row.ind-row {
+    background: rgba(156,39,176,0.05); border-color: rgba(156,39,176,0.22);
+  }
+  .zd-add-row.mm-row {
+    background: rgba(255,145,0,0.05); border-color: rgba(255,145,0,0.18);
+  }
+  .zd-add-row label { color: #787b86; font-size: 10px; display: flex; flex-direction: column; gap: 3px; white-space: nowrap; }
+  .zd-add-row input, .zd-add-row select {
+    padding: 6px 7px; background: #131722; border: 1px solid #2a2e39;
+    border-radius: 4px; color: #d1d4dc; font-size: 12px; box-sizing: border-box;
+  }
+  .zd-add-row select.entry-sel { width: 72px; }
+  .zd-add-row select.side-sel  { width: 65px; }
+  .zd-add-row select.tf-sel    { width: 60px; }
+  .zd-add-row select.algo-sel  { width: 118px; }
+  .zd-add-row select.ind-sel   { width: 105px; }
+  .zd-add-row select.mm-sel    { width: 115px; }
+  .zd-add-row input.score-inp  { width: 58px; }
+  .zd-add-btn {
+    padding: 7px 13px; background: #2962ff; border: none; border-radius: 5px;
+    color: #fff; font-size: 12px; cursor: pointer; font-weight: 700; white-space: nowrap;
+  }
+  .zd-add-btn:hover { background: #1e6ec8; }
+  .zd-add-btn.ind-btn { background: #7b1fa2; }
+  .zd-add-btn.ind-btn:hover { background: #9c27b0; }
+  .zd-add-btn.mm-btn { background: #ff9100; }
+  .zd-add-btn.mm-btn:hover { background: #ffb300; }
+  /* Entry/Exit badges */
+  .badge-entry { background: rgba(38,166,154,0.18); color: #26a69a; border-radius: 3px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+  .badge-exit  { background: rgba(239,83,80,0.18);  color: #ef5350; border-radius: 3px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+  .badge-buy   { background: rgba(38,166,154,0.15); color: #26a69a; border-radius: 3px; padding: 2px 6px; font-size: 10px; }
+  .badge-sell  { background: rgba(239,83,80,0.15);  color: #ef5350; border-radius: 3px; padding: 2px 6px; font-size: 10px; }
+  .badge-idle  { background: rgba(120,123,134,0.15);color: #787b86; border-radius: 3px; padding: 2px 6px; font-size: 10px; }
+  .zd-table-wrap { overflow-x: auto; margin-bottom: 14px; }
+  .zd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .zd-table th { background: #131722; color: #787b86; font-weight: 600; padding: 7px 10px; text-align: left; border-bottom: 1px solid #2a2e39; font-size: 11px; text-transform: uppercase; }
+  .zd-table td { padding: 8px 10px; border-bottom: 1px solid #1a1e2b; color: #d1d4dc; vertical-align: middle; }
+  .zd-table tr:hover td { background: rgba(255,255,255,0.02); }
+  .zd-table .badge-buy { background: rgba(38,166,154,0.15); color: #26a69a; border-radius: 3px; padding: 2px 7px; font-size: 11px; }
+  .zd-table .badge-sell { background: rgba(239,83,80,0.15); color: #ef5350; border-radius: 3px; padding: 2px 7px; font-size: 11px; }
+  .zd-table .badge-idle { background: rgba(120,123,134,0.15); color: #787b86; border-radius: 3px; padding: 2px 7px; font-size: 11px; }
+  .zd-table .del-btn { background: none; border: none; color: #ef5350; cursor: pointer; font-size: 15px; padding: 0 4px; }
+  .zd-table .del-btn:hover { color: #ff1744; }
+  /* Inline-editable cells */
+  .zd-table input.zd-cell, .zd-table select.zd-cell {
+    background: #131722; color: #d1d4dc; border: 1px solid #2a2e39;
+    border-radius: 3px; padding: 3px 6px; font-size: 12px;
+    font-family: inherit; width: auto; min-width: 50px; box-sizing: border-box;
+  }
+  .zd-table input.zd-cell:focus, .zd-table select.zd-cell:focus {
+    outline: none; border-color: #2962ff;
+  }
+  .zd-table input.zd-cell:disabled, .zd-table select.zd-cell:disabled {
+    opacity: 0.55; cursor: not-allowed; background: #1a1e2b;
+  }
+  .zd-table .zd-cell-sym { width: 110px; font-weight: 700; text-transform: uppercase; }
+  .zd-table .zd-cell-qty { width: 64px; }
+  .zd-table .zd-cell-score { width: 60px; }
+  /* Prominent per-row Delete button */
+  .zd-table .zd-row-del {
+    background: rgba(239,83,80,0.15); color: #ef5350;
+    border: 1px solid rgba(239,83,80,0.45); border-radius: 4px;
+    padding: 5px 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+    transition: background 0.15s, color 0.15s, transform 0.05s;
+    font-family: inherit;
+  }
+  .zd-table .zd-row-del:hover { background: #ef5350; color: #fff; }
+  .zd-table .zd-row-del:active { transform: scale(0.96); }
+  .zd-table .zd-row-del:disabled { opacity: 0.4; cursor: not-allowed; background: rgba(120,123,134,0.1); color: #787b86; border-color: #2a2e39; }
+  .zd-footer { display: flex; gap: 10px; align-items: center; padding-top: 6px; }
+  .zd-start-btn {
+    flex: 1; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
+    font-weight: 700; cursor: pointer; transition: background 0.2s;
+  }
+  .zd-start-btn.start { background: #26a69a; color: #fff; }
+  .zd-start-btn.start:hover { background: #1de9b6; }
+  .zd-start-btn.stop { background: #ef5350; color: #fff; }
+  .zd-start-btn.stop:hover { background: #ff1744; }
+  .zd-start-btn:disabled, .zd-start-btn:disabled:hover {
+    background: #2a2e39 !important; color: #555 !important;
+    cursor: not-allowed; opacity: 0.7;
+  }
+  .zd-log { background: #131722; border: 1px solid #2a2e39; border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #787b86; max-height: 100px; overflow-y: auto; font-family: monospace; margin-top: 10px; }
+  .zd-log .log-buy { color: #26a69a; }
+  .zd-log .log-sell { color: #ef5350; }
+  .zd-log .log-info { color: #787b86; }
+
+  /* Instrument Search Modal */
+  .zd-inst-overlay {
+    position: fixed; inset: 0; z-index: 600;
+    background: rgba(0,0,0,0.65); display: none; align-items: flex-start;
+    justify-content: center; padding-top: 60px;
+  }
+  .zd-inst-overlay.open { display: flex; }
+  .zd-inst-modal {
+    background: #1e222d; border: 1px solid #2a2e39; border-radius: 12px;
+    width: 760px; max-width: 96vw; max-height: 82vh;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 20px 80px rgba(0,0,0,0.85);
+  }
+  .zd-inst-header {
+    padding: 14px 20px; border-bottom: 1px solid #2a2e39;
+    display: flex; align-items: center; justify-content: space-between;
+    background: #23273a; border-radius: 12px 12px 0 0; flex-shrink: 0;
+  }
+  .zd-inst-header h3 { margin: 0; font-size: 15px; color: #fff; }
+  .zd-inst-close { background: none; border: none; color: #787b86; font-size: 22px; cursor: pointer; }
+  .zd-inst-close:hover { color: #fff; }
+  .zd-inst-search-wrap {
+    padding: 14px 20px 10px; border-bottom: 1px solid #2a2e39; flex-shrink: 0;
+  }
+  .zd-inst-search-box {
+    display: flex; align-items: center; gap: 10px;
+    background: #131722; border: 1px solid #2a2e39; border-radius: 8px;
+    padding: 8px 14px;
+  }
+  .zd-inst-search-box svg { color: #787b86; flex-shrink: 0; }
+  .zd-inst-search-input {
+    flex: 1; background: none; border: none; outline: none;
+    color: #d1d4dc; font-size: 14px;
+  }
+  .zd-inst-search-input::placeholder { color: #555; }
+  .zd-inst-search-clear {
+    background: none; border: none; color: #787b86; cursor: pointer; font-size: 16px; padding: 0;
+  }
+  .zd-inst-tabs {
+    display: flex; gap: 6px; padding: 10px 20px; overflow-x: auto;
+    border-bottom: 1px solid #2a2e39; flex-shrink: 0; scrollbar-width: none;
+  }
+  .zd-inst-tabs::-webkit-scrollbar { display: none; }
+  .zd-inst-tab {
+    padding: 4px 13px; border: 1px solid #2a2e39; border-radius: 20px;
+    background: none; color: #787b86; font-size: 12px; cursor: pointer;
+    white-space: nowrap; transition: all 0.15s;
+  }
+  .zd-inst-tab.active { background: #2962ff; border-color: #2962ff; color: #fff; font-weight: 600; }
+  .zd-inst-tab:hover:not(.active) { background: #2a2e39; color: #d1d4dc; }
+  .zd-inst-body {
+    display: flex; flex: 1; overflow: hidden;
+  }
+  .zd-inst-list-panel {
+    flex: 1; overflow-y: auto; border-right: 1px solid #2a2e39; padding: 4px 0;
+  }
+  .zd-inst-list-panel::-webkit-scrollbar { width: 4px; }
+  .zd-inst-list-panel::-webkit-scrollbar-thumb { background: #2a2e39; }
+  .zd-inst-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 20px; cursor: pointer; transition: background 0.12s;
+    border-bottom: 1px solid rgba(42,46,57,0.5);
+  }
+  .zd-inst-item:hover { background: #252934; }
+  .zd-inst-item.selected { background: rgba(41,98,255,0.12); }
+  .zd-inst-chk {
+    width: 16px; height: 16px; border: 1.5px solid #2a2e39; border-radius: 3px;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    transition: all 0.15s;
+  }
+  .zd-inst-item.selected .zd-inst-chk { background: #2962ff; border-color: #2962ff; }
+  .zd-inst-item.selected .zd-inst-chk::after { content: '✓'; color: #fff; font-size: 11px; }
+  .zd-inst-info { flex: 1; }
+  .zd-inst-sym { font-size: 13px; font-weight: 600; color: #d1d4dc; }
+  .zd-inst-name { font-size: 11px; color: #787b86; margin-top: 1px; }
+  .zd-inst-exch {
+    font-size: 10px; padding: 2px 7px; border-radius: 3px;
+    background: rgba(41,98,255,0.15); color: #7090ff; font-weight: 600; flex-shrink: 0;
+  }
+  .zd-inst-exch.bse { background: rgba(38,166,154,0.15); color: #26a69a; }
+  .zd-inst-exch.other { background: rgba(255,145,0,0.15); color: #ff9100; }
+  .zd-inst-selected-panel {
+    width: 240px; flex-shrink: 0; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .zd-inst-sel-header { padding: 12px 14px; font-size: 11px; color: #787b86; border-bottom: 1px solid #2a2e39; text-transform: uppercase; letter-spacing: 0.07em; }
+  .zd-inst-sel-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+  .zd-inst-sel-list::-webkit-scrollbar { width: 4px; }
+  .zd-inst-sel-list::-webkit-scrollbar-thumb { background: #2a2e39; }
+  .zd-inst-sel-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 14px; border-bottom: 1px solid rgba(42,46,57,0.5);
+  }
+  .zd-inst-sel-sym { font-size: 13px; font-weight: 600; color: #d1d4dc; }
+  .zd-inst-sel-exch { font-size: 10px; color: #787b86; margin-top: 1px; }
+  .zd-inst-sel-rm { background: none; border: none; color: #787b86; font-size: 16px; cursor: pointer; padding: 0; }
+  .zd-inst-sel-rm:hover { color: #ef5350; }
+  .zd-inst-footer {
+    padding: 12px 20px; border-top: 1px solid #2a2e39;
+    display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+    background: #1e222d;
+  }
+  .zd-inst-empty { padding: 40px 20px; text-align: center; color: #787b86; font-size: 13px; }
+  .zd-inst-count { font-size: 12px; color: #787b86; }
+  .zd-inst-done-btn {
+    padding: 9px 28px; background: #2962ff; border: none; border-radius: 6px;
+    color: #fff; font-size: 14px; font-weight: 700; cursor: pointer;
+  }
+  .zd-inst-done-btn:hover { background: #1e6ec8; }
+  .zd-add-inst-btn {
+    padding: 7px 12px; background: rgba(41,98,255,0.15); border: 1px solid rgba(41,98,255,0.4);
+    border-radius: 5px; color: #7090ff; font-size: 12px; cursor: pointer; font-weight: 600;
+    white-space: nowrap; transition: all 0.15s;
+  }
+  .zd-add-inst-btn:hover { background: #2962ff; color: #fff; border-color: #2962ff; }
+
   /* Real Trade Dropdown */
   .realtrade-dropdown-wrapper { position: relative; display: inline-block; }
   .realtrade-dropdown {
@@ -9039,9 +9966,408 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="separator"></div>
+  <div class="automation-dropdown-wrapper">
+    <button class="ind-btn" id="btnAutomation"><span class="dot" style="background:#00e5ff"></span>Automation &#9662;</button>
+    <div class="automation-dropdown" id="automationDropdown">
+      <button class="automation-item" id="btnZerodhaLogin">&#128272; Zerodha Login</button>
+      <button class="automation-item" id="btnZerodhaAuto">&#129302; Zerodha Automation</button>
+    </div>
+  </div>
+  <div class="separator"></div>
   <button class="gear-btn" id="btnSettingsPanel" title="Settings">&#9881;</button>
 
-  <!-- Settings Panel (Backtest, Data Source, Trade, Real Trade) -->
+  <!-- Zerodha Login Panel (credentials + connect; opens from Automation menu) -->
+  <div class="zerodha-panel" id="zerodhaLoginPanel" style="width:680px">
+    <div class="zd-header" id="zdLoginHeader">
+      <h3><span style="color:#1e6ec8">&#128272;</span> Zerodha Login</h3>
+      <div class="zd-header-actions">
+        <button class="zd-close" id="zdLoginClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-credentials">
+        <!-- Row 1: API Key + Login button -->
+        <div class="zd-cred-row">
+          <div class="zd-cred-group" style="flex:2">
+            <label for="zdApiKey">API Key</label>
+            <input type="text" id="zdApiKey" placeholder="Enter Zerodha API Key" autocomplete="off" spellcheck="false">
+          </div>
+          <button class="zd-login-url-btn" id="zdLoginUrlBtn" title="Open Kite Login in browser">&#128279; Login to Zerodha</button>
+        </div>
+        <!-- Row 2: API Secret + Request Token + Get Token button -->
+        <div class="zd-cred-row">
+          <div class="zd-cred-group">
+            <label for="zdApiSecret">API Secret</label>
+            <input type="password" id="zdApiSecret" placeholder="API Secret" autocomplete="off">
+          </div>
+          <div class="zd-cred-group" style="flex:2">
+            <label for="zdRequestToken">Request Token <span style="color:#787b86;font-size:10px">(paste from redirect URL after login)</span></label>
+            <input type="text" id="zdRequestToken" placeholder="request_token from redirect URL" autocomplete="off" spellcheck="false">
+          </div>
+          <button class="zd-get-token-btn" id="zdGetTokenBtn">&#128273; Get Access Token</button>
+        </div>
+        <!-- Row 3: Access Token (editable / auto-filled) + Connect button -->
+        <div class="zd-cred-row">
+          <div class="zd-cred-group" style="flex:3">
+            <label for="zdAccessToken">Access Token <span style="color:#26a69a;font-size:10px">(auto-filled or enter manually)</span></label>
+            <input type="text" id="zdAccessToken" placeholder="Access Token" autocomplete="off" spellcheck="false">
+          </div>
+          <button class="zd-connect-btn" id="zdConnectBtn">Connect</button>
+        </div>
+      </div>
+      <div class="zd-status-bar">
+        <span class="zd-status-dot" id="zdLoginStatusDot"></span>
+        <span id="zdLoginStatusText">Not connected</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Zerodha Automation Panel -->
+  <div class="zerodha-panel" id="zerodhaPanel">
+    <div class="zd-header" id="zdHeader">
+      <h3><span style="color:#ff9100">&#129302;</span> Zerodha Automation</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="zdMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="zdPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="zdClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <!-- Connection status banner (mirrors Zerodha Login panel) -->
+      <div class="zd-status-bar" id="zdAutoStatusBar" style="margin-bottom:14px">
+        <span class="zd-status-dot" id="zdStatusDot"></span>
+        <span id="zdStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> from the Automation menu</span>
+      </div>
+
+      <!-- Add Rule Row -->
+      <div class="zd-section-title">&#9881; Automation Rules</div>
+
+      <!-- Shared: Symbol + Qty -->
+      <div class="zd-rule-shared">
+        <div class="zd-cred-group" style="flex:2;min-width:110px">
+          <label>Symbol</label>
+          <input type="text" id="zdSymInput" placeholder="e.g. NIFTY50" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="zd-cred-group" style="flex:0;min-width:60px">
+          <label>Qty</label>
+          <input type="number" id="zdQtyInput" value="1" min="1">
+        </div>
+        <div class="zd-cred-group" style="flex:0;align-self:flex-end">
+          <button class="zd-add-inst-btn" id="zdOpenInstSearch">&#43; Add Instrument</button>
+        </div>
+      </div>
+
+      <!-- Row 1: Algo-Based Rule -->
+      <div class="zd-row-label algo-label">&#128202; Algo-Based Rule</div>
+      <div class="zd-add-row" id="zdAlgoRow">
+        <label>Entry / Exit
+          <select class="entry-sel" id="zdAlgoEntryType">
+            <option value="entry">Entry</option>
+            <option value="exit">Exit</option>
+          </select>
+        </label>
+        <label>Buy / Sell
+          <select class="side-sel" id="zdAlgoSide">
+            <option value="BUY">Buy</option>
+            <option value="SELL">Sell</option>
+          </select>
+        </label>
+        <label>Timeframe
+          <select class="tf-sel" id="zdAlgoTF">
+            <option value="1m">1m</option>
+            <option value="2m">2m</option>
+            <option value="3m">3m</option>
+            <option value="5m" selected>5m</option>
+            <option value="10m">10m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="1h">1h</option>
+            <option value="2h">2h</option>
+            <option value="4h">4h</option>
+            <option value="1d">1D</option>
+          </select>
+        </label>
+        <label>Algo
+          <select class="algo-sel" id="zdAlgoInput">
+            <option value="NA">NA</option>
+            <option value="trend">Trend</option>
+            <option value="mstreet">MStreet</option>
+            <option value="mfactor">MFactor</option>
+            <option value="sniper">Sniper</option>
+            <option value="orderflow">OrderFlow</option>
+            <option value="priceaction">PriceAction</option>
+            <option value="breakout">Breakout</option>
+            <option value="momentum">Momentum</option>
+            <option value="scalping">Scalping</option>
+            <option value="smartmoney">SmartMoney</option>
+            <option value="quant">Quant</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="statarb">StatArb</option>
+            <option value="institution">Institution</option>
+            <option value="mpredict">MPredict</option>
+          </select>
+        </label>
+        <label>Score Threshold
+          <input type="number" class="score-inp" id="zdAlgoScore" value="70" min="0" max="100">
+        </label>
+        <button class="zd-add-btn" id="zdAddAlgoRuleBtn">&#43; Add Algo Rule</button>
+      </div>
+
+    <!-- Row 2: Indicator-Based Rule -->
+    <div class="zd-row-label ind-label">&#128200; Indicator-Based Rule</div>
+    <div class="zd-add-row ind-row" id="zdIndRow">
+        <label>Entry / Exit
+          <select class="entry-sel" id="zdIndEntryType">
+            <option value="entry">Entry</option>
+            <option value="exit">Exit</option>
+          </select>
+        </label>
+        <label>Buy / Sell
+          <select class="side-sel" id="zdIndSide">
+            <option value="BUY">Buy</option>
+            <option value="SELL">Sell</option>
+          </select>
+        </label>
+        <label>Timeframe
+          <select class="tf-sel" id="zdIndTF">
+            <option value="1m">1m</option>
+            <option value="2m">2m</option>
+            <option value="3m">3m</option>
+            <option value="5m" selected>5m</option>
+            <option value="10m">10m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="1h">1h</option>
+            <option value="2h">2h</option>
+            <option value="4h">4h</option>
+            <option value="1d">1D</option>
+          </select>
+        </label>
+        <label>Indicator 1
+          <select class="ind-sel" id="zdInd1">
+            <option value="NA">NA</option>
+            <option value="RSI">RSI</option>
+            <option value="MACD">MACD</option>
+            <option value="EMA9">EMA (9)</option>
+            <option value="EMA21">EMA (21)</option>
+            <option value="SMA">SMA</option>
+            <option value="BB">Bollinger Bands</option>
+            <option value="SuperTrend">SuperTrend</option>
+            <option value="VWAP">VWAP</option>
+            <option value="ADX">ADX</option>
+            <option value="Stochastic">Stochastic</option>
+            <option value="CCI">CCI</option>
+            <option value="ATR">ATR</option>
+            <option value="OBV">OBV</option>
+            <option value="Ichimoku">Ichimoku</option>
+          </select>
+        </label>
+        <label>Condition 1
+          <select class="cond-sel" id="zdCond1">
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+          </select>
+        </label>
+        <label>Indicator 2
+          <select class="ind-sel" id="zdInd2">
+            <option value="NA">NA</option>
+            <option value="RSI">RSI</option>
+            <option value="MACD">MACD</option>
+            <option value="EMA9">EMA (9)</option>
+            <option value="EMA21">EMA (21)</option>
+            <option value="SMA">SMA</option>
+            <option value="BB">Bollinger Bands</option>
+            <option value="SuperTrend">SuperTrend</option>
+            <option value="VWAP">VWAP</option>
+            <option value="ADX">ADX</option>
+            <option value="Stochastic">Stochastic</option>
+            <option value="CCI">CCI</option>
+            <option value="ATR">ATR</option>
+            <option value="OBV">OBV</option>
+            <option value="Ichimoku">Ichimoku</option>
+          </select>
+        </label>
+        <label>Condition 2
+          <select class="cond-sel" id="zdCond2">
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+          </select>
+        </label>
+        <label>Indicator 3
+          <select class="ind-sel" id="zdInd3">
+            <option value="NA">NA</option>
+            <option value="RSI">RSI</option>
+            <option value="MACD">MACD</option>
+            <option value="EMA9">EMA (9)</option>
+            <option value="EMA21">EMA (21)</option>
+            <option value="SMA">SMA</option>
+            <option value="BB">Bollinger Bands</option>
+            <option value="SuperTrend">SuperTrend</option>
+            <option value="VWAP">VWAP</option>
+            <option value="ADX">ADX</option>
+            <option value="Stochastic">Stochastic</option>
+            <option value="CCI">CCI</option>
+            <option value="ATR">ATR</option>
+            <option value="OBV">OBV</option>
+            <option value="Ichimoku">Ichimoku</option>
+          </select>
+        </label>
+        <label>Condition 3
+          <select class="cond-sel" id="zdCond3">
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+          </select>
+        </label>
+        <label>Indicator 4
+          <select class="ind-sel" id="zdInd4">
+            <option value="NA">NA</option>
+            <option value="RSI">RSI</option>
+            <option value="MACD">MACD</option>
+            <option value="EMA9">EMA (9)</option>
+            <option value="EMA21">EMA (21)</option>
+            <option value="SMA">SMA</option>
+            <option value="BB">Bollinger Bands</option>
+            <option value="SuperTrend">SuperTrend</option>
+            <option value="VWAP">VWAP</option>
+            <option value="ADX">ADX</option>
+            <option value="Stochastic">Stochastic</option>
+            <option value="CCI">CCI</option>
+            <option value="ATR">ATR</option>
+            <option value="OBV">OBV</option>
+            <option value="Ichimoku">Ichimoku</option>
+          </select>
+        </label>
+        <label>Condition 4
+          <select class="cond-sel" id="zdCond4">
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+          </select>
+        </label>
+        <button class="zd-add-btn ind-btn" id="zdAddIndRuleBtn">&#43; Add Ind. Rule</button>
+      </div>
+
+      <!-- Row 3: Market Making Rule -->
+      <div class="zd-row-label mm-label" style="color:#ff9100">&#129351; Market Making Rule</div>
+      <div class="zd-add-row mm-row" id="zdMMRow">
+        <label>Entry / Exit
+          <select class="entry-sel" id="zdMMEntryType">
+            <option value="entry">Entry</option>
+            <option value="exit">Exit</option>
+          </select>
+        </label>
+        <label>Buy / Sell
+          <select class="side-sel" id="zdMMSide">
+            <option value="BUY">Buy</option>
+            <option value="SELL">Sell</option>
+          </select>
+        </label>
+        <label>Timeframe
+          <select class="tf-sel" id="zdMMTF">
+            <option value="1m">1m</option>
+            <option value="2m">2m</option>
+            <option value="3m">3m</option>
+            <option value="5m" selected>5m</option>
+            <option value="10m">10m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="1h">1h</option>
+            <option value="2h">2h</option>
+            <option value="4h">4h</option>
+            <option value="1d">1D</option>
+          </select>
+        </label>
+        <label>Market Making
+          <select class="mm-sel" id="zdMMInput">
+            <option value="NA">NA</option>
+            <option value="marketmaking">Market Making</option>
+            <option value="mma">MM Advanced</option>
+          </select>
+        </label>
+        <label>Buy Score Threshold
+          <input type="number" class="score-inp" id="zdMMBuyScore" value="70" min="0" max="100">
+        </label>
+        <label>Sell Score Threshold
+          <input type="number" class="score-inp" id="zdMMSellScore" value="70" min="0" max="100">
+        </label>
+        <button class="zd-add-btn mm-btn" id="zdAddMMRuleBtn" style="background:#ff9100">&#43; Add MM Rule</button>
+      </div>
+
+      <!-- Rules Table -->
+      <div class="zd-table-wrap">
+        <table class="zd-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Type</th>
+              <th>Side</th>
+              <th>Symbol</th>
+              <th>Qty</th>
+              <th>TF</th>
+              <th>Algo</th>
+              <th>Indicators</th>
+              <th>Score</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="zdRulesBody">
+            <tr id="zdNoRules"><td colspan="11" style="text-align:center;color:#787b86;padding:18px">No rules added yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Start / Stop -->
+      <div class="zd-footer">
+        <button class="zd-start-btn start" id="zdStartBtn">&#9654; Start Automation</button>
+        <button class="zd-start-btn stop"  id="zdStopBtn" disabled>&#9632; Stop Automation</button>
+      </div>
+      <div class="zd-log" id="zdLog"><span class="log-info">Ready. Add rules and click Start.</span></div>
+    </div>
+  </div>
+
+  <!-- Instrument Search Modal -->
+  <div class="zd-inst-overlay" id="zdInstOverlay">
+    <div class="zd-inst-modal">
+      <div class="zd-inst-header">
+        <h3>&#128269; Add Instrument</h3>
+        <button class="zd-inst-close" id="zdInstClose">&times;</button>
+      </div>
+      <div class="zd-inst-search-wrap">
+        <div class="zd-inst-search-box">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+          <input type="text" class="zd-inst-search-input" id="zdInstSearchInput" placeholder="Search eg: SBIN, TCS, NIFTY50 etc" autocomplete="off">
+          <button class="zd-inst-search-clear" id="zdInstSearchClear">&times;</button>
+        </div>
+      </div>
+      <div class="zd-inst-tabs" id="zdInstTabs">
+        <button class="zd-inst-tab active" data-seg="">All</button>
+        <button class="zd-inst-tab" data-seg="ZERODHA_CSV" title="Search instruments.csv bundled with the app">&#128190; Zerodha Inst</button>
+        <button class="zd-inst-tab" data-seg="KITE" title="Live Kite API search &mdash; supports queries like 'Nifty 24000'">&#128640; Kite</button>
+        <button class="zd-inst-tab" data-seg="OPTIONS">Options</button>
+        <button class="zd-inst-tab" data-seg="NIFTY50">NIFTY 50</button>
+        <button class="zd-inst-tab" data-seg="BANKNIFTY">BANK NIFTY</button>
+        <button class="zd-inst-tab" data-seg="INDICES">Indices</button>
+        <button class="zd-inst-tab" data-seg="FNO">F&amp;O Stocks</button>
+        <button class="zd-inst-tab" data-seg="ETF">ETF</button>
+        <button class="zd-inst-tab" data-seg="COMM">Commodities</button>
+        <button class="zd-inst-tab" data-seg="CRYPTO">Crypto</button>
+      </div>
+      <div class="zd-inst-body">
+        <div class="zd-inst-list-panel" id="zdInstListPanel">
+          <div class="zd-inst-empty" id="zdInstEmpty">Loading instruments…</div>
+        </div>
+        <div class="zd-inst-selected-panel">
+          <div class="zd-inst-sel-header">Selected Instruments</div>
+          <div class="zd-inst-sel-list" id="zdInstSelList"></div>
+        </div>
+      </div>
+      <div class="zd-inst-footer">
+        <span class="zd-inst-count" id="zdInstCount">0 selected</span>
+        <button class="zd-inst-done-btn" id="zdInstDoneBtn">Done</button>
+      </div>
+    </div>
+  </div>
+
   <div class="cfg-panel" id="cfgPanel">
     <div class="cfg-header"><h3>&#9881; Settings</h3><button class="cfg-close" id="cfgClose">&times;</button></div>
 
@@ -12665,6 +13991,828 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // Auto-refresh every 60 seconds (only when not in live mode, background)
   setInterval(() => { if (!liveMode) loadData(currentTF, true); }, 60000);
+
+  // ---- Automation Menu ----
+  const automationDropdown = document.getElementById('automationDropdown');
+  document.getElementById('btnAutomation').addEventListener('click', function(e) {
+    e.stopPropagation();
+    automationDropdown.classList.toggle('open');
+    indDropdown.classList.remove('open');
+    algoDropdown.classList.remove('open');
+    cfgPanel.classList.remove('open');
+  });
+  document.addEventListener('click', function(e) {
+    if (!e.target.closest('.automation-dropdown-wrapper')) automationDropdown.classList.remove('open');
+  });
+
+  // ---- Zerodha shared store: connection session + rules persistence (localStorage) ----
+  const ZerodhaStore = {
+    SESSION_KEY: 'mangalview_zerodha_session_v1',
+    RULES_KEY:   'mangalview_zerodha_rules_v1',
+    _evt(name) { try { window.dispatchEvent(new Event(name)); } catch(e) {} },
+    getSession() {
+      try { return JSON.parse(localStorage.getItem(this.SESSION_KEY) || 'null') || {connected:false, apiKey:''}; }
+      catch(e) { return {connected:false, apiKey:''}; }
+    },
+    setSession(s) { localStorage.setItem(this.SESSION_KEY, JSON.stringify(s)); this._evt('zerodha-session-change'); },
+    clearSession() { localStorage.removeItem(this.SESSION_KEY); this._evt('zerodha-session-change'); },
+    getRules() {
+      try { return JSON.parse(localStorage.getItem(this.RULES_KEY) || 'null') || {rules:[], ruleId:0, sym:'', qty:1}; }
+      catch(e) { return {rules:[], ruleId:0, sym:'', qty:1}; }
+    },
+    setRules(r) { localStorage.setItem(this.RULES_KEY, JSON.stringify(r)); this._evt('zerodha-rules-change'); }
+  };
+
+  // ---- Zerodha Login Panel (credentials + Connect) ----
+  (function() {
+    const panel       = document.getElementById('zerodhaLoginPanel');
+    const header      = document.getElementById('zdLoginHeader');
+    const closeBtn    = document.getElementById('zdLoginClose');
+    const connectBtn  = document.getElementById('zdConnectBtn');
+    const statusDot   = document.getElementById('zdLoginStatusDot');
+    const statusText  = document.getElementById('zdLoginStatusText');
+    const apiKeyInp   = document.getElementById('zdApiKey');
+    const apiSecInp   = document.getElementById('zdApiSecret');
+    const reqTokInp   = document.getElementById('zdRequestToken');
+    const accTokInp   = document.getElementById('zdAccessToken');
+
+    function refreshStatus() {
+      const s = ZerodhaStore.getSession();
+      if (s.connected && s.apiKey) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>';
+        connectBtn.textContent = 'Connected';
+        connectBtn.classList.add('connected');
+        if (!apiKeyInp.value) apiKeyInp.value = s.apiKey;
+      } else {
+        statusDot.classList.remove('connected');
+        statusText.textContent = 'Not connected';
+        connectBtn.textContent = 'Connect';
+        connectBtn.classList.remove('connected');
+      }
+    }
+
+    // Open via menu item
+    document.getElementById('btnZerodhaLogin').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refreshStatus();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+
+    // Login URL — open Kite login in a new tab
+    document.getElementById('zdLoginUrlBtn').addEventListener('click', function() {
+      const apiKey = apiKeyInp.value.trim();
+      if (!apiKey) { alert('Enter your API Key first.'); return; }
+      window.open('https://kite.zerodha.com/connect/login?api_key=' + encodeURIComponent(apiKey) + '&v=3', '_blank');
+    });
+
+    // Exchange request_token → access_token via backend
+    document.getElementById('zdGetTokenBtn').addEventListener('click', function() {
+      const apiKey       = apiKeyInp.value.trim();
+      const apiSecret    = apiSecInp.value.trim();
+      const requestToken = reqTokInp.value.trim();
+      if (!apiKey || !apiSecret || !requestToken) {
+        alert('API Key, API Secret and Request Token are all required to generate an access token.'); return;
+      }
+      const btn = this;
+      btn.disabled = true; btn.textContent = 'Fetching…';
+      fetch('/api/zerodha/generate_token', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({api_key: apiKey, api_secret: apiSecret, request_token: requestToken})
+      }).then(r => r.json()).then(res => {
+        btn.disabled = false; btn.textContent = '🔓 Get Access Token';
+        if (res.success) {
+          accTokInp.value = res.access_token;
+        } else {
+          alert('Token exchange failed: ' + (res.error || 'Unknown error'));
+        }
+      }).catch(() => { btn.disabled = false; btn.textContent = '🔓 Get Access Token'; alert('Token exchange request error.'); });
+    });
+
+    // Connect — authenticates with backend then writes session to shared store
+    connectBtn.addEventListener('click', function() {
+      const apiKey      = apiKeyInp.value.trim();
+      const apiSecret   = apiSecInp.value.trim();
+      const accessToken = accTokInp.value.trim();
+      if (!apiKey || !accessToken) { alert('API Key and Access Token are required.'); return; }
+      fetch('/api/zerodha/connect', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({api_key: apiKey, api_secret: apiSecret, access_token: accessToken})
+      }).then(r => r.json()).then(res => {
+        if (res.success) {
+          ZerodhaStore.setSession({connected: true, apiKey: apiKey});
+          refreshStatus();
+        } else {
+          alert('Connection failed: ' + (res.error || 'Unknown error'));
+        }
+      }).catch(() => alert('Connection error.'));
+    });
+
+    // Draggable
+    (function() {
+      let dragging = false, sx, sy, ol, ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        dragging = true; panel.style.transform = 'none';
+        const r = panel.getBoundingClientRect();
+        ol = r.left; ot = r.top; sx = e.clientX; sy = e.clientY;
+        panel.style.left = ol + 'px'; panel.style.top = ot + 'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', function(e) {
+        if (!dragging) return;
+        panel.style.left = (ol + e.clientX - sx) + 'px';
+        panel.style.top  = (ot + e.clientY - sy) + 'px';
+      });
+      document.addEventListener('mouseup', () => { dragging = false; });
+    })();
+
+    // Reflect session changes from this window or others
+    window.addEventListener('zerodha-session-change', refreshStatus);
+    window.addEventListener('storage', e => { if (e.key === ZerodhaStore.SESSION_KEY) refreshStatus(); });
+    refreshStatus();
+  })();
+
+  // ---- Zerodha Automation Panel ----
+  (function() {
+    const panel    = document.getElementById('zerodhaPanel');
+    const header   = document.getElementById('zdHeader');
+    const closeBtn = document.getElementById('zdClose');
+    // (addBtn removed — now handled by zdAddAlgoRuleBtn / zdAddIndRuleBtn)
+    const startBtn = document.getElementById('zdStartBtn');
+    const stopBtn  = document.getElementById('zdStopBtn');
+    const maximizeBtn = document.getElementById('zdMaximizeBtn');
+    const popoutBtn   = document.getElementById('zdPopoutBtn');
+    const logEl    = document.getElementById('zdLog');
+    const rulesBody = document.getElementById('zdRulesBody');
+
+    let zdConnected = false;
+    let zdApiKey    = '';
+    let zdRules     = [];    // {id, symbol, algo, qty, buyScore, sellScore, status}
+    let zdRunning   = false;
+    let zdTimer     = null;
+    let zdRuleId    = 0;
+    let zdMaximized = false;
+
+    // If this window was opened as the Zerodha popout, auto-open + maximize the panel
+    const isZerodhaPopout = new URLSearchParams(window.location.search).get('zerodhaPopout') === '1';
+    if (isZerodhaPopout) {
+      document.body.classList.add('zerodha-popout-window');
+      panel.classList.add('open');
+      // In popout the window itself IS the panel — hide max/popout/close which don't apply
+      maximizeBtn.style.display = 'none';
+      popoutBtn.style.display = 'none';
+      closeBtn.style.display = 'none';
+      document.title = '🤖 Zerodha Automation';
+    }
+
+    // Open panel
+    document.getElementById('btnZerodhaAuto').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refreshAutoStatus();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+
+    // Mirror connection state from the shared session store into the automation panel
+    function refreshAutoStatus() {
+      const s = ZerodhaStore.getSession();
+      zdConnected = !!(s.connected && s.apiKey);
+      zdApiKey    = s.apiKey || '';
+      const dot  = document.getElementById('zdStatusDot');
+      const text = document.getElementById('zdStatusText');
+      if (zdRunning) {
+        dot.classList.remove('connected'); dot.classList.add('running');
+        text.textContent = 'Automation running…';
+      } else if (zdConnected) {
+        dot.classList.add('connected'); dot.classList.remove('running');
+        text.innerHTML = 'Connected <span style="color:#787b86;font-size:11px">(api_key: ' + zdApiKey + ')</span>';
+      } else {
+        dot.classList.remove('connected'); dot.classList.remove('running');
+        text.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> from the Automation menu';
+      }
+    }
+    window.addEventListener('zerodha-session-change', refreshAutoStatus);
+    window.addEventListener('zerodha-rules-change', loadRulesFromStore);
+    window.addEventListener('storage', e => {
+      if (e.key === ZerodhaStore.SESSION_KEY) refreshAutoStatus();
+      if (e.key === ZerodhaStore.RULES_KEY)   loadRulesFromStore();
+    });
+
+    // ---- Rules persistence (so popout windows + reloads keep the table) ----
+    let _suspendSave = false;   // avoid save-loops when applying remote updates
+    function saveRulesToStore() {
+      if (_suspendSave) return;
+      ZerodhaStore.setRules({
+        rules:  zdRules,
+        ruleId: zdRuleId,
+        sym:    document.getElementById('zdSymInput').value,
+        qty:    document.getElementById('zdQtyInput').value
+      });
+    }
+    function loadRulesFromStore() {
+      const s = ZerodhaStore.getRules();
+      _suspendSave = true;
+      try {
+        if (Array.isArray(s.rules)) zdRules = s.rules;
+        if (typeof s.ruleId === 'number') zdRuleId = Math.max(zdRuleId, s.ruleId);
+        const symEl = document.getElementById('zdSymInput');
+        const qtyEl = document.getElementById('zdQtyInput');
+        if (symEl && s.sym != null && document.activeElement !== symEl) symEl.value = s.sym;
+        if (qtyEl && s.qty != null && document.activeElement !== qtyEl) qtyEl.value = s.qty;
+        renderRules();
+      } finally { _suspendSave = false; }
+    }
+    // Persist the shared sym/qty bar when typed
+    ['zdSymInput','zdQtyInput'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('input', saveRulesToStore);
+    });
+
+    // Maximize / Restore
+    maximizeBtn.addEventListener('click', function() {
+      zdMaximized = !zdMaximized;
+      panel.classList.toggle('maximized', zdMaximized);
+      if (zdMaximized) {
+        // Save inline drag-position so we can restore on un-maximize
+        panel.dataset.savedLeft = panel.style.left || '';
+        panel.dataset.savedTop  = panel.style.top  || '';
+        panel.dataset.savedTransform = panel.style.transform || '';
+        panel.style.left = ''; panel.style.top = ''; panel.style.transform = '';
+        this.innerHTML = '&#9635;';   // ▣ restore-ish glyph
+        this.title = 'Restore';
+      } else {
+        panel.style.left = panel.dataset.savedLeft || '';
+        panel.style.top  = panel.dataset.savedTop  || '';
+        panel.style.transform = panel.dataset.savedTransform || '';
+        this.innerHTML = '&#9633;';   // □
+        this.title = 'Maximize';
+      }
+    });
+
+    // Pop out — open a new browser window that loads this page and auto-opens the Zerodha panel
+    popoutBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('zerodhaPopout', '1');
+      const popoutWin = window.open(
+        url.toString(), 'zerodhaPopout',
+        'width=1100,height=820,resizable=yes,scrollbars=yes'
+      );
+      if (!popoutWin) {
+        zdLog('Popup blocked. Please allow popups for this site and click again.', 'info');
+        return;
+      }
+      zdLog('Opened Zerodha panel in a new window.', 'info');
+    });
+
+    // (Login URL / Get Access Token handlers live in the Zerodha Login IIFE above.)
+
+    // Draggable
+    (function() {
+      let isDragging = false, startX, startY, origLeft, origTop;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;            // any header button skips drag
+        if (panel.classList.contains('maximized')) return;  // no dragging when maximized
+        if (isZerodhaPopout) return;                        // no dragging inside popout window
+        isDragging = true;
+        panel.style.transform = 'none';
+        const rect = panel.getBoundingClientRect();
+        origLeft = rect.left; origTop = rect.top;
+        startX = e.clientX; startY = e.clientY;
+        panel.style.left = origLeft + 'px';
+        panel.style.top = origTop + 'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', function(e) {
+        if (!isDragging) return;
+        panel.style.left = (origLeft + e.clientX - startX) + 'px';
+        panel.style.top  = (origTop  + e.clientY - startY) + 'px';
+      });
+      document.addEventListener('mouseup', () => { isDragging = false; });
+    })();
+
+
+    // ---- Add Rule: Algo-Based ----
+    document.getElementById('zdAddAlgoRuleBtn').addEventListener('click', function() {
+      const sym       = document.getElementById('zdSymInput').value.trim().toUpperCase();
+      const qty       = parseInt(document.getElementById('zdQtyInput').value) || 1;
+      const entryType = document.getElementById('zdAlgoEntryType').value;
+      const side      = document.getElementById('zdAlgoSide').value;
+      const tf        = document.getElementById('zdAlgoTF').value;
+      const algo      = document.getElementById('zdAlgoInput').value;
+      const score     = parseFloat(document.getElementById('zdAlgoScore').value) || 70;
+      if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
+      zdRules.push({
+        id: ++zdRuleId, ruleType: 'algo',
+        entryType: entryType, side: side,
+        symbol: sym, qty: qty, tf: tf,
+        algo: algo, indicators: [],
+        score: score, status: 'idle', lastOrder: null
+      });
+      renderRules();
+      saveRulesToStore();
+      zdLog('[Algo] ' + entryType.toUpperCase() + ' ' + side + ' ' + sym + ' TF:' + tf + ' Algo:' + algo + ' Score\u2265' + score, 'info');
+    });
+
+    // ---- Add Rule: Indicator-Based ----
+    document.getElementById('zdAddIndRuleBtn').addEventListener('click', function() {
+      const sym       = document.getElementById('zdSymInput').value.trim().toUpperCase();
+      const qty       = parseInt(document.getElementById('zdQtyInput').value) || 1;
+      const entryType = document.getElementById('zdIndEntryType').value;
+      const side      = document.getElementById('zdIndSide').value;
+      const tf        = document.getElementById('zdIndTF').value;
+      const rawInds = [
+        { ind: document.getElementById('zdInd1').value, cond: document.getElementById('zdCond1').value },
+        { ind: document.getElementById('zdInd2').value, cond: document.getElementById('zdCond2').value },
+        { ind: document.getElementById('zdInd3').value, cond: document.getElementById('zdCond3').value },
+        { ind: document.getElementById('zdInd4').value, cond: document.getElementById('zdCond4').value }
+      ].filter(v => v.ind && v.ind !== 'NA');
+      const indicators = rawInds.map(v => v.ind);
+      const conditions = rawInds.map(v => v.cond);
+      if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
+      zdRules.push({
+        id: ++zdRuleId, ruleType: 'indicator',
+        entryType: entryType, side: side,
+        symbol: sym, qty: qty, tf: tf,
+        algo: 'NA', indicators: indicators, conditions: conditions,
+        score: 0, status: 'idle', lastOrder: null
+      });
+      renderRules();
+      saveRulesToStore();
+      const indSummary = rawInds.map(v => v.ind + '(' + v.cond + ')').join(', ');
+      zdLog('[Indicator] ' + entryType.toUpperCase() + ' ' + side + ' ' + sym + ' TF:' + tf + ' [' + (indSummary || 'NA') + ']', 'info');
+    });
+
+    // ---- Add Rule: Market Making ----
+    document.getElementById('zdAddMMRuleBtn').addEventListener('click', function() {
+      const sym       = document.getElementById('zdSymInput').value.trim().toUpperCase();
+      const qty       = parseInt(document.getElementById('zdQtyInput').value) || 1;
+      const entryType = document.getElementById('zdMMEntryType').value;
+      const side      = document.getElementById('zdMMSide').value;
+      const tf        = document.getElementById('zdMMTF').value;
+      const mmAlgo    = document.getElementById('zdMMInput').value;
+      const buyScore  = parseFloat(document.getElementById('zdMMBuyScore').value) || 70;
+      const sellScore = parseFloat(document.getElementById('zdMMSellScore').value) || 70;
+      if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
+      if (mmAlgo === 'NA') { zdLog('Select a Market Making strategy.', 'info'); return; }
+      zdRules.push({
+        id: ++zdRuleId, ruleType: 'mm',
+        entryType: entryType, side: side,
+        symbol: sym, qty: qty, tf: tf,
+        algo: mmAlgo, indicators: [],
+        buyScore: buyScore, sellScore: sellScore,
+        score: 0, status: 'idle', lastOrder: null
+      });
+      renderRules();
+      saveRulesToStore();
+      zdLog('[MarketMaking] ' + entryType.toUpperCase() + ' ' + side + ' ' + sym + ' TF:' + tf + ' Algo:' + mmAlgo + ' BuyScore≥' + buyScore + ' SellScore≥' + sellScore, 'info');
+    });
+
+    function renderRules() {
+      if (zdRules.length === 0) {
+        rulesBody.innerHTML = '<tr id="zdNoRules"><td colspan="11" style="text-align:center;color:#787b86;padding:18px">No rules added yet</td></tr>';
+        return;
+      }
+      // Option lists mirror the Add Rule controls above
+      const tfOpts   = ['1m','2m','3m','5m','10m','15m','30m','1h','2h','4h','1d'];
+      const algoOpts = ['NA','trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution','mpredict'];
+      const mmOpts   = ['NA','marketmaking','mma'];
+      const indOpts  = ['NA','RSI','MACD','EMA9','EMA21','SMA','BB','SuperTrend','VWAP','ADX','Stochastic','CCI','ATR','OBV','Ichimoku'];
+      const condOpts = ['bullish','bearish'];
+      // Disable inputs once automation has started — edits are only allowed before execution
+      const dis = zdRunning ? ' disabled' : '';
+      const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const sel = (opts, val, field, id, arrIndex) => {
+        const optHtml = opts.map(o => '<option value="'+esc(o)+'"'+(o===val?' selected':'')+'>'+esc(o)+'</option>').join('');
+        const ai = (arrIndex !== undefined) ? ' data-arr-index="'+arrIndex+'"' : '';
+        return '<select class="zd-cell" data-rule-id="'+id+'" data-field="'+field+'"'+ai+dis+'>'+optHtml+'</select>';
+      };
+      rulesBody.innerHTML = zdRules.map((r, i) => {
+        const typeCell = sel(['entry','exit'], r.entryType, 'entryType', r.id);
+        const sideCell = sel(['BUY','SELL'], r.side, 'side', r.id);
+        const symCell  = '<input type="text" class="zd-cell zd-cell-sym" data-rule-id="'+r.id+'" data-field="symbol" value="'+esc(r.symbol)+'"'+dis+'>';
+        const qtyCell  = '<input type="number" class="zd-cell zd-cell-qty" data-rule-id="'+r.id+'" data-field="qty" value="'+(r.qty||1)+'" min="1"'+dis+'>';
+        const tfCell   = sel(tfOpts, r.tf, 'tf', r.id);
+
+        let algoCell;
+        if (r.ruleType === 'mm')        algoCell = sel(mmOpts,   r.algo, 'algo', r.id);
+        else if (r.ruleType === 'algo') algoCell = sel(algoOpts, r.algo, 'algo', r.id);
+        else                            algoCell = '<span style="color:#787b86">NA</span>';
+
+        let indsCell;
+        if (r.ruleType === 'indicator' && r.indicators && r.indicators.length) {
+          indsCell = r.indicators.map((ind, j) => {
+            const cond = (r.conditions && r.conditions[j]) || 'bullish';
+            return '<span style="display:inline-flex;gap:3px;margin:1px 4px 1px 0;align-items:center">' +
+                     sel(indOpts,  ind,  'indicators', r.id, j) +
+                     sel(condOpts, cond, 'conditions', r.id, j) +
+                   '</span>';
+          }).join('');
+        } else {
+          indsCell = '<span style="color:#787b86">NA</span>';
+        }
+
+        let scoreCell;
+        if (r.ruleType === 'mm') {
+          scoreCell = '<td>'
+            + '<input type="number" class="zd-cell zd-cell-score" data-rule-id="'+r.id+'" data-field="buyScore" value="'+(r.buyScore||0)+'" min="0" max="100" title="Buy Score Threshold" style="color:#26a69a"'+dis+'>'
+            + ' <span style="color:#787b86">/</span> '
+            + '<input type="number" class="zd-cell zd-cell-score" data-rule-id="'+r.id+'" data-field="sellScore" value="'+(r.sellScore||0)+'" min="0" max="100" title="Sell Score Threshold" style="color:#ef5350"'+dis+'>'
+            + '</td>';
+        } else if (r.ruleType === 'indicator') {
+          scoreCell = '<td><span style="color:#787b86">—</span></td>';
+        } else {
+          scoreCell = '<td><input type="number" class="zd-cell zd-cell-score" data-rule-id="'+r.id+'" data-field="score" value="'+(r.score||0)+'" min="0" max="100"'+dis+'></td>';
+        }
+
+        const statusBadge = r.status === 'buy'  ? '<span class="badge-buy">BUY</span>'
+                          : r.status === 'sell' ? '<span class="badge-sell">SELL</span>'
+                          : '<span class="badge-idle">Idle</span>';
+
+        return '<tr>' +
+          '<td>' + (i+1) + '</td>' +
+          '<td>' + typeCell + '</td>' +
+          '<td>' + sideCell + '</td>' +
+          '<td>' + symCell  + '</td>' +
+          '<td>' + qtyCell  + '</td>' +
+          '<td>' + tfCell   + '</td>' +
+          '<td>' + algoCell + '</td>' +
+          '<td style="font-size:11px">' + indsCell + '</td>' +
+          scoreCell +
+          '<td>' + statusBadge + '</td>' +
+          '<td><button class="zd-row-del" data-id="' + r.id + '" title="Delete this rule"' + dis + '>&#128465; Delete</button></td>' +
+        '</tr>';
+      }).join('');
+
+      // Delete button — remove the rule (only enabled while automation is stopped)
+      rulesBody.querySelectorAll('.zd-row-del').forEach(btn => {
+        btn.addEventListener('click', function() {
+          if (this.disabled) return;
+          const id = parseInt(this.dataset.id);
+          const rule = zdRules.find(r => r.id === id);
+          const label = rule ? (rule.symbol + ' (' + rule.ruleType + (rule.algo && rule.algo !== 'NA' ? '/' + rule.algo : '') + ')') : ('#' + id);
+          zdRules = zdRules.filter(r => r.id !== id);
+          renderRules();
+          saveRulesToStore();
+          zdLog('Rule removed: ' + label, 'info');
+        });
+      });
+
+      // Inline edit handler — applies to every input/select with class .zd-cell
+      rulesBody.querySelectorAll('.zd-cell').forEach(el => {
+        el.addEventListener('change', function() {
+          const id    = parseInt(this.dataset.ruleId);
+          const field = this.dataset.field;
+          const rule  = zdRules.find(r => r.id === id);
+          if (!rule) return;
+          let val = this.value;
+          if (field === 'qty') {
+            val = Math.max(1, parseInt(val) || 1);
+            this.value = val;
+          } else if (field === 'score' || field === 'buyScore' || field === 'sellScore') {
+            val = Math.max(0, Math.min(100, parseFloat(val) || 0));
+            this.value = val;
+          } else if (field === 'symbol') {
+            val = String(val).trim().toUpperCase();
+            this.value = val;
+          }
+          if (field === 'indicators') {
+            const idx = parseInt(this.dataset.arrIndex);
+            if (!isNaN(idx)) rule.indicators[idx] = val;
+          } else if (field === 'conditions') {
+            const idx = parseInt(this.dataset.arrIndex);
+            if (!isNaN(idx)) {
+              if (!rule.conditions) rule.conditions = [];
+              rule.conditions[idx] = val;
+            }
+          } else {
+            rule[field] = val;
+          }
+          saveRulesToStore();  // persist inline edits
+        });
+      });
+    }
+
+    function zdLog(msg, type) {
+      const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
+      const now = new Date().toLocaleTimeString();
+      logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    // Start / Stop \u2014 separate buttons; one is always disabled depending on state
+    function setRunningState(running) {
+      zdRunning = running;
+      startBtn.disabled = running;
+      stopBtn.disabled  = !running;
+      refreshAutoStatus();   // updates the status banner from shared session + running state
+      renderRules();         // refresh table \u2014 disables/enables inline edits + Delete button
+    }
+
+    startBtn.addEventListener('click', function() {
+      if (zdRunning) return;
+      if (!zdConnected) { zdLog('Please connect to Zerodha first.', 'info'); return; }
+      if (zdRules.length === 0) { zdLog('Add at least one rule.', 'info'); return; }
+      setRunningState(true);
+      zdLog('Automation started. Checking signals every 60s.', 'info');
+      runAutomation();
+      zdTimer = setInterval(runAutomation, 60000);
+    });
+
+    stopBtn.addEventListener('click', function() {
+      if (!zdRunning) return;
+      clearInterval(zdTimer); zdTimer = null;
+      setRunningState(false);
+      zdLog('Automation stopped.', 'info');
+    });
+
+    function runAutomation() {
+      zdRules.forEach(function(rule) {
+        // Use rule's own timeframe; fall back to chart TF
+        const useTF  = rule.tf || currentTF;
+        const useAlgo = (rule.algo && rule.algo !== 'NA') ? rule.algo : '';
+        const url = '/api/data?symbol=' + encodeURIComponent(rule.symbol)
+          + '&interval=' + encodeURIComponent(useTF)
+          + '&source=' + encodeURIComponent(currentSource)
+          + (useAlgo ? '&algo=' + encodeURIComponent(useAlgo) : '');
+        fetch(url)
+        .then(r => r.json())
+        .then(function(data) {
+          const signals = (data.signals || []);
+          if (!signals.length) return;
+          const last  = signals[signals.length - 1];
+          const score = last.score !== undefined ? last.score
+                      : last.buy_score !== undefined ? last.buy_score : null;
+          const sig   = (last.signal || '').toUpperCase();
+
+          // Check if the signal matches the rule's configured side
+          let triggered = false;
+          if (rule.ruleType === 'mm') {
+            // Market Making rule: check buy/sell score thresholds
+            if (sig === 'BUY' && score !== null) {
+              triggered = score >= (rule.buyScore || 0);
+            } else if (sig === 'SELL' && score !== null) {
+              triggered = score >= (rule.sellScore || 0);
+            }
+          } else if (score !== null) {
+            triggered = score >= (rule.score || 0);
+          } else {
+            triggered = (sig === rule.side);
+          }
+          if (!triggered) return;
+
+          // Avoid duplicate orders on same candle
+          if (rule.lastOrder === last.time) return;
+          rule.lastOrder = last.time;
+          
+          // For MM rules, use the actual signal direction; otherwise use configured side
+          const orderSide = (rule.ruleType === 'mm' && sig) ? sig : rule.side;
+          rule.status = orderSide.toLowerCase();
+          renderRules();
+
+          // Place order with determined side (BUY or SELL)
+          fetch('/api/zerodha/order', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+              api_key: zdApiKey, symbol: rule.symbol, side: orderSide,
+              qty: rule.qty, algo: rule.algo,
+              score: score !== null ? score : sig
+            })
+          }).then(r => r.json()).then(function(res) {
+            if (res.success) {
+              const label = '[' + rule.entryType.toUpperCase() + '] ' + orderSide + ' '
+                + rule.qty + ' ' + rule.symbol + ' (' + useTF + ')'
+                + (useAlgo ? ' Algo:' + useAlgo : ' Ind:[' + (rule.indicators.join(',') || 'NA') + ']')
+                + (score !== null ? ' score=' + score : '')
+                + ' #' + res.orderId;
+              zdLog(label, orderSide.toLowerCase());
+            } else {
+              zdLog('Order failed: ' + (res.error || 'Unknown'), 'info');
+            }
+          });
+        }).catch(function() {
+          zdLog('Fetch error for ' + rule.symbol, 'info');
+        });
+      });
+    }
+
+    // ---- Initial state: hydrate from shared store (rules + connection) ----
+    loadRulesFromStore();
+    refreshAutoStatus();
+  })();
+
+  // ---- Instrument Search Modal ----
+  (function() {
+    const overlay    = document.getElementById('zdInstOverlay');
+    const listPanel  = document.getElementById('zdInstListPanel');
+    const selList    = document.getElementById('zdInstSelList');
+    const countEl    = document.getElementById('zdInstCount');
+    const searchInp  = document.getElementById('zdInstSearchInput');
+    const clearBtn   = document.getElementById('zdInstSearchClear');
+    const tabsEl     = document.getElementById('zdInstTabs');
+
+    let allInstruments = [];   // loaded once from API
+    let selectedItems  = [];   // [{symbol, name, exchange}]
+    let currentSeg     = '';
+    let searchTimer    = null;
+
+    // Open modal
+    document.getElementById('zdOpenInstSearch').addEventListener('click', function() {
+      overlay.classList.add('open');
+      searchInp.value = '';
+      currentSeg = '';
+      tabsEl.querySelectorAll('.zd-inst-tab').forEach(t => t.classList.toggle('active', t.dataset.seg === ''));
+      loadInstruments('', '');
+      setTimeout(() => searchInp.focus(), 80);
+    });
+
+    // Close modal
+    document.getElementById('zdInstClose').addEventListener('click', closeModal);
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) closeModal(); });
+
+    function closeModal() { overlay.classList.remove('open'); }
+
+    // Done button — fill zdSymInput with first selected and close
+    document.getElementById('zdInstDoneBtn').addEventListener('click', function() {
+      if (selectedItems.length > 0) {
+        // Fill the symbol input with the first (or all comma-separated)
+        document.getElementById('zdSymInput').value = selectedItems.map(s => s.symbol).join(', ');
+      }
+      closeModal();
+    });
+
+    // Tabs
+    tabsEl.addEventListener('click', function(e) {
+      const tab = e.target.closest('.zd-inst-tab');
+      if (!tab) return;
+      tabsEl.querySelectorAll('.zd-inst-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentSeg = tab.dataset.seg;
+      loadInstruments(searchInp.value.trim(), currentSeg);
+    });
+
+    // Search input
+    searchInp.addEventListener('input', function() {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => loadInstruments(this.value.trim(), currentSeg), 220);
+    });
+    clearBtn.addEventListener('click', function() {
+      searchInp.value = '';
+      loadInstruments('', currentSeg);
+      searchInp.focus();
+    });
+
+    function loadInstruments(q, seg) {
+      listPanel.innerHTML = '<div class="zd-inst-empty">Loading\u2026</div>';
+
+      // Kite tab \u2014 live Kite API search (api.kite.trade/instruments). Smart-parses
+      // strike/side/month so 'Nifty 24000' lists all expiries at that strike.
+      if (seg === 'KITE') {
+        listPanel.innerHTML = '<div class="zd-inst-empty" style="color:#f0b429">' +
+          (q ? 'Searching Kite API\u2026' : 'Loading live Kite instruments (~1MB, first time only)\u2026') + '</div>';
+        fetch('/api/zerodha/kite/search?q=' + encodeURIComponent(q))
+          .then(r => r.json()).then(function(data) {
+            if (!data.success) {
+              listPanel.innerHTML = '<div class="zd-inst-empty" style="color:#e74c3c">' +
+                (data.error || 'Failed to load Kite instruments') + '</div>';
+              return;
+            }
+            allInstruments = data.results || [];
+            renderList();
+          }).catch(function() {
+            listPanel.innerHTML = '<div class="zd-inst-empty">Network error fetching Kite instruments.</div>';
+          });
+        return;
+      }
+
+      // Zerodha Inst tab \u2014 search local instruments.csv (full Kite instrument dump)
+      if (seg === 'ZERODHA_CSV') {
+        fetch('/api/zerodha/csv/search?q=' + encodeURIComponent(q))
+          .then(r => r.json()).then(function(data) {
+            if (!data.success) {
+              listPanel.innerHTML = '<div class="zd-inst-empty" style="color:#e74c3c">' +
+                (data.error || 'Failed to load instruments.csv') + '</div>';
+              return;
+            }
+            allInstruments = data.results || [];
+            renderList();
+            if (!q && data.total) {
+              const note = document.createElement('div');
+              note.className = 'zd-inst-empty';
+              note.style.cssText = 'padding:6px 14px;color:#787b86;font-size:11px;border-bottom:1px solid #2a2e39';
+              note.textContent = 'Showing first ' + allInstruments.length + ' of ' + data.total + ' instruments \u2014 type to filter.';
+              listPanel.insertBefore(note, listPanel.firstChild);
+            }
+          }).catch(function() {
+            listPanel.innerHTML = '<div class="zd-inst-empty">Network error loading instruments.csv.</div>';
+          });
+        return;
+      }
+
+      // Use Zerodha NFO search when: Options tab is active, OR query looks like an options query
+      const _optKeywords = /\b(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|SENSEX|BANKEX)\b|\d{4,}|\b(CE|PE|CALL|PUT)\b/i;
+      const useNFO = seg === 'OPTIONS' || _optKeywords.test(q);
+
+      if (useNFO) {
+        listPanel.innerHTML = '<div class="zd-inst-empty" style="color:#f0b429">' +
+          (q ? 'Searching NFO options\u2026' : 'Loading NFO instruments from Zerodha\u2026') + '</div>';
+        fetch('/api/zerodha/nfo/search?q=' + encodeURIComponent(q))
+          .then(r => r.json()).then(function(data) {
+            if (!data.success) {
+              listPanel.innerHTML = '<div class="zd-inst-empty" style="color:#e74c3c">' +
+                (data.error || 'Failed to load NFO instruments') + '</div>';
+              return;
+            }
+            allInstruments = data.results || [];
+            renderList();
+          }).catch(function() {
+            listPanel.innerHTML = '<div class="zd-inst-empty">Network error loading NFO instruments.</div>';
+          });
+        return;
+      }
+
+      const url = '/api/zerodha/instruments/search?q=' + encodeURIComponent(q) + '&seg=' + encodeURIComponent(seg);
+      fetch(url).then(r => r.json()).then(function(data) {
+        allInstruments = data.results || [];
+        renderList();
+      }).catch(function() {
+        listPanel.innerHTML = '<div class="zd-inst-empty">Failed to load instruments.</div>';
+      });
+    }
+
+    function renderList() {
+      if (!allInstruments.length) {
+        listPanel.innerHTML = '<div class="zd-inst-empty">No instruments found.</div>';
+        return;
+      }
+      listPanel.innerHTML = allInstruments.map(function(inst) {
+        const isSel = selectedItems.some(s => s.symbol === inst.symbol);
+        const exchClass = inst.exchange === 'BSE' ? 'bse'
+                        : inst.exchange === 'NSE' ? ''
+                        : 'other';
+        // For options contracts, show expiry + LTP badge
+        let badge = '';
+        if (inst.seg === 'OPTIONS' && inst.expiry_short) {
+          const side = inst.type === 'CE' ? 'call' : 'put';
+          badge = '<span class="zd-inst-exch" style="background:' +
+            (inst.type==='CE'?'#1a6b3a':'#7b1c1c') + ';color:#fff;margin-left:4px;font-size:9px">' +
+            inst.expiry_short + '</span>';
+        }
+        return '<div class="zd-inst-item' + (isSel ? ' selected' : '') + '" data-sym="' + inst.symbol + '">' +
+          '<div class="zd-inst-chk"></div>' +
+          '<div class="zd-inst-info">' +
+            '<div class="zd-inst-sym">' + inst.symbol + '</div>' +
+            '<div class="zd-inst-name">' + inst.name + '</div>' +
+          '</div>' +
+          badge +
+          '<span class="zd-inst-exch ' + exchClass + '">' + inst.exchange + '</span>' +
+        '</div>';
+      }).join('');
+      listPanel.querySelectorAll('.zd-inst-item').forEach(function(item) {
+        item.addEventListener('click', function() {
+          const sym = this.dataset.sym;
+          const inst = allInstruments.find(i => i.symbol === sym);
+          if (!inst) return;
+          const idx = selectedItems.findIndex(s => s.symbol === sym);
+          if (idx === -1) {
+            selectedItems.push(inst);
+          } else {
+            selectedItems.splice(idx, 1);
+          }
+          renderList();
+          renderSelected();
+        });
+      });
+    }
+
+    function renderSelected() {
+      countEl.textContent = selectedItems.length + ' selected';
+      if (!selectedItems.length) {
+        selList.innerHTML = '<div class="zd-inst-empty" style="padding:20px;font-size:11px">No instruments selected</div>';
+        return;
+      }
+      selList.innerHTML = selectedItems.map(function(inst) {
+        return '<div class="zd-inst-sel-item" data-sym="' + inst.symbol + '">' +
+          '<div><div class="zd-inst-sel-sym">' + inst.symbol + '</div>' +
+          '<div class="zd-inst-sel-exch">' + inst.exchange + ' &middot; ' + inst.type + '</div></div>' +
+          '<button class="zd-inst-sel-rm" title="Remove">&times;</button>' +
+        '</div>';
+      }).join('');
+      selList.querySelectorAll('.zd-inst-sel-rm').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const sym = this.closest('[data-sym]').dataset.sym;
+          selectedItems = selectedItems.filter(s => s.symbol !== sym);
+          renderList();
+          renderSelected();
+        });
+      });
+    }
+
+    // Initial render of selected panel
+    renderSelected();
+  })();
 
   // ---- Theme Toggle ----
   function applyTheme(theme) {

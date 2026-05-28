@@ -4,6 +4,8 @@ Usage:
     python fetch_nifty_options.py                        # Nearest expiry
     python fetch_nifty_options.py --expiry 2026-04-02    # Specific expiry
     python fetch_nifty_options.py --strikes 23000-24000  # Filter strike range
+    python fetch_nifty_options.py --all-months           # Month-wise expiries for current year
+    python fetch_nifty_options.py --year 2026 --all-months
 """
 
 import argparse
@@ -91,6 +93,35 @@ def fetch_options_chain(session):
     except Exception as e:
         print(json.dumps({"error": f"Failed to fetch options chain: {e}"}))
         sys.exit(1)
+
+
+def parse_expiry_date(expiry_value):
+    """Parse NSE expiry strings into datetime objects."""
+    if not expiry_value:
+        return None
+
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(expiry_value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def get_monthly_expiries(expiry_dates, year):
+    """Return the last expiry for each month in the requested year."""
+    monthly = {}
+    for expiry in expiry_dates:
+        expiry_dt = parse_expiry_date(expiry)
+        if not expiry_dt or expiry_dt.year != year:
+            continue
+
+        key = (expiry_dt.year, expiry_dt.month)
+        current = monthly.get(key)
+        if current is None or expiry_dt > current[1]:
+            monthly[key] = (expiry, expiry_dt)
+
+    return [monthly[key] for key in sorted(monthly.keys())]
 
 
 def process_data(data, expiry_filter=None, strike_range=None):
@@ -221,6 +252,43 @@ def process_data(data, expiry_filter=None, strike_range=None):
     return result
 
 
+def process_monthly_data(data, year, strike_range=None):
+    """Build month-wise summaries using the final expiry in each month."""
+    records = data.get("records", {})
+    expiry_dates = records.get("expiryDates", [])
+    monthly_expiries = get_monthly_expiries(expiry_dates, year)
+
+    results = []
+    for expiry_value, expiry_dt in monthly_expiries:
+        monthly_result = process_data(data, expiry_value, strike_range)
+        chain = monthly_result.get("chain", [])
+        top_chain = sorted(
+            chain,
+            key=lambda row: (row.get("CE_OI", 0) + row.get("PE_OI", 0)),
+            reverse=True,
+        )[:10]
+
+        results.append({
+            "month": expiry_dt.strftime("%B"),
+            "expiry": expiry_value,
+            "timestamp": monthly_result.get("timestamp", "N/A"),
+            "underlyingValue": monthly_result.get("underlyingValue", 0),
+            "selectedExpiry": monthly_result.get("selectedExpiry", expiry_value),
+            "summary": monthly_result.get("summary", {}),
+            "topStrikesByOI": top_chain,
+        })
+
+    return {
+        "mode": "month-wise",
+        "year": year,
+        "timestamp": records.get("timestamp", "N/A"),
+        "underlyingValue": records.get("underlyingValue", 0),
+        "expiryDates": expiry_dates,
+        "monthlyExpiries": [item[0] for item in monthly_expiries],
+        "results": results,
+    }
+
+
 def calculate_max_pain(chain, spot):
     """Calculate the Max Pain strike price for the given options chain.
 
@@ -291,6 +359,8 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch Nifty Options Chain from NSE")
     parser.add_argument("--expiry", type=str, help="Expiry date (YYYY-MM-DD)")
     parser.add_argument("--strikes", type=str, help="Strike range (e.g., 23000-24000)")
+    parser.add_argument("--all-months", action="store_true", help="Show month-wise expiry summaries for the selected year")
+    parser.add_argument("--year", type=int, default=datetime.now().year, help="Year to use with --all-months (default: current year)")
     args = parser.parse_args()
 
     expiry_filter = None
@@ -331,7 +401,10 @@ def main():
         print(json.dumps(result, indent=2))
         return
 
-    result = process_data(data, expiry_filter, strike_range)
+    if args.all_months:
+        result = process_monthly_data(data, args.year, strike_range)
+    else:
+        result = process_data(data, expiry_filter, strike_range)
     print(json.dumps(result, indent=2))
 
 
