@@ -669,36 +669,151 @@ def zerodha_connect():
 @app.route('/api/zerodha/order', methods=['POST'])
 @login_required
 def zerodha_order():
+    """Place a Zerodha order.
+
+    Honors a `dry_run` flag (default true if omitted) — when true, the request
+    is logged only and no real order reaches Kite. When false, posts to
+    api.kite.trade/orders/regular using the session's access token.
+
+    Body params (JSON):
+        api_key (str): identifies the session in zerodha_sessions.
+        symbol (str):  Kite tradingsymbol (e.g. CRUDEOILM26JUNFUT, NIFTY26JUN24000CE).
+        exchange (str):NSE | BSE | NFO | BFO | MCX | CDS | BCD (default NSE).
+        side (str):    BUY | SELL.
+        qty (int):     quantity.
+        product (str): MIS | NRML | CNC. Defaults: NRML for derivatives, MIS otherwise.
+        order_type (str): MARKET | LIMIT | SL | SL-M (default MARKET).
+        algo/score: free-form metadata stored in the log.
+        dry_run (bool): if true (default), don't actually call Kite.
+    """
+    import urllib.parse as _up, urllib.error as _ue, json as _json
     data = request.json or {}
     api_key      = data.get('api_key', '').strip()
     symbol       = data.get('symbol', '').strip()
-    side         = data.get('side', '').upper()   # BUY or SELL
-    qty          = data.get('qty', 1)
+    exchange     = (data.get('exchange') or '').strip().upper() or 'NSE'
+    side         = data.get('side', '').upper()
+    qty          = int(data.get('qty', 1) or 1)
+    order_type   = (data.get('order_type') or 'MARKET').strip().upper()
+    product      = (data.get('product') or '').strip().upper()
     algo         = data.get('algo', '')
     score        = data.get('score', 0)
+    dry_run      = data.get('dry_run', True)  # default to dry-run for safety
+
     if api_key not in zerodha_sessions:
-        return jsonify({'success': False, 'error': 'Not connected'}), 403
+        return jsonify({'success': False, 'error': 'Not connected (open Zerodha Login)'}), 403
     if side not in ('BUY', 'SELL'):
         return jsonify({'success': False, 'error': 'Invalid side'}), 400
-    # TODO: Place real order via KiteConnect:
-    #   from kiteconnect import KiteConnect
-    #   kite = KiteConnect(api_key=api_key)
-    #   kite.set_access_token(zerodha_sessions[api_key]['access_token'])
-    #   kite.place_order(tradingsymbol=symbol, exchange='NSE', transaction_type=side,
-    #                    quantity=qty, order_type='MARKET', product='MIS', variety='regular')
-    order_id = str(uuid.uuid4())[:8]
-    entry = {
-        'order_id': order_id, 'symbol': symbol, 'side': side, 'qty': qty,
-        'algo': algo, 'score': score, 'status': 'PLACED',
-        'timestamp': datetime.utcnow().isoformat()
-    }
-    zerodha_orders.append(entry)
-    return jsonify({'success': True, 'orderId': order_id, 'order': entry})
+    if not symbol:
+        return jsonify({'success': False, 'error': 'Missing symbol'}), 400
+
+    # Default product: derivatives use NRML, equities use MIS
+    if not product:
+        product = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD') else 'MIS'
+
+    # Dry-run: log only, return a fake order id
+    if dry_run:
+        order_id = 'DRY-' + str(uuid.uuid4())[:6]
+        entry = {
+            'order_id': order_id, 'symbol': symbol, 'exchange': exchange,
+            'side': side, 'qty': qty, 'product': product, 'order_type': order_type,
+            'algo': algo, 'score': score, 'status': 'DRY-RUN',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        zerodha_orders.append(entry)
+        return jsonify({'success': True, 'orderId': order_id, 'order': entry, 'dry_run': True})
+
+    # Real order via Kite Connect v3 REST API
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        return jsonify({'success': False, 'error': 'No access_token in server session — re-Connect'}), 403
+
+    payload = _up.urlencode({
+        'tradingsymbol':    symbol,
+        'exchange':         exchange,
+        'transaction_type': side,
+        'quantity':         qty,
+        'product':          product,
+        'order_type':       order_type,
+        'validity':         'DAY',
+    }).encode('utf-8')
+    req = _zd_urllib.Request(
+        'https://api.kite.trade/orders/regular',
+        data=payload,
+        headers={
+            'X-Kite-Version': '3',
+            'Authorization':  'token {}:{}'.format(api_key, access_token),
+            'Content-Type':   'application/x-www-form-urlencoded',
+            'User-Agent':     'Mozilla/5.0',
+        },
+        method='POST'
+    )
+    try:
+        with _zd_urllib.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode('utf-8')
+        resp_data = _json.loads(body) if body else {}
+    except _ue.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8')
+        except Exception:
+            pass
+        # Try to parse Kite's structured error
+        try:
+            err_data = _json.loads(err_body)
+            err_msg  = err_data.get('message', err_body[:300])
+        except Exception:
+            err_msg = err_body[:300] or str(e)
+        return jsonify({'success': False, 'error': 'Kite HTTP {}: {}'.format(e.code, err_msg)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Kite request failed: {}'.format(e)})
+
+    if resp_data.get('status') == 'success':
+        order_id = resp_data.get('data', {}).get('order_id', '')
+        entry = {
+            'order_id': order_id, 'symbol': symbol, 'exchange': exchange,
+            'side': side, 'qty': qty, 'product': product, 'order_type': order_type,
+            'algo': algo, 'score': score, 'status': 'PLACED',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        zerodha_orders.append(entry)
+        return jsonify({'success': True, 'orderId': order_id, 'order': entry})
+    return jsonify({'success': False, 'error': resp_data.get('message', 'Order rejected'), 'data': resp_data})
 
 @app.route('/api/zerodha/orders', methods=['GET'])
 @login_required
 def zerodha_orders_list():
     return jsonify({'success': True, 'orders': zerodha_orders[-50:]})
+
+@app.route('/api/myip', methods=['GET'])
+@login_required
+def my_outbound_ip():
+    """Return the server's outbound public IP — the IP Kite/Zerodha sees on
+    incoming API calls. Add this exact value to your Kite app's Allowed IPs
+    list at https://developers.kite.trade/apps to fix HTTP 403 errors like
+    'No IPs configured for this app.'"""
+    import urllib.request as _ur, json as _json
+    sources = [
+        'https://api.ipify.org?format=json',
+        'https://ifconfig.me/all.json',
+        'https://api64.ipify.org?format=json',
+    ]
+    last_err = None
+    for url in sources:
+        try:
+            req = _ur.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with _ur.urlopen(req, timeout=8) as resp:
+                body = resp.read().decode('utf-8').strip()
+            try:
+                data = _json.loads(body)
+                ip = data.get('ip') or data.get('ip_addr')
+            except Exception:
+                ip = body
+            if ip:
+                return jsonify({'success': True, 'ip': ip, 'source': url})
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return jsonify({'success': False, 'error': 'All IP lookup services failed', 'detail': last_err})
 
 # ---- Instrument search list ----
 _ZD_INSTRUMENTS = [
@@ -10316,6 +10431,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </table>
       </div>
 
+      <!-- Safety toggle: dry-run vs live trades -->
+      <div class="zd-live-toggle" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;padding:8px 12px;background:rgba(255,145,0,0.08);border:1px solid rgba(255,145,0,0.25);border-radius:6px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:#d1d4dc">
+          <input type="checkbox" id="zdLiveTradesChk" style="width:14px;height:14px;cursor:pointer">
+          <b style="color:#ff9100">&#9888; Live trades</b>
+          <span style="color:#787b86">&mdash; uncheck for dry-run (log only, no real Zerodha orders).</span>
+        </label>
+      </div>
       <!-- Start / Stop -->
       <div class="zd-footer">
         <button class="zd-start-btn start" id="zdStartBtn">&#9654; Start Automation</button>
@@ -14230,6 +14353,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (el) el.addEventListener('input', saveRulesToStore);
     });
 
+    // Resolve a (sym) entry to chart + trade symbol + exchange. If the modal
+    // staged metadata for this symbol, use it; otherwise treat sym as both
+    // chart and trade (existing behavior — only works for curated chart symbols).
+    function metaForSym(sym) {
+      const m = window.zdPendingInstMeta;
+      if (m && m.tradeSymbol === sym) {
+        return { chartSymbol: m.chartSymbol, tradeSymbol: m.tradeSymbol, exchange: m.exchange || '' };
+      }
+      return { chartSymbol: sym, tradeSymbol: sym, exchange: '' };
+    }
+
     // Maximize / Restore
     maximizeBtn.addEventListener('click', function() {
       zdMaximized = !zdMaximized;
@@ -14303,10 +14437,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const algo      = document.getElementById('zdAlgoInput').value;
       const score     = parseFloat(document.getElementById('zdAlgoScore').value) || 70;
       if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
+      const _meta = metaForSym(sym);
       zdRules.push({
         id: ++zdRuleId, ruleType: 'algo',
         entryType: entryType, side: side,
         symbol: sym, qty: qty, tf: tf,
+        tradeSymbol: _meta.tradeSymbol, chartSymbol: _meta.chartSymbol, exchange: _meta.exchange,
         algo: algo, indicators: [],
         score: score, status: 'idle', lastOrder: null
       });
@@ -14331,10 +14467,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const indicators = rawInds.map(v => v.ind);
       const conditions = rawInds.map(v => v.cond);
       if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
+      const _meta = metaForSym(sym);
       zdRules.push({
         id: ++zdRuleId, ruleType: 'indicator',
         entryType: entryType, side: side,
         symbol: sym, qty: qty, tf: tf,
+        tradeSymbol: _meta.tradeSymbol, chartSymbol: _meta.chartSymbol, exchange: _meta.exchange,
         algo: 'NA', indicators: indicators, conditions: conditions,
         score: 0, status: 'idle', lastOrder: null
       });
@@ -14356,10 +14494,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const sellScore = parseFloat(document.getElementById('zdMMSellScore').value) || 70;
       if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
       if (mmAlgo === 'NA') { zdLog('Select a Market Making strategy.', 'info'); return; }
+      const _meta = metaForSym(sym);
       zdRules.push({
         id: ++zdRuleId, ruleType: 'mm',
         entryType: entryType, side: side,
         symbol: sym, qty: qty, tf: tf,
+        tradeSymbol: _meta.tradeSymbol, chartSymbol: _meta.chartSymbol, exchange: _meta.exchange,
         algo: mmAlgo, indicators: [],
         buyScore: buyScore, sellScore: sellScore,
         score: 0, status: 'idle', lastOrder: null
@@ -14528,11 +14668,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
 
     function runAutomation() {
+      const liveTradesChk = document.getElementById('zdLiveTradesChk');
+      const liveTrades = !!(liveTradesChk && liveTradesChk.checked);
       zdRules.forEach(function(rule) {
         // Use rule's own timeframe; fall back to chart TF
         const useTF  = rule.tf || currentTF;
         const useAlgo = (rule.algo && rule.algo !== 'NA') ? rule.algo : '';
-        const url = '/api/data?symbol=' + encodeURIComponent(rule.symbol)
+        // Use chartSymbol for the signal fetch (Kite tradingsymbols aren't
+        // recognised by yfinance/tradingview), fall back to symbol for old rules.
+        const dataSym  = rule.chartSymbol || rule.symbol;
+        const tradeSym = rule.tradeSymbol || rule.symbol;
+        const url = '/api/candles?symbol=' + encodeURIComponent(dataSym)
           + '&interval=' + encodeURIComponent(useTF)
           + '&source=' + encodeURIComponent(currentSource)
           + (useAlgo ? '&algo=' + encodeURIComponent(useAlgo) : '');
@@ -14571,28 +14717,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
           rule.status = orderSide.toLowerCase();
           renderRules();
 
-          // Place order with determined side (BUY or SELL)
+          // Place order with determined side (BUY or SELL). Uses tradeSymbol
+          // + exchange so Kite-specific tradingsymbols (CRUDEOILM26JUNFUT etc.)
+          // reach the correct exchange. dry_run is the opposite of the panel's
+          // "Live trades" checkbox — defaults to dry-run for safety.
           fetch('/api/zerodha/order', {
             method: 'POST', headers: {'Content-Type':'application/json'},
             body: JSON.stringify({
-              api_key: zdApiKey, symbol: rule.symbol, side: orderSide,
-              qty: rule.qty, algo: rule.algo,
-              score: score !== null ? score : sig
+              api_key:  zdApiKey,
+              symbol:   tradeSym,
+              exchange: rule.exchange || '',
+              side:     orderSide,
+              qty:      rule.qty,
+              algo:     rule.algo,
+              score:    score !== null ? score : sig,
+              dry_run:  !liveTrades
             })
           }).then(r => r.json()).then(function(res) {
             if (res.success) {
-              const label = '[' + rule.entryType.toUpperCase() + '] ' + orderSide + ' '
-                + rule.qty + ' ' + rule.symbol + ' (' + useTF + ')'
+              const tag = res.dry_run ? '[DRY] ' : '[' + rule.entryType.toUpperCase() + '] ';
+              const label = tag + orderSide + ' '
+                + rule.qty + ' ' + tradeSym + (rule.exchange ? '@' + rule.exchange : '')
+                + ' (' + useTF + ')'
                 + (useAlgo ? ' Algo:' + useAlgo : ' Ind:[' + (rule.indicators.join(',') || 'NA') + ']')
                 + (score !== null ? ' score=' + score : '')
                 + ' #' + res.orderId;
               zdLog(label, orderSide.toLowerCase());
             } else {
-              zdLog('Order failed: ' + (res.error || 'Unknown'), 'info');
+              zdLog('Order failed for ' + tradeSym + ': ' + (res.error || 'Unknown'), 'info');
             }
           });
         }).catch(function() {
-          zdLog('Fetch error for ' + rule.symbol, 'info');
+          zdLog('Fetch error for ' + dataSym + ' (rule symbol: ' + rule.symbol + ')', 'info');
         });
       });
     }
@@ -14634,12 +14790,80 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function closeModal() { overlay.classList.remove('open'); }
 
     // Done button — fill zdSymInput with first selected and close
+    // ---- Chart-symbol + exchange derivation for Kite-style tradingsymbols ----
+    // Kite tradingsymbols (CRUDEOILM26JUNFUT, NIFTY26JUN24000CE, RELIANCE) need a
+    // separate "chart symbol" the data backends (yfinance / tradingview) can
+    // actually fetch. We compute that here from the row's name/type/exchange,
+    // and the rule stores both the chart symbol (for /api/candles) and the
+    // Kite tradingsymbol + exchange (for /api/zerodha/order).
+    const _ZD_UNDERLYING_MAP = {
+      'NIFTY':       'NIFTY50',
+      'NIFTYNXT50':  'NIFTYNXT50',
+      'BANKNIFTY':   'BANKNIFTY',
+      'FINNIFTY':    'BANKNIFTY',
+      'MIDCPNIFTY':  'NIFTY50',
+      'SENSEX':      'SENSEX',
+      'BANKEX':      'BANKNIFTY',
+      'CRUDEOIL':    'CRUDEOILMCX',
+      'CRUDEOILM':   'CRUDEOILMCX',
+      'GOLD':        'GOLD',
+      'GOLDM':       'GOLD',
+      'GOLDPETAL':   'GOLD',
+      'SILVER':      'SILVER',
+      'SILVERM':     'SILVER',
+      'SILVERMIC':   'SILVER',
+      'NATURALGAS':  'NATURALGAS',
+      'NATGASMINI':  'NATURALGAS'
+    };
+    function deriveChartMeta(rec) {
+      const sym  = (rec.symbol   || '').toUpperCase();
+      const name = (rec.name     || '').toUpperCase();
+      const exch = (rec.exchange || '').toUpperCase();
+      const type = (rec.type     || '').toUpperCase();
+      // Derivatives (FUT / CE / PE) — map to the underlying's curated chart symbol
+      if (type === 'FUT' || type === 'CE' || type === 'PE') {
+        return {
+          tradeSymbol: sym,
+          chartSymbol: _ZD_UNDERLYING_MAP[name] || _ZD_UNDERLYING_MAP[sym] || sym,
+          exchange:    exch || (type === 'FUT' ? '' : 'NFO')
+        };
+      }
+      // Equities — append yfinance suffix (.NS / .BO) so signal fetch works
+      if (type === 'EQ') {
+        const suffix = exch === 'NSE' ? '.NS' : exch === 'BSE' ? '.BO' : '';
+        return { tradeSymbol: sym, chartSymbol: sym + suffix, exchange: exch };
+      }
+      // Anything else (index, curated) — use as-is, fall through map for safety
+      return {
+        tradeSymbol: sym,
+        chartSymbol: _ZD_UNDERLYING_MAP[name] || _ZD_UNDERLYING_MAP[sym] || sym,
+        exchange:    exch
+      };
+    }
+
+    // Sidecar: the most recent instrument picked via the modal. Add-rule
+    // handlers read this when zdSymInput's value matches its tradeSymbol.
+    window.zdPendingInstMeta = null;
+
     document.getElementById('zdInstDoneBtn').addEventListener('click', function() {
       if (selectedItems.length > 0) {
-        // Fill the symbol input with the first (or all comma-separated)
-        document.getElementById('zdSymInput').value = selectedItems.map(s => s.symbol).join(', ');
+        // Use the first selected as the "active" instrument; its derived
+        // metadata is what the next rule-add picks up.
+        const first = selectedItems[0];
+        const meta = deriveChartMeta(first);
+        document.getElementById('zdSymInput').value = meta.tradeSymbol;
+        window.zdPendingInstMeta = meta;
       }
       closeModal();
+    });
+
+    // If the user manually edits the symbol input after picking, drop the sidecar
+    // (we no longer know the chart symbol / exchange for what's been typed).
+    document.getElementById('zdSymInput').addEventListener('input', function() {
+      if (window.zdPendingInstMeta &&
+          this.value.trim().toUpperCase() !== window.zdPendingInstMeta.tradeSymbol) {
+        window.zdPendingInstMeta = null;
+      }
     });
 
     // Tabs
