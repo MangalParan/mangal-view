@@ -1,5 +1,5 @@
 ---
-description: "Use when checking Nifty options chain, NSE options data, open interest analysis, options Greeks, PCR ratio, max pain, Nifty CE PE prices, strike-wise OI, Indian stock market derivatives analysis, Nifty candlestick chart, technical indicators, buy sell signals, live data, backtest strategy, multi-symbol chart, crypto chart, algo signals (Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, StatArb, Institution, MPredict), signal analysis panel, indicator settings, SuperTrend, Parabolic SAR, support/resistance levels, EMA 9/21 crossover, VWAP, Bollinger Bands, CPR Central Pivot Range, ORB Opening Range Breakout, liquidity pools, Fair Value Gap FVG, Break of Structure BOS, Change of Character CHoCH, Cumulative Volume Delta CVD, volume profile POC VAH VAL, backtest performance overview trade list, futures paper trading, trade log, data source Yahoo Finance TradingView NSE India, theme dark light toggle, zoom controls, admin panel user management, site settings maintenance mode, help pages algos indicators manual."
+description: "Use when checking Nifty options chain, NSE options data, open interest analysis, options Greeks, PCR ratio, max pain, Nifty CE PE prices, strike-wise OI, Indian stock market derivatives analysis, Nifty candlestick chart, technical indicators, buy sell signals, live data, backtest strategy, multi-symbol chart, crypto chart, algo signals (Trend, MStreet, MFactor, Sniper, OrderFlow, PriceAction, Breakout, Momentum, Scalping, SmartMoney, Quant, Hybrid, StatArb, Institution, MPredict), signal analysis panel, indicator settings, SuperTrend, Parabolic SAR, support/resistance levels, EMA 9/21 crossover, VWAP, Bollinger Bands, CPR Central Pivot Range, ORB Opening Range Breakout, liquidity pools, Fair Value Gap FVG, Break of Structure BOS, Change of Character CHoCH, Cumulative Volume Delta CVD, volume profile POC VAH VAL, backtest performance overview trade list, futures paper trading, trade log, data source Yahoo Finance TradingView NSE India Kite, theme dark light toggle, zoom controls, admin panel user management, site settings maintenance mode, help pages algos indicators manual, Zerodha Kite Connect automation, live trading panel, automation rules algo indicator market-making GTT, entry exit pairing position state, instruments.csv Kite tab search, market protection limit order, tick size quantization, OCO stop loss target, dry run live trades toggle, IP whitelist IPv4, instrument exchange dropdown NSE BSE MCX NFO BFO, popout maximize panel."
 tools: [execute, read, edit, search, web]
 ---
 
@@ -14,9 +14,11 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - `app.py` — Top-level entry point for production (gunicorn import)
 - `requirements.txt` — Python dependencies (Flask, yfinance, curl_cffi, websocket-client, gunicorn)
 - `render.yaml` — Render.com deployment config (auto-deploy from GitHub)
+- `instruments.csv` — Kite master instruments dump (~144K rows, 12 MB). Used by the Zerodha automation as an offline fallback for instrument lookup, tick-size resolution, and the Zerodha Inst search tab. Loaded lazily, in-memory cached, reloaded on mtime change
 - `scripts/fetch_nifty_options.py` — NSE options chain fetcher (uses `curl_cffi` with Chrome TLS impersonation to bypass NSE bot detection)
-- `scripts/nifty_chart.py` — Flask-based interactive candlestick chart server (port 5050)
+- `scripts/nifty_chart.py` — Flask-based interactive candlestick chart server + Zerodha Kite Connect automation (port 5000 in dev, gunicorn-wrapped via `app.py` in prod)
 - `scripts/__init__.py` — Package init for module imports
+- `users.db` — SQLite database for user accounts, sessions, and site settings (admin-controlled)
 
 ## Deployment
 
@@ -290,6 +292,112 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - `POST /api/trade/stop` — closes any open position at `{currentPrice}`, returns final summary with all metrics
 - `GET /api/trade/status?sessionId=...` — returns full session state: trades, equity curve, summary (totalTrades, winRate, profitFactor, avgTrade, avgWin, avgLoss, largestWin, largestLoss, maxDrawdown, netPnl)
 
+### Zerodha Kite Connect Automation
+End-to-end live-trading integration with Zerodha's Kite Connect v3 REST API. Built as two separate panels accessible from the **Automation** dropdown menu, with a shared `localStorage`-backed session store so credentials, rules, and connection state survive reloads and pop-out windows.
+
+#### Two-Panel Architecture
+- **🔐 Zerodha Login panel** — holds all credentials (API Key, API Secret, Request Token, Access Token) plus the Login URL, Get Access Token, and Connect buttons. Status bar shows `Connected (api_key: ...)` once authenticated. Draggable.
+- **🤖 Zerodha Automation panel** — login-free. Shows the connection state via a banner at top (`Connected` or `Not connected — open Zerodha Login`), then the rules editor, table, safety controls, Start/Stop, and log. Has **Maximize** (▢/▣) and **Pop-out** (↗) buttons in the header in addition to Close (×).
+- **Pop-out** opens a new browser window with `?zerodhaPopout=1` — the panel fills the viewport. Shares state with the parent via `localStorage` storage events (rules and session sync live across windows).
+- **Shared session store** (`ZerodhaStore` in JS): two `localStorage` keys — `mangalview_zerodha_session_v1` (`{connected, apiKey}`) and `mangalview_zerodha_rules_v1` (rules + shared sym/qty). Dispatches `zerodha-session-change` and `zerodha-rules-change` events.
+
+#### Add Instrument Modal
+Tabs (left to right): **All**, **💾 Zerodha Inst**, **🚀 Kite**, **Options**, **NIFTY 50**, **BANK NIFTY**, **Indices**, **F&O Stocks**, **ETF**, **Commodities**. Crypto tab removed (INR-only Zerodha panel).
+- **All** — curated `_ZD_INSTRUMENTS` list (NIFTY 50 stocks + indices + ETFs); when a query has no curated match, falls back to local `instruments.csv` for any Zerodha-listed tradingsymbol.
+- **💾 Zerodha Inst** — searches the locally bundled `instruments.csv` (~144,078 rows = full Kite master dump). Lazy-loaded, in-memory cached, reloaded on file mtime change.
+- **🚀 Kite** — live `https://api.kite.trade/instruments` (~121K rows, cached 1 hour). Smart query parser recognises patterns like `Nifty 24000` (returns all NIFTY 24000 CE+PE across expiries), `BankNifty 52000 CE`, `Nifty Jun 24000`, etc.
+- **All Zerodha-panel search endpoints filter to INR exchanges only** — NSE, BSE, NFO, BFO, MCX, CDS, BCD, NCO. USD-denominated symbols (USOIL @ NYMEX, XAUUSD @ FX, BTC/ETH, DJI/NASDAQ/SP500) are excluded from results regardless of curated list contents.
+- Picking an instrument auto-fills the Symbol input + the Exchange dropdown + populates a `window.zdPendingInstMeta` sidecar with `{tradeSymbol, chartSymbol, exchange}` used by the next rule-add.
+
+#### Shared Rule Bar (top of automation panel)
+- **Exchange dropdown** — `Auto` (infers from tradingsymbol pattern) or explicit NSE / BSE / NFO / BFO / MCX / CDS / BCD. Selection persists in `localStorage` under `mangalview_zerodha_exchange_v1`. Explicit picks always override auto-inference and the modal's exchange.
+- **Symbol** input — text (auto-uppercased). Synced from the modal pick.
+- **Qty** input — integer ≥ 1.
+- **+ Add Instrument** button — opens the modal.
+
+#### Rule Types (4 add-rule rows below the shared bar)
+Each row adds one rule to the table; the rule carries `entryType` (entry/exit), `side` (BUY/SELL), `tf`, `tradeSymbol`, `chartSymbol`, `exchange`, plus type-specific fields:
+- **📊 Algo-Based Rule** (blue) — Algo dropdown (15 algos), Score Threshold (0-100, default 70). Triggers when the selected algo's signal score ≥ threshold and matches the rule's side.
+- **📈 Indicator-Based Rule** (purple) — up to 4 Indicator + Condition (bullish/bearish) pairs. **ALL** selected indicators must match their conditions on the latest candle for the rule to trigger. Supported: **SuperTrend** (direction == 1 bullish), **RSI** (>50 bullish), **MACD** (histogram >0 bullish), **EMA9 / EMA21** (close > EMA bullish), **VWAP** (close > VWAP bullish), **Bollinger Bands** (close > middle bullish). SMA / ADX / Stochastic / CCI / ATR / OBV / Ichimoku return `?` (unsupported, won't trigger).
+- **🥇 Market Making Rule** (orange) — Market Making algo (Market Making / MM Advanced), separate Buy Score / Sell Score thresholds. Uses the actual signal direction (BUY or SELL) from the MM engine.
+- **🔒 GTT Rule** (cyan) — Type (entry/exit), Side, Trigger Type (**single** = SL only, **OCO** = Kite two-leg with SL + Target), SL % and Target %. **GTT-exit rules are auto-placed after a matching entry triggers**: SL price = entry × (1 − SL%/100) for longs (reversed for shorts), Target = entry × (1 + Target%/100). Placed on Kite via `/gtt/triggers`.
+
+#### Rules Table (fully inline-editable)
+Columns: # / Type / Side / Symbol / Qty / TF / Algo / Indicators / Score / Status / **Action**. Every cell except `#` and `Status` is editable via inline `<input>`/`<select>`. Inputs lock while automation is running. The **Action** column has a prominent red **🗑 Delete** button per row. Edits persist immediately to `localStorage` and broadcast to other windows via storage events.
+
+#### Safety Bar (above Start/Stop)
+Three controls — left to right:
+- **⚠ Live trades** checkbox — when unchecked (default), every order goes dry-run (`[DRY]` logged, no Kite call). When checked, real orders hit Kite Connect.
+- **Market Order** checkbox — when checked, sends `order_type=MARKET` with **no `market_protection`**. NSE/BSE accept; MCX/NFO typically reject (Zerodha policy). When unchecked, sends `order_type=LIMIT` at `signal_price ± MP%` computed client-side. Persists in `mangalview_zerodha_market_order_v1`.
+- **Market Protection %** number input (default 2%, range 0.1–20%) — used as the LIMIT-price buffer when Market Order is unchecked. Disabled/dimmed when Market Order is checked. Persists in `mangalview_zerodha_market_protection_v1`.
+
+#### Start / Stop
+- Separate **▶ Start Automation** (green) and **■ Stop Automation** (red) buttons. The inactive one is greyed out.
+- Tick interval: **15 seconds**.
+- **Start** resets per-rule dedup state (`lastOrder`, `_lastDedupLog`) and rule statuses, so a fresh run isn't blocked by stale state from a previous session persisted in `localStorage`.
+- **Stop** clears local position state (Kite-side positions/GTTs are NOT cancelled — exit those via Kite app if needed).
+
+#### runAutomation Tick Pipeline (every 15s)
+For each rule (GTT rules skipped — they're placed reactively):
+1. Auto-backfill `rule.exchange` from a Kite-style tradingsymbol pattern if missing (MCX for CRUDEOIL*/GOLD*/SILVER*/NATURALGAS/COPPER/ZINC/LEAD/NICKEL/ALUMINIUM/MENTHA/CASTOR; NFO for NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNXT50; BFO for SENSEX/BANKEX/SENSEX50). Logs `[Migrate]` on first back-fill.
+2. Choose data source: rules with a Kite exchange + active session → `source=kite` (real contract candles from Kite historical API). Otherwise the chart-symbol path with `_inferChartFromSym()` mapping (e.g., `CRUDEOILM26JUNFUT` → `CRUDEOILMCX` via TradingView).
+3. Live mode only: poll `/api/zerodha/positions` and reset any locally-tracked symbol whose Kite quantity is 0 (catches GTT triggers, manual square-off).
+4. Fetch `/api/candles?symbol=...&interval=...&source=...&algo=...`.
+5. Evaluate the rule (algo / indicator / mm) against the response. Log `[Tick] [KITE] CRUDEOILM26JUNFUT #9 close=8410 SuperTrend(bearish)=✓` or similar with full reason breakdown.
+6. **Position-state gating**: entry rules only fire when position is flat for that `tradeSymbol`; exit rules only fire when position is open. Logs `[Gated] ENTRY skipped — CRUDEOILM26JUNFUT already open` (or `EXIT skipped — not open`).
+7. **Dedup**: skip if `rule.lastOrder === candleKey` (already fired on this candle). Logs `[Dedup] rule #9 already fired on candle @ HH:MM:SS — waiting for next 5m candle` once per candle.
+8. Build the order body: LIMIT@quantized_price or MARKET (no MP). POST `/api/zerodha/order` with `dry_run` flag.
+9. On accept: log `[LIVE]/[DRY] [ENTRY] SELL 1 CRUDEOILM26JUNFUT@MCX LIMIT@8242 signal=8410 (5m) Ind:[SuperTrend] score=-3.8 #2060221668135051264` and open/close position state.
+10. For entries on success: also place every matching `gtt-exit` rule via `/api/zerodha/gtt`.
+11. Live orders: after 3s, poll `/api/zerodha/order_status?order_id=...` to confirm actual fill. Logs `[OrderStatus] #... COMPLETE filled=1/1 avg=8410` or `REJECTED filled=0/1 msg="..."` plus an actionable `[Hint]` line for circuit/margin/MP-related rejections. If REJECTED/CANCELLED, position is auto-reverted to flat so the rule can re-fire.
+
+#### Per-Instrument Position State (in-memory, per window)
+`zdPositions[tradeSymbol] = {state, side, entryPrice, entryTime, entryRuleId, gttIds}`. State is `'long'`, `'short'`, or absent (flat). Updates on order acceptance (optimistic) and rolls back if status poll reports non-COMPLETE/OPEN. Synced from Kite positions every tick in live mode so external exits register.
+
+#### Tick-Size Quantization
+Every LIMIT, SL trigger, and GTT price is quantized to the instrument's tick_size before being sent to Kite. Lookup hits Kite cache first, falls back to `instruments.csv`, defaults to 0.05. Examples: `CRUDEOILM26JUNFUT @ MCX` tick=**1.00** (price 8241.80 → 8242); `RELIANCE @ NSE` tick=**0.05**; `NIFTY26JUN24000CE @ NFO` tick=**0.05**. Prevents `INVALID PRICE - NOT AS PER TICKSIZE` rejections.
+
+#### IPv4-Only HTTPS for Kite Calls
+Kite Connect IP whitelisting accepts **IPv4 only**, but Python's `urllib.request` happy-eyeballs IPv6 first on dual-stack hosts → Kite rejects with `IP (2401:...) is not allowed`. The custom `_kite_urlopen` opener pins every `api.kite.trade` connection to IPv4 via a subclassed `HTTPSConnection.connect()` that calls `getaddrinfo(host, port, AF_INET, ...)`. Applied to all 5 Kite call-sites: orders/regular, instruments/NFO, instruments full, instruments/historical/{token}, session/token, gtt/triggers, portfolio/positions, orders/{order_id}.
+
+#### Kite Historical Data Source (`source=kite`)
+`fetch_kite_data(interval, symbol, api_key)` looks up `instrument_token` from the Kite cache, then calls `https://api.kite.trade/instruments/historical/{token}/{interval}` with the user's `Authorization: token api_key:access_token`. Returns OHLCV in the same shape as `fetch_nifty_data`. Falls back to TradingView/yfinance if Kite returns empty (not connected, IP not whitelisted). Used by `/api/candles?source=kite` when the rule has an Indian exchange.
+
+#### Kite Connect API Endpoints (added)
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/zerodha/connect` | Store `{api_key, access_token}` in `zerodha_sessions[api_key]` |
+| `POST /api/zerodha/generate_token` | Exchange `{api_key, api_secret, request_token}` for `access_token` via Kite `/session/token` |
+| `POST /api/zerodha/order` | Place a regular order. Body: `api_key, symbol, exchange, side, qty, order_type (MARKET/LIMIT/SL/SL-M), product (auto NRML for derivatives else MIS), market_protection (% — sent only if > 0 and MARKET), price (LIMIT/SL), trigger_price (SL/SL-M), dry_run` (default true). Auto-derives exchange from instrument cache if missing (prefers NSE > BSE > NFO > BFO > MCX > CDS > BCD > NCO). Quantizes price to tick size. Returns `{success, orderId, order, sent_price, dry_run}` or rich error context |
+| `GET /api/zerodha/orders` | Last 50 entries from the in-memory `zerodha_orders` log |
+| `GET /api/zerodha/order_status?api_key=...&order_id=...` | Queries Kite `/orders/{order_id}`, returns `{status, status_message, average_price, filled_quantity, pending_quantity, exchange_order_id, transaction_type, tradingsymbol}` |
+| `GET /api/zerodha/positions?api_key=...` | Queries Kite `/portfolio/positions`, returns `{symbol: net_qty}` map |
+| `POST /api/zerodha/gtt` | Places a GTT. Body: `api_key, tradingsymbol, exchange, trigger_type (single/OCO/two-leg), side, qty, ltp, sl_price, target_price, product, order_type (default LIMIT), dry_run`. For OCO sends Kite `two-leg` with sorted trigger_values. Quantizes all prices to tick size |
+| `GET /api/zerodha/instruments/search?q=&seg=` | All-tab search (curated `_ZD_INSTRUMENTS` + INR-filtered `instruments.csv` fallback when query has no curated match). Max 200 results |
+| `GET /api/zerodha/csv/search?q=` | Zerodha Inst tab — searches `instruments.csv` (full Kite master dump bundled with repo), INR-filtered |
+| `GET /api/zerodha/kite/search?q=` | Kite tab — live `api.kite.trade/instruments` (cached 1h), INR-filtered, smart-parsing queries like "NIFTY 24000" |
+| `GET /api/zerodha/nfo/search?q=` | Options tab — live `api.kite.trade/instruments/NFO` (cached 1h), CE/PE only |
+| `POST /api/zerodha/nfo/refresh` | Force-reload the NFO cache |
+| `GET /api/myip` | Returns server's outbound public IP (queries `api.ipify.org` / `ifconfig.me`) — useful for setting up the Kite IP whitelist |
+
+#### Local Instruments Cache (`instruments.csv`)
+12 MB Kite master dump committed to the repo for offline fallback. Loaded lazily by `_load_csv_instruments()`, kept in memory, reloaded only when file mtime changes. Each row has: `instrument_token, symbol, name, expiry, strike, tick_size, type (EQ/FUT/CE/PE/INDEX), lot_size, segment, exchange`.
+
+#### Live Kite Instruments Cache
+`_load_kite_all_instruments()` fetches `https://api.kite.trade/instruments` (~11 MB, no auth required), parses to the same dict shape including `instrument_token` and `tick_size`. Cached in memory for 1 hour. Used by the Kite tab search, `fetch_kite_data`, the order endpoint's auto-exchange lookup, and the tick-size quantizer.
+
+#### Log Tags (cheat sheet)
+- `[Tick]` — every 15s per rule, shows source + symbol + close + indicator/score breakdown
+- `[Migrate]` — one-time back-fill of legacy rule's missing exchange
+- `[Gated]` — rule skipped because position state doesn't allow it
+- `[Dedup]` — rule skipped because already fired on the same candle
+- `[DRY] [ENTRY/EXIT]` — dry-run order accepted (no Kite call)
+- `[LIVE] [ENTRY/EXIT]` — real Kite order accepted (Kite returned an order_id)
+- `[OrderStatus]` — actual fill status from Kite a few seconds later
+- `[Hint]` — actionable rejection hint (circuit/margin/MP)
+- `[Position]` — local position state change (OPEN/FLAT/reverted)
+- `[GTT]` / `[GTT-DRY]` — GTT placement result
+
 ## Commands
 
 ### Options Chain
@@ -300,19 +408,24 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 
 ### Candlestick Chart
 - **Start server**: `python scripts/nifty_chart.py` → opens at http://localhost:5050
-- **API endpoint**: `GET /api/candles?interval=5m&symbol=NIFTY50&source=tradingview&algo=janestreet&st_period=10&st_multiplier=3&sar_start=0.02&sar_inc=0.02&sar_max=0.2&bb_period=20&bb_stddev=2.0&bt_qty=0`
+- **API endpoint**: `GET /api/candles?interval=5m&symbol=NIFTY50&source=tradingview&algo=janestreet&st_period=10&st_multiplier=3&sar_start=0.02&sar_inc=0.02&sar_max=0.2&bb_period=20&bb_stddev=2.0&bt_qty=0` — also accepts `source=kite&api_key=...` for Kite historical-data fetch keyed by an active Zerodha session
 - **Search endpoint**: `GET /api/search?q=reliance` — searches Yahoo Finance, auto-resolves `.NS`/`.BO` suffixes for Indian stocks
 - **Trade endpoints**: `POST /api/trade/start`, `POST /api/trade/execute`, `POST /api/trade/stop`, `GET /api/trade/status?sessionId=...`
 - Returns JSON: `{candles, supertrend, parabolicSAR, supportResistance, ema9, ema21, vwap, rsi, macd, patterns, signals, signalSummary, cpr, bollingerBands, liquidityPools, fairValueGaps, bosChoch, cvd, volumeProfile, orb, backtest, predictions}`
 - **Admin endpoints**: `GET /admin?key=mangal2026`, `GET/POST /admin/api/settings`, `GET/POST/PUT/DELETE /admin/api/users`
 - **Site settings endpoint**: `GET /api/site-settings` — returns admin-controlled visibility flags
 - **Help endpoints**: `GET /help/algos`, `GET /help/indicators`, `GET /help/manual`
+- **Zerodha automation endpoints**: `POST /api/zerodha/connect`, `POST /api/zerodha/generate_token`, `POST /api/zerodha/order`, `GET /api/zerodha/orders`, `GET /api/zerodha/order_status`, `GET /api/zerodha/positions`, `POST /api/zerodha/gtt`, `GET /api/zerodha/instruments/search`, `GET /api/zerodha/csv/search`, `GET /api/zerodha/kite/search`, `GET /api/zerodha/nfo/search`, `POST /api/zerodha/nfo/refresh`, `GET /api/myip`
 
 ## Data Sources
 - **Options Chain**: NSE India API (`https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY`) via `curl_cffi` with Chrome impersonation
 - **OHLCV Data (Yahoo)**: Yahoo Finance via `yfinance` library. Free, ~15 min delay. Interval mapping: 1m→1m/5d, 2m→2m/1d, 3m→5m/5d, 5m→5m/5d, 10m→15m/10d (aggregated), 15m→15m/10d, 30m→30m/30d, 1h→1h/30d, 2h→1h/60d (aggregated), 4h→1h/60d (aggregated), 1d→1d/1y, 1w→1wk/5y, 1mo→1mo/10y. 2H, 4H, and 10m candles are aggregated server-side. Supports all symbols
 - **OHLCV Data (TradingView)**: TradingView WebSocket API (`wss://data.tradingview.com/socket.io/websocket`) via `websocket-client`. Near real-time, 300 bars per request. Uses unofficial `unauthorized_user_token` auth. Supports NSE, BSE, COMEX, NYMEX, crypto exchanges. Interval mapping: 1m→"1", 2m→"2", 3m→"3", 5m→"5", 10m→"10", 15m→"15", 30m→"30", 1h→"60", 2h→"120", 4h→"240", 1d→"D", 1w→"W", 1mo→"M"
 - **OHLCV Data (NSE)**: NSE India chart API (`https://www.nseindia.com/api/chart-databyindex`) via `curl_cffi`. Returns tick-level [timestamp, price] pairs for current trading day only. Aggregated into OHLC candles at the requested interval server-side. No volume data. Empty after market hours (post 3:30 PM IST). Only supports NIFTY 50 and BANK NIFTY indices
+- **OHLCV Data (Kite, `source=kite`)**: Kite Connect v3 historical-data REST (`https://api.kite.trade/instruments/historical/{instrument_token}/{interval}`) via IPv4-pinned `urllib.request`. Authenticated with the user's `access_token`. Returns real-contract candles (not proxies) for any Indian tradable instrument. Interval mapping: 1m→`minute`, 3m→`3minute`, 5m→`5minute`, 10m→`10minute`, 15m→`15minute`, 30m→`30minute`, 1h→`60minute`, 2h/4h→aggregated from 1h, 1d→`day`. Falls back to TradingView/yfinance on failure (not connected, IP not whitelisted, token unknown)
+- **Kite Instruments Master**: `https://api.kite.trade/instruments` (~11 MB, ~121K rows, no auth required). Cached in memory for 1 hour. Fields per row: `instrument_token, tradingsymbol, name, expiry, strike, tick_size, instrument_type (EQ/FUT/CE/PE/INDEX), lot_size, segment, exchange`
+- **Kite Instruments NFO Subset**: `https://api.kite.trade/instruments/NFO` filtered to CE/PE only. Used by the Options tab and the NFO smart-search endpoint
+- **Local Instruments CSV**: `instruments.csv` at the repo root (~12 MB, committed) — same schema as Kite master dump, used as offline fallback when live Kite fetch fails
 - **Search**: Yahoo Finance ticker info API — resolves symbol names, exchanges, and proper ticker suffixes
 
 ## Dependencies
@@ -355,6 +468,14 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - **Theme**: Dark (toggleable to Light via Theme button, persisted in localStorage)
 - **Live refresh**: 5 seconds when LIVE mode is on
 - **Loading Screen**: Branded "Mangal View" with spinner and "Loading chart data..." text
+- **Zerodha Automation tick interval**: 15 seconds
+- **Zerodha Live trades checkbox**: unchecked (dry-run by default)
+- **Zerodha Market Order checkbox**: unchecked (LIMIT mode by default)
+- **Zerodha Market Protection**: 2% (used as LIMIT-price buffer; tighter = less slippage but more circuit-limit rejections on MCX)
+- **Zerodha Exchange dropdown**: Auto (infers from tradingsymbol pattern)
+- **Zerodha order product**: NRML for derivatives (NFO/BFO/MCX/CDS/BCD/NCO), MIS otherwise. Override via request body
+- **Zerodha order_type**: MARKET when Market Order checked, otherwise LIMIT at signal_price ± MP%
+- **GTT defaults**: Type=Exit, Trigger=OCO, SL=2%, Target=4%
 
 ## Constraints
 - DO NOT give buy/sell recommendations or trading advice
@@ -362,3 +483,14 @@ Fetch, analyze, and present Nifty options chain data from NSE India. Manage an i
 - ALWAYS disclaim that data is for informational purposes only
 - ALWAYS mention the timestamp of fetched data
 - If data fetch fails, suggest the user check their internet connection or try again later
+
+## Zerodha Live-Trading Operational Notes
+- **Access token expiry**: Kite Connect access tokens expire daily ~06:00 IST. User must re-Connect via the Zerodha Login panel each morning before market open
+- **IP whitelisting**: Zerodha requires the server's outbound IPv4 to be registered on the Kite app's Allowed IPs (most personal-tier accounts request this via email to `kiteconnect@zerodha.com`). The `/api/myip` endpoint returns the current outbound IP. Cloud hosts (Render free) without static outbound IPs are unusable for live trading — use Render Pro static IPs, a $3-5/mo VPS proxy, or Fly.io with dedicated IPv4
+- **Market hours by exchange**: NSE/BSE equity 09:15–15:30 IST; NFO/BFO derivatives same; MCX commodities 09:00–23:30/23:55 IST. Orders outside hours queue or reject
+- **Circuit limits**: MCX commodities have ~±3-4% circuit bands around LTP per session. LIMIT prices outside that band get rejected as "outside circuit limits" — tighten Market Protection % accordingly (2% works for MCX crude typically)
+- **Tick sizes**: every LIMIT/SL/GTT price is server-side rounded to the instrument's tick. Common values: MCX CRUDEOILM=1.00, NSE equity=0.05, NFO options=0.05, BSE equity=0.01
+- **MARKET on MCX**: Kite policy rejects bare MARKET orders on MCX without `market_protection`. The "Market Order" checkbox lets the user opt out of MP — works on NSE/BSE equity, expected to fail on MCX/NFO
+- **In-memory state**: `zerodha_sessions`, `zerodha_orders`, position state are all in-memory in the Flask process — server restart wipes them. Users must re-Connect after a deploy/restart
+- **Order acceptance ≠ fill**: Kite's "success" response on order placement means "accepted into the order book", NOT "filled". The `[OrderStatus]` poll 3s later checks the actual `status` (COMPLETE/OPEN/REJECTED/CANCELLED) and reverts the local position state on non-fill
+- **External exits**: GTT triggers and manual square-off on the Kite app close positions outside our automation. The 15s position-sync poll catches this and resets local state to flat so entry rules can re-fire

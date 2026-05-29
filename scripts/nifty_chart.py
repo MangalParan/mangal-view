@@ -699,7 +699,13 @@ def zerodha_order():
     # orders without this set (the API won't let bots fire blind market orders).
     # Default 3% — narrow enough to be safe, wide enough to fill in normal
     # market conditions. User can override per-order via the request body.
-    market_protection = float(data.get('market_protection', 3.0) or 3.0)
+    # NB: cannot do `float(... or 5.0)` here — `0 or 5.0` is 5.0 (0 is falsy).
+    # That would silently override "Market Order = no MP" (mp=0) requests.
+    _mp_raw = data.get('market_protection')
+    try:
+        market_protection = float(_mp_raw) if _mp_raw is not None else 5.0
+    except (TypeError, ValueError):
+        market_protection = 5.0
     limit_price  = data.get('price')   # for LIMIT/SL orders
     trigger_price = data.get('trigger_price')   # for SL/SL-M
     algo         = data.get('algo', '')
@@ -737,17 +743,28 @@ def zerodha_order():
     if not product:
         product = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
 
+    # Quantize LIMIT/SL prices to the instrument's tick size before logging
+    # (so the dry-run preview matches what the live path would send).
+    if order_type in ('LIMIT', 'SL', 'SL-M'):
+        _tick = _get_instrument_tick(symbol, exchange)
+        if order_type in ('LIMIT', 'SL') and limit_price is not None:
+            limit_price = _quantize_to_tick(limit_price, _tick)
+        if order_type in ('SL', 'SL-M') and trigger_price is not None:
+            trigger_price = _quantize_to_tick(trigger_price, _tick)
+
     # Dry-run: log only, return a fake order id
     if dry_run:
         order_id = 'DRY-' + str(uuid.uuid4())[:6]
         entry = {
             'order_id': order_id, 'symbol': symbol, 'exchange': exchange,
             'side': side, 'qty': qty, 'product': product, 'order_type': order_type,
+            'price': limit_price, 'trigger_price': trigger_price,
             'algo': algo, 'score': score, 'status': 'DRY-RUN',
             'timestamp': datetime.utcnow().isoformat()
         }
         zerodha_orders.append(entry)
-        return jsonify({'success': True, 'orderId': order_id, 'order': entry, 'dry_run': True})
+        return jsonify({'success': True, 'orderId': order_id, 'order': entry, 'dry_run': True,
+                        'sent_price': limit_price})
 
     # Real order via Kite Connect v3 REST API
     access_token = zerodha_sessions[api_key].get('access_token', '')
@@ -763,13 +780,22 @@ def zerodha_order():
         'order_type':       order_type,
         'validity':         'DAY',
     }
-    # MARKET orders need an explicit market_protection % (Kite API requirement).
-    if order_type == 'MARKET':
+    # MARKET orders: attach market_protection only if the caller set a positive
+    # value. When zero/omitted, the request goes bare to Kite as a true MARKET
+    # order. Kite enforces MP on some exchanges (MCX in particular) and will
+    # reject — that's the user's explicit choice when the "Market Order"
+    # checkbox is ticked in the panel.
+    if order_type == 'MARKET' and market_protection > 0:
         payload_d['market_protection'] = market_protection
-    # LIMIT / SL orders need a price; SL / SL-M need a trigger
+    # LIMIT / SL orders need a price; SL / SL-M need a trigger.
+    # Quantize to the instrument's tick size — Kite rejects any price that
+    # isn't an exact multiple (MCX CRUDEOILM tick=1.00, NSE equity 0.05, etc.).
+    _tick = _get_instrument_tick(symbol, exchange) if order_type in ('LIMIT', 'SL', 'SL-M') else 0
     if order_type in ('LIMIT', 'SL') and limit_price is not None:
+        limit_price = _quantize_to_tick(limit_price, _tick)
         payload_d['price'] = limit_price
     if order_type in ('SL', 'SL-M') and trigger_price is not None:
+        trigger_price = _quantize_to_tick(trigger_price, _tick)
         payload_d['trigger_price'] = trigger_price
     payload = _up.urlencode(payload_d).encode('utf-8')
     req = _zd_urllib.Request(
@@ -802,8 +828,12 @@ def zerodha_order():
         # Include the order context so the user can see what was actually sent
         ctx_parts = ['{} {} qty={} exch={} prod={}'.format(side, symbol, qty, exchange, product),
                      'type=' + order_type]
-        if order_type == 'MARKET':
+        if order_type == 'MARKET' and market_protection > 0:
             ctx_parts.append('mp={}%'.format(market_protection))
+        elif order_type == 'MARKET':
+            ctx_parts.append('mp=none')
+        if order_type in ('LIMIT', 'SL') and limit_price is not None:
+            ctx_parts.append('price={}'.format(limit_price))
         return jsonify({
             'success': False,
             'error':   'Kite HTTP {}: {} (sent: {})'.format(e.code, err_msg, ' '.join(ctx_parts)),
@@ -817,17 +847,249 @@ def zerodha_order():
         entry = {
             'order_id': order_id, 'symbol': symbol, 'exchange': exchange,
             'side': side, 'qty': qty, 'product': product, 'order_type': order_type,
+            'price': limit_price, 'trigger_price': trigger_price,
             'algo': algo, 'score': score, 'status': 'PLACED',
             'timestamp': datetime.utcnow().isoformat()
         }
         zerodha_orders.append(entry)
-        return jsonify({'success': True, 'orderId': order_id, 'order': entry})
+        return jsonify({'success': True, 'orderId': order_id, 'order': entry,
+                        'sent_price': limit_price})
     return jsonify({'success': False, 'error': resp_data.get('message', 'Order rejected'), 'data': resp_data})
 
 @app.route('/api/zerodha/orders', methods=['GET'])
 @login_required
 def zerodha_orders_list():
     return jsonify({'success': True, 'orders': zerodha_orders[-50:]})
+
+@app.route('/api/zerodha/order_status', methods=['GET'])
+@login_required
+def zerodha_order_status():
+    """Query Kite for the current status of an order. Used by the front-end
+    a few seconds after placing an order to confirm whether it actually
+    filled, sat as OPEN, was REJECTED, or CANCELLED.
+
+    Query params:  api_key, order_id
+    Returns:       {status, status_message, average_price, filled_quantity,
+                    pending_quantity, exchange_order_id, ...}
+    """
+    import json as _json, urllib.parse as _up
+    api_key  = request.args.get('api_key', '').strip()
+    order_id = request.args.get('order_id', '').strip()
+    if not api_key or api_key not in zerodha_sessions:
+        return jsonify({'success': False, 'error': 'Not connected'}), 403
+    if not order_id:
+        return jsonify({'success': False, 'error': 'Missing order_id'}), 400
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    req = _zd_urllib.Request(
+        'https://api.kite.trade/orders/' + _up.quote(order_id),
+        headers={
+            'X-Kite-Version': '3',
+            'Authorization':  'token {}:{}'.format(api_key, access_token),
+            'User-Agent':     'Mozilla/5.0',
+        }, method='GET'
+    )
+    try:
+        with _kite_urlopen(req, timeout=10) as resp:
+            body = resp.read().decode('utf-8')
+        data = _json.loads(body)
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Kite request failed: {}'.format(e)})
+    if data.get('status') != 'success':
+        return jsonify({'success': False, 'error': data.get('message', 'Kite error')})
+    # Kite returns a list (history of state transitions) — last entry is current
+    history = data.get('data', []) or []
+    if not history:
+        return jsonify({'success': False, 'error': 'No order found'})
+    cur = history[-1]
+    return jsonify({
+        'success':            True,
+        'order_id':           cur.get('order_id'),
+        'status':             cur.get('status'),              # OPEN / COMPLETE / REJECTED / CANCELLED
+        'status_message':     cur.get('status_message'),       # Kite's reason text
+        'average_price':      cur.get('average_price'),
+        'filled_quantity':    cur.get('filled_quantity'),
+        'pending_quantity':   cur.get('pending_quantity'),
+        'exchange_order_id':  cur.get('exchange_order_id'),
+        'transaction_type':   cur.get('transaction_type'),
+        'tradingsymbol':      cur.get('tradingsymbol'),
+    })
+
+@app.route('/api/zerodha/positions', methods=['GET'])
+@login_required
+def zerodha_positions():
+    """Return current net positions from Kite, compressed to {symbol: net_qty}.
+
+    The Automation panel polls this each tick to detect external exits
+    (GTT triggers, manual square-off on Kite app, etc.) so it can reset
+    in-memory position state and let entry rules fire again.
+    """
+    import json as _json
+    api_key = request.args.get('api_key', '').strip()
+    if not api_key or api_key not in zerodha_sessions:
+        return jsonify({'success': False, 'error': 'Not connected', 'positions': {}})
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        return jsonify({'success': False, 'error': 'No access token', 'positions': {}})
+
+    req = _zd_urllib.Request(
+        'https://api.kite.trade/portfolio/positions',
+        headers={
+            'X-Kite-Version': '3',
+            'Authorization': 'token {}:{}'.format(api_key, access_token),
+            'User-Agent':    'Mozilla/5.0',
+        }, method='GET'
+    )
+    try:
+        with _kite_urlopen(req, timeout=15) as resp:
+            body = resp.read().decode('utf-8')
+        data = _json.loads(body) if body else {}
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Kite request failed: {}'.format(e), 'positions': {}})
+    if data.get('status') != 'success':
+        return jsonify({'success': False, 'error': data.get('message', 'Kite error'), 'positions': {}})
+    positions = {}
+    for p in (data.get('data', {}).get('net', []) or []):
+        sym = p.get('tradingsymbol', '')
+        if sym:
+            try:
+                positions[sym] = int(p.get('quantity', 0) or 0)
+            except (TypeError, ValueError):
+                positions[sym] = 0
+    return jsonify({'success': True, 'positions': positions})
+
+@app.route('/api/zerodha/gtt', methods=['POST'])
+@login_required
+def zerodha_gtt():
+    """Place a GTT (Good Till Triggered) on Kite.
+
+    Body params (JSON):
+        api_key (str)
+        tradingsymbol (str)
+        exchange (str)
+        trigger_type (str): 'single' | 'OCO' | 'two-leg'
+        side (str): BUY | SELL  (the side of the resulting order)
+        qty (int)
+        ltp (float):           current last-traded-price for Kite's condition
+        sl_price (float):      stop-loss trigger price (always required)
+        target_price (float):  target trigger price (required for OCO)
+        product (str):         default NRML for derivatives, CNC otherwise
+        order_type (str):      default LIMIT (Kite GTTs only support LIMIT)
+        dry_run (bool):        default True (log only, no Kite call)
+    """
+    import urllib.parse as _up, urllib.error as _ue, json as _json
+    data = request.json or {}
+    api_key      = data.get('api_key', '').strip()
+    symbol       = data.get('tradingsymbol', '').strip()
+    exchange     = (data.get('exchange') or '').strip().upper()
+    trigger_type = (data.get('trigger_type') or 'single').strip()
+    side         = data.get('side', '').upper()
+    qty          = int(data.get('qty', 1) or 1)
+    ltp          = float(data.get('ltp', 0) or 0)
+    sl_price     = float(data.get('sl_price', 0)     or 0) if data.get('sl_price')     not in (None, '') else None
+    target_price = float(data.get('target_price', 0) or 0) if data.get('target_price') not in (None, '') else None
+    product      = (data.get('product') or '').strip().upper()
+    order_type   = (data.get('order_type') or 'LIMIT').strip().upper()
+    dry_run      = data.get('dry_run', True)
+
+    if api_key not in zerodha_sessions:
+        return jsonify({'success': False, 'error': 'Not connected'}), 403
+    if side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'Invalid side'}), 400
+    if not symbol or not exchange:
+        return jsonify({'success': False, 'error': 'Missing tradingsymbol or exchange'}), 400
+    if not product:
+        product = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'CNC'
+
+    gtt_type = 'two-leg' if trigger_type.upper() in ('OCO', 'TWO-LEG') else 'single'
+
+    if gtt_type == 'single':
+        if not sl_price:
+            return jsonify({'success': False, 'error': 'sl_price required for single GTT'}), 400
+        sl_q = _quantize_to_tick(sl_price, _get_instrument_tick(symbol, exchange))
+        trigger_values = [sl_q]
+        orders = [{
+            'exchange': exchange, 'tradingsymbol': symbol,
+            'transaction_type': side, 'quantity': qty,
+            'order_type': order_type, 'product': product,
+            'price': sl_q,
+        }]
+    else:
+        if not sl_price or not target_price:
+            return jsonify({'success': False, 'error': 'Both sl_price and target_price required for OCO'}), 400
+        _tick = _get_instrument_tick(symbol, exchange)
+        sl_q  = _quantize_to_tick(sl_price,     _tick)
+        tg_q  = _quantize_to_tick(target_price, _tick)
+        trigger_values = sorted([sl_q, tg_q])
+        orders = [{
+            'exchange': exchange, 'tradingsymbol': symbol,
+            'transaction_type': side, 'quantity': qty,
+            'order_type': order_type, 'product': product,
+            'price': trigger_values[0],
+        }, {
+            'exchange': exchange, 'tradingsymbol': symbol,
+            'transaction_type': side, 'quantity': qty,
+            'order_type': order_type, 'product': product,
+            'price': trigger_values[1],
+        }]
+
+    condition = {
+        'exchange': exchange, 'tradingsymbol': symbol,
+        'trigger_values': trigger_values,
+        'last_price': _quantize_to_tick(ltp, _get_instrument_tick(symbol, exchange)),
+    }
+
+    if dry_run:
+        trigger_id = 'DRY-GTT-' + str(uuid.uuid4())[:6]
+        return jsonify({
+            'success': True, 'triggerId': trigger_id, 'dry_run': True,
+            'sent': {'type': gtt_type, 'condition': condition, 'orders': orders},
+        })
+
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    payload = _up.urlencode({
+        'type':      gtt_type,
+        'condition': _json.dumps(condition),
+        'orders':    _json.dumps(orders),
+    }).encode('utf-8')
+    req = _zd_urllib.Request(
+        'https://api.kite.trade/gtt/triggers',
+        data=payload,
+        headers={
+            'X-Kite-Version': '3',
+            'Authorization':  'token {}:{}'.format(api_key, access_token),
+            'Content-Type':   'application/x-www-form-urlencoded',
+            'User-Agent':     'Mozilla/5.0',
+        }, method='POST'
+    )
+    try:
+        with _kite_urlopen(req, timeout=15) as resp:
+            body = resp.read().decode('utf-8')
+        resp_data = _json.loads(body) if body else {}
+    except _ue.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8')
+        except Exception:
+            pass
+        try:
+            err_data = _json.loads(err_body)
+            err_msg = err_data.get('message', err_body[:300])
+        except Exception:
+            err_msg = err_body[:300] or str(e)
+        return jsonify({
+            'success': False,
+            'error': 'Kite GTT HTTP {}: {} (sent: {} {} qty={} type={} SL={} T={})'.format(
+                e.code, err_msg, side, symbol, qty, gtt_type, sl_price, target_price
+            ),
+            'sent': {'type': gtt_type, 'condition': condition, 'orders': orders},
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Kite GTT request failed: {}'.format(e)})
+
+    if resp_data.get('status') == 'success':
+        trigger_id = resp_data.get('data', {}).get('trigger_id', '')
+        return jsonify({'success': True, 'triggerId': trigger_id})
+    return jsonify({'success': False, 'error': resp_data.get('message', 'GTT rejected'), 'data': resp_data})
 
 @app.route('/api/myip', methods=['GET'])
 @login_required
@@ -992,12 +1254,67 @@ _ZD_INSTRUMENTS = [
     {"symbol":"ETH",        "name":"Ethereum / USD",          "exchange":"CRYPTO","type":"CRYPTO","seg":"CRYPTO","tags":"crypto ethereum eth digital currency"},
 ]
 
+# Indian exchanges only — the Zerodha panel intentionally hides USD/foreign
+# symbols (US equities, CME/COMEX/NYMEX futures, FX, crypto) so an order
+# can never be routed to something Zerodha can't trade.
+_ZD_INR_EXCHANGES = frozenset({'NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO'})
+
+def _is_zd_inr(row):
+    return (row.get('exchange') or '').strip().upper() in _ZD_INR_EXCHANGES
+
+# Per-instrument tick size lookup + price quantizer.
+# Exchanges enforce minimum tick sizes (MCX CRUDEOILM = 1.00, NSE equity = 0.05,
+# NFO options usually 0.05, etc.). Sending a LIMIT or GTT trigger price that
+# isn't an exact multiple of the tick gets rejected as
+# "INVALID PRICE - NOT AS PER TICKSIZE".
+def _get_instrument_tick(symbol, exchange=''):
+    """Find the tick_size for a Kite tradingsymbol. Falls back to 0.05 if unknown."""
+    sym_u  = (symbol  or '').upper().strip()
+    exch_u = (exchange or '').upper().strip()
+    if not sym_u:
+        return 0.05
+    def _try(rows):
+        if not rows:
+            return None
+        match_exact = None
+        match_anyexch = None
+        for r in rows:
+            rsym = (r.get('symbol') or '').upper()
+            if rsym != sym_u:
+                continue
+            try:
+                ts = float(r.get('tick_size') or 0)
+            except (TypeError, ValueError):
+                ts = 0
+            if ts <= 0:
+                continue
+            rexch = (r.get('exchange') or '').upper()
+            if exch_u and rexch == exch_u:
+                match_exact = ts
+                break
+            if match_anyexch is None:
+                match_anyexch = ts
+        return match_exact if match_exact is not None else match_anyexch
+    for src in (_load_kite_all_instruments(), _load_csv_instruments()):
+        ts = _try(src)
+        if ts:
+            return ts
+    return 0.05
+
+def _quantize_to_tick(price, tick_size):
+    """Round `price` to the nearest multiple of `tick_size`."""
+    if not tick_size or tick_size <= 0:
+        return round(float(price), 2)
+    n = round(float(price) / float(tick_size))
+    return round(n * float(tick_size), 4)
+
 @app.route('/api/zerodha/instruments/search')
 @login_required
 def zerodha_instrument_search():
     q   = request.args.get('q', '').strip().upper()
     seg = request.args.get('seg', '').strip()       # optional filter: NIFTY50, BANKNIFTY, etc.
-    results = list(_ZD_INSTRUMENTS)
+    # Drop non-INR entries (USOIL/XAUUSD/BTC/etc.) from the curated list
+    results = [r for r in _ZD_INSTRUMENTS if _is_zd_inr(r)]
     # Special virtual segment for OPTIONS tab
     if seg == 'OPTIONS':
         results = [r for r in results if 'options' in r.get('tags', '').lower()]
@@ -1211,6 +1528,7 @@ def _load_csv_instruments():
                     'name':         (row.get('name') or '').strip(),
                     'expiry':       (row.get('expiry') or '').strip(),
                     'strike':       (row.get('strike') or '').strip(),
+                    'tick_size':    (row.get('tick_size') or '').strip(),
                     'type':         (row.get('instrument_type') or '').strip(),
                     'lot_size':     (row.get('lot_size') or '').strip(),
                     'segment':      (row.get('segment') or '').strip(),
@@ -1226,7 +1544,8 @@ def _load_csv_instruments():
 @app.route('/api/zerodha/csv/search')
 @login_required
 def zerodha_csv_search():
-    """Search the locally-bundled instruments.csv. Returns up to 200 matches."""
+    """Search the locally-bundled instruments.csv. Returns up to 200 matches.
+    Filtered to Indian exchanges only (INR-priced contracts)."""
     q = request.args.get('q', '').strip().upper()
     rows = _load_csv_instruments()
     if not rows:
@@ -1235,6 +1554,8 @@ def zerodha_csv_search():
             'error':   'instruments.csv could not be loaded (file missing or empty).',
             'results': []
         })
+    # Pre-filter to INR exchanges
+    rows = [r for r in rows if _is_zd_inr(r)]
     if q:
         filtered = []
         for r in rows:
@@ -1345,6 +1666,7 @@ def _load_kite_all_instruments():
                 'expiry':       expiry_raw,
                 'expiry_short': expiry_short,
                 'strike':       strike_val,
+                'tick_size':    (row.get('tick_size') or '').strip(),
                 'type':         (row.get('instrument_type') or '').strip(),
                 'lot_size':     (row.get('lot_size') or '').strip(),
                 'segment':      (row.get('segment') or '').strip(),
@@ -1379,6 +1701,8 @@ def zerodha_kite_search():
             'error':   'Could not fetch Kite instruments from api.kite.trade. Check internet.',
             'results': []
         })
+    # Filter to INR-priced Indian exchanges (drop foreign / FX / crypto symbols)
+    rows = [r for r in rows if _is_zd_inr(r)]
 
     if not q:
         return jsonify({'success': True, 'results': rows[:200], 'total': len(rows)})
@@ -9652,6 +9976,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .zd-add-btn.ind-btn:hover { background: #9c27b0; }
   .zd-add-btn.mm-btn { background: #ff9100; }
   .zd-add-btn.mm-btn:hover { background: #ffb300; }
+  .zd-row-label.gtt-label { color: #00bcd4; }
+  .zd-add-row.gtt-row {
+    background: rgba(0,188,212,0.06); border-color: rgba(0,188,212,0.25);
+  }
+  .zd-add-row.gtt-row select.trig-sel { width: 80px; }
+  .zd-add-row.gtt-row input.pct-inp  { width: 65px; }
+  .zd-add-btn.gtt-btn { background: #00bcd4; }
+  .zd-add-btn.gtt-btn:hover { background: #26c6da; }
   /* Entry/Exit badges */
   .badge-entry { background: rgba(38,166,154,0.18); color: #26a69a; border-radius: 3px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
   .badge-exit  { background: rgba(239,83,80,0.18);  color: #ef5350; border-radius: 3px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
@@ -9695,6 +10027,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .zd-table .zd-row-del:hover { background: #ef5350; color: #fff; }
   .zd-table .zd-row-del:active { transform: scale(0.96); }
   .zd-table .zd-row-del:disabled { opacity: 0.4; cursor: not-allowed; background: rgba(120,123,134,0.1); color: #787b86; border-color: #2a2e39; }
+  /* Per-row Update button — only enabled in PAUSE state */
+  .zd-table .zd-row-upd {
+    background: rgba(41,98,255,0.15); color: #4f87ff;
+    border: 1px solid rgba(41,98,255,0.45); border-radius: 4px;
+    padding: 5px 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px;
+    cursor: pointer; margin-right: 4px;
+    transition: background 0.15s, color 0.15s, transform 0.05s;
+    font-family: inherit;
+  }
+  .zd-table .zd-row-upd:hover { background: #2962ff; color: #fff; }
+  .zd-table .zd-row-upd:active { transform: scale(0.96); }
+  .zd-table .zd-row-upd:disabled { opacity: 0.4; cursor: not-allowed; background: rgba(120,123,134,0.1); color: #787b86; border-color: #2a2e39; }
+  /* Briefly flash a row green when its Update is clicked */
+  @keyframes zdRowFlash {
+    0%   { background: rgba(38,166,154,0.35); }
+    100% { background: transparent; }
+  }
+  .zd-table tr.zd-row-updated td { animation: zdRowFlash 0.9s ease-out; }
+  /* Automation Rules summary panel */
+  .zd-rules-summary {
+    margin: 8px 0 12px; padding: 10px 12px;
+    background: #131722; border: 1px solid #2a2e39; border-radius: 6px;
+  }
+  .zd-rules-summary-hd {
+    display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; user-select: none; font-size: 12px; color: #d1d4dc;
+  }
+  .zd-rules-summary-hd b { color: #f0b429; }
+  .zd-rules-summary-body {
+    margin-top: 8px; max-height: 200px; overflow-y: auto;
+    font-family: monospace; font-size: 11.5px; line-height: 1.55;
+  }
+  .zd-rules-summary-body.collapsed { display: none; }
+  .zd-rules-summary-body .zd-sum-sym { color: #d1d4dc; font-weight: 700; margin-top: 6px; display: block; }
+  .zd-rules-summary-body .zd-sum-sym:first-child { margin-top: 0; }
+  .zd-rules-summary-body .zd-sum-line { color: #787b86; display: block; padding-left: 14px; }
+  .zd-rules-summary-body .zd-sum-entry { color: #26a69a; }
+  .zd-rules-summary-body .zd-sum-exit  { color: #ef5350; }
+  .zd-rules-summary-body .zd-sum-gtt   { color: #00bcd4; }
+  .zd-rules-summary-body .zd-sum-empty { color: #787b86; font-style: italic; padding: 4px 0; }
   .zd-footer { display: flex; gap: 10px; align-items: center; padding-top: 6px; }
   .zd-start-btn {
     flex: 1; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
@@ -9704,6 +10076,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .zd-start-btn.start:hover { background: #1de9b6; }
   .zd-start-btn.stop { background: #ef5350; color: #fff; }
   .zd-start-btn.stop:hover { background: #ff1744; }
+  .zd-start-btn.pause { background: #f0b429; color: #131722; }
+  .zd-start-btn.pause:hover { background: #ffca28; }
+  .zd-start-btn.resume { background: #2962ff; color: #fff; }
+  .zd-start-btn.resume:hover { background: #448aff; }
   .zd-start-btn:disabled, .zd-start-btn:disabled:hover {
     background: #2a2e39 !important; color: #555 !important;
     cursor: not-allowed; opacity: 0.7;
@@ -10419,8 +10795,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- Add Rule Row -->
       <div class="zd-section-title">&#9881; Automation Rules</div>
 
-      <!-- Shared: Symbol + Qty -->
+      <!-- Shared: Exchange + Symbol + Qty -->
       <div class="zd-rule-shared">
+        <div class="zd-cred-group" style="flex:0;min-width:90px">
+          <label title="Indian exchange to route orders to. 'Auto' lets the panel detect from the symbol (e.g. CRUDEOILM26JUNFUT -> MCX).">Exchange</label>
+          <select id="zdExchInput" style="padding:6px 8px;background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:13px;width:100%">
+            <option value="">Auto</option>
+            <option value="NSE">NSE</option>
+            <option value="BSE">BSE</option>
+            <option value="NFO">NFO (F&amp;O)</option>
+            <option value="BFO">BFO (BSE F&amp;O)</option>
+            <option value="MCX">MCX</option>
+            <option value="CDS">CDS</option>
+            <option value="BCD">BCD</option>
+          </select>
+        </div>
         <div class="zd-cred-group" style="flex:2;min-width:110px">
           <label>Symbol</label>
           <input type="text" id="zdSymInput" placeholder="e.g. NIFTY50" autocomplete="off" spellcheck="false">
@@ -10669,6 +11058,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn mm-btn" id="zdAddMMRuleBtn" style="background:#ff9100">&#43; Add MM Rule</button>
       </div>
 
+      <!-- Row 4: GTT (Good Till Triggered) Rule -->
+      <div class="zd-row-label gtt-label">&#128274; GTT Rule</div>
+      <div class="zd-add-row gtt-row" id="zdGTTRow">
+        <label>Entry / Exit
+          <select class="entry-sel" id="zdGTTEntryType">
+            <option value="entry">Entry</option>
+            <option value="exit" selected>Exit</option>
+          </select>
+        </label>
+        <label>Buy / Sell
+          <select class="side-sel" id="zdGTTSide">
+            <option value="BUY">Buy</option>
+            <option value="SELL">Sell</option>
+          </select>
+        </label>
+        <label>Trigger Type
+          <select class="trig-sel" id="zdGTTTrigger">
+            <option value="single">Single</option>
+            <option value="OCO" selected>OCO</option>
+          </select>
+        </label>
+        <label>SL %
+          <input type="number" class="pct-inp" id="zdGTTSlPct" value="2" min="0.1" step="0.1">
+        </label>
+        <label>Target %
+          <input type="number" class="pct-inp" id="zdGTTTargetPct" value="4" min="0.1" step="0.1">
+        </label>
+        <button class="zd-add-btn gtt-btn" id="zdAddGTTRuleBtn">&#43; Add GTT Rule</button>
+      </div>
+
       <!-- Rules Table -->
       <div class="zd-table-wrap">
         <table class="zd-table">
@@ -10693,18 +11112,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </table>
       </div>
 
-      <!-- Safety toggle: dry-run vs live trades -->
-      <div class="zd-live-toggle" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;padding:8px 12px;background:rgba(255,145,0,0.08);border:1px solid rgba(255,145,0,0.25);border-radius:6px">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:#d1d4dc">
+      <!-- Read-only summary of all rules in plain English (entry / exit / GTT) -->
+      <div class="zd-rules-summary">
+        <div class="zd-rules-summary-hd" id="zdSumHd">
+          <span><b>&#128203; Automation Rules</b> <span style="color:#787b86;font-size:11px">&mdash; entry / exit / GTT conditions in the system</span></span>
+          <span id="zdSumToggle" style="color:#787b86;font-size:11px">[collapse]</span>
+        </div>
+        <div class="zd-rules-summary-body" id="zdSumBody">
+          <div class="zd-sum-empty">No rules added yet.</div>
+        </div>
+      </div>
+
+      <!-- Safety toggle: dry-run vs live trades + order-type controls -->
+      <div class="zd-live-toggle" style="display:flex;align-items:center;gap:12px;margin-bottom:10px;padding:8px 12px;background:rgba(255,145,0,0.08);border:1px solid rgba(255,145,0,0.25);border-radius:6px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:#d1d4dc;flex:1;min-width:260px">
           <input type="checkbox" id="zdLiveTradesChk" style="width:14px;height:14px;cursor:pointer">
           <b style="color:#ff9100">&#9888; Live trades</b>
-          <span style="color:#787b86">&mdash; uncheck for dry-run (log only, no real Zerodha orders).</span>
+          <span style="color:#787b86">&mdash; uncheck for dry-run.</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:11px;color:#d1d4dc;white-space:nowrap"
+               title="MARKET order: sent as a true market order. Fills at any price the exchange/Zerodha allow. Note: Kite may reject MARKET without protection on some exchanges (MCX especially).">
+          <input type="checkbox" id="zdMarketOrderChk" style="width:14px;height:14px;cursor:pointer">
+          <b style="color:#d1d4dc">Market Order</b>
+        </label>
+        <label id="zdMpLabel" style="display:flex;align-items:center;gap:6px;font-size:11px;color:#d1d4dc;white-space:nowrap"
+               title="Used as a LIMIT-price buffer when Market Order is unchecked. SELL LIMIT = signal x (1 - MP%); BUY LIMIT = signal x (1 + MP%). Wider MP fills more readily but trades farther from signal price.">
+          <span style="color:#787b86">Market Protection</span>
+          <input type="number" id="zdMarketProtection" value="2" min="0.1" max="20" step="0.5"
+                 style="width:58px;padding:3px 6px;background:#131722;border:1px solid #2a2e39;border-radius:3px;color:#d1d4dc;font-size:12px;text-align:right">
+          <span style="color:#787b86">%</span>
         </label>
       </div>
       <!-- Start / Stop -->
       <div class="zd-footer">
-        <button class="zd-start-btn start" id="zdStartBtn">&#9654; Start Automation</button>
-        <button class="zd-start-btn stop"  id="zdStopBtn" disabled>&#9632; Stop Automation</button>
+        <button class="zd-start-btn start"  id="zdStartBtn">&#9654; Start Automation</button>
+        <button class="zd-start-btn pause"  id="zdPauseBtn" disabled title="Pause execution but keep the panel state — rules become editable, position state preserved">&#9208; Pause</button>
+        <button class="zd-start-btn stop"   id="zdStopBtn" disabled>&#9632; Stop Automation</button>
       </div>
       <div class="zd-log" id="zdLog"><span class="log-info">Ready. Add rules and click Start.</span></div>
     </div>
@@ -10735,7 +11178,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-inst-tab" data-seg="FNO">F&amp;O Stocks</button>
         <button class="zd-inst-tab" data-seg="ETF">ETF</button>
         <button class="zd-inst-tab" data-seg="COMM">Commodities</button>
-        <button class="zd-inst-tab" data-seg="CRYPTO">Crypto</button>
       </div>
       <div class="zd-inst-body">
         <div class="zd-inst-list-panel" id="zdInstListPanel">
@@ -14527,6 +14969,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // (addBtn removed — now handled by zdAddAlgoRuleBtn / zdAddIndRuleBtn)
     const startBtn = document.getElementById('zdStartBtn');
     const stopBtn  = document.getElementById('zdStopBtn');
+    const pauseBtn = document.getElementById('zdPauseBtn');
     const maximizeBtn = document.getElementById('zdMaximizeBtn');
     const popoutBtn   = document.getElementById('zdPopoutBtn');
     const logEl    = document.getElementById('zdLog');
@@ -14536,6 +14979,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let zdApiKey    = '';
     let zdRules     = [];    // {id, symbol, algo, qty, buyScore, sellScore, status}
     let zdRunning   = false;
+    let zdPaused    = false; // paused = running but not executing ticks (rules become editable)
     let zdTimer     = null;
     let zdRuleId    = 0;
     let zdMaximized = false;
@@ -14567,7 +15011,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       zdApiKey    = s.apiKey || '';
       const dot  = document.getElementById('zdStatusDot');
       const text = document.getElementById('zdStatusText');
-      if (zdRunning) {
+      if (zdRunning && zdPaused) {
+        dot.classList.remove('connected'); dot.classList.remove('running');
+        const openCount = Object.keys(zdPositions).length;
+        text.innerHTML = '⏸ Automation paused <span style="color:#787b86;font-size:11px">' +
+                         '(rules editable; ' + openCount + ' open position' + (openCount === 1 ? '' : 's') + ' preserved)</span>';
+      } else if (zdRunning) {
         dot.classList.remove('connected'); dot.classList.add('running');
         text.textContent = 'Automation running…';
       } else if (zdConnected) {
@@ -14609,21 +15058,179 @@ HTML_PAGE = r"""<!DOCTYPE html>
         renderRules();
       } finally { _suspendSave = false; }
     }
-    // Persist the shared sym/qty bar when typed
+    // Persist the shared sym/qty/exchange bar when typed
     ['zdSymInput','zdQtyInput'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('input', saveRulesToStore);
     });
+    // Persist the Exchange dropdown across reloads / popout windows
+    const exchEl = document.getElementById('zdExchInput');
+    const EXCH_KEY = 'mangalview_zerodha_exchange_v1';
+    try {
+      const storedExch = localStorage.getItem(EXCH_KEY);
+      if (storedExch !== null) exchEl.value = storedExch;
+    } catch(e) {}
+    exchEl.addEventListener('change', function() {
+      try { localStorage.setItem(EXCH_KEY, this.value); } catch(e) {}
+    });
+    function getSelectedExchange() {
+      return (exchEl.value || '').trim().toUpperCase();
+    }
 
-    // Resolve a (sym) entry to chart + trade symbol + exchange. If the modal
-    // staged metadata for this symbol, use it; otherwise treat sym as both
-    // chart and trade (existing behavior — only works for curated chart symbols).
+    // Market protection: persist input value across reloads/windows
+    const mpEl = document.getElementById('zdMarketProtection');
+    const mpLabel = document.getElementById('zdMpLabel');
+    const marketOrderChk = document.getElementById('zdMarketOrderChk');
+    const MP_KEY = 'mangalview_zerodha_market_protection_v1';
+    const MARKET_ORDER_KEY = 'mangalview_zerodha_market_order_v1';
+    try {
+      const stored = parseFloat(localStorage.getItem(MP_KEY));
+      if (!isNaN(stored) && stored > 0) mpEl.value = stored;
+      const storedMO = localStorage.getItem(MARKET_ORDER_KEY);
+      if (storedMO === '1') marketOrderChk.checked = true;
+    } catch(e) {}
+    mpEl.addEventListener('input', function() {
+      const v = parseFloat(this.value);
+      if (!isNaN(v) && v > 0) {
+        try { localStorage.setItem(MP_KEY, String(v)); } catch(e) {}
+      }
+    });
+    function reflectMarketOrderState() {
+      const isMarket = !!marketOrderChk.checked;
+      // MP input is only relevant for LIMIT mode — dim it when MARKET is chosen
+      mpEl.disabled = isMarket;
+      mpLabel.style.opacity = isMarket ? '0.45' : '1';
+    }
+    marketOrderChk.addEventListener('change', function() {
+      try { localStorage.setItem(MARKET_ORDER_KEY, this.checked ? '1' : '0'); } catch(e) {}
+      reflectMarketOrderState();
+    });
+    reflectMarketOrderState();
+    function getMarketProtection() {
+      const v = parseFloat(mpEl.value);
+      return (isNaN(v) || v <= 0) ? 2 : v;
+    }
+    function isMarketOrderChecked() { return !!marketOrderChk.checked; }
+
+    // ---- Per-instrument position state (entry/exit pairing) ----
+    // zdPositions[tradeSymbol] = {state, side, entryPrice, entryTime, entryRuleId, gttIds}
+    // - state: 'long' | 'short' (entry filled), or absent (flat)
+    // - Entry rules only fire when state is absent (flat)
+    // - Exit rules only fire when state is 'long' or 'short'
+    // - Live mode: pollKitePositions() syncs with Kite so external exits
+    //   (GTT triggers, manual square-off) reset us to flat automatically.
+    let zdPositions = {};
+    function isPositionOpen(tradeSym) {
+      const p = zdPositions[tradeSym];
+      return !!(p && (p.state === 'long' || p.state === 'short'));
+    }
+    function openPosition(tradeSym, side, entryPrice, ruleId) {
+      zdPositions[tradeSym] = {
+        state:       side === 'BUY' ? 'long' : 'short',
+        side:        side,
+        entryPrice:  entryPrice || 0,
+        entryTime:   Date.now(),
+        entryRuleId: ruleId,
+        gttIds:      []
+      };
+    }
+    function closePosition(tradeSym) {
+      delete zdPositions[tradeSym];
+    }
+    function _round2(x) { return Math.round((x || 0) * 100) / 100; }
+
+    // Place GTT exit rule(s) matching the symbol just entered. Called right
+    // after a successful entry order. Honors dry-run via dryRun flag.
+    function placeMatchingGTTs(tradeSym, entrySide, entryPrice, exchange, dryRun) {
+      const isLong = entrySide === 'BUY';
+      const matching = zdRules.filter(r =>
+        r.ruleType === 'gtt' && r.entryType === 'exit' &&
+        (r.tradeSymbol || r.symbol) === tradeSym
+      );
+      if (!matching.length || !entryPrice) return;
+      // Resolve exchange — prefer caller's, then GTT rule's, then infer from symbol
+      const resolvedExch = exchange || (matching[0].exchange) || _inferExchangeFromSym(tradeSym) || '';
+      matching.forEach(function(gttRule) {
+        // Back-fill GTT rule's own exchange too (for legacy rules)
+        if (!gttRule.exchange && resolvedExch) {
+          gttRule.exchange = resolvedExch;
+          saveRulesToStore();
+        }
+        // For long: SL below entry, Target above. For short: reversed.
+        const slPct = gttRule.slPct     || 2;
+        const tgPct = gttRule.targetPct || 4;
+        const slPrice     = _round2(isLong ? entryPrice * (1 - slPct / 100) : entryPrice * (1 + slPct / 100));
+        const targetPrice = _round2(isLong ? entryPrice * (1 + tgPct / 100) : entryPrice * (1 - tgPct / 100));
+        const gttSide = isLong ? 'SELL' : 'BUY';   // exit reverses entry direction
+        fetch('/api/zerodha/gtt', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({
+            api_key:       zdApiKey,
+            tradingsymbol: tradeSym,
+            exchange:      resolvedExch || gttRule.exchange || '',
+            trigger_type:  gttRule.triggerType || 'OCO',
+            side:          gttSide,
+            qty:           gttRule.qty || 1,
+            ltp:           entryPrice,
+            sl_price:      slPrice,
+            target_price:  gttRule.triggerType === 'single' ? null : targetPrice,
+            dry_run:       dryRun
+          })
+        }).then(r => r.json()).then(function(res) {
+          if (res.success) {
+            const tag = res.dry_run ? '[GTT-DRY]' : '[GTT]';
+            zdLog(tag + ' placed ' + (gttRule.triggerType||'OCO') + ' on ' + tradeSym +
+                  ' SL=' + slPrice + (gttRule.triggerType==='single' ? '' : ' T=' + targetPrice) +
+                  ' #' + (res.triggerId || '?'), 'info');
+            const pos = zdPositions[tradeSym];
+            if (pos && res.triggerId) pos.gttIds.push(res.triggerId);
+          } else {
+            zdLog('[GTT] Failed for ' + tradeSym + ': ' + (res.error || 'Unknown'), 'info');
+          }
+        }).catch(function() {
+          zdLog('[GTT] Network error placing GTT for ' + tradeSym, 'info');
+        });
+      });
+    }
+
+    // Sync local position state from Kite. Called each tick in live mode.
+    let _zdPosSyncInFlight = false;
+    function syncKitePositions() {
+      if (!zdConnected || !zdApiKey || _zdPosSyncInFlight) return;
+      const tracked = Object.keys(zdPositions);
+      if (!tracked.length) return;
+      _zdPosSyncInFlight = true;
+      fetch('/api/zerodha/positions?api_key=' + encodeURIComponent(zdApiKey))
+        .then(r => r.json()).then(function(data) {
+          _zdPosSyncInFlight = false;
+          if (!data || !data.success) return;
+          const kitePos = data.positions || {};
+          tracked.forEach(function(sym) {
+            const qty = kitePos[sym];
+            if (qty === undefined || qty === 0) {
+              if (zdPositions[sym]) {
+                zdLog('[Position] ' + sym + ' closed externally (GTT/manual) — resetting to flat', 'info');
+                closePosition(sym);
+              }
+            }
+          });
+        }).catch(function() { _zdPosSyncInFlight = false; });
+    }
+
+    // Resolve a (sym) entry to chart + trade symbol + exchange.
+    //
+    // Precedence for exchange:
+    //   1. User's Exchange dropdown selection (most explicit)
+    //   2. Metadata staged by the Add-Instrument modal (Kite-tab pick)
+    //   3. Empty (server-side / inference fills it later)
     function metaForSym(sym) {
+      const userExch = getSelectedExchange();
       const m = window.zdPendingInstMeta;
       if (m && m.tradeSymbol === sym) {
-        return { chartSymbol: m.chartSymbol, tradeSymbol: m.tradeSymbol, exchange: m.exchange || '' };
+        return { chartSymbol: m.chartSymbol, tradeSymbol: m.tradeSymbol,
+                 exchange: userExch || m.exchange || '' };
       }
-      return { chartSymbol: sym, tradeSymbol: sym, exchange: '' };
+      return { chartSymbol: sym, tradeSymbol: sym, exchange: userExch || '' };
     }
 
     // Maximize / Restore
@@ -14771,6 +15378,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
       zdLog('[MarketMaking] ' + entryType.toUpperCase() + ' ' + side + ' ' + sym + ' TF:' + tf + ' Algo:' + mmAlgo + ' BuyScore≥' + buyScore + ' SellScore≥' + sellScore, 'info');
     });
 
+    // ---- Add Rule: GTT (Good Till Triggered) ----
+    document.getElementById('zdAddGTTRuleBtn').addEventListener('click', function() {
+      const sym       = document.getElementById('zdSymInput').value.trim().toUpperCase();
+      const qty       = parseInt(document.getElementById('zdQtyInput').value) || 1;
+      const entryType = document.getElementById('zdGTTEntryType').value;
+      const side      = document.getElementById('zdGTTSide').value;
+      const triggerT  = document.getElementById('zdGTTTrigger').value;   // single|OCO
+      const slPct     = parseFloat(document.getElementById('zdGTTSlPct').value) || 2;
+      const targetPct = parseFloat(document.getElementById('zdGTTTargetPct').value) || 4;
+      if (!sym) { zdLog('Enter a symbol.', 'info'); return; }
+      const _meta = metaForSym(sym);
+      zdRules.push({
+        id: ++zdRuleId, ruleType: 'gtt',
+        entryType: entryType, side: side,
+        symbol: sym, qty: qty, tf: '-',
+        tradeSymbol: _meta.tradeSymbol, chartSymbol: _meta.chartSymbol, exchange: _meta.exchange,
+        algo: 'NA', indicators: [],
+        triggerType: triggerT, slPct: slPct, targetPct: targetPct,
+        score: 0, status: 'idle', lastOrder: null
+      });
+      renderRules();
+      saveRulesToStore();
+      zdLog('[GTT] ' + entryType.toUpperCase() + ' ' + side + ' ' + sym +
+            ' Trigger:' + triggerT + ' SL:' + slPct + '% Target:' + targetPct + '%', 'info');
+    });
+
     function renderRules() {
       if (zdRules.length === 0) {
         rulesBody.innerHTML = '<tr id="zdNoRules"><td colspan="11" style="text-align:center;color:#787b86;padding:18px">No rules added yet</td></tr>';
@@ -14783,7 +15416,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const indOpts  = ['NA','RSI','MACD','EMA9','EMA21','SMA','BB','SuperTrend','VWAP','ADX','Stochastic','CCI','ATR','OBV','Ichimoku'];
       const condOpts = ['bullish','bearish'];
       // Disable inputs once automation has started — edits are only allowed before execution
-      const dis = zdRunning ? ' disabled' : '';
+      // Treat paused state as not-running for editability — that's the whole
+      // point of Pause: tweak rules without stopping the session.
+      const dis = (zdRunning && !zdPaused) ? ' disabled' : '';
       const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
       const sel = (opts, val, field, id, arrIndex) => {
         const optHtml = opts.map(o => '<option value="'+esc(o)+'"'+(o===val?' selected':'')+'>'+esc(o)+'</option>').join('');
@@ -14795,11 +15430,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const sideCell = sel(['BUY','SELL'], r.side, 'side', r.id);
         const symCell  = '<input type="text" class="zd-cell zd-cell-sym" data-rule-id="'+r.id+'" data-field="symbol" value="'+esc(r.symbol)+'"'+dis+'>';
         const qtyCell  = '<input type="number" class="zd-cell zd-cell-qty" data-rule-id="'+r.id+'" data-field="qty" value="'+(r.qty||1)+'" min="1"'+dis+'>';
-        const tfCell   = sel(tfOpts, r.tf, 'tf', r.id);
+        const tfCell   = r.ruleType === 'gtt'
+          ? '<span style="color:#787b86">—</span>'
+          : sel(tfOpts, r.tf, 'tf', r.id);
 
         let algoCell;
         if (r.ruleType === 'mm')        algoCell = sel(mmOpts,   r.algo, 'algo', r.id);
         else if (r.ruleType === 'algo') algoCell = sel(algoOpts, r.algo, 'algo', r.id);
+        else if (r.ruleType === 'gtt')  algoCell = sel(['single','OCO'], r.triggerType || 'OCO', 'triggerType', r.id);
         else                            algoCell = '<span style="color:#787b86">NA</span>';
 
         let indsCell;
@@ -14822,6 +15460,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
             + ' <span style="color:#787b86">/</span> '
             + '<input type="number" class="zd-cell zd-cell-score" data-rule-id="'+r.id+'" data-field="sellScore" value="'+(r.sellScore||0)+'" min="0" max="100" title="Sell Score Threshold" style="color:#ef5350"'+dis+'>'
             + '</td>';
+        } else if (r.ruleType === 'gtt') {
+          // For GTT rules, the "Score" column shows SL% / Target% (both editable)
+          scoreCell = '<td style="white-space:nowrap">'
+            + '<span style="color:#787b86;font-size:10px">SL </span>'
+            + '<input type="number" class="zd-cell zd-cell-score" data-rule-id="'+r.id+'" data-field="slPct" value="'+(r.slPct||2)+'" min="0.1" step="0.1" title="Stop Loss %" style="color:#ef5350;width:50px"'+dis+'>'
+            + '<span style="color:#787b86;font-size:10px"> T </span>'
+            + '<input type="number" class="zd-cell zd-cell-score" data-rule-id="'+r.id+'" data-field="targetPct" value="'+(r.targetPct||4)+'" min="0.1" step="0.1" title="Target %" style="color:#26a69a;width:50px"'+dis+'>'
+            + '</td>';
         } else if (r.ruleType === 'indicator') {
           scoreCell = '<td><span style="color:#787b86">—</span></td>';
         } else {
@@ -14843,7 +15489,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           '<td style="font-size:11px">' + indsCell + '</td>' +
           scoreCell +
           '<td>' + statusBadge + '</td>' +
-          '<td><button class="zd-row-del" data-id="' + r.id + '" title="Delete this rule"' + dis + '>&#128465; Delete</button></td>' +
+          '<td style="white-space:nowrap">' +
+            // Update button — only enabled in PAUSE state (zdRunning && zdPaused).
+            // While stopped: cells auto-commit anyway so it's a no-op (disabled).
+            // While running (not paused): cells are locked so editing isn't allowed (disabled).
+            '<button class="zd-row-upd" data-id="' + r.id + '" title="Commit edits for this rule (enabled only when paused)"' +
+              ((zdRunning && zdPaused) ? '' : ' disabled') + '>&#10003; Update</button>' +
+            '<button class="zd-row-del" data-id="' + r.id + '" title="Delete this rule"' + dis + '>&#128465; Delete</button>' +
+          '</td>' +
         '</tr>';
       }).join('');
 
@@ -14861,6 +15514,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
         });
       });
 
+      // Per-row Update — explicitly commit that rule's edits and reset its
+      // per-candle dedup state so the new config takes effect on the very
+      // next tick. Enabled only in PAUSE state. (Inline cells also auto-
+      // commit on change; this button confirms + flashes the row + logs.)
+      rulesBody.querySelectorAll('.zd-row-upd').forEach(btn => {
+        btn.addEventListener('click', function() {
+          if (this.disabled) return;
+          const id = parseInt(this.dataset.id);
+          const rule = zdRules.find(r => r.id === id);
+          if (!rule) return;
+          // Reset dedup so the updated rule re-evaluates immediately on resume
+          rule.lastOrder = null; rule._lastDedupLog = null;
+          saveRulesToStore();
+          renderSummary();
+          zdLog('[Rule] Updated #' + id + ' — ' + _summariseRule(rule), 'info');
+          // Flash the row green briefly
+          const tr = this.closest('tr');
+          if (tr) {
+            tr.classList.remove('zd-row-updated');
+            // Force reflow so the animation restarts on repeated clicks
+            void tr.offsetWidth;
+            tr.classList.add('zd-row-updated');
+          }
+        });
+      });
+
       // Inline edit handler — applies to every input/select with class .zd-cell
       rulesBody.querySelectorAll('.zd-cell').forEach(el => {
         el.addEventListener('change', function() {
@@ -14874,6 +15553,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
             this.value = val;
           } else if (field === 'score' || field === 'buyScore' || field === 'sellScore') {
             val = Math.max(0, Math.min(100, parseFloat(val) || 0));
+            this.value = val;
+          } else if (field === 'slPct' || field === 'targetPct') {
+            val = Math.max(0.1, parseFloat(val) || 0);
             this.value = val;
           } else if (field === 'symbol') {
             val = String(val).trim().toUpperCase();
@@ -14894,7 +15576,89 @@ HTML_PAGE = r"""<!DOCTYPE html>
           saveRulesToStore();  // persist inline edits
         });
       });
+      // Refresh the human-readable summary section after every render
+      try { renderSummary(); } catch(e) {}
     }
+
+    // ---- Automation Rules summary: plain-English description of every rule ----
+    function _summariseRule(r) {
+      const tf  = (r.tf && r.tf !== '-') ? ' (' + r.tf + ')' : '';
+      const sym = r.tradeSymbol || r.symbol;
+      const side = r.side || '';
+      const typeUp = (r.entryType || '').toUpperCase();
+      if (r.ruleType === 'gtt') {
+        return typeUp + ' ' + side + ' ' + sym +
+               ' GTT ' + (r.triggerType || 'OCO') +
+               ' (SL ' + (r.slPct || 2) + '%, T ' + (r.targetPct || 4) + '%)';
+      }
+      if (r.ruleType === 'algo') {
+        return typeUp + ' ' + side + ' ' + sym + tf +
+               ' on ' + (r.algo || '?') + ' algo, score ≥ ' + (r.score || 0);
+      }
+      if (r.ruleType === 'indicator') {
+        const inds = (r.indicators || []).map((ind, i) => {
+          const c = (r.conditions && r.conditions[i]) || 'bullish';
+          return ind + '(' + c + ')';
+        }).join(' AND ');
+        return typeUp + ' ' + side + ' ' + sym + tf + ' when ' + (inds || 'no indicators');
+      }
+      if (r.ruleType === 'mm') {
+        return typeUp + ' ' + side + ' ' + sym + tf +
+               ' on ' + (r.algo || '?') +
+               ' MM (buy≥' + (r.buyScore || 0) + ', sell≥' + (r.sellScore || 0) + ')';
+      }
+      return typeUp + ' ' + side + ' ' + sym;
+    }
+    function renderSummary() {
+      const body = document.getElementById('zdSumBody');
+      if (!body) return;
+      if (!zdRules.length) {
+        body.innerHTML = '<div class="zd-sum-empty">No rules added yet.</div>';
+        return;
+      }
+      // Group rules by tradeSymbol so entry/exit pairing is obvious at a glance
+      const groups = {};
+      zdRules.forEach(function(r) {
+        const key = (r.tradeSymbol || r.symbol) + (r.exchange ? ' @ ' + r.exchange : '');
+        (groups[key] = groups[key] || []).push(r);
+      });
+      const sortRules = arr => arr.sort((a, b) => {
+        // entry > exit > gtt, then by id
+        const order = { entry: 0, exit: 1 };
+        const ax = (a.entryType === 'entry' ? 0 : a.entryType === 'exit' ? 1 : 2);
+        const bx = (b.entryType === 'entry' ? 0 : b.entryType === 'exit' ? 1 : 2);
+        if (ax !== bx) return ax - bx;
+        return a.id - b.id;
+      });
+      const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const parts = [];
+      Object.keys(groups).sort().forEach(function(key) {
+        parts.push('<span class="zd-sum-sym">' + esc(key) + '</span>');
+        sortRules(groups[key]).forEach(function(r) {
+          const arrow = r.entryType === 'entry' ? '↗ '   // ↗
+                     : r.entryType === 'exit'  ? '↘ '    // ↘
+                     : '⚡ ';                              // ⚡
+          const cls   = r.ruleType === 'gtt'   ? 'zd-sum-gtt'
+                     : r.entryType === 'entry' ? 'zd-sum-entry'
+                     : r.entryType === 'exit'  ? 'zd-sum-exit'  : '';
+          parts.push('<span class="zd-sum-line ' + cls + '">' +
+                     '#' + r.id + ' ' + arrow + esc(_summariseRule(r)) + '</span>');
+        });
+      });
+      body.innerHTML = parts.join('');
+    }
+
+    // Collapse / expand the summary section
+    (function() {
+      const hd  = document.getElementById('zdSumHd');
+      const body = document.getElementById('zdSumBody');
+      const tog = document.getElementById('zdSumToggle');
+      if (!hd || !body) return;
+      hd.addEventListener('click', function() {
+        const collapsed = body.classList.toggle('collapsed');
+        if (tog) tog.textContent = collapsed ? '[expand]' : '[collapse]';
+      });
+    })();
 
     function zdLog(msg, type) {
       const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
@@ -14906,16 +15670,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // Start / Stop \u2014 separate buttons; one is always disabled depending on state
     function setRunningState(running) {
       zdRunning = running;
+      if (!running) zdPaused = false;     // stop also clears pause
       startBtn.disabled = running;
       stopBtn.disabled  = !running;
+      pauseBtn.disabled = !running;       // pause only available while running
+      _renderPauseBtn();
       refreshAutoStatus();   // updates the status banner from shared session + running state
       renderRules();         // refresh table \u2014 disables/enables inline edits + Delete button
+    }
+
+    // Render the Pause button's label/class according to zdPaused.
+    function _renderPauseBtn() {
+      if (zdPaused) {
+        pauseBtn.innerHTML = '\u25b6 Resume';   // \u25b6 Resume
+        pauseBtn.classList.remove('pause');
+        pauseBtn.classList.add('resume');
+        pauseBtn.title = 'Resume execution \u2014 picks up where it was paused';
+      } else {
+        pauseBtn.innerHTML = '\u23f8 Pause';     // \u23f8 Pause
+        pauseBtn.classList.remove('resume');
+        pauseBtn.classList.add('pause');
+        pauseBtn.title = 'Pause execution but keep panel state \u2014 rules become editable, position state preserved';
+      }
     }
 
     startBtn.addEventListener('click', function() {
       if (zdRunning) return;
       if (!zdConnected) { zdLog('Please connect to Zerodha first.', 'info'); return; }
       if (zdRules.length === 0) { zdLog('Add at least one rule.', 'info'); return; }
+      // Reset per-rule dedup so a fresh start isn't silently blocked by stale
+      // lastOrder/_lastDedupLog values persisted from a previous run.
+      zdRules.forEach(function(r) { r.lastOrder = null; r._lastDedupLog = null; r.status = 'idle'; });
+      saveRulesToStore();
       setRunningState(true);
       zdLog('Automation started. Checking signals every 15s.', 'info');
       runAutomation();
@@ -14926,7 +15712,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!zdRunning) return;
       clearInterval(zdTimer); zdTimer = null;
       setRunningState(false);
+      // Clear local position state on stop so a fresh start is unambiguous.
+      // (Kite-side positions/GTTs are NOT cancelled — exit those via Kite app.)
+      const openCount = Object.keys(zdPositions).length;
+      if (openCount) zdLog('[Position] Cleared ' + openCount + ' local position(s). Kite-side positions/GTTs untouched.', 'info');
+      zdPositions = {};
       zdLog('Automation stopped.', 'info');
+    });
+
+    // Pause / Resume — does NOT clear positions, dedup, or the tick timer.
+    // While paused: runAutomation early-returns, rules become editable in
+    // the table, and any edits you make take effect when you Resume.
+    pauseBtn.addEventListener('click', function() {
+      if (!zdRunning) return;
+      zdPaused = !zdPaused;
+      _renderPauseBtn();
+      refreshAutoStatus();
+      renderRules();                // re-render to unlock/lock inline edits
+      if (zdPaused) {
+        zdLog('Automation paused — rules can be edited. Click Resume to continue from this state.', 'info');
+      } else {
+        zdLog('Automation resumed — picking up from existing position state. Next tick in ≤15s.', 'info');
+        // Trigger an immediate tick so the user doesn't have to wait up to 15s
+        runAutomation();
+      }
     });
 
     // Underlying-name -> curated chart symbol. Used to back-fill chartSymbol
@@ -14960,14 +15769,63 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return null;
     }
 
+    // Categorise known underlying names by their tradeable exchange so a
+    // Kite-style tradingsymbol (CRUDEOILM26JUNFUT, NIFTY26JUN24000CE, etc.)
+    // can be routed to the correct exchange without an instruments-dump
+    // round-trip on every tick.
+    const _ZD_NAMES_MCX = new Set([
+      'CRUDEOIL','CRUDEOILM','GOLD','GOLDM','GOLDMINI','GOLDGUINEA','GOLDPETAL',
+      'SILVER','SILVERM','SILVERMIC','SILVERMINI','NATURALGAS','NATGASMINI',
+      'COPPER','COPPERMINI','ZINC','ZINCMINI','LEAD','LEADMINI','NICKEL','NICKELMINI',
+      'ALUMINIUM','MENTHA','MENTHAOIL','CASTOR','CASTORSEED','CRUDEOILWKLY'
+    ]);
+    const _ZD_NAMES_NFO = new Set(['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','NIFTYNXT50']);
+    const _ZD_NAMES_BFO = new Set(['SENSEX','BANKEX','SENSEX50']);
+    function _inferExchangeFromSym(sym) {
+      const s = String(sym || '').toUpperCase();
+      if (!/(FUT|CE|PE)$/.test(s)) return '';
+      for (const name of _ZD_NAMES_SORTED) {
+        if (s.startsWith(name)) {
+          if (_ZD_NAMES_MCX.has(name)) return 'MCX';
+          if (_ZD_NAMES_NFO.has(name)) return 'NFO';
+          if (_ZD_NAMES_BFO.has(name)) return 'BFO';
+          return '';
+        }
+      }
+      return '';
+    }
+
     function runAutomation() {
+      // Pause = skip execution entirely. Position state, dedup state, and
+      // the 15s timer are all preserved so resuming picks up exactly where
+      // we left off.
+      if (zdPaused) return;
       const liveTradesChk = document.getElementById('zdLiveTradesChk');
       const liveTrades = !!(liveTradesChk && liveTradesChk.checked);
+      // Live mode: pull current positions from Kite so external exits
+      // (GTT triggers, manual square-off) reset our local state.
+      if (liveTrades) syncKitePositions();
       zdRules.forEach(function(rule) {
+        // GTT rules are placed reactively after an entry triggers (see
+        // placeMatchingGTTs). They don't have their own signal-driven tick.
+        if (rule.ruleType === 'gtt') return;
         // Use rule's own timeframe; fall back to chart TF
         const useTF  = rule.tf || currentTF;
         const useAlgo = (rule.algo && rule.algo !== 'NA') ? rule.algo : '';
         const tradeSym = rule.tradeSymbol || rule.symbol;
+        // Back-fill rule.exchange for legacy rules where it wasn't captured.
+        // Without an exchange the rule falls through to the yfinance/TradingView
+        // proxy path — which for MCX symbols means USD WTI prices, wrong scale,
+        // wrong signals, and orders that miss circuit limits.
+        if (!rule.exchange) {
+          const inferredExch = _inferExchangeFromSym(rule.symbol);
+          if (inferredExch) {
+            rule.exchange = inferredExch;
+            saveRulesToStore();
+            zdLog('[Migrate] rule #' + rule.id + ' (' + rule.symbol + '): exchange ' +
+                  'back-filled to ' + inferredExch + ' — Kite live data + correct routing will engage next tick.', 'info');
+          }
+        }
         // Choose data source. Rules with a Kite exchange (added from the Kite
         // tab) fetch directly from Kite's historical-data API — the actual
         // contract, not a proxy. Everything else uses the chart-symbol path.
@@ -15102,15 +15960,40 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
           // Per-tick visibility — always log so the user can see what's happening
           const srcTag = useKite ? '[KITE]' : '[' + useSource + ']';
-          zdLog('[Tick] ' + srcTag + ' ' + dataSym + ' #' + rule.id + ' ' + reason, 'info');
+          const priceStr = (lastCandle && lastCandle.close != null) ? ' close=' + lastCandle.close : '';
+          zdLog('[Tick] ' + srcTag + ' ' + dataSym + ' #' + rule.id + priceStr + ' ' + reason, 'info');
 
           if (!triggered) return;
 
-          // Avoid duplicate orders on same candle
+          // Position-state gating: keep entry/exit paired per instrument
+          //   - ENTRY rules only fire when position is flat
+          //   - EXIT  rules only fire when position is open
+          // (Without this, a constantly-bearish indicator would re-fire SELL
+          //  every tick, and a flipping signal would yank between entries.)
+          const posOpen = isPositionOpen(tradeSym);
+          if (rule.entryType === 'entry' && posOpen) {
+            zdLog('[Gated] ENTRY skipped — ' + tradeSym + ' already open (rule #' + rule.id + ')', 'info');
+            return;
+          }
+          if (rule.entryType === 'exit' && !posOpen) {
+            zdLog('[Gated] EXIT skipped — ' + tradeSym + ' not open (rule #' + rule.id + ')', 'info');
+            return;
+          }
+
+          // Avoid duplicate orders on same candle. Log only on the FIRST
+          // dedup hit per candle so the user sees why the rule went quiet.
           const candleKey = (last && last.time) || (lastCandle && lastCandle.time) || Date.now();
-          if (rule.lastOrder === candleKey) return;
+          if (rule.lastOrder === candleKey) {
+            if (rule._lastDedupLog !== candleKey) {
+              const t = new Date(candleKey * 1000).toLocaleTimeString();
+              zdLog('[Dedup] rule #' + rule.id + ' already fired on candle @ ' + t +
+                    ' — waiting for next ' + (rule.tf || '?') + ' candle', 'info');
+              rule._lastDedupLog = candleKey;
+            }
+            return;
+          }
           rule.lastOrder = candleKey;
-          
+
           // For MM rules, use the actual signal direction; otherwise use configured side
           const orderSide = (rule.ruleType === 'mm' && sig) ? sig : rule.side;
           rule.status = orderSide.toLowerCase();
@@ -15120,30 +16003,118 @@ HTML_PAGE = r"""<!DOCTYPE html>
           // + exchange so Kite-specific tradingsymbols (CRUDEOILM26JUNFUT etc.)
           // reach the correct exchange. dry_run is the opposite of the panel's
           // "Live trades" checkbox — defaults to dry-run for safety.
+          // Build order body — two modes:
+          //   - Market Order checkbox ticked: order_type=MARKET, no MP (true market).
+          //     Kite may reject for MCX since those exchanges enforce MP, but the
+          //     user has opted in explicitly.
+          //   - Market Order unticked:    order_type=LIMIT at signal_price ± MP%.
+          //     For SELL: LIMIT = signal x (1 - MP/100) so any bid >= LIMIT fills.
+          //     For BUY:  LIMIT = signal x (1 + MP/100) so any ask <= LIMIT fills.
+          //     This keeps execution close to the signal price + safe from runaway slippage.
+          const _mo  = isMarketOrderChecked();
+          const _mp  = getMarketProtection();
+          const _sp  = (lastCandle && lastCandle.close) || 0;
+          const orderBody = {
+            api_key:  zdApiKey,
+            symbol:   tradeSym,
+            exchange: rule.exchange || '',
+            side:     orderSide,
+            qty:      rule.qty,
+            algo:     rule.algo,
+            score:    score !== null ? score : sig,
+            dry_run:  !liveTrades
+          };
+          if (_mo) {
+            orderBody.order_type        = 'MARKET';
+            orderBody.market_protection = 0;        // explicit zero -> backend omits it
+          } else {
+            const buf = _mp / 100;
+            const limitPx = orderSide === 'SELL'
+              ? Math.round(_sp * (1 - buf) * 100) / 100
+              : Math.round(_sp * (1 + buf) * 100) / 100;
+            orderBody.order_type = 'LIMIT';
+            orderBody.price      = limitPx;
+          }
           fetch('/api/zerodha/order', {
             method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({
-              api_key:  zdApiKey,
-              symbol:   tradeSym,
-              exchange: rule.exchange || '',
-              side:     orderSide,
-              qty:      rule.qty,
-              algo:     rule.algo,
-              score:    score !== null ? score : sig,
-              dry_run:  !liveTrades
-            })
+            body: JSON.stringify(orderBody)
           }).then(r => r.json()).then(function(res) {
+            const signalPrice = (lastCandle && lastCandle.close) || 0;
             if (res.success) {
-              const tag = res.dry_run ? '[DRY] ' : '[' + rule.entryType.toUpperCase() + '] ';
-              const label = tag + orderSide + ' '
+              const modeTag = res.dry_run ? '[DRY]' : '[LIVE]';
+              const typeTag = '[' + rule.entryType.toUpperCase() + ']';
+              // Prefer the server's rounded `sent_price` (tick-quantized) over
+              // the client-computed value, so the log matches what hit Kite.
+              const _shownPx = (res.sent_price != null) ? res.sent_price : orderBody.price;
+              const otTag   = orderBody.order_type === 'LIMIT'
+                ? ' LIMIT@' + _shownPx
+                : ' MARKET';
+              const label = modeTag + ' ' + typeTag + ' ' + orderSide + ' '
                 + rule.qty + ' ' + tradeSym + (rule.exchange ? '@' + rule.exchange : '')
-                + ' (' + useTF + ')'
+                + otTag
+                + ' signal=' + signalPrice + ' (' + useTF + ')'
                 + (useAlgo ? ' Algo:' + useAlgo : ' Ind:[' + (rule.indicators.join(',') || 'NA') + ']')
                 + (score !== null ? ' score=' + score : '')
                 + ' #' + res.orderId;
               zdLog(label, orderSide.toLowerCase());
+
+              // For LIVE orders, query Kite a few seconds later for the actual
+              // fill status — this tells the user whether the order COMPLETED,
+              // sat as OPEN, or was REJECTED. Kite's "accepted" response just
+              // means the request was received, NOT that it filled.
+              if (!res.dry_run && res.orderId) {
+                setTimeout(function() {
+                  fetch('/api/zerodha/order_status?api_key=' + encodeURIComponent(zdApiKey) +
+                        '&order_id=' + encodeURIComponent(res.orderId))
+                    .then(r => r.json()).then(function(st) {
+                      if (!st || !st.success) {
+                        zdLog('[OrderStatus] #' + res.orderId + ' lookup failed: ' + (st && st.error || 'unknown'), 'info');
+                        return;
+                      }
+                      const fillTxt = st.average_price ? ' avg=' + st.average_price : '';
+                      const qtyTxt  = ' filled=' + (st.filled_quantity || 0) + '/' + rule.qty;
+                      const msgTxt  = st.status_message ? ' msg="' + st.status_message + '"' : '';
+                      const cls     = st.status === 'COMPLETE' ? orderSide.toLowerCase()
+                                    : st.status === 'REJECTED' ? 'info' : 'info';
+                      zdLog('[OrderStatus] #' + res.orderId + ' ' + st.status + qtyTxt + fillTxt + msgTxt, cls);
+                      // Actionable hints for common rejection causes
+                      const msg = (st.status_message || '').toLowerCase();
+                      if (st.status === 'REJECTED') {
+                        if (msg.indexOf('circuit') !== -1) {
+                          zdLog('[Hint] Order outside circuit limits. Reduce "Market Protection %" in the panel (try 0.5-1.5%) so the LIMIT price stays inside the circuit band.', 'info');
+                        } else if (msg.indexOf('margin') !== -1) {
+                          zdLog('[Hint] Margin shortfall. Check available margin in Kite or lower qty.', 'info');
+                        } else if (msg.indexOf('market protection') !== -1) {
+                          zdLog('[Hint] Market-protection value not accepted. Try a value between 0.5-10% in the panel.', 'info');
+                        }
+                      }
+                      // If the order didn't actually fill, downgrade the position state
+                      // (entry didn't really happen — let the rule re-fire on next tick).
+                      if (rule.entryType === 'entry' &&
+                          st.status !== 'COMPLETE' && st.status !== 'OPEN') {
+                        closePosition(tradeSym);
+                        zdLog('[Position] ' + tradeSym + ' reverted to flat (order ' + st.status + ')', 'info');
+                      }
+                    });
+                }, 3000);
+              }
+
+              // Update position state on order acceptance. NOTE: for live orders,
+              // "acceptance" != "fill" — but we optimistically mark the position
+              // open so duplicate entries are blocked; the status poll above will
+              // revert if the order didn't actually fill.
+              if (rule.entryType === 'entry') {
+                openPosition(tradeSym, orderSide, signalPrice, rule.id);
+                zdLog('[Position] OPEN ' + (orderSide==='BUY'?'LONG':'SHORT') + ' ' + tradeSym +
+                      ' @ ~' + signalPrice + ' (entry rule #' + rule.id + ')', 'info');
+                // Auto-place matching GTT exit rules (same trade symbol, entryType=exit)
+                placeMatchingGTTs(tradeSym, orderSide, signalPrice, rule.exchange, !liveTrades);
+              } else if (rule.entryType === 'exit') {
+                closePosition(tradeSym);
+                zdLog('[Position] FLAT ' + tradeSym + ' (exited by rule #' + rule.id + ' @ ~' + signalPrice + ')', 'info');
+              }
             } else {
-              zdLog('Order failed for ' + tradeSym + ': ' + (res.error || 'Unknown'), 'info');
+              zdLog('Order failed for ' + tradeSym + ' @ signal=' + signalPrice + ': ' + (res.error || 'Unknown'), 'info');
             }
           });
         }).catch(function() {
@@ -15251,6 +16222,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const first = selectedItems[0];
         const meta = deriveChartMeta(first);
         document.getElementById('zdSymInput').value = meta.tradeSymbol;
+        // Also sync the Exchange dropdown so the user sees where the order will go.
+        const exchEl = document.getElementById('zdExchInput');
+        if (exchEl && meta.exchange) {
+          // Only set if the value is one of the known options; otherwise leave on 'Auto'.
+          const known = Array.from(exchEl.options).map(o => o.value);
+          if (known.indexOf(meta.exchange) !== -1) {
+            exchEl.value = meta.exchange;
+            try { localStorage.setItem('mangalview_zerodha_exchange_v1', meta.exchange); } catch(e) {}
+          }
+        }
         window.zdPendingInstMeta = meta;
       }
       closeModal();
