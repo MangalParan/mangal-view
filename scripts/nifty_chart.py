@@ -9262,6 +9262,11 @@ def api_candles():
     # Data source — kite fetches actual contract candles via Kite historical API;
     # USOIL/CRUDEOILMCX always use TradingView (continuous proxy).
     source = request.args.get("source", "yahoo")
+    # served_source = which source ACTUALLY produced the candles. Differs
+    # from `source` when Kite fails and we fall through to a proxy. The
+    # front-end uses this in the [Tick] log tag so the user can't be
+    # misled by a [KITE] label when TradingView actually filled the data.
+    served_source = source
     if source == "kite":
         api_key_q = request.args.get("api_key", "").strip()
         candles = fetch_kite_data(interval, symbol, api_key=api_key_q or None)
@@ -9272,14 +9277,21 @@ def api_candles():
         if not candles:
             if symbol in ("USOIL", "CRUDEOILMCX"):
                 candles = fetch_tradingview_data(interval, symbol)
+                served_source = "tradingview-fallback"
             else:
                 candles = fetch_nifty_data(interval, symbol)
+                served_source = "yahoo-fallback"
+        else:
+            served_source = "kite"
     elif symbol in ("USOIL", "CRUDEOILMCX") or source == "tradingview":
         candles = fetch_tradingview_data(interval, symbol)
+        served_source = "tradingview"
     elif source == "nse":
         candles = fetch_nse_data(interval, symbol)
+        served_source = "nse"
     else:
         candles = fetch_nifty_data(interval, symbol)
+        served_source = "yahoo"
 
     supertrend = compute_supertrend(candles, st_period, st_multiplier)
     psar = compute_parabolic_sar(candles, sar_start, sar_inc, sar_max)
@@ -9420,6 +9432,11 @@ def api_candles():
         "orb": orb,
         "backtest": backtest,
         "predictions": predictions,
+        # Diagnostics for the Zerodha automation log so the user can tell
+        # whether a [Tick] line came from real Kite data or a proxy fallback.
+        # served_source values: kite | tradingview | yahoo | nse |
+        # tradingview-fallback | yahoo-fallback.
+        "data_source": served_source,
     })
 
 
@@ -15958,10 +15975,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
             }
           }
 
-          // Per-tick visibility — always log so the user can see what's happening
-          const srcTag = useKite ? '[KITE]' : '[' + useSource + ']';
+          // Per-tick visibility — always log so the user can see what's happening.
+          // Prefer the SERVER-REPORTED source so silent Kite->TradingView fallbacks
+          // are visible (otherwise we'd show [KITE] even when the fetch fell back).
+          const servedSrc = data.data_source || (useKite ? 'kite' : useSource);
+          const srcTag = '[' + servedSrc + ']';
+          const fellBack = useKite && servedSrc !== 'kite';
           const priceStr = (lastCandle && lastCandle.close != null) ? ' close=' + lastCandle.close : '';
           zdLog('[Tick] ' + srcTag + ' ' + dataSym + ' #' + rule.id + priceStr + ' ' + reason, 'info');
+          // First time a Kite request falls back, surface a one-off Hint so the
+          // user knows their session/whitelist isn't actually in effect.
+          if (fellBack && !rule._fallbackWarned) {
+            rule._fallbackWarned = true;
+            zdLog('[Hint] rule #' + rule.id + ' requested source=kite but server returned source=' + servedSrc +
+                  '. Either Zerodha is not connected on this origin, the access_token expired, or this server\'s outbound IP is not whitelisted. Re-Connect via Zerodha Login. Until then, prices/indicators are from a proxy, not the real Kite contract.', 'info');
+          }
 
           if (!triggered) return;
 
