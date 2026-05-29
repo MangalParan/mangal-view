@@ -2114,7 +2114,17 @@ def fetch_kite_data(interval_key, symbol, api_key=None):
         days_back = 30
     else:
         days_back = 5
-    now    = datetime.now()
+    # IMPORTANT: Kite's historical endpoint expects from/to in **IST**, not in
+    # whatever the server's local timezone happens to be. Using bare
+    # datetime.now() works fine on an IST host (e.g., local dev), but on a
+    # UTC host (Render, most cloud providers) it requests a `to` timestamp
+    # that's 5h30m in the past — so the "latest" candle returned is hours
+    # stale and prices diverge from a co-located IST host. Compute IST
+    # explicitly using IST_OFFSET (already a module-level constant for
+    # exactly this purpose).
+    from datetime import timezone as _tz, timedelta as _td_in
+    _IST = _tz(_td_in(seconds=IST_OFFSET))
+    now    = datetime.now(_IST).replace(tzinfo=None)
     fr_dt  = (now - _td_safe(days=days_back)).strftime('%Y-%m-%d %H:%M:%S')
     to_dt  = now.strftime('%Y-%m-%d %H:%M:%S')
 
