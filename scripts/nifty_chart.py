@@ -1091,6 +1091,436 @@ def zerodha_gtt():
         return jsonify({'success': True, 'triggerId': trigger_id})
     return jsonify({'success': False, 'error': resp_data.get('message', 'GTT rejected'), 'data': resp_data})
 
+# ============================================================================
+# Delta Exchange Integration (crypto derivatives — INR settlement on some pairs)
+# Public docs: https://docs.delta.exchange/
+# Base URL: https://api.delta.exchange
+# Auth: HMAC-SHA256 signature header on private endpoints.
+#   Signature payload = method + timestamp + request_path + query_string + body
+# ============================================================================
+delta_v2_sessions = {}  # api_key -> {api_secret, base_url, connected}
+
+_DELTA_PRODUCT_CACHE = {'ts': 0.0, 'by_symbol': {}, 'base_url': ''}
+_DELTA_PRODUCT_TTL   = 3600
+
+# Delta runs two regional clusters. Indian users register at delta.exchange
+# but their keys live on the India host — calls to the global host return
+# auth failures even when keys are valid. Try India first, fall back to global.
+_DELTA_BASES = ['https://api.india.delta.exchange', 'https://api.delta.exchange']
+
+def _delta_sign(api_secret, method, path, query_string='', body=''):
+    """HMAC-SHA256 signature for a Delta Exchange API call.
+    Returns (signature_hex, timestamp_str)."""
+    import hmac, hashlib
+    ts = str(int(_zd_time.time()))
+    payload = method.upper() + ts + path + (query_string or '') + (body or '')
+    sig = hmac.new(api_secret.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+    return sig, ts
+
+def _delta_request(api_key, api_secret, method, path, params=None, body=None, timeout=15, base_url=None):
+    """Make a signed HTTPS request to Delta Exchange. Returns parsed JSON dict;
+    on transport/parse failure returns {success: False, error: ...}.
+
+    When base_url is None we don't fall back — call _delta_connect_try_bases
+    for that. For requests after the session is established, the bound
+    session base_url is passed in explicitly."""
+    import urllib.request as _ur, urllib.parse as _up, urllib.error as _ue, json as _json
+    base = base_url or _DELTA_BASES[0]
+    query_string = ''
+    if params:
+        query_string = '?' + _up.urlencode(params, doseq=True)
+    body_str = ''
+    if body is not None and method.upper() != 'GET':
+        body_str = body if isinstance(body, str) else _json.dumps(body, separators=(',', ':'))
+    sig, ts = _delta_sign(api_secret, method, path, query_string, body_str)
+    url = base + path + query_string
+    headers = {
+        'api-key':      api_key,
+        'signature':    sig,
+        'timestamp':    ts,
+        'Content-Type': 'application/json',
+        'Accept':       'application/json',
+        'User-Agent':   'mangal-view/1.0',
+    }
+    data = body_str.encode('utf-8') if body_str else None
+    req = _ur.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with _ur.urlopen(req, timeout=timeout) as resp:
+            txt = resp.read().decode('utf-8')
+        return _json.loads(txt) if txt else {'success': False, 'error': 'empty response'}
+    except _ue.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8')
+        except Exception:
+            pass
+        # Try to parse Delta's structured error
+        msg = err_body[:500] or str(e)
+        code = None
+        try:
+            err_data = _json.loads(err_body)
+            err_obj  = err_data.get('error') if isinstance(err_data.get('error'), dict) else None
+            code     = (err_obj or {}).get('code')
+            msg      = (err_obj or {}).get('code') or err_data.get('message') or err_body[:500]
+        except Exception:
+            pass
+        return {'success': False, 'error': 'Delta HTTP {}: {} (host={})'.format(e.code, msg, base),
+                'http_code': e.code, 'delta_code': code, 'host': base, 'raw': err_body[:500]}
+    except Exception as e:
+        return {'success': False, 'error': 'Delta request failed: {} (host={})'.format(e, base), 'host': base}
+
+def _delta_get_public(path, params=None, base_url=None, timeout=20):
+    """GET a public Delta endpoint (no auth). When base_url is None, try the
+    India host first then global, returning the first that succeeds. Returns
+    {success, result?, error?, host}."""
+    import urllib.request as _ur, urllib.parse as _up, urllib.error as _ue, json as _json
+    qs = ('?' + _up.urlencode(params, doseq=True)) if params else ''
+    bases = [base_url] if base_url else list(_DELTA_BASES)
+    last = None
+    for base in bases:
+        url = base + path + qs
+        try:
+            req = _ur.Request(url, headers={'User-Agent': 'mangal-view/1.0'})
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                data = _json.loads(resp.read().decode('utf-8'))
+            data['host'] = base
+            return data
+        except _ue.HTTPError as e:
+            try:    err = e.read().decode('utf-8')[:300]
+            except Exception: err = str(e)
+            last = {'success': False, 'error': 'HTTP {}: {}'.format(e.code, err), 'host': base, 'http_code': e.code}
+        except Exception as e:
+            last = {'success': False, 'error': str(e), 'host': base}
+    return last or {'success': False, 'error': 'no hosts tried'}
+
+def _load_delta_products():
+    """Cache Delta's /v2/products list. Tries India host first, then global —
+    the two regions serve different product catalogs (India has USDT
+    perpetuals like BTCUSDT, global has USD perpetuals like BTCUSD)."""
+    now = _zd_time.time()
+    if now - _DELTA_PRODUCT_CACHE['ts'] < _DELTA_PRODUCT_TTL and _DELTA_PRODUCT_CACHE['by_symbol']:
+        return _DELTA_PRODUCT_CACHE['by_symbol']
+    resp = _delta_get_public('/v2/products')
+    if not resp.get('success'):
+        return _DELTA_PRODUCT_CACHE.get('by_symbol', {})
+    by_symbol = {}
+    for p in (resp.get('result') or []):
+        sym = (p.get('symbol') or '').upper()
+        if not sym:
+            continue
+        by_symbol[sym] = {
+            'id':            p.get('id'),
+            'symbol':        p.get('symbol'),
+            'description':   p.get('description', ''),
+            'contract_type': p.get('contract_type', ''),
+            'tick_size':     float(p.get('tick_size', 0) or 0),
+            'state':         p.get('state', ''),
+        }
+    _DELTA_PRODUCT_CACHE['ts']        = now
+    _DELTA_PRODUCT_CACHE['by_symbol'] = by_symbol
+    _DELTA_PRODUCT_CACHE['base_url']  = resp.get('host', '')
+    return by_symbol
+
+_LAST_DELTA_ERROR = {'msg': '', 'host': '', 'symbol': ''}
+
+def fetch_delta_data(interval_key, symbol):
+    """Fetch OHLCV candles from Delta's public history endpoint. No auth.
+    Tries India host first then global. Records the last error in
+    _LAST_DELTA_ERROR so /api/candles can surface it to the user."""
+    if not symbol:
+        return []
+    interval_map = {
+        '1m': '1m', '3m': '3m', '5m': '5m', '10m': '5m',
+        '15m': '15m', '30m': '30m',
+        '1h': '1h', '2h': '1h', '4h': '4h', '1d': '1d'
+    }
+    res = interval_map.get(interval_key, '5m')
+    from datetime import timezone as _tz
+    now = int(datetime.now(_tz.utc).timestamp())
+    if res in ('1d',):     days = 200
+    elif res in ('1h','2h','4h'):  days = 30
+    else:                  days = 5
+    start = now - days * 86400
+    params = {'symbol': symbol, 'resolution': res, 'start': start, 'end': now}
+    # Prefer whichever host the products cache used (if any) — same region.
+    preferred = _DELTA_PRODUCT_CACHE.get('base_url') or None
+    bases = [preferred] if preferred else list(_DELTA_BASES)
+    last_err = None
+    rows = None
+    used_host = None
+    for base in bases:
+        resp = _delta_get_public('/v2/history/candles', params=params, base_url=base)
+        if resp.get('success'):
+            rows = resp.get('result') or []
+            used_host = base
+            break
+        last_err = resp.get('error') or 'unknown'
+    if rows is None:
+        # If we tried the preferred host first and it failed, also try the other one.
+        if preferred:
+            for base in _DELTA_BASES:
+                if base == preferred: continue
+                resp = _delta_get_public('/v2/history/candles', params=params, base_url=base)
+                if resp.get('success'):
+                    rows = resp.get('result') or []; used_host = base
+                    break
+                last_err = resp.get('error') or last_err
+    if rows is None or not rows:
+        _LAST_DELTA_ERROR.update({'msg': last_err or 'no candles', 'host': used_host or '', 'symbol': symbol})
+        return []
+    candles = []
+    for c in rows:
+        try:
+            candles.append({
+                'time':   int(c.get('time', 0)),
+                'open':   float(c.get('open', 0)),
+                'high':   float(c.get('high', 0)),
+                'low':    float(c.get('low', 0)),
+                'close':  float(c.get('close', 0)),
+                'volume': float(c.get('volume', 0) or 0),
+            })
+        except Exception:
+            continue
+    # Delta returns candles in DESCENDING time order. LightweightCharts
+    # silently rejects setData() when the time series isn't ascending —
+    # so sort ascending and dedupe by timestamp before returning.
+    if candles:
+        candles.sort(key=lambda x: x['time'])
+        deduped = []
+        prev_t = None
+        for c in candles:
+            if c['time'] != prev_t:
+                deduped.append(c)
+                prev_t = c['time']
+        candles = deduped
+        # Delta returns raw UTC unix seconds. LightweightCharts displays the
+        # time axis as UTC by default, so without a shift the chart would
+        # read 5h30m behind IST. Match the rest of this app's convention
+        # (fetch_nifty_data also adds IST_OFFSET) — gives correct IST display.
+        for c in candles:
+            c['time'] = c['time'] + IST_OFFSET
+    if interval_key in ('2h', '4h') and candles:
+        n = 2 if interval_key == '2h' else 4
+        agg = []
+        for i in range(0, len(candles), n):
+            grp = candles[i:i + n]
+            if not grp: continue
+            agg.append({
+                'time':   grp[0]['time'],
+                'open':   grp[0]['open'],
+                'high':   max(c['high'] for c in grp),
+                'low':    min(c['low']  for c in grp),
+                'close':  grp[-1]['close'],
+                'volume': sum(c['volume'] for c in grp),
+            })
+        candles = agg
+    _LAST_DELTA_ERROR.update({'msg': '', 'host': used_host or '', 'symbol': symbol})
+    return candles
+
+@app.route('/api/delta/connect', methods=['POST'])
+@login_required
+def delta_connect():
+    """Validate Delta credentials by calling /v2/wallet/balances.
+    Tries the India host first (most users), falls back to the global host.
+    Returns clear diagnostic info on failure so the user can debug."""
+    data = request.json or {}
+    api_key    = (data.get('api_key') or '').strip()
+    api_secret = (data.get('api_secret') or '').strip()
+    forced_base = (data.get('base_url') or '').strip().rstrip('/')
+    if not api_key or not api_secret:
+        return jsonify({'success': False, 'error': 'API Key and API Secret are required.'}), 400
+
+    attempts = []
+    bases    = [forced_base] if forced_base else list(_DELTA_BASES)
+    for base in bases:
+        result = _delta_request(api_key, api_secret, 'GET', '/v2/wallet/balances', base_url=base)
+        attempts.append({'host': base, 'ok': bool(result.get('success')),
+                         'http_code': result.get('http_code'),
+                         'delta_code': result.get('delta_code'),
+                         'error': None if result.get('success') else result.get('error')})
+        if result.get('success'):
+            delta_v2_sessions[api_key] = {'api_secret': api_secret, 'base_url': base, 'connected': True}
+            return jsonify({'success': True, 'message': 'Connected', 'host': base,
+                            'attempts': attempts})
+
+    # All hosts failed — return rich diagnostics
+    last = attempts[-1] if attempts else {}
+    hint = _delta_diag_hint(last)
+    return jsonify({
+        'success': False,
+        'error':   'Could not authenticate against any Delta host. ' + hint,
+        'attempts': attempts,
+        'hosts_tried': bases,
+    })
+
+def _delta_diag_hint(last_attempt):
+    """Map common Delta error codes / HTTP codes to a one-line hint."""
+    code  = (last_attempt.get('delta_code') or '').lower() if isinstance(last_attempt.get('delta_code'), str) else ''
+    http  = last_attempt.get('http_code') or 0
+    err   = (last_attempt.get('error') or '').lower()
+    if 'invalid_api_key' in code or 'unauthorized' in code or http == 401:
+        return ('Likely cause: API key not recognised on this host. '
+                'If you registered at delta.exchange (India), the key only works on the India host '
+                'and vice versa. Also confirm the key exists and is enabled at '
+                'https://www.delta.exchange/app/account/manage-api-keys')
+    if 'signature_mismatch' in code or 'invalid_signature' in code:
+        return ('Signature mismatch — the API Secret might be wrong (re-copy without trailing spaces), '
+                'or the server clock is skewed (Delta requires within ~5s).')
+    if 'ip_not_whitelisted' in code:
+        return ('Your outbound IP is not on the API key\'s allowlist. '
+                'Open the key on Delta and either remove IP restriction or add this server\'s IP. '
+                'Use /api/myip while logged in to see the IP this server uses.')
+    if 'inactive' in code or 'disabled' in code:
+        return ('API key is inactive — enable it on the Delta API keys page.')
+    if http == 404:
+        return ('404 on /v2/wallet/balances — possible regional API mismatch. '
+                'Try delta.exchange (global) explicitly if you registered there.')
+    if 'expired' in code or 'timestamp' in code:
+        return ('Timestamp rejection — server clock is more than ~5s off Delta\'s. '
+                'Sync system clock (Windows: time settings → Sync now).')
+    return ('Open DevTools console and the /api/delta/connect response for the exact Delta error code. '
+            'Common fixes: try the other regional host (delta.exchange ↔ india.delta.exchange), '
+            're-copy keys, enable Trading permission, wait 10 min if the key is brand new.')
+
+@app.route('/api/delta/products')
+@login_required
+def delta_products():
+    """Search Delta products by symbol substring."""
+    q = (request.args.get('q') or '').strip().upper()
+    products = _load_delta_products()
+    if not products:
+        return jsonify({'success': False, 'error': 'Could not fetch Delta products', 'results': []})
+    out = []
+    for sym, p in products.items():
+        if not q or q in sym or q in (p.get('description', '') or '').upper():
+            out.append(p)
+            if len(out) >= 200:
+                break
+    return jsonify({'success': True, 'results': out, 'total': len(products)})
+
+@app.route('/api/delta/order', methods=['POST'])
+@login_required
+def delta_place_order():
+    """Place a Delta Exchange order. Honors dry_run (default true)."""
+    data = request.json or {}
+    api_key    = (data.get('api_key') or '').strip()
+    symbol     = (data.get('symbol') or '').strip().upper()
+    side       = (data.get('side') or '').upper()        # BUY / SELL -> buy / sell
+    qty        = int(data.get('qty', 1) or 1)
+    order_type = (data.get('order_type') or 'market_order').strip()
+    price      = data.get('price')
+    dry_run    = data.get('dry_run', True)
+    algo       = data.get('algo', '')
+
+    if api_key not in delta_v2_sessions:
+        return jsonify({'success': False, 'error': 'Not connected (open Delta Login)'}), 403
+    if side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'Invalid side'}), 400
+    if not symbol:
+        return jsonify({'success': False, 'error': 'Missing symbol'}), 400
+
+    if dry_run:
+        order_id = 'DRY-D-' + str(uuid.uuid4())[:6]
+        return jsonify({'success': True, 'orderId': order_id, 'dry_run': True,
+                        'sent': {'symbol': symbol, 'side': side, 'qty': qty, 'order_type': order_type}})
+
+    api_secret = delta_v2_sessions[api_key]['api_secret']
+    products   = _load_delta_products()
+    p          = products.get(symbol)
+    if not p or not p.get('id'):
+        return jsonify({'success': False, 'error': 'Unknown Delta symbol: ' + symbol})
+    body = {
+        'product_id': p['id'],
+        'size':       qty,
+        'side':       'buy' if side == 'BUY' else 'sell',
+        'order_type': order_type,   # 'market_order' or 'limit_order'
+    }
+    if order_type == 'limit_order' and price is not None:
+        body['limit_price'] = str(price)
+    sess_base = delta_v2_sessions[api_key].get('base_url') or _DELTA_BASES[0]
+    result = _delta_request(api_key, api_secret, 'POST', '/v2/orders', body=body, base_url=sess_base)
+    if result.get('success'):
+        oid = (result.get('result') or {}).get('id', '')
+        entry = {'order_id': oid, 'symbol': symbol, 'side': side, 'qty': qty,
+                 'order_type': order_type, 'price': price, 'algo': algo,
+                 'status': 'PLACED', 'timestamp': datetime.utcnow().isoformat()}
+        return jsonify({'success': True, 'orderId': oid, 'order': entry})
+    return jsonify({'success': False,
+                    'error': result.get('error', 'Delta order rejected'),
+                    'sent': body})
+
+@app.route('/api/delta/positions')
+@login_required
+def delta_positions():
+    """Return current positions as {symbol: net_size}. Used by the bot to detect
+    external exits and reset local state."""
+    api_key = (request.args.get('api_key') or '').strip()
+    if api_key not in delta_v2_sessions:
+        return jsonify({'success': False, 'error': 'Not connected', 'positions': {}})
+    api_secret = delta_v2_sessions[api_key]['api_secret']
+    sess_base  = delta_v2_sessions[api_key].get('base_url') or _DELTA_BASES[0]
+    result = _delta_request(api_key, api_secret, 'GET', '/v2/positions/margined', base_url=sess_base)
+    if not result.get('success'):
+        # Try the alternative endpoint name
+        result = _delta_request(api_key, api_secret, 'GET', '/v2/positions', base_url=sess_base)
+    positions = {}
+    for p in (result.get('result') or []):
+        sym  = (p.get('product', {}) or {}).get('symbol') or p.get('symbol', '')
+        size = p.get('size', 0)
+        if sym:
+            try: positions[sym.upper()] = int(size or 0)
+            except (TypeError, ValueError): positions[sym.upper()] = 0
+    return jsonify({'success': True, 'positions': positions})
+
+@app.route('/api/aibot/log_append', methods=['POST'])
+@login_required
+def aibot_log_append():
+    """Append a trade-log line to log.txt at the project root. Each line is
+    timestamped (server clock, IST) by the front-end already; we just append.
+    Used by the Zerodha AI Bot so trade history persists across reloads."""
+    data = request.json or {}
+    line = (data.get('line') or '').strip()
+    if not line:
+        return jsonify({'success': False, 'error': 'empty line'}), 400
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log.txt')
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+    return jsonify({'success': True, 'path': path})
+
+@app.route('/api/aibot/log_download', methods=['GET'])
+@login_required
+def aibot_log_download():
+    """Stream log.txt as plain text so 'View log.txt' opens cleanly in a tab."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log.txt')
+    if not os.path.exists(path):
+        return Response('(log.txt is empty — no bot events yet)', content_type='text/plain; charset=utf-8')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        return Response('Error reading log.txt: ' + str(e), content_type='text/plain; charset=utf-8', status=500)
+    return Response(content, content_type='text/plain; charset=utf-8')
+
+@app.route('/api/aibot/log_read', methods=['GET'])
+@login_required
+def aibot_log_read():
+    """Return the last N lines of log.txt (default 200) so the bot panel can
+    show prior trades on open."""
+    n = int(request.args.get('n', 200) or 200)
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log.txt')
+    try:
+        if not os.path.exists(path):
+            return jsonify({'success': True, 'lines': []})
+        with open(path, 'r', encoding='utf-8') as f:
+            all_lines = f.readlines()
+        tail = [ln.rstrip('\n') for ln in all_lines[-n:]]
+        return jsonify({'success': True, 'lines': tail, 'total': len(all_lines)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/api/myip', methods=['GET'])
 @login_required
 def my_outbound_ip():
@@ -9277,7 +9707,22 @@ def api_candles():
     # front-end uses this in the [Tick] log tag so the user can't be
     # misled by a [KITE] label when TradingView actually filled the data.
     served_source = source
-    if source == "kite":
+    if source == "delta":
+        candles = fetch_delta_data(interval, symbol)
+        served_source = "delta" if candles else "delta-empty"
+        # If empty, attach the actual upstream error for the front-end to show.
+        # This is set as a module-level dict by fetch_delta_data on failure.
+        delta_err_info = None
+        if not candles:
+            try:
+                delta_err_info = {
+                    'msg': _LAST_DELTA_ERROR.get('msg', ''),
+                    'host': _LAST_DELTA_ERROR.get('host', ''),
+                    'symbol': _LAST_DELTA_ERROR.get('symbol', ''),
+                }
+            except Exception:
+                delta_err_info = None
+    elif source == "kite":
         api_key_q = request.args.get("api_key", "").strip()
         candles = fetch_kite_data(interval, symbol, api_key=api_key_q or None)
         # If Kite fetch returned nothing (not connected, IP not whitelisted,
@@ -9445,8 +9890,11 @@ def api_candles():
         # Diagnostics for the Zerodha automation log so the user can tell
         # whether a [Tick] line came from real Kite data or a proxy fallback.
         # served_source values: kite | tradingview | yahoo | nse |
-        # tradingview-fallback | yahoo-fallback.
+        # tradingview-fallback | yahoo-fallback | delta | delta-empty.
         "data_source": served_source,
+        # When Delta returns nothing, attach the upstream reason so the
+        # front-end can show the actual error (wrong symbol, wrong region, etc.)
+        "delta_error": (locals().get('delta_err_info') if source == "delta" and not candles else None),
     })
 
 
@@ -10094,6 +10542,130 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .zd-rules-summary-body .zd-sum-exit  { color: #ef5350; }
   .zd-rules-summary-body .zd-sum-gtt   { color: #00bcd4; }
   .zd-rules-summary-body .zd-sum-empty { color: #787b86; font-style: italic; padding: 4px 0; }
+  /* TradingView watchlist + analysis */
+  .tv-watch-wrap { overflow-x: auto; margin-bottom: 8px; }
+  .tv-watch-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .tv-watch-table th { background: #131722; color: #787b86; font-weight: 600; padding: 7px 10px; text-align: left; border-bottom: 1px solid #2a2e39; font-size: 11px; text-transform: uppercase; }
+  .tv-watch-table td { padding: 7px 10px; border-bottom: 1px solid #1a1e2b; color: #d1d4dc; vertical-align: middle; }
+  .tv-watch-table tr.tv-row { cursor: pointer; transition: background 0.1s; }
+  .tv-watch-table tr.tv-row:hover td { background: rgba(41,98,255,0.08); }
+  .tv-watch-table tr.tv-row.active td { background: rgba(41,98,255,0.15); }
+  .tv-watch-table .tv-sym { font-weight: 700; color: #d1d4dc; }
+  .tv-watch-table .tv-price { font-family: monospace; font-weight: 600; }
+  .tv-watch-table .tv-chg-pos { color: #26a69a; font-family: monospace; }
+  .tv-watch-table .tv-chg-neg { color: #ef5350; font-family: monospace; }
+  .tv-watch-table .tv-chg-zero { color: #787b86; font-family: monospace; }
+  .tv-watch-table .tv-rm { background: rgba(239,83,80,0.15); color: #ef5350; border: 1px solid rgba(239,83,80,0.4); border-radius: 4px; padding: 3px 9px; font-size: 11px; cursor: pointer; }
+  .tv-watch-table .tv-rm:hover { background: #ef5350; color: #fff; }
+  /* Analysis card */
+  #tvAnalysisCard {
+    background: #131722; border: 1px solid #2a2e39; border-radius: 8px;
+    padding: 12px 14px; font-size: 12px; color: #d1d4dc;
+  }
+  .tv-an-hd { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #2a2e39; padding-bottom: 8px; margin-bottom: 10px; }
+  .tv-an-hd .tv-an-sym { font-size: 16px; font-weight: 800; color: #fff; letter-spacing: 0.5px; }
+  .tv-an-hd .tv-an-price { font-family: monospace; font-size: 15px; font-weight: 700; }
+  .tv-an-section { margin-bottom: 12px; }
+  .tv-an-section h4 { margin: 0 0 6px; font-size: 11px; color: #787b86; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+  .tv-an-summary {
+    background: rgba(41,98,255,0.08); border-left: 3px solid #2962ff;
+    padding: 9px 12px; border-radius: 0 4px 4px 0; font-size: 12.5px; line-height: 1.55; color: #d1d4dc;
+  }
+  .tv-an-summary.bullish { background: rgba(38,166,154,0.10); border-left-color: #26a69a; }
+  .tv-an-summary.bearish { background: rgba(239,83,80,0.10);  border-left-color: #ef5350; }
+  .tv-an-summary.neutral { background: rgba(120,123,134,0.10); border-left-color: #787b86; }
+  .tv-an-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 6px 14px; font-size: 11.5px; }
+  .tv-an-grid .lab { color: #787b86; }
+  .tv-an-grid .val { color: #d1d4dc; font-family: monospace; }
+  .tv-an-grid .val.bullish { color: #26a69a; }
+  .tv-an-grid .val.bearish { color: #ef5350; }
+  .tv-an-algos { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 4px 10px; font-size: 11.5px; font-family: monospace; }
+  .tv-an-algos .a-row { display: flex; justify-content: space-between; gap: 6px; padding: 2px 4px; border-radius: 3px; }
+  .tv-an-algos .a-row.buy   { background: rgba(38,166,154,0.10); color: #26a69a; }
+  .tv-an-algos .a-row.sell  { background: rgba(239,83,80,0.10);  color: #ef5350; }
+  .tv-an-algos .a-row.neutral{ background: rgba(120,123,134,0.08); color: #d1d4dc; }
+  .tv-sr-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-family: monospace; font-size: 11.5px; }
+  .tv-sr-row .lab { width: 32px; color: #787b86; }
+  .tv-sr-row .val { width: 90px; color: #d1d4dc; }
+  .tv-sr-row .bar { height: 6px; border-radius: 3px; background: linear-gradient(90deg, currentColor, currentColor); flex: 1; max-width: 200px; opacity: 0.7; }
+  .tv-sr-row.r { color: #ef5350; }
+  .tv-sr-row.s { color: #26a69a; }
+  .tv-sr-divider {
+    height: 1px; background: linear-gradient(90deg, transparent, #f0b429, transparent);
+    margin: 6px 0; position: relative; text-align: center; font-size: 10px; color: #f0b429; font-weight: 700;
+  }
+  .tv-plan { background: rgba(240,180,41,0.06); border: 1px solid rgba(240,180,41,0.30); border-radius: 6px; padding: 10px 12px; }
+  .tv-plan .lab { color: #f0b429; font-weight: 700; }
+  .tv-plan .row { display: flex; justify-content: space-between; padding: 3px 0; font-family: monospace; font-size: 12px; }
+  .tv-plan .row .val { color: #d1d4dc; }
+  /* Zerodha AI Bot panel */
+  .ai-mode-bar {
+    display: flex; gap: 14px; margin-bottom: 10px; padding: 8px 12px;
+    background: rgba(41,98,255,0.06); border: 1px solid rgba(41,98,255,0.25); border-radius: 6px;
+  }
+  .ai-mode-bar label { font-size: 12px; color: #d1d4dc; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+  .ai-mode-bar label.live { color: #ff9100; font-weight: 700; }
+  .ai-mode-bar input[type=radio] { cursor: pointer; }
+  .ai-input-bar {
+    display: flex; gap: 8px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap;
+  }
+  .ai-input-bar input, .ai-input-bar select {
+    padding: 6px 8px; background: #131722; border: 1px solid #2a2e39; border-radius: 4px;
+    color: #d1d4dc; font-size: 13px;
+  }
+  .ai-input-bar label { display: flex; flex-direction: column; gap: 3px; }
+  .ai-input-bar label > span { font-size: 10px; color: #787b86; }
+  #aiBotChart, #deltaBotChart { width: 100%; height: 280px; background: #131722; border: 1px solid #2a2e39; border-radius: 6px; margin-bottom: 10px; position: relative; }
+  .bot-chart-wrap { position: relative; }
+  .bot-price-overlay {
+    position: absolute; top: 8px; right: 12px; z-index: 5;
+    background: rgba(19, 23, 34, 0.88);
+    border: 1px solid #2a2e39; border-radius: 5px;
+    padding: 5px 10px; font-family: monospace; font-size: 13px;
+    color: #d1d4dc; pointer-events: none; line-height: 1.3;
+  }
+  .bot-price-overlay .sym { color: #787b86; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .bot-price-overlay .px { font-size: 16px; font-weight: 700; }
+  .bot-price-overlay .px.up   { color: #26a69a; }
+  .bot-price-overlay .px.down { color: #ef5350; }
+  .bot-log-btn {
+    background: rgba(41,98,255,0.15); color: #4f87ff;
+    border: 1px solid rgba(41,98,255,0.45); border-radius: 4px;
+    padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
+    font-family: inherit; margin-left: 8px;
+  }
+  .bot-log-btn:hover { background: #2962ff; color: #fff; }
+  .ai-info-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 6px 12px; padding: 10px 12px; background: #131722; border: 1px solid #2a2e39;
+    border-radius: 6px; margin-bottom: 10px; font-size: 12px;
+  }
+  .ai-info-grid .cell { display: flex; flex-direction: column; gap: 2px; }
+  .ai-info-grid .lab { font-size: 10px; color: #787b86; text-transform: uppercase; letter-spacing: 0.06em; }
+  .ai-info-grid .val { font-family: monospace; font-size: 13px; font-weight: 700; color: #d1d4dc; }
+  .ai-info-grid .val.bull { color: #26a69a; }
+  .ai-info-grid .val.bear { color: #ef5350; }
+  .ai-info-grid .val.warn { color: #f0b429; }
+  .ai-risk-bar {
+    display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 10px;
+    background: rgba(240,180,41,0.06); border: 1px solid rgba(240,180,41,0.25); border-radius: 6px;
+    font-size: 11px; color: #d1d4dc;
+  }
+  .ai-strat-bar {
+    display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 10px;
+    background: rgba(156,39,176,0.06); border: 1px solid rgba(156,39,176,0.25); border-radius: 6px;
+    font-size: 11px; color: #d1d4dc; align-items: center;
+  }
+  .ai-strat-bar > .lbl { color: #b56cc7; font-weight: 700; }
+  .ai-strat-bar label { display: flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+  .ai-strat-bar input[type=checkbox] { cursor: pointer; }
+  .ai-risk-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .ai-risk-bar input { width: 70px; padding: 3px 6px; background: #131722; border: 1px solid #2a2e39; border-radius: 3px; color: #d1d4dc; font-size: 12px; text-align: right; }
+  .ai-disclaimer {
+    font-size: 11px; color: #f0b429; background: rgba(240,180,41,0.06);
+    border: 1px solid rgba(240,180,41,0.25); border-radius: 6px;
+    padding: 8px 12px; margin-bottom: 10px; line-height: 1.45;
+  }
   .zd-footer { display: flex; gap: 10px; align-items: center; padding-top: 6px; }
   .zd-start-btn {
     flex: 1; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
@@ -10751,6 +11323,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="automation-dropdown" id="automationDropdown">
       <button class="automation-item" id="btnZerodhaLogin">&#128272; Zerodha Login</button>
       <button class="automation-item" id="btnZerodhaAuto">&#129302; Zerodha Automation</button>
+      <button class="automation-item" id="btnTradingView">&#128200; TradingView</button>
+      <button class="automation-item" id="btnAIBot">&#129504; Zerodha AI Bot</button>
+      <button class="automation-item" id="btnDeltaLogin">&#128272; Delta Login</button>
+      <button class="automation-item" id="btnDeltaBot">&#129504; Delta AI Bot</button>
     </div>
   </div>
   <div class="separator"></div>
@@ -11177,6 +11753,317 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-start-btn stop"   id="zdStopBtn" disabled>&#9632; Stop Automation</button>
       </div>
       <div class="zd-log" id="zdLog"><span class="log-info">Ready. Add rules and click Start.</span></div>
+    </div>
+  </div>
+
+  <!-- TradingView Watchlist & Analysis Panel -->
+  <div class="zerodha-panel" id="tvPanel" style="width:880px">
+    <div class="zd-header" id="tvHeader">
+      <h3><span style="color:#2962ff">&#128200;</span> TradingView Watchlist &amp; Analysis</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="tvMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="tvPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="tvClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <!-- Why TradingView API isn't direct -->
+      <div style="font-size:11px;color:#787b86;background:#131722;border:1px solid #2a2e39;border-radius:6px;padding:8px 10px;margin-bottom:10px">
+        <b style="color:#d1d4dc">Note:</b> TradingView doesn't expose a public API for user watchlists or saved layouts.
+        This panel uses a local watchlist (persists in your browser) with live prices via the same TradingView WebSocket the chart uses.
+        Click any symbol for a full multi-algo + indicator + S/R + Volume Profile analysis with entry/SL/target.
+      </div>
+      <!-- Add-symbol bar -->
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap">
+        <div class="zd-cred-group" style="flex:2;min-width:160px">
+          <label>Add symbol</label>
+          <input type="text" id="tvAddInput" placeholder="e.g. NIFTY50, RELIANCE, CRUDEOILMCX, BTC" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="zd-cred-group" style="flex:0;min-width:90px">
+          <label>Timeframe</label>
+          <select id="tvAddTF" style="padding:6px 8px;background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:13px;width:100%">
+            <option value="5m">5m</option>
+            <option value="15m" selected>15m</option>
+            <option value="1h">1h</option>
+            <option value="1d">1D</option>
+          </select>
+        </div>
+        <button class="zd-add-btn" id="tvAddBtn" style="padding:7px 14px">&#43; Add</button>
+      </div>
+      <!-- Watchlist table -->
+      <div class="tv-watch-wrap">
+        <table class="tv-watch-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Symbol</th>
+              <th>TF</th>
+              <th>Price</th>
+              <th>Chg%</th>
+              <th>Updated</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="tvWatchBody">
+            <tr id="tvNoSymbols"><td colspan="7" style="text-align:center;color:#787b86;padding:18px">No symbols. Type one above and click Add.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <!-- Analysis section -->
+      <div id="tvAnalysisWrap" style="margin-top:10px">
+        <div id="tvAnalysisEmpty" style="padding:18px;text-align:center;color:#787b86;background:#131722;border:1px dashed #2a2e39;border-radius:6px;font-size:12px">
+          Click a symbol above to run analysis &mdash; 16 algos, indicators, S/R, Volume Profile, entry/SL/target.
+        </div>
+        <div id="tvAnalysisCard" style="display:none"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Zerodha AI Bot Panel -->
+  <div class="zerodha-panel" id="aiBotPanel" style="width:920px">
+    <div class="zd-header" id="aiBotHeader">
+      <h3><span style="color:#9c27b0">&#129504;</span> Zerodha AI Bot</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="aiBotMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="aiBotPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="aiBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <!-- Connection status -->
+      <div class="zd-status-bar" id="aiBotStatusBar" style="margin-bottom:10px">
+        <span class="zd-status-dot" id="aiBotStatusDot"></span>
+        <span id="aiBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> from the Automation menu to enable live Kite data + live orders</span>
+      </div>
+
+      <!-- Honest disclaimer -->
+      <div class="ai-disclaimer">
+        <b>&#9888; Reality check:</b> no automated strategy can guarantee zero losses &mdash; markets gap and signals reverse.
+        This bot uses strict risk management (SL on every trade, max-consecutive-losses + max-daily-loss circuit breakers,
+        entry filtering on regime-adjusted score thresholds) to minimise losses, but losing trades are inevitable.
+        Always paper trade first.
+      </div>
+
+      <!-- Mode toggle -->
+      <div class="ai-mode-bar">
+        <label><input type="radio" name="aiBotMode" value="paper" checked> &#128221; Paper Trading <span style="color:#787b86;font-size:11px">(simulated, no Kite calls)</span></label>
+        <label class="live"><input type="radio" name="aiBotMode" value="live"> &#9888; Live Trading <span style="color:#787b86;font-size:11px">(real Kite orders)</span></label>
+      </div>
+
+      <!-- Instrument + Qty -->
+      <div class="ai-input-bar">
+        <label>
+          <span>Tradingsymbol</span>
+          <input type="text" id="aiBotSymbol" value="NIFTY50" placeholder="e.g. CRUDEOILM26JUNFUT" style="min-width:220px">
+        </label>
+        <label>
+          <span>Exchange</span>
+          <select id="aiBotExchange">
+            <option value="">Auto</option>
+            <option value="NSE">NSE</option>
+            <option value="BSE">BSE</option>
+            <option value="NFO">NFO</option>
+            <option value="BFO">BFO</option>
+            <option value="MCX">MCX</option>
+            <option value="CDS">CDS</option>
+          </select>
+        </label>
+        <label>
+          <span>Qty</span>
+          <input type="number" id="aiBotQty" value="1" min="1" style="width:70px">
+        </label>
+        <label>
+          <span>Timeframe</span>
+          <select id="aiBotTF">
+            <option value="3m">3m</option>
+            <option value="5m" selected>5m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="1h">1h</option>
+          </select>
+        </label>
+        <button class="zd-add-btn" id="aiBotLoadBtn" style="padding:7px 14px">&#128202; Load Chart</button>
+        <button class="bot-log-btn" id="aiBotLogBtn" title="Open log.txt in a new tab (all bot events for both Zerodha and Delta)">&#128196; log.txt</button>
+      </div>
+
+      <!-- Chart -->
+      <div class="bot-chart-wrap">
+        <div id="aiBotChart"></div>
+        <div class="bot-price-overlay" id="aiBotPriceOverlay" style="display:none">
+          <div class="sym" id="aiBotPxSym">—</div>
+          <div class="px"  id="aiBotPxVal">—</div>
+        </div>
+      </div>
+
+      <!-- Strategy / Position / P&L display -->
+      <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Active Strategy</span><span class="val" id="aiBotStrategy">—</span></div>
+        <div class="cell"><span class="lab">Market Regime</span><span class="val" id="aiBotRegime">—</span></div>
+        <div class="cell"><span class="lab">Position</span><span class="val" id="aiBotPosition">FLAT</span></div>
+        <div class="cell"><span class="lab">Entry Price</span><span class="val" id="aiBotEntryPx">—</span></div>
+        <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="aiBotRealizedPnl">&#8377;0.00</span></div>
+        <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="aiBotUnrealPnl">&#8377;0.00</span></div>
+        <div class="cell"><span class="lab">Trades</span><span class="val" id="aiBotTradeCount">0</span></div>
+        <div class="cell"><span class="lab">Win Rate</span><span class="val" id="aiBotWinRate">—</span></div>
+      </div>
+
+      <!-- Optional strategies the bot is allowed to select -->
+      <div class="ai-strat-bar">
+        <span class="lbl">&#129504; Allow strategies:</span>
+        <label title="Mean-reversion bid-ask Market Making strategy. Best in range/sideways markets."><input type="checkbox" id="aiBotIncludeMM"> Market Making</label>
+        <label title="Advanced Market Making with spread analysis. Best in range markets with stable volatility."><input type="checkbox" id="aiBotIncludeMMA"> MM Advanced</label>
+        <span style="color:#787b86;font-size:10px">(uncheck to exclude from active-strategy selection)</span>
+      </div>
+
+      <!-- Risk controls -->
+      <div class="ai-risk-bar">
+        <label title="Stop-Loss % from entry">SL %: <input type="number" id="aiBotSlPct" value="1.5" min="0.1" step="0.1"></label>
+        <label title="Target % from entry">Target %: <input type="number" id="aiBotTpPct" value="3.0" min="0.1" step="0.1"></label>
+        <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
+        <label title="Min algo score to enter (regime-adjusted automatically)">Min score: <input type="number" id="aiBotMinScore" value="3.5" min="0.5" step="0.1"></label>
+      </div>
+
+      <!-- Control buttons -->
+      <div class="zd-footer">
+        <button class="zd-start-btn start"  id="aiBotStartBtn">&#9654; Start Bot</button>
+        <button class="zd-start-btn pause"  id="aiBotPauseBtn" disabled>&#9208; Pause</button>
+        <button class="zd-start-btn stop"   id="aiBotStopBtn" disabled>&#9632; Stop Bot</button>
+      </div>
+
+      <!-- Log -->
+      <div class="zd-log" id="aiBotLog" style="max-height:180px"><span class="log-info">Bot ready. Paper Trading is selected by default. Enter symbol + qty, click Load Chart, then Start Bot.</span></div>
+    </div>
+  </div>
+
+  <!-- Delta Exchange Login Panel -->
+  <div class="zerodha-panel" id="deltaLoginPanel" style="width:680px">
+    <div class="zd-header" id="deltaLoginHeader">
+      <h3><span style="color:#1e6ec8">&#128272;</span> Delta Exchange Login</h3>
+      <div class="zd-header-actions">
+        <button class="zd-close" id="deltaLoginClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-credentials">
+        <div class="zd-cred-row">
+          <div class="zd-cred-group" style="flex:2">
+            <label for="deltaApiKey">API Key</label>
+            <input type="text" id="deltaApiKey" placeholder="Enter Delta Exchange API Key" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+        <div class="zd-cred-row">
+          <div class="zd-cred-group" style="flex:2">
+            <label for="deltaApiSecret">API Secret</label>
+            <input type="password" id="deltaApiSecret" placeholder="API Secret" autocomplete="off">
+          </div>
+          <button class="zd-connect-btn" id="deltaConnectBtn">Connect</button>
+        </div>
+      </div>
+      <div class="zd-status-bar">
+        <span class="zd-status-dot" id="deltaLoginStatusDot"></span>
+        <span id="deltaLoginStatusText">Not connected</span>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:#787b86;background:#131722;border:1px solid #2a2e39;border-radius:6px;padding:8px 10px">
+        <b style="color:#d1d4dc">Get credentials:</b> https://www.delta.exchange/app/account/manage-api-keys —
+        create a key with Read + Trading permissions. Unlike Kite, Delta uses API Key + API Secret directly (no daily token rotation).
+      </div>
+    </div>
+  </div>
+
+  <!-- Delta AI Bot Panel -->
+  <div class="zerodha-panel" id="deltaBotPanel" style="width:920px">
+    <div class="zd-header" id="deltaBotHeader">
+      <h3><span style="color:#9c27b0">&#129504;</span> Delta Exchange AI Bot</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="deltaBotMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="deltaBotPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="deltaBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-status-bar" id="deltaBotStatusBar" style="margin-bottom:10px">
+        <span class="zd-status-dot" id="deltaBotStatusDot"></span>
+        <span id="deltaBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> from the Automation menu to enable live trading</span>
+      </div>
+
+      <div class="ai-disclaimer">
+        <b>&#9888; Reality check:</b> no automated strategy can guarantee zero losses. Crypto is especially volatile — gaps and slippage are larger than equities.
+        Same strict risk management as the Zerodha bot (SL on every trade, max-consec-losses + max-daily-loss circuit breakers).
+        Always paper trade first.
+      </div>
+
+      <div class="ai-mode-bar">
+        <label><input type="radio" name="deltaBotMode" value="paper" checked> &#128221; Paper Trading <span style="color:#787b86;font-size:11px">(simulated, no Delta calls)</span></label>
+        <label class="live"><input type="radio" name="deltaBotMode" value="live"> &#9888; Live Trading <span style="color:#787b86;font-size:11px">(real Delta orders)</span></label>
+      </div>
+
+      <div class="ai-input-bar">
+        <label>
+          <span>Delta Symbol</span>
+          <input type="text" id="deltaBotSymbol" value="BTCUSD" placeholder="e.g. BTCUSD, ETHUSD, BTCUSDT" style="min-width:200px">
+        </label>
+        <label>
+          <span>Qty (contracts)</span>
+          <input type="number" id="deltaBotQty" value="1" min="1" style="width:70px">
+        </label>
+        <label>
+          <span>Timeframe</span>
+          <select id="deltaBotTF">
+            <option value="1m">1m</option>
+            <option value="3m">3m</option>
+            <option value="5m" selected>5m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="1h">1h</option>
+            <option value="1d">1d</option>
+          </select>
+        </label>
+        <button class="zd-add-btn" id="deltaBotLoadBtn" style="padding:7px 14px">&#128202; Load Chart</button>
+        <button class="bot-log-btn" id="deltaBotLogBtn" title="Open log.txt in a new tab (all bot events for both Zerodha and Delta)">&#128196; log.txt</button>
+      </div>
+
+      <div class="bot-chart-wrap">
+        <div id="deltaBotChart"></div>
+        <div class="bot-price-overlay" id="deltaBotPriceOverlay" style="display:none">
+          <div class="sym" id="deltaBotPxSym">—</div>
+          <div class="px"  id="deltaBotPxVal">—</div>
+        </div>
+      </div>
+
+      <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Active Strategy</span><span class="val" id="deltaBotStrategy">—</span></div>
+        <div class="cell"><span class="lab">Market Regime</span><span class="val" id="deltaBotRegime">—</span></div>
+        <div class="cell"><span class="lab">Position</span><span class="val" id="deltaBotPosition">FLAT</span></div>
+        <div class="cell"><span class="lab">Entry Price</span><span class="val" id="deltaBotEntryPx">—</span></div>
+        <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="deltaBotRealizedPnl">0.00</span></div>
+        <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="deltaBotUnrealPnl">0.00</span></div>
+        <div class="cell"><span class="lab">Trades</span><span class="val" id="deltaBotTradeCount">0</span></div>
+        <div class="cell"><span class="lab">Win Rate</span><span class="val" id="deltaBotWinRate">—</span></div>
+      </div>
+
+      <div class="ai-strat-bar">
+        <span class="lbl">&#129504; Allow strategies:</span>
+        <label title="Mean-reversion bid-ask Market Making. Best in range/sideways crypto."><input type="checkbox" id="deltaBotIncludeMM"> Market Making</label>
+        <label title="Advanced Market Making with spread analysis."><input type="checkbox" id="deltaBotIncludeMMA"> MM Advanced</label>
+        <span style="color:#787b86;font-size:10px">(uncheck to exclude from active-strategy selection)</span>
+      </div>
+
+      <div class="ai-risk-bar">
+        <label>SL %: <input type="number" id="deltaBotSlPct" value="1.0" min="0.1" step="0.1"></label>
+        <label>Target %: <input type="number" id="deltaBotTpPct" value="2.0" min="0.1" step="0.1"></label>
+        <label>Max consec losses: <input type="number" id="deltaBotMaxConsec" value="3" min="1"></label>
+        <label>Max daily loss: <input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
+        <label>Min score: <input type="number" id="deltaBotMinScore" value="3.5" min="0.5" step="0.1"></label>
+      </div>
+
+      <div class="zd-footer">
+        <button class="zd-start-btn start"  id="deltaBotStartBtn">&#9654; Start Bot</button>
+        <button class="zd-start-btn pause"  id="deltaBotPauseBtn" disabled>&#9208; Pause</button>
+        <button class="zd-start-btn stop"   id="deltaBotStopBtn" disabled>&#9632; Stop Bot</button>
+      </div>
+
+      <div class="zd-log" id="deltaBotLog" style="max-height:180px"><span class="log-info">Delta bot ready. Paper Trading default. Enter symbol (BTCUSD/ETHUSD), click Load Chart, then Start Bot.</span></div>
     </div>
   </div>
 
@@ -16164,6 +17051,1555 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // ---- Initial state: hydrate from shared store (rules + connection) ----
     loadRulesFromStore();
     refreshAutoStatus();
+  })();
+
+  // ---- TradingView Watchlist & Analysis Panel ----
+  (function() {
+    const panel        = document.getElementById('tvPanel');
+    const header       = document.getElementById('tvHeader');
+    const closeBtn     = document.getElementById('tvClose');
+    const maximizeBtn  = document.getElementById('tvMaximizeBtn');
+    const popoutBtn    = document.getElementById('tvPopoutBtn');
+    const addInput     = document.getElementById('tvAddInput');
+    const addTF        = document.getElementById('tvAddTF');
+    const addBtn       = document.getElementById('tvAddBtn');
+    const watchBody    = document.getElementById('tvWatchBody');
+    const analysisCard = document.getElementById('tvAnalysisCard');
+    const analysisEmpty = document.getElementById('tvAnalysisEmpty');
+
+    const STORE_KEY = 'mangalview_tv_watchlist_v1';
+    let tvWatch      = [];          // [{symbol, tf, last:{price, chg, time}}]
+    let tvActiveSym  = null;
+    let tvPriceTimer = null;
+    let tvMaximized  = false;
+
+    // ---- Persistence ----
+    function loadWatch() {
+      try {
+        const raw = localStorage.getItem(STORE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) tvWatch = parsed;
+        }
+      } catch(e) {}
+    }
+    function saveWatch() {
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(tvWatch.map(w => ({symbol: w.symbol, tf: w.tf})))); } catch(e) {}
+    }
+
+    // ---- Open/close ----
+    document.getElementById('btnTradingView').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      if (!tvPriceTimer) startPricePolling();
+      renderWatch();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+
+    // ---- Drag ----
+    (function() {
+      let dragging = false, sx, sy, ol, ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        if (panel.classList.contains('maximized')) return;
+        dragging = true; panel.style.transform = 'none';
+        const r = panel.getBoundingClientRect();
+        ol = r.left; ot = r.top; sx = e.clientX; sy = e.clientY;
+        panel.style.left = ol + 'px'; panel.style.top = ot + 'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', function(e) {
+        if (!dragging) return;
+        panel.style.left = (ol + e.clientX - sx) + 'px';
+        panel.style.top  = (ot + e.clientY - sy) + 'px';
+      });
+      document.addEventListener('mouseup', () => { dragging = false; });
+    })();
+
+    // ---- Maximize ----
+    maximizeBtn.addEventListener('click', function() {
+      tvMaximized = !tvMaximized;
+      panel.classList.toggle('maximized', tvMaximized);
+      if (tvMaximized) {
+        panel.dataset.savedLeft = panel.style.left || '';
+        panel.dataset.savedTop  = panel.style.top  || '';
+        panel.dataset.savedTransform = panel.style.transform || '';
+        panel.style.left = ''; panel.style.top = ''; panel.style.transform = '';
+        this.innerHTML = '&#9635;'; this.title = 'Restore';
+      } else {
+        panel.style.left = panel.dataset.savedLeft || '';
+        panel.style.top  = panel.dataset.savedTop  || '';
+        panel.style.transform = panel.dataset.savedTransform || '';
+        this.innerHTML = '&#9633;'; this.title = 'Maximize';
+      }
+    });
+
+    // ---- Popout ----
+    popoutBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('tvPopout', '1');
+      window.open(url.toString(), 'tvPopout', 'width=1100,height=820,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('tvPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window');
+      panel.classList.add('open');
+      maximizeBtn.style.display = 'none';
+      popoutBtn.style.display = 'none';
+      closeBtn.style.display = 'none';
+      document.title = '📈 TradingView — Mangal View';
+    }
+
+    // ---- Add / remove symbol ----
+    addBtn.addEventListener('click', addSymbol);
+    addInput.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') addSymbol();
+    });
+    function addSymbol() {
+      const sym = (addInput.value || '').trim().toUpperCase();
+      const tf  = addTF.value || '15m';
+      if (!sym) return;
+      if (tvWatch.some(w => w.symbol === sym && w.tf === tf)) {
+        addInput.value = '';
+        return;
+      }
+      tvWatch.push({ symbol: sym, tf: tf, last: null });
+      saveWatch();
+      addInput.value = '';
+      renderWatch();
+      // Kick off an immediate fetch for the new row
+      refreshOne(sym, tf);
+    }
+    function removeSymbol(sym, tf) {
+      tvWatch = tvWatch.filter(w => !(w.symbol === sym && w.tf === tf));
+      saveWatch();
+      if (tvActiveSym && tvActiveSym.symbol === sym && tvActiveSym.tf === tf) {
+        tvActiveSym = null;
+        analysisCard.style.display = 'none';
+        analysisEmpty.style.display = '';
+      }
+      renderWatch();
+    }
+
+    // ---- Live prices ----
+    function refreshOne(sym, tf) {
+      const url = '/api/candles?symbol=' + encodeURIComponent(sym) +
+                  '&interval=' + encodeURIComponent(tf) +
+                  '&source=' + encodeURIComponent(currentSource);
+      fetch(url).then(r => r.json()).then(function(d) {
+        const candles = d.candles || [];
+        if (!candles.length) return;
+        const last  = candles[candles.length - 1];
+        const prev  = candles.length > 1 ? candles[0] : last;     // day-open proxy
+        const chg   = prev.close ? (last.close - prev.close) / prev.close * 100 : 0;
+        const row = tvWatch.find(w => w.symbol === sym && w.tf === tf);
+        if (row) {
+          row.last = { price: last.close, chg: chg, time: last.time, source: d.data_source || currentSource };
+          renderWatch();
+        }
+      }).catch(() => {});
+    }
+    function refreshAll() { tvWatch.forEach(w => refreshOne(w.symbol, w.tf)); }
+    function startPricePolling() {
+      tvPriceTimer = setInterval(() => { if (panel.classList.contains('open')) refreshAll(); }, 30000);
+      refreshAll();
+    }
+
+    // ---- Render watchlist ----
+    function renderWatch() {
+      if (!tvWatch.length) {
+        watchBody.innerHTML = '<tr id="tvNoSymbols"><td colspan="7" style="text-align:center;color:#787b86;padding:18px">No symbols. Type one above and click Add.</td></tr>';
+        return;
+      }
+      const fmt = n => (n == null || isNaN(n)) ? '—' : (n >= 100 ? n.toFixed(2) : n.toFixed(4));
+      const fmtChg = c => {
+        if (c == null || isNaN(c)) return '<span class="tv-chg-zero">—</span>';
+        const cls = c > 0.001 ? 'tv-chg-pos' : c < -0.001 ? 'tv-chg-neg' : 'tv-chg-zero';
+        const sign = c > 0 ? '+' : '';
+        return '<span class="' + cls + '">' + sign + c.toFixed(2) + '%</span>';
+      };
+      const fmtTime = t => t ? new Date(t * 1000).toLocaleTimeString() : '—';
+      watchBody.innerHTML = tvWatch.map((w, i) => {
+        const isActive = tvActiveSym && tvActiveSym.symbol === w.symbol && tvActiveSym.tf === w.tf;
+        return '<tr class="tv-row' + (isActive ? ' active' : '') + '" data-sym="' + w.symbol + '" data-tf="' + w.tf + '">' +
+          '<td>' + (i + 1) + '</td>' +
+          '<td class="tv-sym">' + w.symbol + '</td>' +
+          '<td>' + w.tf + '</td>' +
+          '<td class="tv-price">' + (w.last ? fmt(w.last.price) : '—') + '</td>' +
+          '<td>' + (w.last ? fmtChg(w.last.chg) : '<span class="tv-chg-zero">—</span>') + '</td>' +
+          '<td style="color:#787b86;font-size:11px">' + (w.last ? fmtTime(w.last.time) : '…') + '</td>' +
+          '<td><button class="tv-rm" data-sym="' + w.symbol + '" data-tf="' + w.tf + '">Remove</button></td>' +
+        '</tr>';
+      }).join('');
+      // Click row -> analyse
+      watchBody.querySelectorAll('.tv-row').forEach(tr => {
+        tr.addEventListener('click', function(e) {
+          if (e.target.closest('.tv-rm')) return;
+          analyseSymbol(this.dataset.sym, this.dataset.tf);
+        });
+      });
+      // Remove buttons
+      watchBody.querySelectorAll('.tv-rm').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          removeSymbol(this.dataset.sym, this.dataset.tf);
+        });
+      });
+    }
+
+    // ---- Analysis ----
+    function analyseSymbol(sym, tf) {
+      tvActiveSym = { symbol: sym, tf: tf };
+      renderWatch();
+      analysisEmpty.style.display = 'none';
+      analysisCard.style.display = '';
+      analysisCard.innerHTML = '<div style="text-align:center;padding:18px;color:#787b86">Loading analysis for <b>' + sym + '</b>…</div>';
+      // Run with the full algo bouquet — 14 signal algos + MM + MMA
+      const algos = 'trend,mstreet,mfactor,sniper,orderflow,priceaction,breakout,momentum,scalping,smartmoney,quant,hybrid,statarb,institution,marketmaking,mma';
+      const src = (typeof currentSource !== 'undefined' && currentSource) ? currentSource : 'tradingview';
+      const url = '/api/candles?symbol=' + encodeURIComponent(sym) +
+                  '&interval=' + encodeURIComponent(tf) +
+                  '&source=' + encodeURIComponent(src) +
+                  '&algo=' + encodeURIComponent(algos);
+      fetch(url).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+        const ct = r.headers.get('content-type') || '';
+        if (ct.indexOf('json') < 0) {
+          return r.text().then(function(t) { throw new Error('Non-JSON response: ' + t.slice(0, 200)); });
+        }
+        return r.json();
+      }).then(function(data) {
+        try {
+          renderAnalysis(sym, tf, data);
+        } catch(e) {
+          console.error('TradingView analysis render error:', e, 'data:', data);
+          analysisCard.innerHTML =
+            '<div style="color:#ef5350;padding:14px">Analysis render error: <code>' +
+            String(e && e.message || e).replace(/</g,'&lt;') +
+            '</code><br><span style="color:#787b86;font-size:11px">Open DevTools console for the full stack trace.</span></div>';
+        }
+      }).catch(function(err) {
+        console.error('TradingView analysis fetch error:', err);
+        analysisCard.innerHTML =
+          '<div style="color:#ef5350;padding:14px">Analysis fetch failed: <code>' +
+          String(err && err.message || err).replace(/</g,'&lt;') +
+          '</code><br><span style="color:#787b86;font-size:11px">' +
+          'symbol=' + sym + ' tf=' + tf + ' source=' + src +
+          '</span></div>';
+      });
+    }
+
+    function renderAnalysis(sym, tf, d) {
+      d = d || {};
+      const candles = (d.candles && d.candles.length) ? d.candles : [];
+      if (!candles.length) {
+        analysisCard.innerHTML =
+          '<div style="color:#ef5350;padding:14px">No candle data returned for <b>' + sym + '</b>' +
+          (d.data_source ? ' (source: ' + d.data_source + ')' : '') +
+          '.<br><span style="color:#787b86;font-size:11px">' +
+          'The symbol may not be recognised by the active data source ' +
+          '(yfinance/TradingView don\'t know Kite tradingsymbols like CRUDEOILM26JUNFUT — use the Zerodha panel for those, ' +
+          'or add a curated symbol like NIFTY50, BANKNIFTY, RELIANCE, CRUDEOILMCX here).</span></div>';
+        return;
+      }
+      const lc       = candles[candles.length - 1] || {};
+      const price    = lc.close || 0;
+      const open0    = candles[0].close;
+      const chgPct   = open0 ? (price - open0) / open0 * 100 : 0;
+      const fmt      = n => (n == null || isNaN(n)) ? '—' : (Math.abs(n) >= 100 ? n.toFixed(2) : n.toFixed(4));
+      const fmtPx    = n => (n == null || isNaN(n)) ? '—' : (n >= 1000 ? n.toFixed(0) : Math.abs(n) >= 100 ? n.toFixed(2) : n.toFixed(4));
+
+      // Per-algo consensus
+      const summaries = d.signalSummary || {};
+      const algoOrder = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution','marketmaking','mma'];
+      let buyN = 0, sellN = 0, neutralN = 0, scoreSum = 0, scoreN = 0;
+      const algoRows = [];
+      algoOrder.forEach(function(name) {
+        const sm = summaries[name];
+        if (!sm) return;
+        const verdict = (sm.verdict || sm.signal || sm.bias || '').toString().toUpperCase();
+        const score   = (sm.score != null) ? sm.score
+                      : (sm.composite_score != null) ? sm.composite_score
+                      : null;
+        let cls = 'neutral';
+        if (verdict.indexOf('BUY') >= 0 || verdict.indexOf('BULL') >= 0) { cls = 'buy'; buyN++; }
+        else if (verdict.indexOf('SELL') >= 0 || verdict.indexOf('BEAR') >= 0) { cls = 'sell'; sellN++; }
+        else { neutralN++; }
+        if (score != null) { scoreSum += score; scoreN++; }
+        algoRows.push({ name, verdict: verdict || '—', score, cls });
+      });
+      const totalAlgos = buyN + sellN + neutralN;
+      const avgScore   = scoreN ? scoreSum / scoreN : 0;
+      let bias = 'neutral';
+      if (buyN > sellN + 1)      bias = 'bullish';
+      else if (sellN > buyN + 1) bias = 'bearish';
+
+      // Indicator readings
+      const tail = a => Array.isArray(a) && a.length ? a[a.length-1] : null;
+      const st   = tail(d.supertrend);
+      const rsi  = tail(d.rsi);
+      const macd = tail(d.macd);
+      const e9   = tail(d.ema9);
+      const e21  = tail(d.ema21);
+      const vw   = tail(d.vwap);
+      const bb   = tail(d.bollingerBands);
+
+      // S/R from supportResistance — backend returns {support: [...], resistance: [...]}
+      // (each entry is {price, strength}). The lists are already sorted by
+      // proximity to current price (closest first).
+      const sr          = d.supportResistance || {};
+      const supports    = Array.isArray(sr.support)    ? sr.support.slice()    : [];
+      const resistances = Array.isArray(sr.resistance) ? sr.resistance.slice() : [];
+      const nearestSup  = supports[0];
+      const nearestRes  = resistances[0];
+      const secondRes   = resistances[1];
+
+      // Trade plan
+      const longBias = bias === 'bullish';
+      const sl   = longBias ? (nearestSup ? nearestSup.price : price * 0.99)
+                            : (nearestRes ? nearestRes.price : price * 1.01);
+      const t1   = longBias ? (nearestRes ? nearestRes.price : price * 1.01)
+                            : (nearestSup ? nearestSup.price : price * 0.99);
+      const t2   = longBias ? (secondRes ? secondRes.price : price * 1.02)
+                            : (supports[1] ? supports[1].price : price * 0.98);
+      const risk = Math.abs(price - sl);
+      const rwd1 = Math.abs(t1 - price);
+      const rwd2 = Math.abs(t2 - price);
+      const rr1  = risk > 0 ? (rwd1 / risk) : 0;
+      const rr2  = risk > 0 ? (rwd2 / risk) : 0;
+
+      // Volume profile
+      const vp = d.volumeProfile || {};
+
+      // ---- Plain-English summary ----
+      const indNotes = [];
+      if (st && st.direction != null) indNotes.push('SuperTrend ' + (st.direction === 1 ? 'up' : 'down'));
+      if (rsi && rsi.value != null)   indNotes.push('RSI ' + rsi.value.toFixed(0));
+      if (macd && macd.histogram != null) indNotes.push('MACD ' + (macd.histogram > 0 ? '+' : '') + macd.histogram.toFixed(2));
+      const summaryText =
+        (bias === 'bullish' ? 'Bullish bias' :
+         bias === 'bearish' ? 'Bearish bias' : 'Neutral / mixed bias') +
+        ' — ' + buyN + ' BUY / ' + sellN + ' SELL / ' + neutralN + ' NEUTRAL across ' + totalAlgos + ' algos' +
+        (scoreN ? ' (avg score ' + avgScore.toFixed(1) + ')' : '') +
+        '. ' + (indNotes.length ? indNotes.join(', ') + '. ' : '') +
+        (bias === 'neutral'
+          ? 'No clear directional edge — best to wait or trade range.'
+          : (longBias
+              ? 'Buy zone ' + fmtPx(price) + ' (near ' + (vp.poc ? 'POC ' + fmtPx(vp.poc) : 'current price') +
+                '), SL ' + fmtPx(sl) + ', T1 ' + fmtPx(t1) + ' (R:R 1:' + rr1.toFixed(1) + '), T2 ' + fmtPx(t2) + ' (R:R 1:' + rr2.toFixed(1) + ').'
+              : 'Sell zone ' + fmtPx(price) + ' (near ' + (vp.poc ? 'POC ' + fmtPx(vp.poc) : 'current price') +
+                '), SL ' + fmtPx(sl) + ', T1 ' + fmtPx(t1) + ' (R:R 1:' + rr1.toFixed(1) + '), T2 ' + fmtPx(t2) + ' (R:R 1:' + rr2.toFixed(1) + ').'));
+
+      // ---- Build HTML ----
+      const fmtBullish = b => '<span class="val ' + (b ? 'bullish' : 'bearish') + '">' + (b ? 'BULLISH' : 'BEARISH') + '</span>';
+      const algosHtml = algoRows.map(a =>
+        '<div class="a-row ' + a.cls + '">' +
+          '<span>' + a.name + '</span>' +
+          '<span>' + a.verdict + (a.score != null ? ' (' + a.score.toFixed(1) + ')' : '') + '</span>' +
+        '</div>'
+      ).join('');
+      const srHtml = (() => {
+        const rs = resistances.slice(0, 3).reverse();   // furthest first so top-down reads R3 R2 R1
+        const ss = supports.slice(0, 3);                // closest first (S1 S2 S3)
+        const allSR = supports.concat(resistances);
+        const maxStrength = allSR.length
+          ? Math.max.apply(null, allSR.map(x => x.strength || 1).concat([1]))
+          : 1;
+        const renderRow = (x, cls) => {
+          const w = ((x.strength || 1) / maxStrength) * 100;
+          return '<div class="tv-sr-row ' + cls + '"><span class="lab">' + cls.toUpperCase() + '</span><span class="val">' + fmtPx(x.price) + '</span><div class="bar" style="width:' + w + '%"></div></div>';
+        };
+        if (!rs.length && !ss.length) return '';
+        return rs.map(r => renderRow(r, 'r')).join('') +
+               '<div class="tv-sr-divider">▼ PRICE ' + fmtPx(price) + ' ▼</div>' +
+               ss.map(s => renderRow(s, 's')).join('');
+      })();
+
+      const chgCls = chgPct > 0 ? 'tv-chg-pos' : chgPct < 0 ? 'tv-chg-neg' : 'tv-chg-zero';
+      const chgStr = (chgPct >= 0 ? '+' : '') + chgPct.toFixed(2) + '%';
+
+      analysisCard.innerHTML =
+        '<div class="tv-an-hd">' +
+          '<div class="tv-an-sym">' + sym + ' <span style="color:#787b86;font-size:11px;font-weight:500">(' + tf + (d.data_source ? ' • ' + d.data_source : '') + ')</span></div>' +
+          '<div class="tv-an-price">' + fmtPx(price) + ' <span class="' + chgCls + '">' + chgStr + '</span></div>' +
+        '</div>' +
+        '<div class="tv-an-section"><h4>📝 Summary</h4>' +
+          '<div class="tv-an-summary ' + bias + '">' + summaryText + '</div></div>' +
+        '<div class="tv-an-section"><h4>📋 Trade Plan</h4>' +
+          '<div class="tv-plan">' +
+            '<div class="row"><span class="lab">Direction</span><span class="val">' + (longBias ? 'LONG' : (bias === 'bearish' ? 'SHORT' : 'WAIT / RANGE')) + '</span></div>' +
+            '<div class="row"><span class="lab">Entry</span><span class="val">' + fmtPx(price) + '</span></div>' +
+            '<div class="row"><span class="lab">Stop Loss</span><span class="val">' + fmtPx(sl) + ' (' + (risk / price * 100).toFixed(2) + '%)</span></div>' +
+            '<div class="row"><span class="lab">Target 1</span><span class="val">' + fmtPx(t1) + ' (R:R 1:' + rr1.toFixed(1) + ')</span></div>' +
+            '<div class="row"><span class="lab">Target 2</span><span class="val">' + fmtPx(t2) + ' (R:R 1:' + rr2.toFixed(1) + ')</span></div>' +
+          '</div></div>' +
+        '<div class="tv-an-section"><h4>🧠 Algo Consensus (' + buyN + ' BUY / ' + sellN + ' SELL / ' + neutralN + ' NEUTRAL)</h4>' +
+          '<div class="tv-an-algos">' + (algosHtml || '<div style="color:#787b86">No algo summaries returned.</div>') + '</div></div>' +
+        '<div class="tv-an-section"><h4>📊 Indicators</h4><div class="tv-an-grid">' +
+          ((st && st.direction != null) ? '<div><span class="lab">SuperTrend:</span> ' + fmtBullish(st.direction === 1) + ' <span class="val">' + fmtPx(st.value) + '</span></div>' : '') +
+          ((rsi && rsi.value != null) ? '<div><span class="lab">RSI:</span> <span class="val ' + (rsi.value > 70 ? 'bearish' : rsi.value < 30 ? 'bullish' : '') + '">' + rsi.value.toFixed(1) + '</span></div>' : '') +
+          ((macd && macd.histogram != null) ? '<div><span class="lab">MACD hist:</span> <span class="val ' + (macd.histogram > 0 ? 'bullish' : 'bearish') + '">' + (macd.histogram > 0 ? '+' : '') + macd.histogram.toFixed(2) + '</span></div>' : '') +
+          ((e9 && e21 && e9.value != null && e21.value != null) ? '<div><span class="lab">EMA 9/21:</span> <span class="val ' + (e9.value > e21.value ? 'bullish' : 'bearish') + '">' + fmtPx(e9.value) + ' / ' + fmtPx(e21.value) + '</span></div>' : '') +
+          ((vw && vw.value != null) ? '<div><span class="lab">VWAP:</span> <span class="val ' + (price > vw.value ? 'bullish' : 'bearish') + '">' + fmtPx(vw.value) + '</span></div>' : '') +
+          ((bb && bb.middle != null) ? '<div><span class="lab">BB mid/up/lo:</span> <span class="val">' + fmtPx(bb.middle) + ' / ' + fmtPx(bb.upper) + ' / ' + fmtPx(bb.lower) + '</span></div>' : '') +
+        '</div></div>' +
+        '<div class="tv-an-section"><h4>🎯 Support / Resistance</h4>' + (srHtml || '<div style="color:#787b86">No S/R levels.</div>') + '</div>' +
+        (vp && vp.poc ? '<div class="tv-an-section"><h4>📈 Volume Profile</h4><div class="tv-an-grid">' +
+          '<div><span class="lab">POC:</span> <span class="val">' + fmtPx(vp.poc) + '</span></div>' +
+          (vp.vah ? '<div><span class="lab">VAH:</span> <span class="val">' + fmtPx(vp.vah) + '</span></div>' : '') +
+          (vp.val ? '<div><span class="lab">VAL:</span> <span class="val">' + fmtPx(vp.val) + '</span></div>' : '') +
+          '</div></div>' : '');
+    }
+
+    // ---- Init ----
+    loadWatch();
+  })();
+
+  // ---- Zerodha AI Bot Panel ----
+  (function() {
+    const panel    = document.getElementById('aiBotPanel');
+    const header   = document.getElementById('aiBotHeader');
+    const closeBtn = document.getElementById('aiBotClose');
+    const maxBtn   = document.getElementById('aiBotMaximizeBtn');
+    const popBtn   = document.getElementById('aiBotPopoutBtn');
+    const symEl    = document.getElementById('aiBotSymbol');
+    const exchEl   = document.getElementById('aiBotExchange');
+    const qtyEl    = document.getElementById('aiBotQty');
+    const tfEl     = document.getElementById('aiBotTF');
+    const loadBtn  = document.getElementById('aiBotLoadBtn');
+    const chartDiv = document.getElementById('aiBotChart');
+    const stratEl  = document.getElementById('aiBotStrategy');
+    const regimeEl = document.getElementById('aiBotRegime');
+    const posEl    = document.getElementById('aiBotPosition');
+    const entryPxEl= document.getElementById('aiBotEntryPx');
+    const realPnlEl= document.getElementById('aiBotRealizedPnl');
+    const unrPnlEl = document.getElementById('aiBotUnrealPnl');
+    const tcEl     = document.getElementById('aiBotTradeCount');
+    const wrEl     = document.getElementById('aiBotWinRate');
+    const slPctEl  = document.getElementById('aiBotSlPct');
+    const tpPctEl  = document.getElementById('aiBotTpPct');
+    const maxConsecEl = document.getElementById('aiBotMaxConsec');
+    const maxLossEl   = document.getElementById('aiBotMaxLoss');
+    const minScoreEl  = document.getElementById('aiBotMinScore');
+    const startBtn = document.getElementById('aiBotStartBtn');
+    const pauseBtn = document.getElementById('aiBotPauseBtn');
+    const stopBtn  = document.getElementById('aiBotStopBtn');
+    const logEl    = document.getElementById('aiBotLog');
+    const statusDot  = document.getElementById('aiBotStatusDot');
+    const statusText = document.getElementById('aiBotStatusText');
+
+    // ---- State ----
+    let botRunning   = false;
+    let botPaused    = false;
+    let botTimer     = null;
+    let botChart     = null;
+    let botCandleSeries = null;
+    let botPosition  = null;   // {side, entryPrice, entryTime, qty, sl, tp, strategy}
+    let botTrades    = [];     // closed trades [{...pos, exitPrice, exitTime, pnl}]
+    let botConsecLosses = 0;
+    let botMaximized = false;
+    let lastKnownPrice = 0;    // last close from any successful tick — used at stopBot when no chart data
+    const STORE_KEY  = 'mangalview_aibot_state_v1';
+
+    // ---- Local exchange inferrer ----
+    // The Zerodha Automation IIFE has _inferExchangeFromSym, but sibling IIFEs
+    // can't see each other's locals, so we keep a small inline copy here.
+    const _AI_NAMES_MCX = ['CRUDEOIL','CRUDEOILM','GOLD','GOLDM','GOLDMINI','GOLDPETAL','SILVER','SILVERM','SILVERMIC','NATURALGAS','COPPER','ZINC','LEAD','NICKEL','ALUMINIUM','MENTHA','CASTOR'];
+    const _AI_NAMES_NFO = ['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','NIFTYNXT50'];
+    const _AI_NAMES_BFO = ['SENSEX','BANKEX','SENSEX50'];
+    const _AI_NAMES_ALL = _AI_NAMES_MCX.concat(_AI_NAMES_NFO, _AI_NAMES_BFO).sort((a,b)=>b.length-a.length);
+    function _aiInferExch(sym) {
+      const s = String(sym || '').toUpperCase();
+      if (!/(FUT|CE|PE)$/.test(s)) return '';
+      for (const name of _AI_NAMES_ALL) {
+        if (s.startsWith(name)) {
+          if (_AI_NAMES_MCX.indexOf(name) >= 0) return 'MCX';
+          if (_AI_NAMES_NFO.indexOf(name) >= 0) return 'NFO';
+          if (_AI_NAMES_BFO.indexOf(name) >= 0) return 'BFO';
+        }
+      }
+      return '';
+    }
+
+    // ---- Optional strategies (MM / MMA) — controlled by checkboxes,
+    //      persisted in localStorage so the choice survives reloads.
+    const incMMChk  = document.getElementById('aiBotIncludeMM');
+    const incMMAChk = document.getElementById('aiBotIncludeMMA');
+    const INC_MM_KEY  = 'mangalview_aibot_inc_mm_v1';
+    const INC_MMA_KEY = 'mangalview_aibot_inc_mma_v1';
+    try {
+      if (localStorage.getItem(INC_MM_KEY)  === '1') incMMChk.checked  = true;
+      if (localStorage.getItem(INC_MMA_KEY) === '1') incMMAChk.checked = true;
+    } catch(e) {}
+    incMMChk.addEventListener('change',  function() { try { localStorage.setItem(INC_MM_KEY,  this.checked ? '1' : '0'); } catch(e) {} });
+    incMMAChk.addEventListener('change', function() { try { localStorage.setItem(INC_MMA_KEY, this.checked ? '1' : '0'); } catch(e) {} });
+    function _activeAlgoList() {
+      const base = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution'];
+      if (incMMChk.checked)  base.push('marketmaking');
+      if (incMMAChk.checked) base.push('mma');
+      return base.join(',');
+    }
+    function _mmEnabled()  { return !!incMMChk.checked; }
+    function _mmaEnabled() { return !!incMMAChk.checked; }
+
+    // ---- Open / Close ----
+    document.getElementById('btnAIBot').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refreshStatus();
+      if (!botChart) initChart();
+      loadChart();
+      loadTradeHistory();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+
+    // ---- Drag ----
+    (function() {
+      let dragging = false, sx, sy, ol, ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        if (panel.classList.contains('maximized')) return;
+        dragging = true; panel.style.transform = 'none';
+        const r = panel.getBoundingClientRect();
+        ol = r.left; ot = r.top; sx = e.clientX; sy = e.clientY;
+        panel.style.left = ol + 'px'; panel.style.top = ot + 'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', function(e) {
+        if (!dragging) return;
+        panel.style.left = (ol + e.clientX - sx) + 'px';
+        panel.style.top  = (ot + e.clientY - sy) + 'px';
+      });
+      document.addEventListener('mouseup', () => { dragging = false; });
+    })();
+
+    // ---- Maximize ----
+    maxBtn.addEventListener('click', function() {
+      botMaximized = !botMaximized;
+      panel.classList.toggle('maximized', botMaximized);
+      this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
+      this.title = botMaximized ? 'Restore' : 'Maximize';
+      // Resize chart to new container width
+      if (botChart) setTimeout(() => botChart.applyOptions({ width: chartDiv.clientWidth }), 50);
+    });
+
+    // ---- Popout ----
+    popBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('aibotPopout', '1');
+      window.open(url.toString(), 'aibotPopout', 'width=1100,height=900,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('aibotPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window');
+      panel.classList.add('open');
+      maxBtn.style.display = 'none';
+      popBtn.style.display = 'none';
+      closeBtn.style.display = 'none';
+      document.title = '🧠 Zerodha AI Bot — Mangal View';
+    }
+
+    // ---- Connection status (mirror Zerodha session) ----
+    function refreshStatus() {
+      const s = ZerodhaStore.getSession();
+      if (s.connected && s.apiKey) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>';
+      } else {
+        statusDot.classList.remove('connected');
+        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
+      }
+    }
+    window.addEventListener('zerodha-session-change', refreshStatus);
+    window.addEventListener('storage', e => { if (e.key === ZerodhaStore.SESSION_KEY) refreshStatus(); });
+
+    // ---- Mini chart ----
+    function initChart() {
+      if (typeof LightweightCharts === 'undefined') return;
+      botChart = LightweightCharts.createChart(chartDiv, {
+        width:  chartDiv.clientWidth,
+        height: 280,
+        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+        grid:   { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+        timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
+        rightPriceScale: { borderColor: '#2a2e39' },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+      });
+      botCandleSeries = botChart.addCandlestickSeries({
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350'
+      });
+      // Resize on window resize
+      window.addEventListener('resize', () => { if (botChart) botChart.applyOptions({ width: chartDiv.clientWidth }); });
+    }
+
+    // ---- Fetch + render chart ----
+    function loadChart() {
+      const sym = symEl.value.trim().toUpperCase();
+      const tf  = tfEl.value;
+      const exch = exchEl.value.trim().toUpperCase();
+      if (!sym) return;
+      const s = ZerodhaStore.getSession();
+      // Prefer Kite source when connected and exchange is Indian; else fall back
+      const isKiteEx = ['NSE','BSE','NFO','BFO','MCX','CDS','BCD','NCO'].indexOf(exch) >= 0;
+      const useKite = s.connected && (isKiteEx || _aiInferExch(sym));
+      const src = useKite ? 'kite' : 'tradingview';
+      const url = '/api/candles?symbol=' + encodeURIComponent(sym) +
+                  '&interval=' + encodeURIComponent(tf) +
+                  '&source=' + encodeURIComponent(src) +
+                  (useKite && s.apiKey ? '&api_key=' + encodeURIComponent(s.apiKey) : '');
+      fetch(url).then(r => r.json()).then(function(d) {
+        if (!d.candles || !d.candles.length) {
+          logLine('[Chart] No candles for ' + sym + ' from ' + (d.data_source || src) + '. Check exchange/source/symbol.', 'info');
+          return;
+        }
+        if (botCandleSeries) botCandleSeries.setData(d.candles);
+        if (botChart) botChart.timeScale().fitContent();
+        const lc = d.candles[d.candles.length - 1];
+        if (lc && lc.close != null) updatePriceOverlay(lc.close);
+        logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + sym + ' (source: ' + (d.data_source || src) + ')', 'info');
+      }).catch(function() {
+        logLine('[Chart] Fetch failed for ' + sym, 'info');
+      });
+    }
+    loadBtn.addEventListener('click', loadChart);
+
+    // ---- Strategy selector + market-regime detector ----
+    // Detect the market regime from the last 20 candles. Output: volatility
+    // (high/low) + trending (true/false) + direction (up/down).
+    function detectRegime(candles) {
+      const n = Math.min(20, candles.length);
+      if (n < 5) return { volatility: 'low', trending: false, direction: 'flat', volPct: 0, trendPct: 0 };
+      const window = candles.slice(-n);
+      const ranges = window.map(c => c.high - c.low);
+      const avgRange = ranges.reduce((a, b) => a + b, 0) / n;
+      const avgPrice = window.reduce((s, c) => s + c.close, 0) / n;
+      const volPct = avgPrice > 0 ? (avgRange / avgPrice * 100) : 0;
+      const trendPct = window[0].close > 0 ? ((window[n-1].close - window[0].close) / window[0].close * 100) : 0;
+      const isTrending = Math.abs(trendPct) > 0.6;
+      return {
+        volatility: volPct > 1.2 ? 'high' : 'low',
+        trending:   isTrending,
+        direction:  trendPct > 0 ? 'up' : (trendPct < 0 ? 'down' : 'flat'),
+        volPct, trendPct
+      };
+    }
+
+    // Pick the best-fit algo for the current regime, then translate its
+    // signal/score to BUY / SELL / HOLD. The score threshold scales with
+    // volatility — choppier markets need a stronger edge before we enter.
+    function selectStrategy(regime, data) {
+      const summaries = data.signalSummary || {};
+      // Candidate algos by regime
+      const trendingCands = ['trend','momentum','sniper','breakout','priceaction','smartmoney','institution'];
+      const rangeCands    = ['mstreet','statarb','mfactor','scalping','quant','orderflow'];
+      // Market-making variants fit RANGE markets best. Only allow when the
+      // user has ticked the corresponding checkbox above the risk bar.
+      if (_mmEnabled())  rangeCands.push('marketmaking');
+      if (_mmaEnabled()) rangeCands.push('mma');
+      const cands = regime.trending ? trendingCands : rangeCands;
+
+      let best = null;
+      for (const name of cands) {
+        const sm = summaries[name];
+        if (!sm) continue;
+        const score = (sm.score != null) ? sm.score
+                    : (sm.composite_score != null) ? sm.composite_score : null;
+        if (score == null) continue;
+        if (best == null || Math.abs(score) > Math.abs(best.score)) {
+          best = { name, score, verdict: (sm.verdict || sm.signal || '').toString().toUpperCase() };
+        }
+      }
+      // Fall back to overall scan if regime-specific algos returned nothing
+      if (!best) {
+        for (const name of Object.keys(summaries)) {
+          const sm = summaries[name];
+          const score = (sm.score != null) ? sm.score
+                      : (sm.composite_score != null) ? sm.composite_score : null;
+          if (score == null) continue;
+          if (best == null || Math.abs(score) > Math.abs(best.score)) {
+            best = { name, score, verdict: (sm.verdict || sm.signal || '').toString().toUpperCase() };
+          }
+        }
+      }
+      if (!best) return { name: 'wait', signal: 'HOLD', score: 0, reason: 'no algo data' };
+
+      // Regime-adjusted threshold: choppy/low-vol needs stronger edge.
+      const userMin = parseFloat(minScoreEl.value) || 3.5;
+      const threshold = regime.volatility === 'high' ? userMin : userMin + 0.5;
+      let signal = 'HOLD';
+      if (best.score >=  threshold) signal = 'BUY';
+      if (best.score <= -threshold) signal = 'SELL';
+
+      const reasonBits = [];
+      reasonBits.push(regime.volatility + ' vol ' + regime.volPct.toFixed(2) + '%');
+      reasonBits.push(regime.trending ? 'trending ' + regime.direction + ' ' + regime.trendPct.toFixed(2) + '%' : 'range');
+      reasonBits.push('score ' + best.score.toFixed(1) + ' vs ±' + threshold.toFixed(1));
+
+      return {
+        name:   best.name,
+        signal: signal,
+        score:  best.score,
+        reason: reasonBits.join(' • ')
+      };
+    }
+
+    // ---- Position / order placement ----
+    function openPosition(side, price, strategy, mode) {
+      const qty   = Math.max(1, parseInt(qtyEl.value) || 1);
+      const slPct = Math.max(0.1, parseFloat(slPctEl.value) || 1.5);
+      const tpPct = Math.max(0.1, parseFloat(tpPctEl.value) || 3.0);
+      const sl = side === 'BUY' ? price * (1 - slPct / 100) : price * (1 + slPct / 100);
+      const tp = side === 'BUY' ? price * (1 + tpPct / 100) : price * (1 - tpPct / 100);
+      botPosition = {
+        side, entryPrice: price, entryTime: Date.now(), qty,
+        sl: round2(sl), tp: round2(tp), strategy: strategy.name, mode
+      };
+      const tag = '[' + mode.toUpperCase() + ']';
+      const line = tag + ' ENTRY ' + side + ' ' + qty + ' ' + symEl.value.trim().toUpperCase() +
+                   ' @ ' + price.toFixed(2) +
+                   ' SL=' + botPosition.sl + ' TP=' + botPosition.tp +
+                   ' strat=' + strategy.name + ' score=' + strategy.score.toFixed(1);
+      logLine(line, side.toLowerCase());
+      persistLog(line);
+      // Live order
+      if (mode === 'live') placeLiveOrder(side, price, qty);
+      updateInfo();
+    }
+
+    function closePosition(price, reason, mode) {
+      if (!botPosition) return;
+      const pos  = botPosition;
+      const dir  = pos.side === 'BUY' ? 1 : -1;
+      const pnl  = (price - pos.entryPrice) * pos.qty * dir;
+      const closeTrade = Object.assign({}, pos, {
+        exitPrice: round2(price), exitTime: Date.now(), pnl: round2(pnl), reason
+      });
+      botTrades.push(closeTrade);
+      if (pnl < 0) botConsecLosses++;
+      else botConsecLosses = 0;
+
+      const tag = '[' + mode.toUpperCase() + ']';
+      const pnlSign = pnl >= 0 ? '+' : '';
+      const pnlCls  = pnl >= 0 ? 'buy' : 'sell';
+      const line = tag + ' EXIT ' + (pos.side === 'BUY' ? 'SELL' : 'BUY') + ' ' + pos.qty + ' ' +
+                   symEl.value.trim().toUpperCase() + ' @ ' + price.toFixed(2) +
+                   ' (entry ' + pos.entryPrice.toFixed(2) + ') PnL=' + pnlSign + '₹' + pnl.toFixed(2) +
+                   ' reason=' + reason + ' strat=' + pos.strategy;
+      logLine(line, pnlCls);
+      persistLog(line);
+      if (mode === 'live') placeLiveOrder(pos.side === 'BUY' ? 'SELL' : 'BUY', price, pos.qty);
+      botPosition = null;
+      updateInfo();
+
+      // Circuit breakers
+      const realized = botTrades.reduce((s, t) => s + t.pnl, 0);
+      const maxConsec = parseInt(maxConsecEl.value) || 3;
+      const maxLoss   = parseFloat(maxLossEl.value) || 2000;
+      if (botConsecLosses >= maxConsec) {
+        logLine('[STOP] Max consecutive losses (' + maxConsec + ') reached. Bot stopped.', 'info');
+        persistLog('[STOP] Max consecutive losses');
+        stopBot();
+      } else if (realized < -Math.abs(maxLoss)) {
+        logLine('[STOP] Max daily loss ₹' + maxLoss + ' breached (realised ₹' + realized.toFixed(2) + '). Bot stopped.', 'info');
+        persistLog('[STOP] Max daily loss');
+        stopBot();
+      }
+    }
+
+    function placeLiveOrder(side, price, qty) {
+      const s = ZerodhaStore.getSession();
+      if (!s.connected || !s.apiKey) {
+        logLine('[LIVE] Order skipped — Zerodha not connected.', 'info');
+        return;
+      }
+      const exch = (exchEl.value || _aiInferExch(symEl.value.trim().toUpperCase()) || 'NSE').toUpperCase();
+      fetch('/api/zerodha/order', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          api_key:           s.apiKey,
+          symbol:            symEl.value.trim().toUpperCase(),
+          exchange:          exch,
+          side:              side,
+          qty:               qty,
+          order_type:        'LIMIT',
+          price:             round2(side === 'SELL' ? price * 0.998 : price * 1.002),  // tight LIMIT around LTP
+          market_protection: 0,
+          dry_run:           false
+        })
+      }).then(r => r.json()).then(function(res) {
+        if (res.success) {
+          const line = '[LIVE] Kite accepted #' + res.orderId;
+          logLine(line, 'info');
+          persistLog(line);  // live response from exchange
+        } else {
+          const line = '[LIVE] Order failed: ' + (res.error || 'unknown');
+          logLine(line, 'info');
+          persistLog(line);  // failed live response
+        }
+      }).catch(() => {
+        const line = '[LIVE] Order request error';
+        logLine(line, 'info');
+        persistLog(line);
+      });
+    }
+
+    // ---- Bot tick ----
+    function botTick() {
+      if (!botRunning || botPaused) return;
+      const sym = symEl.value.trim().toUpperCase();
+      const tf  = tfEl.value;
+      if (!sym) return;
+      const s = ZerodhaStore.getSession();
+      const exch = exchEl.value.trim().toUpperCase();
+      const isKiteEx = ['NSE','BSE','NFO','BFO','MCX','CDS','BCD','NCO'].indexOf(exch) >= 0;
+      const useKite = s.connected && (isKiteEx || _aiInferExch(sym));
+      const src = useKite ? 'kite' : 'tradingview';
+      const algos = _activeAlgoList();
+      const url = '/api/candles?symbol=' + encodeURIComponent(sym) +
+                  '&interval=' + encodeURIComponent(tf) +
+                  '&source=' + encodeURIComponent(src) +
+                  (useKite && s.apiKey ? '&api_key=' + encodeURIComponent(s.apiKey) : '') +
+                  '&algo=' + encodeURIComponent(algos);
+      fetch(url).then(r => r.json()).then(function(data) {
+        const candles = data.candles || [];
+        if (!candles.length) {
+          logLine('[Tick] no candles', 'info');
+          return;
+        }
+        // Update chart
+        if (botCandleSeries) botCandleSeries.setData(candles);
+        const lc = candles[candles.length - 1];
+        const price = lc.close;
+        lastKnownPrice = price;
+        updatePriceOverlay(price);
+
+        // Regime + strategy
+        const regime = detectRegime(candles);
+        const strat  = selectStrategy(regime, data);
+        regimeEl.textContent = regime.volatility + ' vol, ' + (regime.trending ? 'trending ' + regime.direction : 'range');
+        stratEl.textContent  = strat.name + ' [' + strat.signal + ']';
+        stratEl.className    = 'val ' + (strat.signal === 'BUY' ? 'bull' : strat.signal === 'SELL' ? 'bear' : '');
+
+        const mode = currentMode();
+        const srcTag = data.data_source ? '[' + data.data_source + ']' : '[' + src + ']';
+        const noTradeReasons = [];
+
+        // Position management
+        if (botPosition) {
+          // Update unrealized P/L
+          updateUnrealized(price);
+          // SL / TP / Strategy reversal exit
+          const isLong = botPosition.side === 'BUY';
+          if (isLong && price <= botPosition.sl)      closePosition(price, 'SL hit',  mode);
+          else if (isLong && price >= botPosition.tp) closePosition(price, 'TP hit',  mode);
+          else if (!isLong && price >= botPosition.sl) closePosition(price, 'SL hit', mode);
+          else if (!isLong && price <= botPosition.tp) closePosition(price, 'TP hit', mode);
+          else if (isLong && strat.signal === 'SELL')  closePosition(price, 'signal reversal', mode);
+          else if (!isLong && strat.signal === 'BUY')  closePosition(price, 'signal reversal', mode);
+          else {
+            logLine('[Tick] ' + srcTag + ' price=' + price.toFixed(2) + ' (in position ' + botPosition.side + ' from ' + botPosition.entryPrice.toFixed(2) + ', strat=' + strat.name + ')', 'info');
+          }
+        } else {
+          // Look for entry
+          if (strat.signal === 'BUY' || strat.signal === 'SELL') {
+            openPosition(strat.signal, price, strat, mode);
+          } else {
+            noTradeReasons.push(strat.reason);
+            logLine('[Tick] ' + srcTag + ' price=' + price.toFixed(2) + ' HOLD — ' + noTradeReasons.join(' • '), 'info');
+          }
+        }
+      }).catch(function() {
+        logLine('[Tick] fetch error', 'info');
+      });
+    }
+
+    // ---- Start / Pause / Stop ----
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const sym = symEl.value.trim().toUpperCase();
+      if (!sym) { logLine('Enter a tradingsymbol first.', 'info'); return; }
+      botRunning = true; botPaused = false; botConsecLosses = 0;
+      startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
+      _renderPauseBtn();
+      const mode = currentMode();
+      logLine('Bot started in ' + mode.toUpperCase() + ' mode for ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value + '. Checking every 15s.', 'info');
+      persistLog('[' + mode.toUpperCase() + '] BOT START ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value);
+      botTick();
+      botTimer = setInterval(botTick, 15000);
+    });
+
+    pauseBtn.addEventListener('click', function() {
+      if (!botRunning) return;
+      botPaused = !botPaused;
+      _renderPauseBtn();
+      logLine(botPaused ? 'Bot paused — position state preserved.' : 'Bot resumed.', 'info');
+      if (!botPaused) botTick();
+    });
+    function _renderPauseBtn() {
+      if (botPaused) {
+        pauseBtn.innerHTML = '▶ Resume';
+        pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume');
+      } else {
+        pauseBtn.innerHTML = '⏸ Pause';
+        pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause');
+      }
+    }
+
+    stopBtn.addEventListener('click', stopBot);
+    function stopBot() {
+      if (!botRunning) return;
+      clearInterval(botTimer); botTimer = null;
+      botRunning = false; botPaused = false;
+      startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true;
+      _renderPauseBtn();
+      // Close any open position at last known price (tracked from the last tick).
+      if (botPosition) {
+        const px = lastKnownPrice || botPosition.entryPrice;
+        closePosition(px, 'bot stop', currentMode());
+      }
+      logLine('Bot stopped.', 'info');
+      persistLog('[' + currentMode().toUpperCase() + '] BOT STOP');
+    }
+
+    // ---- Helpers ----
+    function currentMode() {
+      const r = document.querySelector('input[name="aiBotMode"]:checked');
+      return r ? r.value : 'paper';
+    }
+    function round2(x) { return Math.round(x * 100) / 100; }
+    function updateUnrealized(price) {
+      if (!botPosition) { unrPnlEl.textContent = '₹0.00'; unrPnlEl.className = 'val'; return; }
+      const dir = botPosition.side === 'BUY' ? 1 : -1;
+      const u   = (price - botPosition.entryPrice) * botPosition.qty * dir;
+      unrPnlEl.textContent = (u >= 0 ? '+₹' : '-₹') + Math.abs(u).toFixed(2);
+      unrPnlEl.className   = 'val ' + (u >= 0 ? 'bull' : 'bear');
+    }
+    function updateInfo() {
+      if (botPosition) {
+        posEl.textContent = botPosition.side === 'BUY' ? 'LONG' : 'SHORT';
+        posEl.className   = 'val ' + (botPosition.side === 'BUY' ? 'bull' : 'bear');
+        entryPxEl.textContent = botPosition.entryPrice.toFixed(2);
+      } else {
+        posEl.textContent = 'FLAT'; posEl.className = 'val';
+        entryPxEl.textContent = '—';
+        unrPnlEl.textContent  = '₹0.00'; unrPnlEl.className = 'val';
+      }
+      const realized = botTrades.reduce((s, t) => s + t.pnl, 0);
+      realPnlEl.textContent = (realized >= 0 ? '+₹' : '-₹') + Math.abs(realized).toFixed(2);
+      realPnlEl.className   = 'val ' + (realized > 0 ? 'bull' : realized < 0 ? 'bear' : '');
+      tcEl.textContent = botTrades.length;
+      const wins = botTrades.filter(t => t.pnl > 0).length;
+      wrEl.textContent = botTrades.length ? (wins / botTrades.length * 100).toFixed(0) + '% (' + wins + '/' + botTrades.length + ')' : '—';
+    }
+    function logLine(msg, type) {
+      const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
+      const now = new Date().toLocaleTimeString();
+      logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
+      logEl.scrollTop = logEl.scrollHeight;
+      // log.txt persistence is opt-in via explicit persistLog() calls — only
+      // trade events (entries, exits, live responses, circuit breakers,
+      // start/stop) hit the file. Per-tick UI noise is excluded.
+    }
+    function persistLog(line) {
+      // Server-side append to log.txt
+      const ts = new Date().toISOString();
+      fetch('/api/aibot/log_append', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ line: '[' + ts + '] ' + line })
+      }).catch(() => {});
+    }
+    // Price overlay + log.txt button (Zerodha bot)
+    const zPxOverlay = document.getElementById('aiBotPriceOverlay');
+    const zPxSymEl   = document.getElementById('aiBotPxSym');
+    const zPxValEl   = document.getElementById('aiBotPxVal');
+    let _zLastShownPx = null;
+    function updatePriceOverlay(price) {
+      if (price == null || isNaN(price)) return;
+      const sym = symEl.value.trim().toUpperCase();
+      zPxOverlay.style.display = '';
+      zPxSymEl.textContent = sym;
+      zPxValEl.textContent = Math.abs(price) >= 100 ? price.toFixed(2) : price.toFixed(4);
+      if (_zLastShownPx != null && price !== _zLastShownPx) {
+        zPxValEl.classList.remove('up','down');
+        zPxValEl.classList.add(price > _zLastShownPx ? 'up' : 'down');
+      }
+      _zLastShownPx = price;
+    }
+    document.getElementById('aiBotLogBtn').addEventListener('click', function() {
+      window.open('/api/aibot/log_download', '_blank');
+    });
+    function loadTradeHistory() {
+      fetch('/api/aibot/log_read?n=50').then(r => r.json()).then(function(d) {
+        if (d.success && d.lines && d.lines.length) {
+          logLine('--- Previous session (' + d.lines.length + ' lines from log.txt) ---', 'info');
+          d.lines.forEach(L => logLine(L.replace(/^\[\d{4}-\d{2}-\d{2}T[^\]]+\]\s*/, ''), 'info'));
+          logLine('--- New session ---', 'info');
+        }
+      }).catch(() => {});
+    }
+
+    refreshStatus();
+    updateInfo();
+  })();
+
+  // ---- Delta Exchange shared store (mirrors ZerodhaStore) ----
+  const DeltaStore = {
+    SESSION_KEY: 'mangalview_delta_session_v1',
+    getSession() {
+      try { return JSON.parse(localStorage.getItem(this.SESSION_KEY) || 'null') || {connected:false, apiKey:''}; }
+      catch(e) { return {connected:false, apiKey:''}; }
+    },
+    setSession(s) {
+      localStorage.setItem(this.SESSION_KEY, JSON.stringify(s));
+      try { window.dispatchEvent(new Event('delta-session-change')); } catch(e) {}
+    },
+    clearSession() {
+      localStorage.removeItem(this.SESSION_KEY);
+      try { window.dispatchEvent(new Event('delta-session-change')); } catch(e) {}
+    }
+  };
+
+  // ---- Delta Exchange Login Panel ----
+  (function() {
+    const panel      = document.getElementById('deltaLoginPanel');
+    const header     = document.getElementById('deltaLoginHeader');
+    const closeBtn   = document.getElementById('deltaLoginClose');
+    const connectBtn = document.getElementById('deltaConnectBtn');
+    const statusDot  = document.getElementById('deltaLoginStatusDot');
+    const statusText = document.getElementById('deltaLoginStatusText');
+    const apiKeyInp  = document.getElementById('deltaApiKey');
+    const apiSecInp  = document.getElementById('deltaApiSecret');
+
+    function refresh() {
+      const s = DeltaStore.getSession();
+      if (s.connected && s.apiKey) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected to Delta <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>';
+        connectBtn.textContent = 'Connected';
+        connectBtn.classList.add('connected');
+        if (!apiKeyInp.value) apiKeyInp.value = s.apiKey;
+      } else {
+        statusDot.classList.remove('connected');
+        statusText.textContent = 'Not connected';
+        connectBtn.textContent = 'Connect';
+        connectBtn.classList.remove('connected');
+      }
+    }
+    document.getElementById('btnDeltaLogin').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refresh();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+
+    connectBtn.addEventListener('click', function() {
+      const apiKey    = apiKeyInp.value.trim();
+      const apiSecret = apiSecInp.value.trim();
+      if (!apiKey || !apiSecret) { alert('API Key and API Secret are required.'); return; }
+      // Show progress in the status text
+      statusText.textContent = 'Trying api.india.delta.exchange…';
+      fetch('/api/delta/connect', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({api_key: apiKey, api_secret: apiSecret})
+      }).then(r => r.json()).then(res => {
+        if (res.success) {
+          DeltaStore.setSession({connected: true, apiKey: apiKey, baseUrl: res.host});
+          refresh();
+          statusText.innerHTML = 'Connected via <span style="color:#26a69a">' + res.host + '</span>';
+          return;
+        }
+        // Detailed diag — show each host tried
+        const lines = ['<b style="color:#ef5350">Delta connection failed.</b>'];
+        if (Array.isArray(res.attempts)) {
+          res.attempts.forEach(a => {
+            const status = a.ok ? '✓' : '✗';
+            lines.push('<span style="font-family:monospace;font-size:11px">' + status + ' ' + a.host +
+                       (a.http_code ? ' (HTTP ' + a.http_code + ')' : '') +
+                       (a.delta_code ? ' code=' + a.delta_code : '') +
+                       (a.error && !a.ok ? '<br><span style="color:#787b86;padding-left:18px">' + (a.error||'').replace(/</g,'&lt;') + '</span>' : '') +
+                       '</span>');
+          });
+        }
+        if (res.error) lines.push('<span style="color:#f0b429;font-size:11px;margin-top:6px;display:inline-block">' + res.error.replace(/</g,'&lt;') + '</span>');
+        statusText.innerHTML = lines.join('<br>');
+        console.error('Delta connect failed:', res);
+      }).catch(e => {
+        statusText.textContent = 'Delta connection request error: ' + e.message;
+      });
+    });
+
+    // Draggable
+    (function() {
+      let dr=false,sx,sy,ol,ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        dr=true; panel.style.transform='none';
+        const r = panel.getBoundingClientRect();
+        ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
+        panel.style.left=ol+'px'; panel.style.top=ot+'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', e => { if (dr) { panel.style.left=(ol+e.clientX-sx)+'px'; panel.style.top=(ot+e.clientY-sy)+'px'; }});
+      document.addEventListener('mouseup', () => { dr=false; });
+    })();
+
+    window.addEventListener('delta-session-change', refresh);
+    window.addEventListener('storage', e => { if (e.key === DeltaStore.SESSION_KEY) refresh(); });
+    refresh();
+  })();
+
+  // ---- Delta AI Bot Panel ----
+  // Mirrors the Zerodha AI Bot — same regime detector + strategy selector +
+  // position state machine + circuit breakers. Differences: uses source=delta
+  // for candles and /api/delta/order for live execution. Symbols are Delta's
+  // BTCUSD / ETHUSD / BTCUSDT shape.
+  (function() {
+    const panel    = document.getElementById('deltaBotPanel');
+    const header   = document.getElementById('deltaBotHeader');
+    const closeBtn = document.getElementById('deltaBotClose');
+    const maxBtn   = document.getElementById('deltaBotMaximizeBtn');
+    const popBtn   = document.getElementById('deltaBotPopoutBtn');
+    const symEl    = document.getElementById('deltaBotSymbol');
+    const qtyEl    = document.getElementById('deltaBotQty');
+    const tfEl     = document.getElementById('deltaBotTF');
+    const loadBtn  = document.getElementById('deltaBotLoadBtn');
+    const chartDiv = document.getElementById('deltaBotChart');
+    const stratEl  = document.getElementById('deltaBotStrategy');
+    const regimeEl = document.getElementById('deltaBotRegime');
+    const posEl    = document.getElementById('deltaBotPosition');
+    const entryPxEl= document.getElementById('deltaBotEntryPx');
+    const realPnlEl= document.getElementById('deltaBotRealizedPnl');
+    const unrPnlEl = document.getElementById('deltaBotUnrealPnl');
+    const tcEl     = document.getElementById('deltaBotTradeCount');
+    const wrEl     = document.getElementById('deltaBotWinRate');
+    const slPctEl  = document.getElementById('deltaBotSlPct');
+    const tpPctEl  = document.getElementById('deltaBotTpPct');
+    const maxConsecEl = document.getElementById('deltaBotMaxConsec');
+    const maxLossEl   = document.getElementById('deltaBotMaxLoss');
+    const minScoreEl  = document.getElementById('deltaBotMinScore');
+    const startBtn = document.getElementById('deltaBotStartBtn');
+    const pauseBtn = document.getElementById('deltaBotPauseBtn');
+    const stopBtn  = document.getElementById('deltaBotStopBtn');
+    const logEl    = document.getElementById('deltaBotLog');
+    const statusDot  = document.getElementById('deltaBotStatusDot');
+    const statusText = document.getElementById('deltaBotStatusText');
+
+    let botRunning = false, botPaused = false, botTimer = null;
+    let botChart = null, botCandleSeries = null;
+    let botPosition = null;        // {side, entryPrice, entryTime, qty, sl, tp, strategy}
+    let botTrades = [];
+    let botConsecLosses = 0;
+    let botMaximized = false;
+    let lastKnownPrice = 0;
+
+    document.getElementById('btnDeltaBot').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refreshStatus();
+      if (!botChart) initChart();
+      loadChart();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+
+    // Drag
+    (function() {
+      let dr=false,sx,sy,ol,ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        if (panel.classList.contains('maximized')) return;
+        dr=true; panel.style.transform='none';
+        const r = panel.getBoundingClientRect();
+        ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
+        panel.style.left=ol+'px'; panel.style.top=ot+'px';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', e => { if (dr) { panel.style.left=(ol+e.clientX-sx)+'px'; panel.style.top=(ot+e.clientY-sy)+'px'; }});
+      document.addEventListener('mouseup', () => { dr=false; });
+    })();
+
+    maxBtn.addEventListener('click', function() {
+      botMaximized = !botMaximized;
+      panel.classList.toggle('maximized', botMaximized);
+      this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
+      if (botChart) setTimeout(() => botChart.applyOptions({ width: chartDiv.clientWidth }), 50);
+    });
+    popBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('deltaBotPopout', '1');
+      window.open(url.toString(), 'deltaBotPopout', 'width=1100,height=900,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('deltaBotPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window');
+      panel.classList.add('open');
+      maxBtn.style.display='none'; popBtn.style.display='none'; closeBtn.style.display='none';
+      document.title = '🧠 Delta AI Bot — Mangal View';
+    }
+
+    function refreshStatus() {
+      const s = DeltaStore.getSession();
+      if (s.connected && s.apiKey) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected to Delta <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>';
+      } else {
+        statusDot.classList.remove('connected');
+        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> to enable live orders';
+      }
+    }
+    window.addEventListener('delta-session-change', refreshStatus);
+    window.addEventListener('storage', e => { if (e.key === DeltaStore.SESSION_KEY) refreshStatus(); });
+
+    function initChart() {
+      if (typeof LightweightCharts === 'undefined') return;
+      botChart = LightweightCharts.createChart(chartDiv, {
+        width: chartDiv.clientWidth || 880, height: 280,
+        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+        timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
+        rightPriceScale: { borderColor: '#2a2e39' },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+      });
+      botCandleSeries = botChart.addCandlestickSeries({
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350'
+      });
+      window.addEventListener('resize', () => { if (botChart) botChart.applyOptions({ width: chartDiv.clientWidth }); });
+    }
+
+    function loadChart() {
+      const sym = symEl.value.trim().toUpperCase();
+      const tf  = tfEl.value;
+      if (!sym) return;
+      // Delta candle endpoint is public — no api_key needed
+      const url = '/api/candles?symbol=' + encodeURIComponent(sym) + '&interval=' + encodeURIComponent(tf) + '&source=delta';
+      fetch(url).then(r => r.json()).then(function(d) {
+        if (!d.candles || !d.candles.length) {
+          const e = d.delta_error || {};
+          logLine('[Chart] No Delta candles for <b>' + sym + '</b>' +
+                  (e.host ? ' (host: ' + e.host + ')' : '') + '.' +
+                  (e.msg ? ' Upstream: ' + (e.msg||'').replace(/</g,'&lt;') : '') +
+                  ' &mdash; verified working symbols: <code>BTCUSD</code>, <code>ETHUSD</code>, <code>SOLUSD</code> on Delta India; <code>BTCUSDT</code>, <code>ETHUSDT</code> on Delta Global. Check the Delta web app for your exact symbol.', 'info');
+          return;
+        }
+        if (botCandleSeries) botCandleSeries.setData(d.candles);
+        if (botChart) botChart.timeScale().fitContent();
+        const lc = d.candles[d.candles.length - 1];
+        if (lc && lc.close != null) updatePriceOverlay(lc.close);
+        logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' Delta candles for ' + sym +
+                (d.data_source ? ' (' + d.data_source + ')' : ''), 'info');
+      }).catch(() => logLine('[Chart] Delta fetch failed for ' + sym, 'info'));
+    }
+    loadBtn.addEventListener('click', loadChart);
+
+    // ---- Optional strategies (MM / MMA) for Delta — persisted in localStorage
+    const dIncMMChk  = document.getElementById('deltaBotIncludeMM');
+    const dIncMMAChk = document.getElementById('deltaBotIncludeMMA');
+    const D_INC_MM_KEY  = 'mangalview_delta_aibot_inc_mm_v1';
+    const D_INC_MMA_KEY = 'mangalview_delta_aibot_inc_mma_v1';
+    try {
+      if (localStorage.getItem(D_INC_MM_KEY)  === '1') dIncMMChk.checked  = true;
+      if (localStorage.getItem(D_INC_MMA_KEY) === '1') dIncMMAChk.checked = true;
+    } catch(e) {}
+    dIncMMChk.addEventListener('change',  function() { try { localStorage.setItem(D_INC_MM_KEY,  this.checked ? '1' : '0'); } catch(e) {} });
+    dIncMMAChk.addEventListener('change', function() { try { localStorage.setItem(D_INC_MMA_KEY, this.checked ? '1' : '0'); } catch(e) {} });
+    function _dActiveAlgoList() {
+      const base = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution'];
+      if (dIncMMChk.checked)  base.push('marketmaking');
+      if (dIncMMAChk.checked) base.push('mma');
+      return base.join(',');
+    }
+    function _dMMEnabled()  { return !!dIncMMChk.checked; }
+    function _dMMAEnabled() { return !!dIncMMAChk.checked; }
+
+    // ---- Regime + strategy (same as Zerodha bot) ----
+    function detectRegime(candles) {
+      const n = Math.min(20, candles.length);
+      if (n < 5) return { volatility: 'low', trending: false, direction: 'flat', volPct: 0, trendPct: 0 };
+      const w = candles.slice(-n);
+      const ranges = w.map(c => c.high - c.low);
+      const avgRange = ranges.reduce((a,b)=>a+b,0)/n;
+      const avgPrice = w.reduce((s,c)=>s+c.close,0)/n;
+      const volPct  = avgPrice > 0 ? (avgRange/avgPrice*100) : 0;
+      const trendPct = w[0].close > 0 ? ((w[n-1].close - w[0].close)/w[0].close*100) : 0;
+      // Crypto threshold a bit higher than equities
+      const isTrending = Math.abs(trendPct) > 1.0;
+      return {
+        volatility: volPct > 1.5 ? 'high' : 'low',
+        trending: isTrending,
+        direction: trendPct > 0 ? 'up' : (trendPct < 0 ? 'down' : 'flat'),
+        volPct, trendPct
+      };
+    }
+    function selectStrategy(regime, data) {
+      const summaries = data.signalSummary || {};
+      const trendingCands = ['trend','momentum','sniper','breakout','priceaction','smartmoney','institution'];
+      const rangeCands    = ['mstreet','statarb','mfactor','scalping','quant','orderflow'];
+      // MM / MMA opt-in via the checkboxes above the risk bar
+      if (_dMMEnabled())  rangeCands.push('marketmaking');
+      if (_dMMAEnabled()) rangeCands.push('mma');
+      const cands = regime.trending ? trendingCands : rangeCands;
+      let best = null;
+      for (const name of cands) {
+        const sm = summaries[name];
+        if (!sm) continue;
+        const score = (sm.score != null) ? sm.score : (sm.composite_score != null) ? sm.composite_score : null;
+        if (score == null) continue;
+        if (best == null || Math.abs(score) > Math.abs(best.score)) {
+          best = { name, score, verdict: (sm.verdict || sm.signal || '').toString().toUpperCase() };
+        }
+      }
+      if (!best) {
+        for (const name of Object.keys(summaries)) {
+          const sm = summaries[name];
+          const score = (sm.score != null) ? sm.score : (sm.composite_score != null) ? sm.composite_score : null;
+          if (score == null) continue;
+          if (best == null || Math.abs(score) > Math.abs(best.score)) {
+            best = { name, score, verdict: (sm.verdict || sm.signal || '').toString().toUpperCase() };
+          }
+        }
+      }
+      if (!best) return { name: 'wait', signal: 'HOLD', score: 0, reason: 'no algo data' };
+      const userMin = parseFloat(minScoreEl.value) || 3.5;
+      const threshold = regime.volatility === 'high' ? userMin : userMin + 0.5;
+      let signal = 'HOLD';
+      if (best.score >=  threshold) signal = 'BUY';
+      if (best.score <= -threshold) signal = 'SELL';
+      return {
+        name: best.name,
+        signal,
+        score: best.score,
+        reason: regime.volatility + ' vol ' + regime.volPct.toFixed(2) + '% • ' +
+                (regime.trending ? 'trending ' + regime.direction + ' ' + regime.trendPct.toFixed(2) + '%' : 'range') +
+                ' • score ' + best.score.toFixed(1) + ' vs ±' + threshold.toFixed(1)
+      };
+    }
+
+    function round4(x) { return Math.round(x * 10000) / 10000; }
+    function currentMode() {
+      const r = document.querySelector('input[name="deltaBotMode"]:checked');
+      return r ? r.value : 'paper';
+    }
+    function logLine(msg, type) {
+      const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
+      const now = new Date().toLocaleTimeString();
+      logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
+      logEl.scrollTop = logEl.scrollHeight;
+      // log.txt persistence is opt-in via explicit persistLog() calls — only
+      // trade events (entries, exits, live responses, circuit breakers,
+      // start/stop) hit the file. Per-tick UI noise is excluded.
+    }
+    function persistLog(line) {
+      const ts = new Date().toISOString();
+      fetch('/api/aibot/log_append', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ line: '[' + ts + '] [DELTA] ' + line })
+      }).catch(() => {});
+    }
+    // Price overlay + log.txt button
+    const pxOverlay = document.getElementById('deltaBotPriceOverlay');
+    const pxSymEl   = document.getElementById('deltaBotPxSym');
+    const pxValEl   = document.getElementById('deltaBotPxVal');
+    let _lastShownPx = null;
+    function updatePriceOverlay(price) {
+      if (price == null || isNaN(price)) return;
+      const sym = symEl.value.trim().toUpperCase();
+      pxOverlay.style.display = '';
+      pxSymEl.textContent = sym;
+      pxValEl.textContent = Math.abs(price) >= 100 ? price.toFixed(2) : price.toFixed(4);
+      // Color: green if up vs last shown, red if down
+      if (_lastShownPx != null && price !== _lastShownPx) {
+        pxValEl.classList.remove('up','down');
+        pxValEl.classList.add(price > _lastShownPx ? 'up' : 'down');
+      }
+      _lastShownPx = price;
+    }
+    document.getElementById('deltaBotLogBtn').addEventListener('click', function() {
+      window.open('/api/aibot/log_download', '_blank');
+    });
+
+    function openPosition(side, price, strategy, mode) {
+      const qty   = Math.max(1, parseInt(qtyEl.value) || 1);
+      const slPct = Math.max(0.1, parseFloat(slPctEl.value) || 1.0);
+      const tpPct = Math.max(0.1, parseFloat(tpPctEl.value) || 2.0);
+      const sl = side === 'BUY' ? price * (1 - slPct/100) : price * (1 + slPct/100);
+      const tp = side === 'BUY' ? price * (1 + tpPct/100) : price * (1 - tpPct/100);
+      botPosition = { side, entryPrice: price, entryTime: Date.now(), qty,
+                      sl: round4(sl), tp: round4(tp), strategy: strategy.name, mode };
+      const tag = '[DELTA-' + mode.toUpperCase() + ']';
+      const line = tag + ' ENTRY ' + side + ' ' + qty + ' ' + symEl.value.trim().toUpperCase() +
+                   ' @ ' + price + ' SL=' + botPosition.sl + ' TP=' + botPosition.tp +
+                   ' strat=' + strategy.name + ' score=' + strategy.score.toFixed(1);
+      logLine(line, side.toLowerCase());
+      persistLog(line);
+      if (mode === 'live') placeLiveOrder(side, price, qty);
+      updateInfo();
+    }
+    function closePosition(price, reason, mode) {
+      if (!botPosition) return;
+      const pos = botPosition;
+      const dir = pos.side === 'BUY' ? 1 : -1;
+      const pnl = (price - pos.entryPrice) * pos.qty * dir;
+      botTrades.push(Object.assign({}, pos, { exitPrice: round4(price), exitTime: Date.now(), pnl: round4(pnl), reason }));
+      if (pnl < 0) botConsecLosses++; else botConsecLosses = 0;
+      const tag = '[DELTA-' + mode.toUpperCase() + ']';
+      const pnlSign = pnl >= 0 ? '+' : '';
+      const line = tag + ' EXIT ' + (pos.side === 'BUY' ? 'SELL' : 'BUY') + ' ' + pos.qty + ' ' +
+                   symEl.value.trim().toUpperCase() + ' @ ' + price + ' (entry ' + pos.entryPrice + ')' +
+                   ' PnL=' + pnlSign + pnl.toFixed(4) + ' reason=' + reason + ' strat=' + pos.strategy;
+      logLine(line, pnl >= 0 ? 'buy' : 'sell');
+      persistLog(line);
+      if (mode === 'live') placeLiveOrder(pos.side === 'BUY' ? 'SELL' : 'BUY', price, pos.qty);
+      botPosition = null;
+      updateInfo();
+      const realized = botTrades.reduce((s,t) => s + t.pnl, 0);
+      const maxConsec = parseInt(maxConsecEl.value) || 3;
+      const maxLoss   = parseFloat(maxLossEl.value) || 200;
+      if (botConsecLosses >= maxConsec) {
+        logLine('[STOP] Max consecutive losses (' + maxConsec + ') reached. Bot stopped.', 'info');
+        persistLog('[STOP] Max consecutive losses');
+        stopBot();
+      } else if (realized < -Math.abs(maxLoss)) {
+        logLine('[STOP] Max daily loss ' + maxLoss + ' breached (realised ' + realized.toFixed(2) + '). Bot stopped.', 'info');
+        persistLog('[STOP] Max daily loss');
+        stopBot();
+      }
+    }
+    function placeLiveOrder(side, price, qty) {
+      const s = DeltaStore.getSession();
+      if (!s.connected || !s.apiKey) {
+        logLine('[LIVE] Delta order skipped — not connected.', 'info');
+        return;
+      }
+      fetch('/api/delta/order', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          api_key: s.apiKey, symbol: symEl.value.trim().toUpperCase(),
+          side, qty, order_type: 'market_order', dry_run: false
+        })
+      }).then(r => r.json()).then(function(res) {
+        if (res.success) {
+          const line = '[LIVE] Delta accepted #' + res.orderId;
+          logLine(line, 'info');
+          persistLog(line);  // live response from exchange
+        } else {
+          const line = '[LIVE] Delta order failed: ' + (res.error || 'unknown');
+          logLine(line, 'info');
+          persistLog(line);  // failed live response
+        }
+      }).catch(() => {
+        const line = '[LIVE] Delta order request error';
+        logLine(line, 'info');
+        persistLog(line);
+      });
+    }
+    function updateUnrealized(price) {
+      if (!botPosition) { unrPnlEl.textContent = '0.00'; unrPnlEl.className = 'val'; return; }
+      const dir = botPosition.side === 'BUY' ? 1 : -1;
+      const u   = (price - botPosition.entryPrice) * botPosition.qty * dir;
+      unrPnlEl.textContent = (u >= 0 ? '+' : '') + u.toFixed(4);
+      unrPnlEl.className   = 'val ' + (u >= 0 ? 'bull' : 'bear');
+    }
+    function updateInfo() {
+      if (botPosition) {
+        posEl.textContent = botPosition.side === 'BUY' ? 'LONG' : 'SHORT';
+        posEl.className = 'val ' + (botPosition.side === 'BUY' ? 'bull' : 'bear');
+        entryPxEl.textContent = botPosition.entryPrice;
+      } else {
+        posEl.textContent = 'FLAT'; posEl.className = 'val';
+        entryPxEl.textContent = '—';
+        unrPnlEl.textContent  = '0.00'; unrPnlEl.className = 'val';
+      }
+      const realized = botTrades.reduce((s,t) => s + t.pnl, 0);
+      realPnlEl.textContent = (realized >= 0 ? '+' : '') + realized.toFixed(4);
+      realPnlEl.className   = 'val ' + (realized > 0 ? 'bull' : realized < 0 ? 'bear' : '');
+      tcEl.textContent = botTrades.length;
+      const wins = botTrades.filter(t => t.pnl > 0).length;
+      wrEl.textContent = botTrades.length ? (wins/botTrades.length*100).toFixed(0) + '% (' + wins + '/' + botTrades.length + ')' : '—';
+    }
+
+    function botTick() {
+      if (!botRunning || botPaused) return;
+      const sym = symEl.value.trim().toUpperCase();
+      const tf  = tfEl.value;
+      if (!sym) return;
+      const algos = _dActiveAlgoList();
+      const url = '/api/candles?symbol=' + encodeURIComponent(sym) + '&interval=' + encodeURIComponent(tf) +
+                  '&source=delta&algo=' + encodeURIComponent(algos);
+      fetch(url).then(r => r.json()).then(function(data) {
+        const candles = data.candles || [];
+        if (!candles.length) { logLine('[Tick] no Delta candles for ' + sym, 'info'); return; }
+        if (botCandleSeries) botCandleSeries.setData(candles);
+        const lc = candles[candles.length-1];
+        const price = lc.close;
+        lastKnownPrice = price;
+        updatePriceOverlay(price);
+        const regime = detectRegime(candles);
+        const strat  = selectStrategy(regime, data);
+        regimeEl.textContent = regime.volatility + ' vol, ' + (regime.trending ? 'trending ' + regime.direction : 'range');
+        stratEl.textContent  = strat.name + ' [' + strat.signal + ']';
+        stratEl.className    = 'val ' + (strat.signal === 'BUY' ? 'bull' : strat.signal === 'SELL' ? 'bear' : '');
+        const mode = currentMode();
+        if (botPosition) {
+          updateUnrealized(price);
+          const isLong = botPosition.side === 'BUY';
+          if (isLong && price <= botPosition.sl)       closePosition(price, 'SL hit', mode);
+          else if (isLong && price >= botPosition.tp)  closePosition(price, 'TP hit', mode);
+          else if (!isLong && price >= botPosition.sl) closePosition(price, 'SL hit', mode);
+          else if (!isLong && price <= botPosition.tp) closePosition(price, 'TP hit', mode);
+          else if (isLong && strat.signal === 'SELL')  closePosition(price, 'signal reversal', mode);
+          else if (!isLong && strat.signal === 'BUY')  closePosition(price, 'signal reversal', mode);
+          else logLine('[Tick] [delta] ' + sym + ' price=' + price + ' (in position ' + botPosition.side + ' from ' + botPosition.entryPrice + ', strat=' + strat.name + ')', 'info');
+        } else {
+          if (strat.signal === 'BUY' || strat.signal === 'SELL') {
+            openPosition(strat.signal, price, strat, mode);
+          } else {
+            logLine('[Tick] [delta] ' + sym + ' price=' + price + ' HOLD — ' + strat.reason, 'info');
+          }
+        }
+      }).catch(() => logLine('[Tick] Delta fetch error', 'info'));
+    }
+
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const sym = symEl.value.trim().toUpperCase();
+      if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
+      botRunning = true; botPaused = false; botConsecLosses = 0;
+      startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
+      _renderPauseBtn();
+      const mode = currentMode();
+      logLine('Delta Bot started in ' + mode.toUpperCase() + ' mode for ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value + '. Checking every 15s.', 'info');
+      persistLog('[' + mode.toUpperCase() + '] BOT START ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value);
+      botTick();
+      botTimer = setInterval(botTick, 15000);
+    });
+    pauseBtn.addEventListener('click', function() {
+      if (!botRunning) return;
+      botPaused = !botPaused;
+      _renderPauseBtn();
+      logLine(botPaused ? 'Delta Bot paused.' : 'Delta Bot resumed.', 'info');
+      if (!botPaused) botTick();
+    });
+    function _renderPauseBtn() {
+      if (botPaused) { pauseBtn.innerHTML = '▶ Resume'; pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume'); }
+      else           { pauseBtn.innerHTML = '⏸ Pause';  pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause'); }
+    }
+    stopBtn.addEventListener('click', stopBot);
+    function stopBot() {
+      if (!botRunning) return;
+      clearInterval(botTimer); botTimer = null;
+      botRunning = false; botPaused = false;
+      startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true;
+      _renderPauseBtn();
+      if (botPosition) {
+        const px = lastKnownPrice || botPosition.entryPrice;
+        closePosition(px, 'bot stop', currentMode());
+      }
+      logLine('Delta Bot stopped.', 'info');
+      persistLog('[' + currentMode().toUpperCase() + '] BOT STOP');
+    }
+
+    refreshStatus();
+    updateInfo();
   })();
 
   // ---- Instrument Search Modal ----
