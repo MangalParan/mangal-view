@@ -1208,13 +1208,29 @@ def _load_delta_products():
         sym = (p.get('symbol') or '').upper()
         if not sym:
             continue
+        # Pull contract specs needed for accurate P/L math. Delta contracts
+        # don't represent 1 whole unit of the underlying — e.g., 1 BTCUSD
+        # perpetual contract on Delta India = 0.001 BTC worth. Without the
+        # multiplier, the bot reports point-deltas as P/L, which can be 1000x
+        # off from what Delta actually settles to your wallet.
+        try:    _cv = float(p.get('contract_value', 0) or 0)
+        except (TypeError, ValueError): _cv = 0.0
+        if _cv <= 0:
+            try:    _cv = float(p.get('lot_size', 0) or 0)
+            except (TypeError, ValueError): _cv = 0.0
+        if _cv <= 0: _cv = 1.0
         by_symbol[sym] = {
-            'id':            p.get('id'),
-            'symbol':        p.get('symbol'),
-            'description':   p.get('description', ''),
-            'contract_type': p.get('contract_type', ''),
-            'tick_size':     float(p.get('tick_size', 0) or 0),
-            'state':         p.get('state', ''),
+            'id':             p.get('id'),
+            'symbol':         p.get('symbol'),
+            'description':    p.get('description', ''),
+            'contract_type':  p.get('contract_type', ''),
+            'tick_size':      float(p.get('tick_size', 0) or 0),
+            'state':          p.get('state', ''),
+            # New: contract specs for accurate P/L
+            'contract_value': _cv,                                # multiplier per contract (e.g. 0.001 for BTCUSD)
+            'notional_type':  (p.get('notional_type') or 'vanilla'),  # vanilla | inverse | quanto
+            'underlying':     p.get('underlying_asset', {}).get('symbol', '') if isinstance(p.get('underlying_asset'), dict) else '',
+            'settling':       p.get('settling_asset', {}).get('symbol', '') if isinstance(p.get('settling_asset'), dict) else '',
         }
     _DELTA_PRODUCT_CACHE['ts']        = now
     _DELTA_PRODUCT_CACHE['by_symbol'] = by_symbol
@@ -1671,11 +1687,35 @@ def _delta_bot_open(side, price, strat, mode):
     if mode == 'live':
         _delta_bot_place_live(side, qty, cfg)
 
+def _delta_calc_pnl(entry, exit_, qty, side, product):
+    """Approximate P/L for a Delta contract.
+    - Vanilla:  pnl = (exit - entry) * qty * contract_value * direction
+    - Inverse:  pnl = qty * contract_value * (1/entry - 1/exit) * direction
+    Returns float in the settling-asset currency (USDT/USD). Doesn't include
+    fees or funding — for exact P/L use /v2/positions (sync'd in LIVE mode)."""
+    if not entry or not exit_ or not qty: return 0.0
+    direction = 1 if side == 'BUY' else -1
+    cv = float((product or {}).get('contract_value', 1.0) or 1.0)
+    ntype = ((product or {}).get('notional_type') or 'vanilla').lower()
+    try:
+        if ntype == 'inverse':
+            return qty * cv * (1.0/float(entry) - 1.0/float(exit_)) * direction
+        else:
+            return (float(exit_) - float(entry)) * qty * cv * direction
+    except Exception:
+        return 0.0
+
 def _delta_bot_close(price, reason, mode):
     pos = delta_ai_state.get('position')
     if not pos: return
     direction = 1 if pos['side'] == 'BUY' else -1
-    pnl = (price - pos['entryPrice']) * pos['qty'] * direction
+    # Look up the contract spec to scale P/L correctly. For 1 BTCUSD contract
+    # on Delta India this is 0.001 — without it, a $580 price move shows up
+    # as -$580 P/L when actual settlement is -$0.58.
+    sym_u    = delta_ai_state['config']['symbol'].upper()
+    products = _load_delta_products()
+    prod     = products.get(sym_u)
+    pnl      = _delta_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'], prod)
     closed = dict(pos)
     closed.update({'exitPrice': round(price, 4), 'exitTime': int(_zd_time.time()),
                    'pnl': round(pnl, 4), 'reason': reason})
@@ -1764,6 +1804,38 @@ def _delta_bot_tick():
     strat  = _bot_select_strategy(regime, summaries, cfg)
     mode   = cfg.get('mode', 'paper')
 
+    # --- LIVE mode: pull authoritative position/P&L from Delta ---
+    # Delta's /v2/positions response carries the exact unrealized_pnl and
+    # realized_pnl (after fees, funding, contract math). Trust that over our
+    # local approximation when running live. Also catches manual square-off /
+    # liquidation done outside our bot.
+    delta_live_pos = None
+    delta_live_realized = None
+    if mode == 'live':
+        ak = cfg.get('api_key')
+        if ak and ak in delta_v2_sessions:
+            try:
+                sess_base = delta_v2_sessions[ak].get('base_url') or _DELTA_BASES[0]
+                api_sec   = delta_v2_sessions[ak]['api_secret']
+                pos_resp  = _delta_request(ak, api_sec, 'GET', '/v2/positions/margined', base_url=sess_base)
+                if not pos_resp.get('success'):
+                    pos_resp = _delta_request(ak, api_sec, 'GET', '/v2/positions', base_url=sess_base)
+                sym_u = symbol.upper()
+                for p in (pos_resp.get('result') or []):
+                    psym = ((p.get('product') or {}).get('symbol') or p.get('symbol', '')).upper()
+                    if psym == sym_u:
+                        delta_live_pos = {
+                            'size': int(p.get('size', 0) or 0),
+                            'entry_price': float(p.get('entry_price', 0) or 0),
+                            'mark_price':  float(p.get('mark_price',  0) or 0),
+                            'unrealized_pnl': float(p.get('unrealized_pnl', 0) or 0),
+                            'realized_pnl':   float(p.get('realized_pnl', 0) or 0),
+                            'liquidation_price': float(p.get('liquidation_price', 0) or 0),
+                        }
+                        break
+            except Exception:
+                pass
+
     with delta_ai_lock:
         delta_ai_state['last_candles'] = candles[-150:]
         delta_ai_state['last_tick'] = {
@@ -1772,7 +1844,25 @@ def _delta_bot_tick():
             'score': strat['score'], 'reason': strat['reason'],
             'regime': '{} vol, {}'.format(regime['volatility'],
                 'trending ' + regime['direction'] if regime['trending'] else 'range'),
+            # Live values from Delta (when available) — used by /status for display
+            'delta_live': delta_live_pos,
         }
+        # If LIVE and Delta shows our position is closed (size=0), treat it
+        # as an external exit and let the bot resume looking for entries.
+        if mode == 'live' and delta_live_pos is not None:
+            if delta_live_pos['size'] == 0 and delta_ai_state.get('position'):
+                ext_pnl = delta_live_pos.get('realized_pnl', 0.0)
+                _bot_log('[Position] {} closed externally on Delta (realised P/L per Delta: {:+.4f})'.format(symbol, ext_pnl))
+                _persist_log_line('[DELTA] [Position] {} closed externally — Delta realised={:+.4f}'.format(symbol, ext_pnl))
+                # Record the close with Delta's PnL to keep stats accurate
+                pos_local = delta_ai_state['position']
+                closed = dict(pos_local)
+                closed.update({'exitPrice': round(price, 4), 'exitTime': int(_zd_time.time()),
+                               'pnl': round(ext_pnl, 4), 'reason': 'external close (Delta)'})
+                delta_ai_state['trades'].append(closed)
+                if ext_pnl < 0: delta_ai_state['consec_losses'] = delta_ai_state.get('consec_losses', 0) + 1
+                else:            delta_ai_state['consec_losses'] = 0
+                delta_ai_state['position'] = None
         pos = delta_ai_state.get('position')
         if pos:
             is_long = pos['side'] == 'BUY'
@@ -1897,8 +1987,21 @@ def delta_aibot_status():
     wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unrealized = 0.0
     if pos and last_tick.get('price'):
-        direction = 1 if pos['side'] == 'BUY' else -1
-        unrealized = (last_tick['price'] - pos['entryPrice']) * pos['qty'] * direction
+        # Prefer Delta's exact unrealized_pnl (fees + funding + contract math)
+        # over our local approximation when LIVE mode is sending it.
+        live_d = last_tick.get('delta_live') or {}
+        if live_d and live_d.get('unrealized_pnl') is not None and live_d.get('size'):
+            unrealized = live_d['unrealized_pnl']
+        else:
+            # PAPER (or no live data yet): use contract-aware formula
+            try:
+                cfg_local = delta_ai_state.get('config') or {}
+                products  = _load_delta_products()
+                prod      = products.get((cfg_local.get('symbol') or '').upper())
+                unrealized = _delta_calc_pnl(pos['entryPrice'], last_tick['price'], pos['qty'], pos['side'], prod)
+            except Exception:
+                direction = 1 if pos['side'] == 'BUY' else -1
+                unrealized = (last_tick['price'] - pos['entryPrice']) * pos['qty'] * direction
     return jsonify({
         'success':  True,
         'running':  running,
