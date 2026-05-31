@@ -1472,6 +1472,452 @@ def delta_positions():
             except (TypeError, ValueError): positions[sym.upper()] = 0
     return jsonify({'success': True, 'positions': positions})
 
+# ============================================================================
+# Server-side Delta AI Bot (Option C — autonomous bot that runs on the server,
+# survives browser tab close, only needs the tab open for monitoring).
+# ============================================================================
+import threading as _threading
+
+# Single in-memory bot instance. (Multi-user scaling would key by user_id.)
+delta_ai_state = {
+    'running':       False,
+    'paused':        False,
+    'thread':        None,
+    'config':        None,   # {symbol, qty, tf, mode, slPct, tpPct, maxConsec, maxLoss, minScore, includeMM, includeMMA, api_key}
+    'position':      None,   # {side, entryPrice, entryTime, qty, sl, tp, strategy, mode}
+    'trades':        [],     # closed trades
+    'consec_losses': 0,
+    'last_tick':     {},     # {time, price, strategy, regime, signal, score, error?}
+    'log_buffer':    [],     # last ~500 UI log lines for browser display
+    'last_candles':  [],     # last ~150 candles for browser chart
+}
+delta_ai_lock = _threading.RLock()
+
+def _bot_log(msg):
+    """Append a UI-only log line to the bot's circular buffer."""
+    ts = datetime.now(_tz_module.timezone(_tz_module.timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S') \
+         if False else _bot_log_ts()
+    with delta_ai_lock:
+        buf = delta_ai_state.setdefault('log_buffer', [])
+        buf.append('[' + ts + '] ' + msg)
+        if len(buf) > 500:
+            del buf[:len(buf) - 500]
+
+def _bot_log_ts():
+    from datetime import timezone, timedelta
+    return datetime.now(timezone(timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S')
+
+def _persist_log_line(line):
+    """Append a trade-meaningful line to log.txt. Mirrors what the browser
+    persistLog() endpoint did, but called directly from the server."""
+    from datetime import datetime as _dt
+    ts = _dt.utcnow().isoformat()
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log.txt')
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write('[' + ts + '] ' + line + '\n')
+    except Exception:
+        pass
+
+# --- Build a signal-summary dict for the bot, mirroring api_candles --
+# Doesn't need request context. Reuses every compute_*/generate_*_signals
+# helper already defined in this file.
+def _bot_signal_data(symbol, interval, source, algo_names, api_key=None):
+    if source == 'delta':
+        candles = fetch_delta_data(interval, symbol)
+    elif source == 'kite':
+        candles = fetch_kite_data(interval, symbol, api_key=api_key)
+    elif source == 'tradingview':
+        candles = fetch_tradingview_data(interval, symbol)
+    elif source == 'nse':
+        candles = fetch_nse_data(interval, symbol)
+    else:
+        candles = fetch_nifty_data(interval, symbol)
+    if not candles or len(candles) < 20:
+        return {'candles': candles or [], 'signalSummary': {}, 'lastPrice': (candles[-1]['close'] if candles else 0)}
+
+    supertrend = compute_supertrend(candles, 10, 3.0)
+    psar       = compute_parabolic_sar(candles, 0.02, 0.02, 0.2)
+    sr         = compute_support_resistance(candles)
+    rsi_data   = compute_rsi(candles)
+    macd_data  = compute_macd(candles)
+    vwap_data  = compute_vwap(candles)
+    ema9       = compute_ema_series(candles, 9)
+    ema21      = compute_ema_series(candles, 21)
+    patterns   = detect_candlestick_patterns(candles)
+    bb         = compute_bollinger_bands(candles, 20, 2.0)
+
+    summaries = {}
+    for algo in algo_names:
+        try:
+            if algo == 'trend':
+                _sigs, summ = generate_signals(candles, supertrend, psar, rsi_data, macd_data, vwap_data, ema9, ema21, patterns, sr)
+            elif algo == 'mstreet':
+                _sigs, summ = generate_janestreet_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'mfactor':
+                _sigs, summ = generate_accurate_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'sniper':
+                _sigs, summ = generate_sniper_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'orderflow':
+                _sigs, summ = generate_orderflow_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'priceaction':
+                _sigs, summ = generate_priceaction_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'breakout':
+                _sigs, summ = generate_breakout_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'momentum':
+                _sigs, summ = generate_momentum_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'scalping':
+                _sigs, summ = generate_scalping_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'smartmoney':
+                _sigs, summ = generate_smartmoney_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'quant':
+                _sigs, summ = generate_quant_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'hybrid':
+                _sigs, summ = generate_hybrid_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'statarb':
+                _sigs, summ = generate_statarb_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'institution':
+                _sigs, summ = generate_institution_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'marketmaking':
+                _sigs, summ = generate_marketmaking_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            elif algo == 'mma':
+                _sigs, summ = generate_mma_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+            else:
+                continue
+            summaries[algo] = summ
+        except Exception:
+            continue
+
+    return {'candles': candles, 'signalSummary': summaries, 'lastPrice': candles[-1]['close']}
+
+# --- Regime detector + strategy selector (Python port of JS bot logic) ---
+def _bot_detect_regime(candles):
+    n = min(20, len(candles))
+    if n < 5:
+        return {'volatility': 'low', 'trending': False, 'direction': 'flat', 'volPct': 0.0, 'trendPct': 0.0}
+    w = candles[-n:]
+    ranges = [c['high'] - c['low'] for c in w]
+    avg_range = sum(ranges) / n
+    avg_price = sum(c['close'] for c in w) / n
+    vol_pct   = (avg_range / avg_price * 100.0) if avg_price else 0.0
+    trend_pct = ((w[-1]['close'] - w[0]['close']) / w[0]['close'] * 100.0) if w[0]['close'] else 0.0
+    return {
+        'volatility': 'high' if vol_pct > 1.5 else 'low',
+        'trending':   abs(trend_pct) > 1.0,
+        'direction':  'up' if trend_pct > 0 else ('down' if trend_pct < 0 else 'flat'),
+        'volPct':     vol_pct, 'trendPct': trend_pct,
+    }
+
+def _bot_select_strategy(regime, summaries, cfg):
+    trending = ['trend','momentum','sniper','breakout','priceaction','smartmoney','institution']
+    range_   = ['mstreet','statarb','mfactor','scalping','quant','orderflow']
+    if cfg.get('includeMM'):  range_.append('marketmaking')
+    if cfg.get('includeMMA'): range_.append('mma')
+    cands = trending if regime['trending'] else range_
+
+    best = None
+    for name in cands:
+        sm = summaries.get(name)
+        if not sm: continue
+        score = sm.get('score') if sm.get('score') is not None else sm.get('composite_score')
+        if score is None: continue
+        try: score = float(score)
+        except (TypeError, ValueError): continue
+        if best is None or abs(score) > abs(best['score']):
+            best = {'name': name, 'score': score}
+    if not best:
+        for name, sm in summaries.items():
+            score = sm.get('score') if sm.get('score') is not None else sm.get('composite_score')
+            if score is None: continue
+            try: score = float(score)
+            except (TypeError, ValueError): continue
+            if best is None or abs(score) > abs(best['score']):
+                best = {'name': name, 'score': score}
+    if not best:
+        return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0,
+                'reason': '{} vol, {} • no algo data'.format(
+                    regime['volatility'], 'trending' if regime['trending'] else 'range')}
+
+    user_min  = float(cfg.get('minScore', 3.5))
+    threshold = user_min if regime['volatility'] == 'high' else user_min + 0.5
+    signal = 'HOLD'
+    if best['score'] >=  threshold: signal = 'BUY'
+    if best['score'] <= -threshold: signal = 'SELL'
+    return {'name': best['name'], 'signal': signal, 'score': best['score'],
+            'reason': '{} vol {:.2f}% • {} • score {:.1f} vs ±{:.1f}'.format(
+                regime['volatility'], regime['volPct'],
+                'trending ' + regime['direction'] + ' ' + '{:.2f}'.format(regime['trendPct']) + '%' if regime['trending'] else 'range',
+                best['score'], threshold)}
+
+# --- Position management (caller must hold delta_ai_lock) ---
+def _delta_bot_open(side, price, strat, mode):
+    cfg    = delta_ai_state['config']
+    qty    = int(cfg.get('qty', 1))
+    sl_pct = float(cfg.get('slPct', 1.0))
+    tp_pct = float(cfg.get('tpPct', 2.0))
+    sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
+    tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    delta_ai_state['position'] = {
+        'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+        'qty': qty, 'sl': round(sl, 4), 'tp': round(tp, 4),
+        'strategy': strat['name'], 'mode': mode,
+    }
+    tag  = '[DELTA-' + mode.upper() + ']'
+    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+        tag, side, qty, cfg['symbol'], price, round(sl, 4), round(tp, 4),
+        strat['name'], strat['score'])
+    _bot_log(line)
+    _persist_log_line('[DELTA] ' + line)
+    if mode == 'live':
+        _delta_bot_place_live(side, qty, cfg)
+
+def _delta_bot_close(price, reason, mode):
+    pos = delta_ai_state.get('position')
+    if not pos: return
+    direction = 1 if pos['side'] == 'BUY' else -1
+    pnl = (price - pos['entryPrice']) * pos['qty'] * direction
+    closed = dict(pos)
+    closed.update({'exitPrice': round(price, 4), 'exitTime': int(_zd_time.time()),
+                   'pnl': round(pnl, 4), 'reason': reason})
+    delta_ai_state['trades'].append(closed)
+    if pnl < 0: delta_ai_state['consec_losses'] = delta_ai_state.get('consec_losses', 0) + 1
+    else:       delta_ai_state['consec_losses'] = 0
+    cfg = delta_ai_state['config']
+    tag = '[DELTA-' + mode.upper() + ']'
+    line = '{} EXIT {} {} {} @ {} (entry {}) PnL={}{:.4f} reason={} strat={}'.format(
+        tag, 'SELL' if pos['side'] == 'BUY' else 'BUY',
+        pos['qty'], cfg['symbol'], price, pos['entryPrice'],
+        '+' if pnl >= 0 else '', pnl, reason, pos['strategy'])
+    _bot_log(line)
+    _persist_log_line('[DELTA] ' + line)
+    if mode == 'live':
+        _delta_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], cfg)
+    delta_ai_state['position'] = None
+    # Circuit breakers
+    realized   = sum(t['pnl'] for t in delta_ai_state['trades'])
+    max_consec = int(cfg.get('maxConsec', 3))
+    max_loss   = float(cfg.get('maxLoss', 200))
+    if delta_ai_state['consec_losses'] >= max_consec:
+        _bot_log('[STOP] Max consecutive losses ({}) reached. Bot stopped.'.format(max_consec))
+        _persist_log_line('[DELTA] [STOP] Max consecutive losses')
+        delta_ai_state['running'] = False
+    elif realized < -abs(max_loss):
+        _bot_log('[STOP] Max daily loss {} breached (realised {:.2f}). Bot stopped.'.format(max_loss, realized))
+        _persist_log_line('[DELTA] [STOP] Max daily loss')
+        delta_ai_state['running'] = False
+
+def _delta_bot_place_live(side, qty, cfg):
+    api_key = cfg.get('api_key') or ''
+    if not api_key or api_key not in delta_v2_sessions:
+        _bot_log('[LIVE] Delta order skipped — not connected.')
+        _persist_log_line('[DELTA] [LIVE] order skipped: not connected')
+        return
+    products = _load_delta_products()
+    p = products.get(cfg['symbol'].upper())
+    if not p or not p.get('id'):
+        _bot_log('[LIVE] Unknown Delta symbol: ' + cfg['symbol'])
+        return
+    api_secret = delta_v2_sessions[api_key]['api_secret']
+    sess_base  = delta_v2_sessions[api_key].get('base_url') or _DELTA_BASES[0]
+    body = {
+        'product_id': p['id'], 'size': qty,
+        'side': 'buy' if side == 'BUY' else 'sell',
+        'order_type': 'market_order',
+    }
+    result = _delta_request(api_key, api_secret, 'POST', '/v2/orders', body=body, base_url=sess_base)
+    if result.get('success'):
+        oid = (result.get('result') or {}).get('id', '')
+        _bot_log('[LIVE] Delta accepted #' + str(oid))
+        _persist_log_line('[DELTA] [LIVE] Delta accepted #' + str(oid))
+    else:
+        err = result.get('error', 'unknown')
+        _bot_log('[LIVE] Delta order failed: ' + str(err))
+        _persist_log_line('[DELTA] [LIVE] Delta order failed: ' + str(err))
+
+def _delta_bot_tick():
+    cfg = delta_ai_state.get('config') or {}
+    if not cfg: return
+    symbol   = (cfg.get('symbol') or '').upper()
+    interval = cfg.get('tf', '5m')
+    if not symbol: return
+
+    algos = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout',
+             'momentum','scalping','smartmoney','quant','hybrid','statarb','institution']
+    if cfg.get('includeMM'):  algos.append('marketmaking')
+    if cfg.get('includeMMA'): algos.append('mma')
+
+    try:
+        data = _bot_signal_data(symbol, interval, 'delta', algos)
+    except Exception as e:
+        _bot_log('[Tick] ERROR fetching data: ' + str(e))
+        return
+    candles   = data.get('candles') or []
+    summaries = data.get('signalSummary') or {}
+    if not candles:
+        with delta_ai_lock:
+            delta_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
+        _bot_log('[Tick] no Delta candles for ' + symbol)
+        return
+
+    price  = candles[-1]['close']
+    regime = _bot_detect_regime(candles)
+    strat  = _bot_select_strategy(regime, summaries, cfg)
+    mode   = cfg.get('mode', 'paper')
+
+    with delta_ai_lock:
+        delta_ai_state['last_candles'] = candles[-150:]
+        delta_ai_state['last_tick'] = {
+            'time': int(_zd_time.time()), 'price': price,
+            'strategy': strat['name'], 'signal': strat['signal'],
+            'score': strat['score'], 'reason': strat['reason'],
+            'regime': '{} vol, {}'.format(regime['volatility'],
+                'trending ' + regime['direction'] if regime['trending'] else 'range'),
+        }
+        pos = delta_ai_state.get('position')
+        if pos:
+            is_long = pos['side'] == 'BUY'
+            reason = None
+            if is_long and price <= pos['sl']:        reason = 'SL hit'
+            elif is_long and price >= pos['tp']:      reason = 'TP hit'
+            elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
+            elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
+            elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+            elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+            if reason:
+                _delta_bot_close(price, reason, mode)
+            else:
+                _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={})'.format(
+                    symbol, price, pos['side'], pos['entryPrice'], strat['name']))
+        else:
+            if strat['signal'] in ('BUY', 'SELL'):
+                _delta_bot_open(strat['signal'], price, strat, mode)
+            else:
+                _bot_log('[Tick] [delta] {} price={} HOLD — {}'.format(symbol, price, strat['reason']))
+
+def _delta_bot_loop():
+    while True:
+        with delta_ai_lock:
+            running = delta_ai_state.get('running', False)
+            paused  = delta_ai_state.get('paused', False)
+        if not running: break
+        if not paused:
+            try: _delta_bot_tick()
+            except Exception as e:
+                _bot_log('[Tick] ERROR: ' + str(e))
+        _zd_time.sleep(15)
+
+# Need timedelta/timezone for IST log timestamps
+import datetime as _tz_module
+
+@app.route('/api/aibot/delta/start', methods=['POST'])
+@login_required
+def delta_aibot_start():
+    data = request.json or {}
+    with delta_ai_lock:
+        if delta_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+        delta_ai_state['config'] = {
+            'symbol':     (data.get('symbol') or '').upper(),
+            'qty':        int(data.get('qty', 1) or 1),
+            'tf':         data.get('tf', '5m'),
+            'mode':       data.get('mode', 'paper'),
+            'slPct':      float(data.get('slPct', 1.0)),
+            'tpPct':      float(data.get('tpPct', 2.0)),
+            'maxConsec':  int(data.get('maxConsec', 3) or 3),
+            'maxLoss':    float(data.get('maxLoss', 200) or 200),
+            'minScore':   float(data.get('minScore', 3.5) or 3.5),
+            'includeMM':  bool(data.get('includeMM', False)),
+            'includeMMA': bool(data.get('includeMMA', False)),
+            'api_key':    (data.get('api_key') or '').strip(),
+        }
+        if not delta_ai_state['config']['symbol']:
+            return jsonify({'success': False, 'error': 'Symbol required'}), 400
+        delta_ai_state['position']      = None
+        delta_ai_state['trades']        = []
+        delta_ai_state['consec_losses'] = 0
+        delta_ai_state['log_buffer']    = []
+        delta_ai_state['last_tick']     = {}
+        delta_ai_state['last_candles']  = []
+        delta_ai_state['running']       = True
+        delta_ai_state['paused']        = False
+        t = _threading.Thread(target=_delta_bot_loop, daemon=True, name='delta-aibot')
+        delta_ai_state['thread'] = t
+        t.start()
+    cfg = delta_ai_state['config']
+    _bot_log('Delta Bot started SERVER-SIDE in {} mode for {} qty={} TF={}. Tick every 15s — runs even when you close this tab.'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _persist_log_line('[DELTA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/delta/pause', methods=['POST'])
+@login_required
+def delta_aibot_pause():
+    with delta_ai_lock:
+        if not delta_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is not running'}), 400
+        delta_ai_state['paused'] = not delta_ai_state.get('paused', False)
+        paused = delta_ai_state['paused']
+    _bot_log('Delta Bot ' + ('paused' if paused else 'resumed'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/delta/stop', methods=['POST'])
+@login_required
+def delta_aibot_stop():
+    with delta_ai_lock:
+        was_running = delta_ai_state.get('running')
+        delta_ai_state['running'] = False
+        delta_ai_state['paused']  = False
+        cfg  = delta_ai_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        pos  = delta_ai_state.get('position')
+        last_price = (delta_ai_state.get('last_tick') or {}).get('price') or (pos.get('entryPrice') if pos else 0)
+        if pos:
+            _delta_bot_close(last_price, 'bot stop', mode)
+    if was_running:
+        _bot_log('Delta Bot stopped.')
+        _persist_log_line('[DELTA] [{}] BOT STOP'.format(mode.upper()))
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/delta/status', methods=['GET'])
+@login_required
+def delta_aibot_status():
+    with delta_ai_lock:
+        cfg       = dict(delta_ai_state.get('config') or {})
+        cfg.pop('api_key', None)   # never echo the key
+        pos       = delta_ai_state.get('position')
+        trades    = list(delta_ai_state.get('trades', []))
+        last_tick = dict(delta_ai_state.get('last_tick', {}))
+        log_buf   = list(delta_ai_state.get('log_buffer', []))[-200:]
+        candles   = list(delta_ai_state.get('last_candles', []))
+        running   = delta_ai_state.get('running', False)
+        paused    = delta_ai_state.get('paused', False)
+        consec    = delta_ai_state.get('consec_losses', 0)
+    realized   = sum(t.get('pnl', 0) for t in trades)
+    wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unrealized = 0.0
+    if pos and last_tick.get('price'):
+        direction = 1 if pos['side'] == 'BUY' else -1
+        unrealized = (last_tick['price'] - pos['entryPrice']) * pos['qty'] * direction
+    return jsonify({
+        'success':  True,
+        'running':  running,
+        'paused':   paused,
+        'config':   cfg,
+        'position': pos,
+        'last_tick': last_tick,
+        'last_candles': candles,
+        'log':      log_buf,
+        'stats': {
+            'realized':     round(realized, 4),
+            'unrealized':   round(unrealized, 4),
+            'tradeCount':   len(trades),
+            'winRate':      round(wins / len(trades) * 100.0, 1) if trades else None,
+            'wins':         wins,
+            'consecLosses': consec,
+        },
+    })
+
 @app.route('/api/aibot/log_append', methods=['POST'])
 @login_required
 def aibot_log_append():
@@ -1520,6 +1966,15 @@ def aibot_log_read():
         return jsonify({'success': True, 'lines': tail, 'total': len(all_lines)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/ping', methods=['GET'])
+def api_ping():
+    """Lightweight keep-alive endpoint for external uptime monitors
+    (UptimeRobot, cron-job.org, GitHub Actions cron, etc.). Hitting this
+    every 5-10 minutes prevents Render Free from spinning down the dyno
+    after 15 minutes of inactivity. NO auth required so monitors don't
+    need credentials. Returns 200 with a tiny JSON body."""
+    return jsonify({'ok': True, 'service': 'mangal-view', 't': int(_zd_time.time())})
 
 @app.route('/api/myip', methods=['GET'])
 @login_required
@@ -18040,6 +18495,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     refreshStatus();
     updateInfo();
+
+    // Keep-alive ping every 10 min. Helps when the tab is open but bot is
+    // paused/stopped (no /api/candles requests). Does NOT help against
+    // browser background-tab throttling — for that, use an external uptime
+    // monitor pointing at /api/ping (see "Render Free spin-down" note).
+    setInterval(function() {
+      fetch('/api/ping').catch(() => {});
+    }, 10 * 60 * 1000);
   })();
 
   // ---- Delta Exchange shared store (mirrors ZerodhaStore) ----
@@ -18559,45 +19022,166 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }).catch(() => logLine('[Tick] Delta fetch error', 'info'));
     }
 
+    // =========================================================================
+    // SERVER-DRIVEN MODE — the Delta bot runs on the server (option C).
+    // Browser only sends config + polls /status; the tick loop lives in Python.
+    // This means closing this tab, backgrounding it, or laptop sleep does NOT
+    // stop the bot. The trade-off: this server has to stay up (Render Pro
+    // satisfies that). Old client-side functions below (botTick, openPosition,
+    // closePosition, detectRegime, selectStrategy) are unused now — kept in
+    // place for reference.
+    // =========================================================================
+    let statusPoller = null;
+    let lastRenderedLogLen = 0;
+    function _serverStarted(resp) {
+      botRunning = true; botPaused = false;
+      startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
+      _renderPauseBtn();
+      startStatusPoll();
+    }
+    function _serverStopped() {
+      botRunning = false; botPaused = false;
+      startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true;
+      _renderPauseBtn();
+      stopStatusPoll();
+    }
+    function startStatusPoll() {
+      if (statusPoller) return;
+      pollStatus();   // immediate first poll
+      statusPoller = setInterval(pollStatus, 5000);
+    }
+    function stopStatusPoll() {
+      if (statusPoller) { clearInterval(statusPoller); statusPoller = null; }
+    }
+    function pollStatus() {
+      fetch('/api/aibot/delta/status').then(r => r.json()).then(applyStatus).catch(() => {});
+    }
+    function applyStatus(s) {
+      if (!s || !s.success) return;
+      // Reconcile running/paused state
+      botRunning = !!s.running;
+      botPaused  = !!s.paused;
+      startBtn.disabled = botRunning;
+      pauseBtn.disabled = !botRunning;
+      stopBtn.disabled  = !botRunning;
+      _renderPauseBtn();
+      if (!botRunning) stopStatusPoll();
+
+      // New log lines (server's log_buffer is a rolling tail)
+      const log = s.log || [];
+      if (log.length > lastRenderedLogLen) {
+        const fresh = log.slice(lastRenderedLogLen);
+        fresh.forEach(line => {
+          logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>';
+        });
+        logEl.scrollTop = logEl.scrollHeight;
+        lastRenderedLogLen = log.length;
+      }
+      // If the server cleared its buffer (e.g., new start), reset our cursor
+      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+
+      // Chart from server's last candles
+      if (s.last_candles && s.last_candles.length && botCandleSeries) {
+        botCandleSeries.setData(s.last_candles);
+        const lc = s.last_candles[s.last_candles.length - 1];
+        if (lc && lc.close != null) updatePriceOverlay(lc.close);
+      }
+      // Strategy / regime
+      const lt = s.last_tick || {};
+      if (lt.strategy) {
+        stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']';
+        stratEl.className   = 'val ' + (lt.signal === 'BUY' ? 'bull' : lt.signal === 'SELL' ? 'bear' : '');
+      }
+      if (lt.regime) regimeEl.textContent = lt.regime;
+      // Position
+      const p = s.position;
+      if (p) {
+        posEl.textContent = p.side === 'BUY' ? 'LONG' : 'SHORT';
+        posEl.className = 'val ' + (p.side === 'BUY' ? 'bull' : 'bear');
+        entryPxEl.textContent = p.entryPrice;
+      } else {
+        posEl.textContent = 'FLAT'; posEl.className = 'val';
+        entryPxEl.textContent = '—';
+      }
+      // P/L + stats
+      const st = s.stats || {};
+      if (st.realized != null) {
+        realPnlEl.textContent = (st.realized >= 0 ? '+' : '') + st.realized.toFixed(4);
+        realPnlEl.className   = 'val ' + (st.realized > 0 ? 'bull' : st.realized < 0 ? 'bear' : '');
+      }
+      if (st.unrealized != null) {
+        unrPnlEl.textContent = (st.unrealized >= 0 ? '+' : '') + st.unrealized.toFixed(4);
+        unrPnlEl.className   = 'val ' + (st.unrealized > 0 ? 'bull' : st.unrealized < 0 ? 'bear' : '');
+      }
+      tcEl.textContent = (st.tradeCount != null) ? st.tradeCount : '—';
+      wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
+    }
+
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
       if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
-      botRunning = true; botPaused = false; botConsecLosses = 0;
-      startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
-      _renderPauseBtn();
-      const mode = currentMode();
-      logLine('Delta Bot started in ' + mode.toUpperCase() + ' mode for ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value + '. Checking every 15s.', 'info');
-      persistLog('[' + mode.toUpperCase() + '] BOT START ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value);
-      botTick();
-      botTimer = setInterval(botTick, 15000);
+      const cfg = {
+        symbol:     sym,
+        qty:        parseInt(qtyEl.value) || 1,
+        tf:         tfEl.value,
+        mode:       currentMode(),
+        slPct:      parseFloat(slPctEl.value) || 1.0,
+        tpPct:      parseFloat(tpPctEl.value) || 2.0,
+        maxConsec:  parseInt(maxConsecEl.value) || 3,
+        maxLoss:    parseFloat(maxLossEl.value) || 200,
+        minScore:   parseFloat(minScoreEl.value) || 3.5,
+        includeMM:  !!dIncMMChk.checked,
+        includeMMA: !!dIncMMAChk.checked,
+        api_key:    (DeltaStore.getSession().apiKey) || ''
+      };
+      logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
+      lastRenderedLogLen = 0;
+      fetch('/api/aibot/delta/start', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(cfg)
+      }).then(r => r.json()).then(res => {
+        if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
+        _serverStarted(res);
+        logLine('Bot is now running on the server. Safe to close this tab — bot keeps ticking.', 'info');
+      }).catch(e => logLine('Start request error: ' + e.message, 'info'));
     });
     pauseBtn.addEventListener('click', function() {
       if (!botRunning) return;
-      botPaused = !botPaused;
-      _renderPauseBtn();
-      logLine(botPaused ? 'Delta Bot paused.' : 'Delta Bot resumed.', 'info');
-      if (!botPaused) botTick();
+      fetch('/api/aibot/delta/pause', { method: 'POST' })
+        .then(r => r.json()).then(res => {
+          if (res.success) {
+            botPaused = !!res.paused;
+            _renderPauseBtn();
+            logLine(botPaused ? 'Delta Bot paused (server).' : 'Delta Bot resumed (server).', 'info');
+          }
+        });
     });
     function _renderPauseBtn() {
       if (botPaused) { pauseBtn.innerHTML = '▶ Resume'; pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume'); }
       else           { pauseBtn.innerHTML = '⏸ Pause';  pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause'); }
     }
-    stopBtn.addEventListener('click', stopBot);
-    function stopBot() {
-      if (!botRunning) return;
-      clearInterval(botTimer); botTimer = null;
-      botRunning = false; botPaused = false;
-      startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true;
-      _renderPauseBtn();
-      if (botPosition) {
-        const px = lastKnownPrice || botPosition.entryPrice;
-        closePosition(px, 'bot stop', currentMode());
-      }
-      logLine('Delta Bot stopped.', 'info');
-      persistLog('[' + currentMode().toUpperCase() + '] BOT STOP');
-    }
+    stopBtn.addEventListener('click', function() {
+      fetch('/api/aibot/delta/stop', { method: 'POST' })
+        .then(r => r.json()).then(() => {
+          _serverStopped();
+          logLine('Delta Bot stopped on server.', 'info');
+        });
+    });
 
+    // On panel open / page load, check whether a server-side bot is already
+    // running (e.g., user closed the tab earlier; the bot kept going). If yes,
+    // start polling so the UI re-syncs with the live state.
+    function syncOnOpen() {
+      fetch('/api/aibot/delta/status').then(r => r.json()).then(s => {
+        if (s && s.success && s.running) {
+          logLine('A server-side Delta Bot is already running. Resuming UI sync…', 'info');
+          _serverStarted({});
+          applyStatus(s);
+        }
+      }).catch(() => {});
+    }
+    syncOnOpen();
     refreshStatus();
     updateInfo();
   })();
