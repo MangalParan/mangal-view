@@ -40,3 +40,15 @@ Trendline , patterns, fibonacci , short long positions
  Default loading of algos 
  implement Basic a table indicators and Algos for basic free, basic paid, Pro version. 
  
+ 1. Add Max Daily Profit once its hit close the trade -done
+ 2. Symbols should be selected from add instrument feature in zerodha automation panel
+ 3 analyse logs and implement reasons for failure loss -done
+ 4. ignore sniper if its poviding loss -done
+ 5. when bot is paused adjust max losses, max daily loss and max daily profit -done
+ 6 Add chat box in panel, so it can be interactive with Ai bot agent. -done
+ 7. if any suggestion provided, claude algo should take in runtime and adjust strategy by itself\
+ 8. Zerodha fetch candle error 
+ 9. fetch chart data from kite\
+ 10. implement all delta ai bot into zerodha ai bot
+ 11. Add download button for log.txt -done
+12. Add IST in log instead of UTC

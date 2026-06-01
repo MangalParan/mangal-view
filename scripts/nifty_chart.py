@@ -30,6 +30,32 @@ from curl_cffi import requests as cffi_requests
 
 from flask import Flask, jsonify, request, Response, redirect, session, g
 
+# --- Load .env (zero-dependency) ---------------------------------------------
+# Reads KEY=VALUE lines from a .env file at the project root into os.environ
+# (without overwriting vars already set in the real environment). Lets you keep
+# secrets like ANTHROPIC_API_KEY in a gitignored .env for local/dev runs.
+def _load_dotenv():
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                if line.lower().startswith('export '):
+                    line = line[7:].lstrip()
+                key, _, val = line.partition('=')
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+_load_dotenv()
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
@@ -1509,6 +1535,32 @@ delta_ai_state = {
 }
 delta_ai_lock = _threading.RLock()
 
+# Server-side Zerodha (Kite) AI bot — mirrors delta_ai_state. Runs on the server
+# so it keeps trading even when the browser tab is closed.
+zd_ai_state = {
+    'running':       False,
+    'paused':        False,
+    'thread':        None,
+    'config':        None,   # {symbol, exchange, qty, tf, mode, slPct, tpPct, maxConsec, maxLoss, maxProfit, minScore, cooldownSec, qualityFilter, includeMM, includeMMA, api_key}
+    'position':      None,
+    'trades':        [],
+    'consec_losses': 0,
+    'last_exit_time': 0,
+    'last_tick':     {},
+    'log_buffer':    [],
+    'last_candles':  [],
+}
+zd_ai_lock = _threading.RLock()
+
+def _zd_log(msg):
+    """Append a UI-only log line to the Zerodha bot's circular buffer."""
+    ts = _bot_log_ts()
+    with zd_ai_lock:
+        buf = zd_ai_state.setdefault('log_buffer', [])
+        buf.append('[' + ts + '] ' + msg)
+        if len(buf) > 500:
+            del buf[:len(buf) - 500]
+
 def _bot_log(msg):
     """Append a UI-only log line to the bot's circular buffer."""
     ts = datetime.now(_tz_module.timezone(_tz_module.timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S') \
@@ -1525,9 +1577,10 @@ def _bot_log_ts():
 
 def _persist_log_line(line):
     """Append a trade-meaningful line to log.txt. Mirrors what the browser
-    persistLog() endpoint did, but called directly from the server."""
-    from datetime import datetime as _dt
-    ts = _dt.utcnow().isoformat()
+    persistLog() endpoint did, but called directly from the server.
+    Timestamps are IST (UTC+5:30) so the log matches the user's clock."""
+    from datetime import datetime as _dt, timezone as _tzc, timedelta as _tdc
+    ts = _dt.now(_tzc(_tdc(seconds=IST_OFFSET))).isoformat()
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log.txt')
     try:
         with open(path, 'a', encoding='utf-8') as f:
@@ -1625,7 +1678,9 @@ def _bot_detect_regime(candles):
     }
 
 def _bot_select_strategy(regime, summaries, cfg):
-    trending = ['trend','momentum','sniper','breakout','priceaction','smartmoney','institution']
+    # NOTE: 'sniper' intentionally excluded from selection — it chases extended
+    # moves and produced the largest SL hits in log.txt (see loss_analysis.md).
+    trending = ['trend','momentum','breakout','priceaction','smartmoney','institution']
     range_   = ['mstreet','statarb','mfactor','scalping','quant','orderflow']
     if cfg.get('includeMM'):  range_.append('marketmaking')
     if cfg.get('includeMMA'): range_.append('mma')
@@ -1654,8 +1709,10 @@ def _bot_select_strategy(regime, summaries, cfg):
                 'reason': '{} vol, {} • no algo data'.format(
                     regime['volatility'], 'trending' if regime['trending'] else 'range')}
 
-    user_min  = float(cfg.get('minScore', 3.5))
-    threshold = user_min if regime['volatility'] == 'high' else user_min + 0.5
+    user_min  = float(cfg.get('minScore', 4.0))
+    # Stricter thresholds lift win rate: demand a clearly stronger edge in calm
+    # markets (more chop, lower follow-through) than in high-vol trends.
+    threshold = user_min + 0.5 if regime['volatility'] == 'high' else user_min + 1.0
     signal = 'HOLD'
     if best['score'] >=  threshold: signal = 'BUY'
     if best['score'] <= -threshold: signal = 'SELL'
@@ -1664,6 +1721,38 @@ def _bot_select_strategy(regime, summaries, cfg):
                 regime['volatility'], regime['volPct'],
                 'trending ' + regime['direction'] + ' ' + '{:.2f}'.format(regime['trendPct']) + '%' if regime['trending'] else 'range',
                 best['score'], threshold)}
+
+def _bot_entry_quality(side, candles, regime, cfg):
+    """High-win-rate gate applied just before an entry. Blocks the two losing
+    patterns seen in log.txt: (1) counter-trend knife-catching, and (2) chasing
+    a move that is already over-extended from its mean (buying the top). Returns
+    (ok: bool, reason: str)."""
+    if cfg.get('qualityFilter') is False:
+        return True, ''
+    n = min(20, len(candles))
+    if n < 10:
+        return True, ''   # not enough data to judge — don't block
+    w      = candles[-n:]
+    closes = [c['close'] for c in w]
+    sma    = sum(closes) / n
+    avg_rng = sum(c['high'] - c['low'] for c in w) / n
+    price   = candles[-1]['close']
+
+    # (1) Trend alignment: never fade a clearly trending market.
+    if regime['trending']:
+        if side == 'BUY' and regime['direction'] == 'down':
+            return False, 'against downtrend'
+        if side == 'SELL' and regime['direction'] == 'up':
+            return False, 'against uptrend'
+
+    # (2) Extension guard: skip entries that are chasing a stretched move.
+    if avg_rng > 0:
+        ext = (price - sma) / avg_rng
+        if side == 'BUY' and ext > 1.5:
+            return False, 'overextended above mean ({:.1f}x range)'.format(ext)
+        if side == 'SELL' and ext < -1.5:
+            return False, 'overextended below mean ({:.1f}x range)'.format(-ext)
+    return True, ''
 
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
@@ -1733,10 +1822,12 @@ def _delta_bot_close(price, reason, mode):
     if mode == 'live':
         _delta_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], cfg)
     delta_ai_state['position'] = None
+    delta_ai_state['last_exit_time'] = int(_zd_time.time())
     # Circuit breakers
     realized   = sum(t['pnl'] for t in delta_ai_state['trades'])
     max_consec = int(cfg.get('maxConsec', 3))
     max_loss   = float(cfg.get('maxLoss', 200))
+    max_profit = float(cfg.get('maxProfit', 0) or 0)
     if delta_ai_state['consec_losses'] >= max_consec:
         _bot_log('[STOP] Max consecutive losses ({}) reached. Bot stopped.'.format(max_consec))
         _persist_log_line('[DELTA] [STOP] Max consecutive losses')
@@ -1744,6 +1835,10 @@ def _delta_bot_close(price, reason, mode):
     elif realized < -abs(max_loss):
         _bot_log('[STOP] Max daily loss {} breached (realised {:.2f}). Bot stopped.'.format(max_loss, realized))
         _persist_log_line('[DELTA] [STOP] Max daily loss')
+        delta_ai_state['running'] = False
+    elif max_profit > 0 and realized >= max_profit:
+        _bot_log('[STOP] Max daily profit {} hit (realised {:.2f}). Trade closed, bot stopped.'.format(max_profit, realized))
+        _persist_log_line('[DELTA] [STOP] Max daily profit')
         delta_ai_state['running'] = False
 
 def _delta_bot_place_live(side, qty, cfg):
@@ -1781,7 +1876,8 @@ def _delta_bot_tick():
     interval = cfg.get('tf', '5m')
     if not symbol: return
 
-    algos = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout',
+    # 'sniper' excluded — see _bot_select_strategy / loss_analysis.md
+    algos = ['trend','mstreet','mfactor','orderflow','priceaction','breakout',
              'momentum','scalping','smartmoney','quant','hybrid','statarb','institution']
     if cfg.get('includeMM'):  algos.append('marketmaking')
     if cfg.get('includeMMA'): algos.append('mma')
@@ -1866,13 +1962,23 @@ def _delta_bot_tick():
         pos = delta_ai_state.get('position')
         if pos:
             is_long = pos['side'] == 'BUY'
+            # Profit-lock: if total P/L (realised + this position's unrealised)
+            # has reached the daily profit target, bank it and stop.
+            max_profit = float(cfg.get('maxProfit', 0) or 0)
             reason = None
-            if is_long and price <= pos['sl']:        reason = 'SL hit'
-            elif is_long and price >= pos['tp']:      reason = 'TP hit'
-            elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
-            elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
-            elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
-            elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+            if max_profit > 0:
+                realized_now = sum(t.get('pnl', 0) for t in delta_ai_state['trades'])
+                prod_now     = _load_delta_products().get(symbol.upper())
+                unreal_now   = _delta_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'], prod_now)
+                if realized_now + unreal_now >= max_profit:
+                    reason = 'max daily profit'
+            if reason is None:
+                if is_long and price <= pos['sl']:        reason = 'SL hit'
+                elif is_long and price >= pos['tp']:      reason = 'TP hit'
+                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
+                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
+                elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _delta_bot_close(price, reason, mode)
             else:
@@ -1880,7 +1986,20 @@ def _delta_bot_tick():
                     symbol, price, pos['side'], pos['entryPrice'], strat['name']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
-                _delta_bot_open(strat['signal'], price, strat, mode)
+                # Re-entry cooldown: avoid whipsaw churn right after an exit
+                # (the PAXGUSD signal-reversal losses in log.txt).
+                cooldown = int(cfg.get('cooldownSec', 60) or 0)
+                last_exit = delta_ai_state.get('last_exit_time') or 0
+                if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
+                    _bot_log('[Tick] [delta] {} {} skipped — cooldown {}s after last exit'.format(
+                        symbol, strat['signal'], cooldown))
+                else:
+                    ok, qreason = _bot_entry_quality(strat['signal'], candles, regime, cfg)
+                    if ok:
+                        _delta_bot_open(strat['signal'], price, strat, mode)
+                    else:
+                        _bot_log('[Tick] [delta] {} {} skipped — entry quality: {}'.format(
+                            symbol, strat['signal'], qreason))
             else:
                 _bot_log('[Tick] [delta] {} price={} HOLD — {}'.format(symbol, price, strat['reason']))
 
@@ -1915,7 +2034,10 @@ def delta_aibot_start():
             'tpPct':      float(data.get('tpPct', 2.0)),
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 200) or 200),
-            'minScore':   float(data.get('minScore', 3.5) or 3.5),
+            'maxProfit':  float(data.get('maxProfit', 0) or 0),
+            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'api_key':    (data.get('api_key') or '').strip(),
@@ -1925,6 +2047,7 @@ def delta_aibot_start():
         delta_ai_state['position']      = None
         delta_ai_state['trades']        = []
         delta_ai_state['consec_losses'] = 0
+        delta_ai_state['last_exit_time'] = 0
         delta_ai_state['log_buffer']    = []
         delta_ai_state['last_tick']     = {}
         delta_ai_state['last_candles']  = []
@@ -1968,6 +2091,159 @@ def delta_aibot_stop():
         _bot_log('Delta Bot stopped.')
         _persist_log_line('[DELTA] [{}] BOT STOP'.format(mode.upper()))
     return jsonify({'success': True})
+
+# --- Claude assistant for the Delta bot -------------------------------------
+# Config keys Claude / the Apply button is allowed to change at runtime. Safety:
+# symbol, qty, mode and api_key are deliberately NOT here — changing those needs
+# an explicit restart so a chat message can never silently flip paper->live or
+# swap the traded instrument / size.
+_DELTA_TUNABLE_KEYS = {
+    'slPct': float, 'tpPct': float, 'maxConsec': int, 'maxLoss': float,
+    'maxProfit': float, 'minScore': float, 'cooldownSec': int,
+    'qualityFilter': bool, 'includeMM': bool, 'includeMMA': bool,
+}
+
+def _sanitize_delta_patch(patch):
+    """Coerce an incoming config patch to the whitelisted keys/types. Returns
+    (clean_patch, rejected_keys)."""
+    clean, rejected = {}, []
+    for k, v in (patch or {}).items():
+        if k not in _DELTA_TUNABLE_KEYS:
+            rejected.append(k); continue
+        caster = _DELTA_TUNABLE_KEYS[k]
+        try:
+            if caster is bool:
+                clean[k] = v if isinstance(v, bool) else str(v).strip().lower() in ('1','true','yes','on')
+            else:
+                clean[k] = caster(v)
+        except (TypeError, ValueError):
+            rejected.append(k)
+    return clean, rejected
+
+def _call_claude(system, messages, max_tokens=1024):
+    """Call the Anthropic Messages API via stdlib only (no SDK dependency).
+    Reads ANTHROPIC_API_KEY from the environment. Returns (text, error)."""
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+    if not api_key:
+        return None, 'ANTHROPIC_API_KEY is not set on the server. Add it in your environment (Render → Environment) and redeploy.'
+    model = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6').strip() or 'claude-sonnet-4-6'
+    import urllib.request as _ur, json as _json
+    body = _json.dumps({
+        'model': model, 'max_tokens': max_tokens,
+        'system': system, 'messages': messages,
+    }).encode('utf-8')
+    req = _ur.Request('https://api.anthropic.com/v1/messages', data=body, method='POST',
+                      headers={'content-type': 'application/json',
+                               'x-api-key': api_key,
+                               'anthropic-version': '2023-06-01'})
+    try:
+        with _ur.urlopen(req, timeout=45) as resp:
+            data = _json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        detail = ''
+        try: detail = e.read().decode('utf-8')   # type: ignore[attr-defined]
+        except Exception: pass
+        return None, 'Claude API error: {} {}'.format(e, detail)[:500]
+    parts = data.get('content') or []
+    text  = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
+    return text, None
+
+def _extract_config_patch(text):
+    """Pull a ```json {...}``` block carrying a configPatch out of Claude's reply.
+    Returns (patch_dict_or_None, summary_or_None, cleaned_text)."""
+    import re, json as _json
+    patch, summary = None, None
+    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if m:
+        try:
+            obj = _json.loads(m.group(1))
+            if isinstance(obj, dict) and isinstance(obj.get('configPatch'), dict):
+                patch = obj['configPatch']
+                summary = obj.get('summary')
+                text = (text[:m.start()] + text[m.end():]).strip()
+        except Exception:
+            pass
+    return patch, summary, text
+
+@app.route('/api/aibot/delta/apply_config', methods=['POST'])
+@login_required
+def delta_aibot_apply_config():
+    """Apply a whitelisted config patch to the running (or next) bot config."""
+    patch = (request.json or {}).get('patch') or {}
+    clean, rejected = _sanitize_delta_patch(patch)
+    if not clean:
+        return jsonify({'success': False, 'error': 'No valid tunable keys in patch', 'rejected': rejected}), 400
+    with delta_ai_lock:
+        cfg = delta_ai_state.get('config')
+        if not cfg:
+            delta_ai_state['config'] = cfg = {}
+        before = {k: cfg.get(k) for k in clean}
+        cfg.update(clean)
+        out = {k: v for k, v in cfg.items() if k != 'api_key'}
+    changes = ', '.join('{}: {}→{}'.format(k, before.get(k), v) for k, v in clean.items())
+    _bot_log('[Config] Applied: ' + changes)
+    _persist_log_line('[DELTA] [Config] ' + changes)
+    return jsonify({'success': True, 'config': out, 'applied': clean, 'rejected': rejected})
+
+@app.route('/api/aibot/delta/chat', methods=['POST'])
+@login_required
+def delta_aibot_chat():
+    """Interactive Claude assistant for the Delta bot. Sees the live bot state
+    and may propose a config patch (applied only when the user clicks Apply)."""
+    data    = request.json or {}
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    history = data.get('history') or []   # [{role, content}, ...]
+
+    with delta_ai_lock:
+        cfg     = {k: v for k, v in (delta_ai_state.get('config') or {}).items() if k != 'api_key'}
+        trades  = list(delta_ai_state.get('trades', []))[-20:]
+        last    = dict(delta_ai_state.get('last_tick', {}))
+        running = delta_ai_state.get('running', False)
+        paused  = delta_ai_state.get('paused', False)
+    last.pop('delta_live', None)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    winrate  = round(wins / len(trades) * 100.0, 1) if trades else None
+    trade_brief = [{'strat': t.get('strategy'), 'side': t.get('side'),
+                    'pnl': round(t.get('pnl', 0), 4), 'reason': t.get('reason')}
+                   for t in trades]
+
+    import json as _json
+    system = (
+        "You are the strategy co-pilot for a server-side crypto-derivatives trading bot on Delta Exchange. "
+        "The bot scores several algos each tick and trades the strongest signal that passes a quality gate. "
+        "Your single goal: help the user reach a SUSTAINED win rate above 80% while protecting capital. "
+        "Be concise and concrete. Prefer fewer, higher-conviction trades. The 'sniper' algo is disabled because "
+        "it chased extended moves and caused the biggest losses.\n\n"
+        "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
+        "minScore, cooldownSec (re-entry cooldown seconds), qualityFilter (trend-alignment + over-extension guard), "
+        "includeMM, includeMMA. You CANNOT change symbol, qty, trading mode, or API keys.\n\n"
+        "When (and only when) you want to change settings, end your reply with a single fenced code block:\n"
+        "```json\n{\"configPatch\": {\"minScore\": 5.0}, \"summary\": \"one-line description\"}\n```\n"
+        "Put only keys you actually want changed. If no change is warranted, omit the block.\n\n"
+        "CURRENT BOT STATE:\n" + _json.dumps({
+            'running': running, 'paused': paused, 'config': cfg,
+            'lastTick': last, 'recentTrades': trade_brief,
+            'realizedPnl': round(realized, 4), 'winRatePct': winrate,
+        }, default=str)[:6000]
+    )
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        content = str(h.get('content', ''))[:4000]
+        if content: msgs.append({'role': role, 'content': content})
+    msgs.append({'role': 'user', 'content': message})
+
+    text, err = _call_claude(system, msgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    patch, summary, clean_text = _extract_config_patch(text or '')
+    safe_patch, rejected = _sanitize_delta_patch(patch) if patch else ({}, [])
+    return jsonify({'success': True, 'reply': clean_text or text,
+                    'configPatch': safe_patch or None, 'summary': summary,
+                    'rejected': rejected})
 
 @app.route('/api/aibot/delta/status', methods=['GET'])
 @login_required
@@ -2021,6 +2297,409 @@ def delta_aibot_status():
         },
     })
 
+# ============================================================================
+# Server-side Zerodha (Kite) AI bot — mirrors the Delta bot architecture.
+# Trades NSE/BSE/NFO/BFO/MCX via Kite Connect. Data + charts always from Kite.
+# ============================================================================
+def _zd_infer_exchange(symbol):
+    """Resolve a tradingsymbol to its exchange via the instrument tables."""
+    sym_u = (symbol or '').upper()
+    candidates = []
+    try:
+        for src in (_load_kite_all_instruments() or [], _load_csv_instruments() or []):
+            candidates.extend([r for r in src if (r.get('symbol') or '').upper() == sym_u])
+            if candidates:
+                break
+    except Exception:
+        return ''
+    _prio = {'NSE':0, 'BSE':1, 'NFO':2, 'BFO':3, 'MCX':4, 'CDS':5, 'BCD':6, 'NCO':7}
+    candidates.sort(key=lambda r: _prio.get((r.get('exchange') or '').strip().upper(), 99))
+    return (candidates[0].get('exchange') or '').strip().upper() if candidates else ''
+
+def _zd_calc_pnl(entry, exit_, qty, side):
+    """Equity/F&O P/L in INR: (exit-entry)*qty*direction."""
+    if not entry or not exit_ or not qty: return 0.0
+    direction = 1 if side == 'BUY' else -1
+    try:
+        return (float(exit_) - float(entry)) * qty * direction
+    except Exception:
+        return 0.0
+
+def _zd_bot_open(side, price, strat, mode):
+    cfg    = zd_ai_state['config']
+    qty    = int(cfg.get('qty', 1))
+    sl_pct = float(cfg.get('slPct', 1.5))
+    tp_pct = float(cfg.get('tpPct', 3.0))
+    sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
+    tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    zd_ai_state['position'] = {
+        'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+        'qty': qty, 'sl': round(sl, 2), 'tp': round(tp, 2),
+        'strategy': strat['name'], 'mode': mode,
+    }
+    tag  = '[' + mode.upper() + ']'
+    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+        tag, side, qty, cfg['symbol'], round(price, 2), round(sl, 2), round(tp, 2),
+        strat['name'], strat['score'])
+    _zd_log(line)
+    _persist_log_line('[ZERODHA] ' + line)
+    if mode == 'live':
+        _zd_bot_place_live(side, qty, price, cfg)
+
+def _zd_bot_close(price, reason, mode):
+    pos = zd_ai_state.get('position')
+    if not pos: return
+    pnl = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
+    closed = dict(pos)
+    closed.update({'exitPrice': round(price, 2), 'exitTime': int(_zd_time.time()),
+                   'pnl': round(pnl, 2), 'reason': reason})
+    zd_ai_state['trades'].append(closed)
+    if pnl < 0: zd_ai_state['consec_losses'] = zd_ai_state.get('consec_losses', 0) + 1
+    else:       zd_ai_state['consec_losses'] = 0
+    cfg = zd_ai_state['config']
+    tag = '[' + mode.upper() + ']'
+    line = '{} EXIT {} {} {} @ {} (entry {}) PnL={}₹{:.2f} reason={} strat={}'.format(
+        tag, 'SELL' if pos['side'] == 'BUY' else 'BUY',
+        pos['qty'], cfg['symbol'], round(price, 2), pos['entryPrice'],
+        '+' if pnl >= 0 else '', pnl, reason, pos['strategy'])
+    _zd_log(line)
+    _persist_log_line('[ZERODHA] ' + line)
+    if mode == 'live':
+        _zd_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg)
+    zd_ai_state['position'] = None
+    zd_ai_state['last_exit_time'] = int(_zd_time.time())
+    # Circuit breakers (mirror Delta)
+    realized   = sum(t['pnl'] for t in zd_ai_state['trades'])
+    max_consec = int(cfg.get('maxConsec', 3))
+    max_loss   = float(cfg.get('maxLoss', 2000))
+    max_profit = float(cfg.get('maxProfit', 0) or 0)
+    if zd_ai_state['consec_losses'] >= max_consec:
+        _zd_log('[STOP] Max consecutive losses ({}) reached. Bot stopped.'.format(max_consec))
+        _persist_log_line('[ZERODHA] [STOP] Max consecutive losses')
+        zd_ai_state['running'] = False
+    elif realized < -abs(max_loss):
+        _zd_log('[STOP] Max daily loss {} breached (realised {:.2f}). Bot stopped.'.format(max_loss, realized))
+        _persist_log_line('[ZERODHA] [STOP] Max daily loss')
+        zd_ai_state['running'] = False
+    elif max_profit > 0 and realized >= max_profit:
+        _zd_log('[STOP] Max daily profit {} hit (realised {:.2f}). Trade closed, bot stopped.'.format(max_profit, realized))
+        _persist_log_line('[ZERODHA] [STOP] Max daily profit')
+        zd_ai_state['running'] = False
+
+def _zd_bot_place_live(side, qty, price, cfg):
+    import urllib.request as _ur, urllib.parse as _up, json as _json
+    api_key = cfg.get('api_key') or ''
+    if not api_key or api_key not in zerodha_sessions:
+        _zd_log('[LIVE] Kite order skipped — not connected.')
+        _persist_log_line('[ZERODHA] [LIVE] order skipped: not connected')
+        return
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        _zd_log('[LIVE] No access_token — re-Connect Zerodha.')
+        _persist_log_line('[ZERODHA] [LIVE] order skipped: no access_token')
+        return
+    symbol   = (cfg.get('symbol') or '').upper()
+    exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
+    product  = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
+    tick     = _get_instrument_tick(symbol, exchange)
+    lim      = price * (0.998 if side == 'SELL' else 1.002)   # tight LIMIT around LTP
+    lim      = _quantize_to_tick(lim, tick)
+    payload  = _up.urlencode({
+        'tradingsymbol': symbol, 'exchange': exchange,
+        'transaction_type': side, 'quantity': qty,
+        'product': product, 'order_type': 'LIMIT',
+        'price': lim, 'validity': 'DAY',
+    }).encode('utf-8')
+    req = _ur.Request('https://api.kite.trade/orders/regular', data=payload,
+                      headers={'X-Kite-Version': '3',
+                               'Authorization': 'token {}:{}'.format(api_key, access_token),
+                               'Content-Type': 'application/x-www-form-urlencoded',
+                               'User-Agent': 'Mozilla/5.0'}, method='POST')
+    try:
+        with _kite_urlopen(req, timeout=15) as resp:
+            rd = _json.loads(resp.read().decode('utf-8') or '{}')
+    except Exception as e:
+        err = ''
+        try: err = e.read().decode('utf-8')   # type: ignore[attr-defined]
+        except Exception: pass
+        _zd_log('[LIVE] Kite order failed: ' + (str(err) or str(e))[:200])
+        _persist_log_line('[ZERODHA] [LIVE] Kite order failed: ' + (str(err) or str(e))[:200])
+        return
+    if rd.get('status') == 'success':
+        oid = (rd.get('data') or {}).get('order_id', '')
+        _zd_log('[LIVE] Kite accepted #' + str(oid))
+        _persist_log_line('[ZERODHA] [LIVE] Kite accepted #' + str(oid))
+    else:
+        _zd_log('[LIVE] Kite rejected: ' + str(rd.get('message', rd))[:200])
+        _persist_log_line('[ZERODHA] [LIVE] Kite rejected: ' + str(rd.get('message', ''))[:200])
+
+def _zd_bot_tick():
+    cfg = zd_ai_state.get('config') or {}
+    if not cfg: return
+    symbol   = (cfg.get('symbol') or '').upper()
+    interval = cfg.get('tf', '5m')
+    if not symbol: return
+
+    algos = ['trend','mstreet','mfactor','orderflow','priceaction','breakout',
+             'momentum','scalping','smartmoney','quant','hybrid','statarb','institution']
+    if cfg.get('includeMM'):  algos.append('marketmaking')
+    if cfg.get('includeMMA'): algos.append('mma')
+
+    try:
+        data = _bot_signal_data(symbol, interval, 'kite', algos, api_key=cfg.get('api_key'))
+    except Exception as e:
+        _zd_log('[Tick] ERROR fetching Kite data: ' + str(e))
+        return
+    candles   = data.get('candles') or []
+    summaries = data.get('signalSummary') or {}
+    if not candles:
+        with zd_ai_lock:
+            zd_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
+        _zd_log('[Tick] no Kite candles for ' + symbol + ' — check connection / symbol / exchange')
+        return
+
+    price  = candles[-1]['close']
+    regime = _bot_detect_regime(candles)
+    strat  = _bot_select_strategy(regime, summaries, cfg)
+    mode   = cfg.get('mode', 'paper')
+
+    with zd_ai_lock:
+        zd_ai_state['last_candles'] = candles[-150:]
+        zd_ai_state['last_tick'] = {
+            'time': int(_zd_time.time()), 'price': price,
+            'strategy': strat['name'], 'signal': strat['signal'],
+            'score': strat['score'], 'reason': strat['reason'],
+            'regime': '{} vol, {}'.format(regime['volatility'],
+                'trending ' + regime['direction'] if regime['trending'] else 'range'),
+        }
+        pos = zd_ai_state.get('position')
+        if pos:
+            is_long = pos['side'] == 'BUY'
+            max_profit = float(cfg.get('maxProfit', 0) or 0)
+            reason = None
+            if max_profit > 0:
+                realized_now = sum(t.get('pnl', 0) for t in zd_ai_state['trades'])
+                unreal_now   = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
+                if realized_now + unreal_now >= max_profit:
+                    reason = 'max daily profit'
+            if reason is None:
+                if is_long and price <= pos['sl']:        reason = 'SL hit'
+                elif is_long and price >= pos['tp']:      reason = 'TP hit'
+                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
+                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
+                elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+            if reason:
+                _zd_bot_close(price, reason, mode)
+            else:
+                _zd_log('[Tick] {} price={} (in position {} from {}, strat={})'.format(
+                    symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name']))
+        else:
+            if strat['signal'] in ('BUY', 'SELL'):
+                cooldown = int(cfg.get('cooldownSec', 60) or 0)
+                last_exit = zd_ai_state.get('last_exit_time') or 0
+                if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
+                    _zd_log('[Tick] {} {} skipped — cooldown {}s after last exit'.format(symbol, strat['signal'], cooldown))
+                else:
+                    ok, qreason = _bot_entry_quality(strat['signal'], candles, regime, cfg)
+                    if ok:
+                        _zd_bot_open(strat['signal'], price, strat, mode)
+                    else:
+                        _zd_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
+            else:
+                _zd_log('[Tick] {} price={} HOLD — {}'.format(symbol, round(price, 2), strat['reason']))
+
+def _zd_bot_loop():
+    while True:
+        with zd_ai_lock:
+            running = zd_ai_state.get('running', False)
+            paused  = zd_ai_state.get('paused', False)
+        if not running: break
+        if not paused:
+            try: _zd_bot_tick()
+            except Exception as e:
+                _zd_log('[Tick] ERROR: ' + str(e))
+        _zd_time.sleep(15)
+
+@app.route('/api/aibot/zerodha/start', methods=['POST'])
+@login_required
+def zd_aibot_start():
+    data = request.json or {}
+    with zd_ai_lock:
+        if zd_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+        zd_ai_state['config'] = {
+            'symbol':     (data.get('symbol') or '').upper(),
+            'exchange':   (data.get('exchange') or '').upper(),
+            'qty':        int(data.get('qty', 1) or 1),
+            'tf':         data.get('tf', '5m'),
+            'mode':       data.get('mode', 'paper'),
+            'slPct':      float(data.get('slPct', 1.5)),
+            'tpPct':      float(data.get('tpPct', 3.0)),
+            'maxConsec':  int(data.get('maxConsec', 3) or 3),
+            'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
+            'maxProfit':  float(data.get('maxProfit', 0) or 0),
+            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'qualityFilter': bool(data.get('qualityFilter', True)),
+            'includeMM':  bool(data.get('includeMM', False)),
+            'includeMMA': bool(data.get('includeMMA', False)),
+            'api_key':    (data.get('api_key') or '').strip(),
+        }
+        if not zd_ai_state['config']['symbol']:
+            return jsonify({'success': False, 'error': 'Symbol required'}), 400
+        zd_ai_state['position']       = None
+        zd_ai_state['trades']         = []
+        zd_ai_state['consec_losses']  = 0
+        zd_ai_state['last_exit_time'] = 0
+        zd_ai_state['log_buffer']     = []
+        zd_ai_state['last_tick']      = {}
+        zd_ai_state['last_candles']   = []
+        zd_ai_state['running']        = True
+        zd_ai_state['paused']         = False
+        t = _threading.Thread(target=_zd_bot_loop, daemon=True, name='zerodha-aibot')
+        zd_ai_state['thread'] = t
+        t.start()
+    cfg = zd_ai_state['config']
+    _zd_log('Zerodha Bot started SERVER-SIDE in {} mode for {} qty={} TF={}. Tick every 15s — runs even when you close this tab.'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _persist_log_line('[ZERODHA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/zerodha/pause', methods=['POST'])
+@login_required
+def zd_aibot_pause():
+    with zd_ai_lock:
+        if not zd_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is not running'}), 400
+        zd_ai_state['paused'] = not zd_ai_state.get('paused', False)
+        paused = zd_ai_state['paused']
+    _zd_log('Zerodha Bot ' + ('paused' if paused else 'resumed'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/zerodha/stop', methods=['POST'])
+@login_required
+def zd_aibot_stop():
+    with zd_ai_lock:
+        was_running = zd_ai_state.get('running')
+        zd_ai_state['running'] = False
+        zd_ai_state['paused']  = False
+        cfg  = zd_ai_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        pos  = zd_ai_state.get('position')
+        last_price = (zd_ai_state.get('last_tick') or {}).get('price') or (pos.get('entryPrice') if pos else 0)
+        if pos:
+            _zd_bot_close(last_price, 'bot stop', mode)
+    if was_running:
+        _zd_log('Zerodha Bot stopped.')
+        _persist_log_line('[ZERODHA] [{}] BOT STOP'.format(mode.upper()))
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/zerodha/status', methods=['GET'])
+@login_required
+def zd_aibot_status():
+    with zd_ai_lock:
+        cfg       = dict(zd_ai_state.get('config') or {})
+        cfg.pop('api_key', None)
+        pos       = zd_ai_state.get('position')
+        trades    = list(zd_ai_state.get('trades', []))
+        last_tick = dict(zd_ai_state.get('last_tick', {}))
+        log_buf   = list(zd_ai_state.get('log_buffer', []))[-200:]
+        candles   = list(zd_ai_state.get('last_candles', []))
+        running   = zd_ai_state.get('running', False)
+        paused    = zd_ai_state.get('paused', False)
+        consec    = zd_ai_state.get('consec_losses', 0)
+    realized   = sum(t.get('pnl', 0) for t in trades)
+    wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unrealized = 0.0
+    if pos and last_tick.get('price'):
+        unrealized = _zd_calc_pnl(pos['entryPrice'], last_tick['price'], pos['qty'], pos['side'])
+    return jsonify({
+        'success':  True, 'running':  running, 'paused':   paused,
+        'config':   cfg, 'position': pos, 'last_tick': last_tick,
+        'last_candles': candles, 'log':      log_buf,
+        'stats': {
+            'realized':     round(realized, 2),
+            'unrealized':   round(unrealized, 2),
+            'tradeCount':   len(trades),
+            'winRate':      round(wins / len(trades) * 100.0, 1) if trades else None,
+            'wins':         wins,
+            'consecLosses': consec,
+        },
+    })
+
+@app.route('/api/aibot/zerodha/apply_config', methods=['POST'])
+@login_required
+def zd_aibot_apply_config():
+    patch = (request.json or {}).get('patch') or {}
+    clean, rejected = _sanitize_delta_patch(patch)   # same tunable whitelist
+    if not clean:
+        return jsonify({'success': False, 'error': 'No valid tunable keys in patch', 'rejected': rejected}), 400
+    with zd_ai_lock:
+        cfg = zd_ai_state.get('config')
+        if not cfg:
+            zd_ai_state['config'] = cfg = {}
+        before = {k: cfg.get(k) for k in clean}
+        cfg.update(clean)
+        out = {k: v for k, v in cfg.items() if k != 'api_key'}
+    changes = ', '.join('{}: {}→{}'.format(k, before.get(k), v) for k, v in clean.items())
+    _zd_log('[Config] Applied: ' + changes)
+    _persist_log_line('[ZERODHA] [Config] ' + changes)
+    return jsonify({'success': True, 'config': out, 'applied': clean, 'rejected': rejected})
+
+@app.route('/api/aibot/zerodha/chat', methods=['POST'])
+@login_required
+def zd_aibot_chat():
+    data    = request.json or {}
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    history = data.get('history') or []
+    with zd_ai_lock:
+        cfg     = {k: v for k, v in (zd_ai_state.get('config') or {}).items() if k != 'api_key'}
+        trades  = list(zd_ai_state.get('trades', []))[-20:]
+        last    = dict(zd_ai_state.get('last_tick', {}))
+        running = zd_ai_state.get('running', False)
+        paused  = zd_ai_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    winrate  = round(wins / len(trades) * 100.0, 1) if trades else None
+    trade_brief = [{'strat': t.get('strategy'), 'side': t.get('side'),
+                    'pnl': round(t.get('pnl', 0), 2), 'reason': t.get('reason')} for t in trades]
+    import json as _json
+    system = (
+        "You are the strategy co-pilot for a server-side Zerodha (Kite) trading bot trading Indian "
+        "equities, index/stock F&O and MCX commodities. The bot scores several algos each tick and trades "
+        "the strongest signal that passes a quality gate. Your single goal: help the user reach a SUSTAINED "
+        "win rate above 80% while protecting capital. Be concise and concrete. Prefer fewer, higher-conviction "
+        "trades. The 'sniper' algo is disabled because it chased extended moves and caused the biggest losses.\n\n"
+        "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
+        "minScore, cooldownSec (re-entry cooldown seconds), qualityFilter (trend-alignment + over-extension guard), "
+        "includeMM, includeMMA. You CANNOT change symbol, exchange, qty, trading mode, or API keys.\n\n"
+        "When (and only when) you want to change settings, end your reply with a single fenced code block:\n"
+        "```json\n{\"configPatch\": {\"minScore\": 5.0}, \"summary\": \"one-line description\"}\n```\n"
+        "Put only keys you actually want changed. If no change is warranted, omit the block.\n\n"
+        "CURRENT BOT STATE:\n" + _json.dumps({
+            'running': running, 'paused': paused, 'config': cfg,
+            'lastTick': last, 'recentTrades': trade_brief,
+            'realizedPnlINR': round(realized, 2), 'winRatePct': winrate,
+        }, default=str)[:6000]
+    )
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        content = str(h.get('content', ''))[:4000]
+        if content: msgs.append({'role': role, 'content': content})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    patch, summary, clean_text = _extract_config_patch(text or '')
+    safe_patch, rejected = _sanitize_delta_patch(patch) if patch else ({}, [])
+    return jsonify({'success': True, 'reply': clean_text or text,
+                    'configPatch': safe_patch or None, 'summary': summary, 'rejected': rejected})
+
 @app.route('/api/aibot/log_append', methods=['POST'])
 @login_required
 def aibot_log_append():
@@ -2042,8 +2721,10 @@ def aibot_log_append():
 @app.route('/api/aibot/log_download', methods=['GET'])
 @login_required
 def aibot_log_download():
-    """Stream log.txt as plain text so 'View log.txt' opens cleanly in a tab."""
+    """Stream log.txt as plain text. ?download=1 forces a file download
+    (Content-Disposition: attachment) instead of opening inline in a tab."""
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log.txt')
+    as_download = request.args.get('download') in ('1', 'true', 'yes')
     if not os.path.exists(path):
         return Response('(log.txt is empty — no bot events yet)', content_type='text/plain; charset=utf-8')
     try:
@@ -2051,7 +2732,12 @@ def aibot_log_download():
             content = f.read()
     except Exception as e:
         return Response('Error reading log.txt: ' + str(e), content_type='text/plain; charset=utf-8', status=500)
-    return Response(content, content_type='text/plain; charset=utf-8')
+    headers = {}
+    if as_download:
+        from datetime import datetime as _dt
+        fname = 'log_{}.txt'.format(_dt.now().strftime('%Y%m%d_%H%M%S'))
+        headers['Content-Disposition'] = 'attachment; filename="{}"'.format(fname)
+    return Response(content, content_type='text/plain; charset=utf-8', headers=headers)
 
 @app.route('/api/aibot/log_read', methods=['GET'])
 @login_required
@@ -11193,6 +11879,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: inherit; margin-left: 8px;
   }
   .bot-log-btn:hover { background: #2962ff; color: #fff; }
+  /* Claude co-pilot chat */
+  .dbot-chat { margin-top: 12px; background: #131722; border: 1px solid #2a2e39; border-radius: 8px; overflow: hidden; }
+  .dbot-chat-head { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; background: rgba(41,98,255,0.10); border-bottom: 1px solid #2a2e39; font-size: 12px; font-weight: 700; color: #d1d4dc; }
+  .dbot-chat-hint { font-size: 10px; font-weight: 400; color: #787b86; }
+  .dbot-chat-msgs { max-height: 240px; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .dbot-msg { font-size: 12px; line-height: 1.45; padding: 7px 10px; border-radius: 8px; max-width: 92%; white-space: pre-wrap; word-wrap: break-word; }
+  .dbot-msg.bot { background: #1c2230; color: #d1d4dc; align-self: flex-start; border: 1px solid #2a2e39; }
+  .dbot-msg.user { background: #2962ff; color: #fff; align-self: flex-end; }
+  .dbot-msg.err { background: rgba(239,83,80,0.12); color: #ef5350; align-self: flex-start; border: 1px solid rgba(239,83,80,0.4); }
+  .dbot-patch { margin-top: 8px; background: #0f1320; border: 1px dashed rgba(38,166,154,0.55); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: #9aa0aa; align-self: flex-start; max-width: 92%; }
+  .dbot-patch code { color: #26a69a; font-family: monospace; }
+  .dbot-patch-apply { margin-top: 6px; background: #26a69a; color: #fff; border: none; border-radius: 4px; padding: 5px 12px; font-size: 11px; font-weight: 700; cursor: pointer; font-family: inherit; }
+  .dbot-patch-apply:hover { background: #2bbbad; }
+  .dbot-patch-apply:disabled { background: #38503c; cursor: default; }
+  .dbot-chat-input { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #2a2e39; }
+  .dbot-chat-input input { flex: 1; background: #0f1320; border: 1px solid #2a2e39; border-radius: 6px; padding: 8px 10px; color: #d1d4dc; font-size: 12px; font-family: inherit; }
+  .dbot-chat-input input:focus { outline: none; border-color: #2962ff; }
+  .dbot-chat-send { background: #2962ff; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; font-size: 12px; font-weight: 700; cursor: pointer; font-family: inherit; }
+  .dbot-chat-send:hover { background: #1e53e5; }
+  .dbot-chat-send:disabled { background: #2a3550; cursor: default; }
   .ai-info-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 6px 12px; padding: 10px 12px; background: #131722; border: 1px solid #2a2e39;
@@ -12412,7 +13118,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-input-bar">
         <label>
           <span>Tradingsymbol</span>
-          <input type="text" id="aiBotSymbol" value="NIFTY50" placeholder="e.g. CRUDEOILM26JUNFUT" style="min-width:220px">
+          <span style="display:flex;gap:6px">
+            <input type="text" id="aiBotSymbol" value="NIFTY50" placeholder="e.g. CRUDEOILM26JUNFUT" style="min-width:170px">
+            <button class="zd-add-inst-btn" id="aiBotAddInst" type="button" title="Pick an instrument (same search as the Automation panel)" style="white-space:nowrap">&#43; Add</button>
+          </span>
         </label>
         <label>
           <span>Exchange</span>
@@ -12442,6 +13151,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </label>
         <button class="zd-add-btn" id="aiBotLoadBtn" style="padding:7px 14px">&#128202; Load Chart</button>
         <button class="bot-log-btn" id="aiBotLogBtn" title="Open log.txt in a new tab (all bot events for both Zerodha and Delta)">&#128196; log.txt</button>
+        <button class="bot-log-btn" id="aiBotLogDownloadBtn" title="Download log.txt to your computer">&#11015; Download log</button>
       </div>
 
       <!-- Chart -->
@@ -12479,7 +13189,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Target % from entry">Target %: <input type="number" id="aiBotTpPct" value="3.0" min="0.1" step="0.1"></label>
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
-        <label title="Min algo score to enter (regime-adjusted automatically)">Min score: <input type="number" id="aiBotMinScore" value="3.5" min="0.5" step="0.1"></label>
+        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
+        <label title="Min algo score to enter (regime-adjusted automatically)">Min score: <input type="number" id="aiBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
       </div>
 
       <!-- Control buttons -->
@@ -12491,6 +13204,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Log -->
       <div class="zd-log" id="aiBotLog" style="max-height:180px"><span class="log-info">Bot ready. Paper Trading is selected by default. Enter symbol + qty, click Load Chart, then Start Bot.</span></div>
+
+      <!-- Claude strategy co-pilot -->
+      <div class="dbot-chat">
+        <div class="dbot-chat-head">
+          <span>&#129302; Claude strategy co-pilot</span>
+          <span class="dbot-chat-hint">Ask for a higher win rate, risk tweaks, or trade analysis. Changes apply only when you click Apply.</span>
+        </div>
+        <div class="dbot-chat-msgs" id="zerodhaChatMsgs">
+          <div class="dbot-msg bot">Hi! I can see your live Zerodha bot state, trades and P/L. Ask me things like <em>"why did the last trades lose?"</em> or <em>"tune settings for an 80%+ win rate"</em>.</div>
+        </div>
+        <div class="dbot-chat-input">
+          <input type="text" id="zerodhaChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
+          <button class="dbot-chat-send" id="zerodhaChatSend">Send</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -12579,6 +13307,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </label>
         <button class="zd-add-btn" id="deltaBotLoadBtn" style="padding:7px 14px">&#128202; Load Chart</button>
         <button class="bot-log-btn" id="deltaBotLogBtn" title="Open log.txt in a new tab (all bot events for both Zerodha and Delta)">&#128196; log.txt</button>
+        <button class="bot-log-btn" id="deltaBotLogDownloadBtn" title="Download log.txt to your computer">&#11015; Download log</button>
       </div>
 
       <div class="bot-chart-wrap">
@@ -12612,7 +13341,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>Target %: <input type="number" id="deltaBotTpPct" value="2.0" min="0.1" step="0.1"></label>
         <label>Max consec losses: <input type="number" id="deltaBotMaxConsec" value="3" min="1"></label>
         <label>Max daily loss: <input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
-        <label>Min score: <input type="number" id="deltaBotMinScore" value="3.5" min="0.5" step="0.1"></label>
+        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
+        <label>Min score: <input type="number" id="deltaBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
       </div>
 
       <div class="zd-footer">
@@ -12622,6 +13354,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="zd-log" id="deltaBotLog" style="max-height:180px"><span class="log-info">Delta bot ready. Paper Trading default. Enter symbol (BTCUSD/ETHUSD), click Load Chart, then Start Bot.</span></div>
+
+      <!-- Claude strategy co-pilot -->
+      <div class="dbot-chat">
+        <div class="dbot-chat-head">
+          <span>&#129302; Claude strategy co-pilot</span>
+          <span class="dbot-chat-hint">Ask for a higher win rate, risk tweaks, or trade analysis. Changes apply only when you click Apply.</span>
+        </div>
+        <div class="dbot-chat-msgs" id="deltaChatMsgs">
+          <div class="dbot-msg bot">Hi! I can see your live bot state, trades and P/L. Ask me things like <em>"why did the last trades lose?"</em> or <em>"tune settings for an 80%+ win rate"</em>.</div>
+        </div>
+        <div class="dbot-chat-input">
+          <input type="text" id="deltaChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
+          <button class="dbot-chat-send" id="deltaChatSend">Send</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -18037,7 +18784,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const tpPctEl  = document.getElementById('aiBotTpPct');
     const maxConsecEl = document.getElementById('aiBotMaxConsec');
     const maxLossEl   = document.getElementById('aiBotMaxLoss');
+    const maxProfitEl = document.getElementById('aiBotMaxProfit');
     const minScoreEl  = document.getElementById('aiBotMinScore');
+    const cooldownEl  = document.getElementById('aiBotCooldown');
+    const qualityChk  = document.getElementById('aiBotQualityFilter');
     const startBtn = document.getElementById('aiBotStartBtn');
     const pauseBtn = document.getElementById('aiBotPauseBtn');
     const stopBtn  = document.getElementById('aiBotStopBtn');
@@ -18091,7 +18841,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     incMMChk.addEventListener('change',  function() { try { localStorage.setItem(INC_MM_KEY,  this.checked ? '1' : '0'); } catch(e) {} });
     incMMAChk.addEventListener('change', function() { try { localStorage.setItem(INC_MMA_KEY, this.checked ? '1' : '0'); } catch(e) {} });
     function _activeAlgoList() {
-      const base = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution'];
+      const base = ['trend','mstreet','mfactor','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution'];
       if (incMMChk.checked)  base.push('marketmaking');
       if (incMMAChk.checked) base.push('mma');
       return base.join(',');
@@ -18107,6 +18857,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!botChart) initChart();
       loadChart();
       loadTradeHistory();
+      syncOnOpen();
     });
     closeBtn.addEventListener('click', () => panel.classList.remove('open'));
 
@@ -18194,20 +18945,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function loadChart() {
       const sym = symEl.value.trim().toUpperCase();
       const tf  = tfEl.value;
-      const exch = exchEl.value.trim().toUpperCase();
       if (!sym) return;
       const s = ZerodhaStore.getSession();
-      // Prefer Kite source when connected and exchange is Indian; else fall back
-      const isKiteEx = ['NSE','BSE','NFO','BFO','MCX','CDS','BCD','NCO'].indexOf(exch) >= 0;
-      const useKite = s.connected && (isKiteEx || _aiInferExch(sym));
-      const src = useKite ? 'kite' : 'tradingview';
+      // Always use Kite for Zerodha bot data + charts.
+      const src = 'kite';
+      if (!s.connected || !s.apiKey) {
+        logLine('[Chart] Connect Zerodha first — charts and data use Kite only.', 'info');
+        return;
+      }
       const url = '/api/candles?symbol=' + encodeURIComponent(sym) +
                   '&interval=' + encodeURIComponent(tf) +
-                  '&source=' + encodeURIComponent(src) +
-                  (useKite && s.apiKey ? '&api_key=' + encodeURIComponent(s.apiKey) : '');
+                  '&source=kite&api_key=' + encodeURIComponent(s.apiKey);
       fetch(url).then(r => r.json()).then(function(d) {
         if (!d.candles || !d.candles.length) {
-          logLine('[Chart] No candles for ' + sym + ' from ' + (d.data_source || src) + '. Check exchange/source/symbol.', 'info');
+          logLine('[Chart] No Kite candles for ' + sym + '. Check symbol/exchange and that Zerodha is connected.', 'info');
           return;
         }
         if (botCandleSeries) botCandleSeries.setData(d.candles);
@@ -18248,7 +18999,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function selectStrategy(regime, data) {
       const summaries = data.signalSummary || {};
       // Candidate algos by regime
-      const trendingCands = ['trend','momentum','sniper','breakout','priceaction','smartmoney','institution'];
+      const trendingCands = ['trend','momentum','breakout','priceaction','smartmoney','institution'];
       const rangeCands    = ['mstreet','statarb','mfactor','scalping','quant','orderflow'];
       // Market-making variants fit RANGE markets best. Only allow when the
       // user has ticked the corresponding checkbox above the risk bar.
@@ -18471,52 +19222,144 @@ HTML_PAGE = r"""<!DOCTYPE html>
       });
     }
 
-    // ---- Start / Pause / Stop ----
+    // ---- Server-side controller (mirrors the Delta bot) ----
+    // The bot now runs on the server (/api/aibot/zerodha/*) so it keeps trading
+    // even when this tab is closed. The browser only starts/stops it and polls
+    // /status for display. The old client-side botTick() above is unused.
+    let lastRenderedLogLen = 0;
+    let statusPoller = null;
+    function _renderPauseBtn() {
+      if (botPaused) { pauseBtn.innerHTML = '▶ Resume'; pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume'); }
+      else           { pauseBtn.innerHTML = '⏸ Pause';  pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause'); }
+    }
+    function _serverStarted() {
+      botRunning = true; botPaused = false;
+      startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
+      _renderPauseBtn(); startStatusPoll();
+    }
+    function _serverStopped() {
+      botRunning = false; botPaused = false;
+      startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true;
+      _renderPauseBtn(); stopStatusPoll();
+    }
+    function startStatusPoll() { if (statusPoller) return; pollStatus(); statusPoller = setInterval(pollStatus, 5000); }
+    function stopStatusPoll()  { if (statusPoller) { clearInterval(statusPoller); statusPoller = null; } }
+    function pollStatus() { fetch('/api/aibot/zerodha/status').then(r => r.json()).then(applyStatus).catch(() => {}); }
+    function applyStatus(s) {
+      if (!s || !s.success) return;
+      botRunning = !!s.running; botPaused = !!s.paused;
+      startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
+      _renderPauseBtn();
+      if (!botRunning) stopStatusPoll();
+      // Mirror live (possibly Claude-tuned) config into the inputs
+      if (botRunning && s.config) {
+        const c = s.config;
+        if (c.slPct != null)     slPctEl.value     = c.slPct;
+        if (c.tpPct != null)     tpPctEl.value     = c.tpPct;
+        if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+        if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
+        if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+        if (c.minScore != null)  minScoreEl.value  = c.minScore;
+        if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+      }
+      const log = s.log || [];
+      if (log.length > lastRenderedLogLen) {
+        log.slice(lastRenderedLogLen).forEach(line => {
+          logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>';
+        });
+        logEl.scrollTop = logEl.scrollHeight;
+        lastRenderedLogLen = log.length;
+      }
+      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      if (s.last_candles && s.last_candles.length && botCandleSeries) {
+        botCandleSeries.setData(s.last_candles);
+        const lc = s.last_candles[s.last_candles.length - 1];
+        if (lc && lc.close != null) updatePriceOverlay(lc.close);
+      }
+      const lt = s.last_tick || {};
+      if (lt.strategy) {
+        stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']';
+        stratEl.className   = 'val ' + (lt.signal === 'BUY' ? 'bull' : lt.signal === 'SELL' ? 'bear' : '');
+      }
+      if (lt.regime) regimeEl.textContent = lt.regime;
+      const p = s.position;
+      if (p) {
+        posEl.textContent = p.side === 'BUY' ? 'LONG' : 'SHORT';
+        posEl.className = 'val ' + (p.side === 'BUY' ? 'bull' : 'bear');
+        entryPxEl.textContent = p.entryPrice;
+      } else {
+        posEl.textContent = 'FLAT'; posEl.className = 'val'; entryPxEl.textContent = '—';
+      }
+      const st = s.stats || {};
+      if (st.realized != null) {
+        realPnlEl.textContent = (st.realized >= 0 ? '+₹' : '-₹') + Math.abs(st.realized).toFixed(2);
+        realPnlEl.className   = 'val ' + (st.realized > 0 ? 'bull' : st.realized < 0 ? 'bear' : '');
+      }
+      if (st.unrealized != null) {
+        unrPnlEl.textContent = (st.unrealized >= 0 ? '+₹' : '-₹') + Math.abs(st.unrealized).toFixed(2);
+        unrPnlEl.className   = 'val ' + (st.unrealized > 0 ? 'bull' : st.unrealized < 0 ? 'bear' : '');
+      }
+      tcEl.textContent = (st.tradeCount != null) ? st.tradeCount : '—';
+      wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
+    }
+
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
-      if (!sym) { logLine('Enter a tradingsymbol first.', 'info'); return; }
-      botRunning = true; botPaused = false; botConsecLosses = 0;
-      startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
-      _renderPauseBtn();
+      if (!sym) { logLine('Enter a tradingsymbol first (or use + Add).', 'info'); return; }
+      const s = ZerodhaStore.getSession();
       const mode = currentMode();
-      logLine('Bot started in ' + mode.toUpperCase() + ' mode for ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value + '. Checking every 15s.', 'info');
-      persistLog('[' + mode.toUpperCase() + '] BOT START ' + sym + ' qty=' + qtyEl.value + ' TF=' + tfEl.value);
-      botTick();
-      botTimer = setInterval(botTick, 15000);
+      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
+      const cfg = {
+        symbol:      sym,
+        exchange:    (exchEl.value || '').trim().toUpperCase(),
+        qty:         parseInt(qtyEl.value) || 1,
+        tf:          tfEl.value,
+        mode:        mode,
+        slPct:       parseFloat(slPctEl.value) || 1.5,
+        tpPct:       parseFloat(tpPctEl.value) || 3.0,
+        maxConsec:   parseInt(maxConsecEl.value) || 3,
+        maxLoss:     parseFloat(maxLossEl.value) || 2000,
+        maxProfit:   parseFloat(maxProfitEl.value) || 0,
+        minScore:    parseFloat(minScoreEl.value) || 4.0,
+        cooldownSec: parseInt(cooldownEl.value) || 0,
+        qualityFilter: !!qualityChk.checked,
+        includeMM:   !!incMMChk.checked,
+        includeMMA:  !!incMMAChk.checked,
+        api_key:     s.apiKey || ''
+      };
+      logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
+      lastRenderedLogLen = 0;
+      fetch('/api/aibot/zerodha/start', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg)
+      }).then(r => r.json()).then(res => {
+        if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
+        _serverStarted();
+        logLine('Bot is now running on the server. Safe to close this tab — bot keeps ticking.', 'info');
+      }).catch(e => logLine('Start request error: ' + e.message, 'info'));
     });
 
     pauseBtn.addEventListener('click', function() {
       if (!botRunning) return;
-      botPaused = !botPaused;
-      _renderPauseBtn();
-      logLine(botPaused ? 'Bot paused — position state preserved.' : 'Bot resumed.', 'info');
-      if (!botPaused) botTick();
+      fetch('/api/aibot/zerodha/pause', { method: 'POST' }).then(r => r.json()).then(res => {
+        if (res.success) { botPaused = !!res.paused; _renderPauseBtn(); logLine(botPaused ? 'Bot paused (server).' : 'Bot resumed (server).', 'info'); }
+      });
     });
-    function _renderPauseBtn() {
-      if (botPaused) {
-        pauseBtn.innerHTML = '▶ Resume';
-        pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume');
-      } else {
-        pauseBtn.innerHTML = '⏸ Pause';
-        pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause');
-      }
-    }
 
-    stopBtn.addEventListener('click', stopBot);
-    function stopBot() {
-      if (!botRunning) return;
-      clearInterval(botTimer); botTimer = null;
-      botRunning = false; botPaused = false;
-      startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true;
-      _renderPauseBtn();
-      // Close any open position at last known price (tracked from the last tick).
-      if (botPosition) {
-        const px = lastKnownPrice || botPosition.entryPrice;
-        closePosition(px, 'bot stop', currentMode());
-      }
-      logLine('Bot stopped.', 'info');
-      persistLog('[' + currentMode().toUpperCase() + '] BOT STOP');
+    stopBtn.addEventListener('click', function() {
+      fetch('/api/aibot/zerodha/stop', { method: 'POST' }).then(r => r.json()).then(() => {
+        _serverStopped(); logLine('Bot stopped on server.', 'info');
+      });
+    });
+
+    function syncOnOpen() {
+      fetch('/api/aibot/zerodha/status').then(r => r.json()).then(s => {
+        if (s && s.success && s.running) {
+          logLine('A server-side Zerodha Bot is already running. Resuming UI sync…', 'info');
+          _serverStarted(); applyStatus(s);
+        }
+      }).catch(() => {});
     }
 
     // ---- Helpers ----
@@ -18559,8 +19402,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       // start/stop) hit the file. Per-tick UI noise is excluded.
     }
     function persistLog(line) {
-      // Server-side append to log.txt
-      const ts = new Date().toISOString();
+      // Server-side append to log.txt — timestamp in IST (UTC+5:30)
+      const ts = new Date(Date.now() + 5.5*3600*1000).toISOString().replace('Z', '+05:30');
       fetch('/api/aibot/log_append', {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ line: '[' + ts + '] ' + line })
@@ -18586,6 +19429,87 @@ HTML_PAGE = r"""<!DOCTYPE html>
     document.getElementById('aiBotLogBtn').addEventListener('click', function() {
       window.open('/api/aibot/log_download', '_blank');
     });
+    document.getElementById('aiBotLogDownloadBtn').addEventListener('click', function() {
+      const a = document.createElement('a');
+      a.href = '/api/aibot/log_download?download=1';
+      a.download = 'log.txt';
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+    // Reuse the Automation panel's Add Instrument modal, targeting the bot fields.
+    document.getElementById('aiBotAddInst').addEventListener('click', function() {
+      window.zdInstTarget = { sym: 'aiBotSymbol', exch: 'aiBotExchange' };
+      if (typeof window.openZdInstModal === 'function') window.openZdInstModal();
+    });
+
+    // ---- Claude strategy co-pilot chat (Zerodha) ----
+    (function() {
+      const msgsEl  = document.getElementById('zerodhaChatMsgs');
+      const inputEl = document.getElementById('zerodhaChatInput');
+      const sendEl  = document.getElementById('zerodhaChatSend');
+      if (!msgsEl || !inputEl || !sendEl) return;
+      const history = [];
+      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function addMsg(text, cls) {
+        const d = document.createElement('div');
+        d.className = 'dbot-msg ' + (cls || 'bot');
+        d.innerHTML = esc(text);
+        msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d;
+      }
+      function addPatchCard(patch, summary) {
+        const card = document.createElement('div');
+        card.className = 'dbot-patch';
+        const pairs = Object.keys(patch).map(k => k + ' → ' + patch[k]).join(', ');
+        card.innerHTML = '<div>' + (summary ? esc(summary) + '<br>' : '') +
+          'Proposed change: <code>' + esc(pairs) + '</code></div>';
+        const btn = document.createElement('button');
+        btn.className = 'dbot-patch-apply'; btn.textContent = 'Apply to bot';
+        btn.addEventListener('click', function() {
+          btn.disabled = true; btn.textContent = 'Applying…';
+          fetch('/api/aibot/zerodha/apply_config', {
+            method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ patch })
+          }).then(r => r.json()).then(res => {
+            if (res.success) {
+              btn.textContent = '✓ Applied';
+              const c = res.config || {};
+              if (c.slPct != null)     slPctEl.value     = c.slPct;
+              if (c.tpPct != null)     tpPctEl.value     = c.tpPct;
+              if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+              if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
+              if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+              if (c.minScore != null)  minScoreEl.value  = c.minScore;
+              if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+              if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+              logLine('[Claude] Applied config: ' + Object.keys(res.applied||{}).map(k=>k+'='+res.applied[k]).join(', '), 'info');
+            } else {
+              btn.disabled = false; btn.textContent = 'Apply to bot';
+              addMsg('Apply failed: ' + (res.error || 'unknown'), 'err');
+            }
+          }).catch(e => { btn.disabled = false; btn.textContent = 'Apply to bot'; addMsg('Apply error: ' + e.message, 'err'); });
+        });
+        card.appendChild(btn); msgsEl.appendChild(card); msgsEl.scrollTop = msgsEl.scrollHeight;
+      }
+      function send() {
+        const msg = inputEl.value.trim();
+        if (!msg) return;
+        addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
+        inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
+        const thinking = addMsg('Thinking…', 'bot');
+        fetch('/api/aibot/zerodha/chat', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1) })
+        }).then(r => r.json()).then(res => {
+          thinking.remove();
+          if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
+          const reply = res.reply || '(no reply)';
+          addMsg(reply, 'bot'); history.push({ role: 'assistant', content: reply });
+          if (res.configPatch && Object.keys(res.configPatch).length) addPatchCard(res.configPatch, res.summary);
+        }).catch(e => { thinking.remove(); addMsg('Chat error: ' + e.message, 'err'); })
+          .finally(() => { sendEl.disabled = false; inputEl.disabled = false; inputEl.focus(); });
+      }
+      sendEl.addEventListener('click', send);
+      inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+    })();
+
     function loadTradeHistory() {
       fetch('/api/aibot/log_read?n=50').then(r => r.json()).then(function(d) {
         if (d.success && d.lines && d.lines.length) {
@@ -18742,7 +19666,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const tpPctEl  = document.getElementById('deltaBotTpPct');
     const maxConsecEl = document.getElementById('deltaBotMaxConsec');
     const maxLossEl   = document.getElementById('deltaBotMaxLoss');
+    const maxProfitEl = document.getElementById('deltaBotMaxProfit');
     const minScoreEl  = document.getElementById('deltaBotMinScore');
+    const cooldownEl  = document.getElementById('deltaBotCooldown');
+    const qualityChk  = document.getElementById('deltaBotQualityFilter');
     const startBtn = document.getElementById('deltaBotStartBtn');
     const pauseBtn = document.getElementById('deltaBotPauseBtn');
     const stopBtn  = document.getElementById('deltaBotStopBtn');
@@ -18869,7 +19796,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     dIncMMChk.addEventListener('change',  function() { try { localStorage.setItem(D_INC_MM_KEY,  this.checked ? '1' : '0'); } catch(e) {} });
     dIncMMAChk.addEventListener('change', function() { try { localStorage.setItem(D_INC_MMA_KEY, this.checked ? '1' : '0'); } catch(e) {} });
     function _dActiveAlgoList() {
-      const base = ['trend','mstreet','mfactor','sniper','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution'];
+      const base = ['trend','mstreet','mfactor','orderflow','priceaction','breakout','momentum','scalping','smartmoney','quant','hybrid','statarb','institution'];
       if (dIncMMChk.checked)  base.push('marketmaking');
       if (dIncMMAChk.checked) base.push('mma');
       return base.join(',');
@@ -18898,7 +19825,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function selectStrategy(regime, data) {
       const summaries = data.signalSummary || {};
-      const trendingCands = ['trend','momentum','sniper','breakout','priceaction','smartmoney','institution'];
+      const trendingCands = ['trend','momentum','breakout','priceaction','smartmoney','institution'];
       const rangeCands    = ['mstreet','statarb','mfactor','scalping','quant','orderflow'];
       // MM / MMA opt-in via the checkboxes above the risk bar
       if (_dMMEnabled())  rangeCands.push('marketmaking');
@@ -18955,7 +19882,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       // start/stop) hit the file. Per-tick UI noise is excluded.
     }
     function persistLog(line) {
-      const ts = new Date().toISOString();
+      // IST (UTC+5:30) timestamp so log.txt matches the user's clock
+      const ts = new Date(Date.now() + 5.5*3600*1000).toISOString().replace('Z', '+05:30');
       fetch('/api/aibot/log_append', {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ line: '[' + ts + '] [DELTA] ' + line })
@@ -18981,6 +19909,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     document.getElementById('deltaBotLogBtn').addEventListener('click', function() {
       window.open('/api/aibot/log_download', '_blank');
+    });
+    document.getElementById('deltaBotLogDownloadBtn').addEventListener('click', function() {
+      // Force a file download (Content-Disposition: attachment) rather than
+      // opening inline. A hidden iframe avoids navigating away from the panel.
+      const a = document.createElement('a');
+      a.href = '/api/aibot/log_download?download=1';
+      a.download = 'log.txt';
+      document.body.appendChild(a); a.click(); a.remove();
     });
 
     function openPosition(side, price, strategy, mode) {
@@ -19170,6 +20106,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       _renderPauseBtn();
       if (!botRunning) stopStatusPoll();
 
+      // While running, mirror the live (possibly Claude-tuned) config into the
+      // inputs so the panel always shows what the bot is actually using.
+      if (botRunning && s.config) {
+        const c = s.config;
+        if (c.slPct != null)     slPctEl.value     = c.slPct;
+        if (c.tpPct != null)     tpPctEl.value     = c.tpPct;
+        if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+        if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
+        if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+        if (c.minScore != null)  minScoreEl.value  = c.minScore;
+        if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+      }
+
       // New log lines (server's log_buffer is a rolling tail)
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
@@ -19233,7 +20183,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         tpPct:      parseFloat(tpPctEl.value) || 2.0,
         maxConsec:  parseInt(maxConsecEl.value) || 3,
         maxLoss:    parseFloat(maxLossEl.value) || 200,
-        minScore:   parseFloat(minScoreEl.value) || 3.5,
+        maxProfit:  parseFloat(maxProfitEl.value) || 0,
+        minScore:   parseFloat(minScoreEl.value) || 4.0,
+        cooldownSec: parseInt(cooldownEl.value) || 0,
+        qualityFilter: !!qualityChk.checked,
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
         api_key:    (DeltaStore.getSession().apiKey) || ''
@@ -19272,6 +20225,87 @@ HTML_PAGE = r"""<!DOCTYPE html>
         });
     });
 
+    // ---- Claude strategy co-pilot chat ----
+    (function() {
+      const msgsEl  = document.getElementById('deltaChatMsgs');
+      const inputEl = document.getElementById('deltaChatInput');
+      const sendEl  = document.getElementById('deltaChatSend');
+      if (!msgsEl || !inputEl || !sendEl) return;
+      const history = [];   // [{role:'user'|'assistant', content}]
+
+      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function addMsg(text, cls) {
+        const d = document.createElement('div');
+        d.className = 'dbot-msg ' + (cls || 'bot');
+        d.innerHTML = esc(text);
+        msgsEl.appendChild(d);
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        return d;
+      }
+      function addPatchCard(patch, summary) {
+        const card = document.createElement('div');
+        card.className = 'dbot-patch';
+        const pairs = Object.keys(patch).map(k => k + ' → ' + patch[k]).join(', ');
+        card.innerHTML = '<div>' + (summary ? esc(summary) + '<br>' : '') +
+          'Proposed change: <code>' + esc(pairs) + '</code></div>';
+        const btn = document.createElement('button');
+        btn.className = 'dbot-patch-apply';
+        btn.textContent = 'Apply to bot';
+        btn.addEventListener('click', function() {
+          btn.disabled = true; btn.textContent = 'Applying…';
+          fetch('/api/aibot/delta/apply_config', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ patch })
+          }).then(r => r.json()).then(res => {
+            if (res.success) {
+              btn.textContent = '✓ Applied';
+              const c = res.config || {};
+              if (c.slPct != null)     slPctEl.value     = c.slPct;
+              if (c.tpPct != null)     tpPctEl.value     = c.tpPct;
+              if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+              if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
+              if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+              if (c.minScore != null)  minScoreEl.value  = c.minScore;
+              if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+              if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+              logLine('[Claude] Applied config: ' + Object.keys(res.applied||{}).map(k=>k+'='+res.applied[k]).join(', '), 'info');
+            } else {
+              btn.disabled = false; btn.textContent = 'Apply to bot';
+              addMsg('Apply failed: ' + (res.error || 'unknown'), 'err');
+            }
+          }).catch(e => { btn.disabled = false; btn.textContent = 'Apply to bot'; addMsg('Apply error: ' + e.message, 'err'); });
+        });
+        card.appendChild(btn);
+        msgsEl.appendChild(card);
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+      }
+      function send() {
+        const msg = inputEl.value.trim();
+        if (!msg) return;
+        addMsg(msg, 'user');
+        history.push({ role: 'user', content: msg });
+        inputEl.value = '';
+        sendEl.disabled = true; inputEl.disabled = true;
+        const thinking = addMsg('Thinking…', 'bot');
+        fetch('/api/aibot/delta/chat', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1) })
+        }).then(r => r.json()).then(res => {
+          thinking.remove();
+          if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
+          const reply = res.reply || '(no reply)';
+          addMsg(reply, 'bot');
+          history.push({ role: 'assistant', content: reply });
+          if (res.configPatch && Object.keys(res.configPatch).length) {
+            addPatchCard(res.configPatch, res.summary);
+          }
+        }).catch(e => { thinking.remove(); addMsg('Chat error: ' + e.message, 'err'); })
+          .finally(() => { sendEl.disabled = false; inputEl.disabled = false; inputEl.focus(); });
+      }
+      sendEl.addEventListener('click', send);
+      inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+    })();
+
     // On panel open / page load, check whether a server-side bot is already
     // running (e.g., user closed the tab earlier; the bot kept going). If yes,
     // start polling so the UI re-syncs with the live state.
@@ -19305,13 +20339,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let searchTimer    = null;
 
     // Open modal
-    document.getElementById('zdOpenInstSearch').addEventListener('click', function() {
+    // Shared opener so other panels (e.g. the Zerodha AI Bot) can reuse the
+    // exact same instrument search. Callers set window.zdInstTarget first.
+    function openInstModal() {
       overlay.classList.add('open');
       searchInp.value = '';
       currentSeg = '';
       tabsEl.querySelectorAll('.zd-inst-tab').forEach(t => t.classList.toggle('active', t.dataset.seg === ''));
       loadInstruments('', '');
       setTimeout(() => searchInp.focus(), 80);
+    }
+    window.openZdInstModal = openInstModal;
+    document.getElementById('zdOpenInstSearch').addEventListener('click', function() {
+      window.zdInstTarget = null;   // default → Automation panel fields
+      openInstModal();
     });
 
     // Close modal
@@ -19382,18 +20423,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // metadata is what the next rule-add picks up.
         const first = selectedItems[0];
         const meta = deriveChartMeta(first);
-        document.getElementById('zdSymInput').value = meta.tradeSymbol;
-        // Also sync the Exchange dropdown so the user sees where the order will go.
-        const exchEl = document.getElementById('zdExchInput');
-        if (exchEl && meta.exchange) {
-          // Only set if the value is one of the known options; otherwise leave on 'Auto'.
-          const known = Array.from(exchEl.options).map(o => o.value);
-          if (known.indexOf(meta.exchange) !== -1) {
-            exchEl.value = meta.exchange;
-            try { localStorage.setItem('mangalview_zerodha_exchange_v1', meta.exchange); } catch(e) {}
+        const target = window.zdInstTarget;
+        if (target && target.sym) {
+          // Routed to another panel (e.g. the Zerodha AI Bot)
+          const symEl = document.getElementById(target.sym);
+          if (symEl) symEl.value = meta.tradeSymbol;
+          const exEl = target.exch ? document.getElementById(target.exch) : null;
+          if (exEl && meta.exchange) {
+            const known = Array.from(exEl.options || []).map(o => o.value);
+            if (known.indexOf(meta.exchange) !== -1) exEl.value = meta.exchange;
           }
+          window.zdInstTarget = null;
+        } else {
+          document.getElementById('zdSymInput').value = meta.tradeSymbol;
+          // Also sync the Exchange dropdown so the user sees where the order will go.
+          const exchEl = document.getElementById('zdExchInput');
+          if (exchEl && meta.exchange) {
+            // Only set if the value is one of the known options; otherwise leave on 'Auto'.
+            const known = Array.from(exchEl.options).map(o => o.value);
+            if (known.indexOf(meta.exchange) !== -1) {
+              exchEl.value = meta.exchange;
+              try { localStorage.setItem('mangalview_zerodha_exchange_v1', meta.exchange); } catch(e) {}
+            }
+          }
+          window.zdPendingInstMeta = meta;
         }
-        window.zdPendingInstMeta = meta;
       }
       closeModal();
     });
