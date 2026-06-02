@@ -1596,6 +1596,8 @@ def _bot_signal_data(symbol, interval, source, algo_names, api_key=None):
         candles = fetch_delta_data(interval, symbol)
     elif source == 'kite':
         candles = fetch_kite_data(interval, symbol, api_key=api_key)
+    elif source == 'mt5':
+        candles = fetch_mt5_data(interval, symbol, api_key)   # api_key carries the MT5 session id
     elif source == 'tradingview':
         candles = fetch_tradingview_data(interval, symbol)
     elif source == 'nse':
@@ -1678,17 +1680,14 @@ def _bot_detect_regime(candles):
     }
 
 def _bot_select_strategy(regime, summaries, cfg):
-    # NOTE: 'sniper' intentionally excluded from selection — it chases extended
-    # moves and produced the largest SL hits in log.txt (see loss_analysis.md).
-    trending = ['trend','momentum','breakout','priceaction','smartmoney','institution']
-    range_   = ['mstreet','statarb','mfactor','scalping','quant','orderflow']
-    if cfg.get('includeMM'):  range_.append('marketmaking')
-    if cfg.get('includeMMA'): range_.append('mma')
-    cands = trending if regime['trending'] else range_
-
+    # Candidates = every strategy that was COMPUTED this tick, which is exactly
+    # the always-on core plus the user-selected configurable strategies (see the
+    # algos list built in each *_bot_tick). We pick the strongest |score| among
+    # them; regime safety is enforced separately by _bot_entry_quality. This is
+    # what makes the strategy checkboxes authoritative — an unticked strategy is
+    # never computed, so it can never become the active strategy.
     best = None
-    for name in cands:
-        sm = summaries.get(name)
+    for name, sm in summaries.items():
         if not sm: continue
         score = sm.get('score') if sm.get('score') is not None else sm.get('composite_score')
         if score is None: continue
@@ -1697,22 +1696,16 @@ def _bot_select_strategy(regime, summaries, cfg):
         if best is None or abs(score) > abs(best['score']):
             best = {'name': name, 'score': score}
     if not best:
-        for name, sm in summaries.items():
-            score = sm.get('score') if sm.get('score') is not None else sm.get('composite_score')
-            if score is None: continue
-            try: score = float(score)
-            except (TypeError, ValueError): continue
-            if best is None or abs(score) > abs(best['score']):
-                best = {'name': name, 'score': score}
-    if not best:
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0,
                 'reason': '{} vol, {} • no algo data'.format(
                     regime['volatility'], 'trending' if regime['trending'] else 'range')}
 
     user_min  = float(cfg.get('minScore', 4.0))
-    # Stricter thresholds lift win rate: demand a clearly stronger edge in calm
-    # markets (more chop, lower follow-through) than in high-vol trends.
-    threshold = user_min + 0.5 if regime['volatility'] == 'high' else user_min + 1.0
+    # Score buffer (panel setting): extra edge required above Min score before
+    # entering. Full buffer in calm markets (more chop / less follow-through),
+    # half in volatile ones. buffer=0 makes Min score the literal threshold.
+    buf       = float(cfg.get('scoreBuffer', 1.0))
+    threshold = user_min + (buf * 0.5 if regime['volatility'] == 'high' else buf)
     signal = 'HOLD'
     if best['score'] >=  threshold: signal = 'BUY'
     if best['score'] <= -threshold: signal = 'SELL'
@@ -1753,6 +1746,30 @@ def _bot_entry_quality(side, candles, regime, cfg):
         if side == 'SELL' and ext < -1.5:
             return False, 'overextended below mean ({:.1f}x range)'.format(-ext)
     return True, ''
+
+# Always-on reliable strategies (the "core") + the user-configurable opt-ins
+# exposed as checkboxes in both AI bot panels.
+_BOT_CORE_ALGOS         = ['trend', 'momentum', 'breakout', 'priceaction', 'smartmoney', 'orderflow']
+_BOT_CONFIGURABLE_ALGOS = ['mfactor', 'mstreet', 'sniper', 'scalping', 'quant', 'hybrid', 'mpredict', 'institution', 'statarb']
+# Default opt-ins when a client doesn't send allowedStrategies (preserves the
+# pre-checkbox behaviour: the old always-on set minus sniper, which caused the
+# biggest losses, and mpredict, which is only a chart overlay).
+_BOT_DEFAULT_ALLOWED    = ['mfactor', 'mstreet', 'scalping', 'quant', 'hybrid', 'institution', 'statarb']
+
+def _bot_build_algos(cfg):
+    """Candidate algo pool = always-on core + user-selected configurable
+    strategies (+ MM/MMA opt-ins). 'mpredict' is dropped — it has no trading
+    signal (chart prediction overlay only), so it can never be active."""
+    algos = list(_BOT_CORE_ALGOS)
+    allowed = cfg.get('allowedStrategies')
+    if allowed is None:
+        allowed = _BOT_DEFAULT_ALLOWED
+    for s in allowed:
+        if s in _BOT_CONFIGURABLE_ALGOS and s not in algos:
+            algos.append(s)
+    if cfg.get('includeMM'):  algos.append('marketmaking')
+    if cfg.get('includeMMA'): algos.append('mma')
+    return [a for a in algos if a != 'mpredict']
 
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
@@ -1876,11 +1893,7 @@ def _delta_bot_tick():
     interval = cfg.get('tf', '5m')
     if not symbol: return
 
-    # 'sniper' excluded — see _bot_select_strategy / loss_analysis.md
-    algos = ['trend','mstreet','mfactor','orderflow','priceaction','breakout',
-             'momentum','scalping','smartmoney','quant','hybrid','statarb','institution']
-    if cfg.get('includeMM'):  algos.append('marketmaking')
-    if cfg.get('includeMMA'): algos.append('mma')
+    algos = _bot_build_algos(cfg)   # core + user-selected configurable strategies
 
     try:
         data = _bot_signal_data(symbol, interval, 'delta', algos)
@@ -2036,10 +2049,12 @@ def delta_aibot_start():
             'maxLoss':    float(data.get('maxLoss', 200) or 200),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
             'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
         if not delta_ai_state['config']['symbol']:
@@ -2099,7 +2114,7 @@ def delta_aibot_stop():
 # swap the traded instrument / size.
 _DELTA_TUNABLE_KEYS = {
     'slPct': float, 'tpPct': float, 'maxConsec': int, 'maxLoss': float,
-    'maxProfit': float, 'minScore': float, 'cooldownSec': int,
+    'maxProfit': float, 'minScore': float, 'scoreBuffer': float, 'cooldownSec': int,
     'qualityFilter': bool, 'includeMM': bool, 'includeMMA': bool,
 }
 
@@ -2215,10 +2230,14 @@ def delta_aibot_chat():
         "You are the strategy co-pilot for a server-side crypto-derivatives trading bot on Delta Exchange. "
         "The bot scores several algos each tick and trades the strongest signal that passes a quality gate. "
         "Your single goal: help the user reach a SUSTAINED win rate above 80% while protecting capital. "
-        "Be concise and concrete. Prefer fewer, higher-conviction trades. The 'sniper' algo is disabled because "
-        "it chased extended moves and caused the biggest losses.\n\n"
+        "Be concise and concrete. Prefer fewer, higher-conviction trades. The active strategy pool is an "
+        "always-on core (trend, momentum, breakout, price-action, smart-money, order-flow) PLUS the user-selected "
+        "strategies in config.allowedStrategies (panel checkboxes) — only those compete to be the active strategy. "
+        "'sniper' is off by default (it chased extended moves and caused the biggest past losses); 'mpredict' is a "
+        "chart overlay that does not trade. You cannot change which strategies are enabled — only the user can.\n\n"
         "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
-        "minScore, cooldownSec (re-entry cooldown seconds), qualityFilter (trend-alignment + over-extension guard), "
+        "minScore, scoreBuffer (extra edge above minScore; full in calm markets, half in volatile; 0 = literal), "
+        "cooldownSec (re-entry cooldown seconds), qualityFilter (trend-alignment + over-extension guard), "
         "includeMM, includeMMA. You CANNOT change symbol, qty, trading mode, or API keys.\n\n"
         "When (and only when) you want to change settings, end your reply with a single fenced code block:\n"
         "```json\n{\"configPatch\": {\"minScore\": 5.0}, \"summary\": \"one-line description\"}\n```\n"
@@ -2440,10 +2459,7 @@ def _zd_bot_tick():
     interval = cfg.get('tf', '5m')
     if not symbol: return
 
-    algos = ['trend','mstreet','mfactor','orderflow','priceaction','breakout',
-             'momentum','scalping','smartmoney','quant','hybrid','statarb','institution']
-    if cfg.get('includeMM'):  algos.append('marketmaking')
-    if cfg.get('includeMMA'): algos.append('mma')
+    algos = _bot_build_algos(cfg)   # core + user-selected configurable strategies
 
     try:
         data = _bot_signal_data(symbol, interval, 'kite', algos, api_key=cfg.get('api_key'))
@@ -2540,10 +2556,12 @@ def zd_aibot_start():
             'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
             'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
         if not zd_ai_state['config']['symbol']:
@@ -2673,9 +2691,14 @@ def zd_aibot_chat():
         "equities, index/stock F&O and MCX commodities. The bot scores several algos each tick and trades "
         "the strongest signal that passes a quality gate. Your single goal: help the user reach a SUSTAINED "
         "win rate above 80% while protecting capital. Be concise and concrete. Prefer fewer, higher-conviction "
-        "trades. The 'sniper' algo is disabled because it chased extended moves and caused the biggest losses.\n\n"
+        "trades. The active strategy pool is an always-on core (trend, momentum, breakout, price-action, "
+        "smart-money, order-flow) PLUS the user-selected strategies in config.allowedStrategies (panel checkboxes) "
+        "— only those compete to be the active strategy. 'sniper' is off by default (it chased extended moves and "
+        "caused the biggest past losses); 'mpredict' is a chart overlay that does not trade. You cannot change "
+        "which strategies are enabled — only the user can.\n\n"
         "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
-        "minScore, cooldownSec (re-entry cooldown seconds), qualityFilter (trend-alignment + over-extension guard), "
+        "minScore, scoreBuffer (extra edge above minScore; full in calm markets, half in volatile; 0 = literal), "
+        "cooldownSec (re-entry cooldown seconds), qualityFilter (trend-alignment + over-extension guard), "
         "includeMM, includeMMA. You CANNOT change symbol, exchange, qty, trading mode, or API keys.\n\n"
         "When (and only when) you want to change settings, end your reply with a single fenced code block:\n"
         "```json\n{\"configPatch\": {\"minScore\": 5.0}, \"summary\": \"one-line description\"}\n```\n"
@@ -2684,6 +2707,897 @@ def zd_aibot_chat():
             'running': running, 'paused': paused, 'config': cfg,
             'lastTick': last, 'recentTrades': trade_brief,
             'realizedPnlINR': round(realized, 2), 'winRatePct': winrate,
+        }, default=str)[:6000]
+    )
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        content = str(h.get('content', ''))[:4000]
+        if content: msgs.append({'role': role, 'content': content})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    patch, summary, clean_text = _extract_config_patch(text or '')
+    safe_patch, rejected = _sanitize_delta_patch(patch) if patch else ({}, [])
+    return jsonify({'success': True, 'reply': clean_text or text,
+                    'configPatch': safe_patch or None, 'summary': summary, 'rejected': rejected})
+
+# ============================================================================
+# Server-side Zerodha OPTIONS AI bot — trades up to two option contracts
+# independently from their own Kite charts. Each leg is gated by the
+# Option Buyer (open long via BUY, exit SELL) and Option Seller (open short via
+# SELL, exit BUY) toggles. Mirrors the Zerodha bot's architecture.
+# ============================================================================
+zo_ai_state = {
+    'running': False, 'paused': False, 'thread': None,
+    'config': None,
+    'legs': [],            # [{symbol, exchange, position, last_tick, last_candles, last_exit_time}]
+    'trades': [],          # closed trades across both legs
+    'consec_losses': 0,
+    'log_buffer': [],
+}
+zo_ai_lock = _threading.RLock()
+
+def _zo_log(msg):
+    ts = _bot_log_ts()
+    with zo_ai_lock:
+        buf = zo_ai_state.setdefault('log_buffer', [])
+        buf.append('[' + ts + '] ' + msg)
+        if len(buf) > 500:
+            del buf[:len(buf) - 500]
+
+def _kite_limit_order(api_key, symbol, exchange, side, qty, price):
+    """Place a tight LIMIT order (±0.2% around price) on Kite. Returns (ok, msg)."""
+    import urllib.request as _ur, urllib.parse as _up, json as _json
+    if not api_key or api_key not in zerodha_sessions:
+        return False, 'not connected'
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        return False, 'no access_token'
+    exchange = (exchange or '').upper() or _zd_infer_exchange(symbol) or 'NFO'
+    product  = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
+    tick     = _get_instrument_tick(symbol, exchange)
+    lim      = _quantize_to_tick(price * (0.998 if side == 'SELL' else 1.002), tick)
+    payload  = _up.urlencode({
+        'tradingsymbol': symbol, 'exchange': exchange,
+        'transaction_type': side, 'quantity': qty,
+        'product': product, 'order_type': 'LIMIT', 'price': lim, 'validity': 'DAY',
+    }).encode('utf-8')
+    req = _ur.Request('https://api.kite.trade/orders/regular', data=payload,
+                      headers={'X-Kite-Version': '3',
+                               'Authorization': 'token {}:{}'.format(api_key, access_token),
+                               'Content-Type': 'application/x-www-form-urlencoded',
+                               'User-Agent': 'Mozilla/5.0'}, method='POST')
+    try:
+        with _kite_urlopen(req, timeout=15) as resp:
+            rd = _json.loads(resp.read().decode('utf-8') or '{}')
+    except Exception as e:
+        err = ''
+        try: err = e.read().decode('utf-8')   # type: ignore[attr-defined]
+        except Exception: pass
+        return False, (str(err) or str(e))[:200]
+    if rd.get('status') == 'success':
+        return True, str((rd.get('data') or {}).get('order_id', ''))
+    return False, str(rd.get('message', rd))[:200]
+
+def _zo_place_live(leg, side, qty, price, cfg):
+    ok, msg = _kite_limit_order(cfg.get('api_key'), leg['symbol'], leg['exchange'], side, qty, price)
+    if ok:
+        _zo_log('[LIVE] Kite accepted #' + msg + ' (' + leg['symbol'] + ')')
+        _persist_log_line('[ZOPTIONS] [LIVE] Kite accepted #' + msg)
+    else:
+        _zo_log('[LIVE] order failed (' + leg['symbol'] + '): ' + msg)
+        _persist_log_line('[ZOPTIONS] [LIVE] order failed: ' + msg)
+
+def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
+    """open_side 'BUY' = long the option (exit SELL); 'SELL' = short (exit BUY)."""
+    qty    = int(cfg.get('qty', 1))
+    sl_pct = float(cfg.get('slPct', 10.0))
+    tp_pct = float(cfg.get('tpPct', 10.0))
+    is_long = open_side == 'BUY'
+    sl = price * (1 - sl_pct/100.0) if is_long else price * (1 + sl_pct/100.0)
+    tp = price * (1 + tp_pct/100.0) if is_long else price * (1 - tp_pct/100.0)
+    leg['position'] = {
+        'side': open_side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+        'qty': qty, 'sl': round(sl, 2), 'tp': round(tp, 2),
+        'strategy': strat['name'], 'mode': mode,
+    }
+    kind = 'BUY-to-open (long)' if is_long else 'SELL-to-open (short)'
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+        mode.upper(), kind, qty, leg['symbol'], round(price, 2),
+        round(sl, 2), round(tp, 2), strat['name'], strat['score'])
+    _zo_log(line)
+    _persist_log_line('[ZOPTIONS] ' + line)
+    if mode == 'live':
+        _zo_place_live(leg, open_side, qty, price, cfg)
+
+def _zo_close_leg(leg, price, reason, cfg, mode):
+    pos = leg.get('position')
+    if not pos: return
+    pnl = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
+    closed = dict(pos)
+    closed.update({'symbol': leg['symbol'], 'exitPrice': round(price, 2),
+                   'exitTime': int(_zd_time.time()), 'pnl': round(pnl, 2), 'reason': reason})
+    zo_ai_state['trades'].append(closed)
+    if pnl < 0: zo_ai_state['consec_losses'] = zo_ai_state.get('consec_losses', 0) + 1
+    else:       zo_ai_state['consec_losses'] = 0
+    close_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
+    line = '[{}] EXIT {} {} {} @ {} (entry {}) PnL={}₹{:.2f} reason={} strat={}'.format(
+        mode.upper(), close_side, pos['qty'], leg['symbol'], round(price, 2),
+        pos['entryPrice'], '+' if pnl >= 0 else '', pnl, reason, pos['strategy'])
+    _zo_log(line)
+    _persist_log_line('[ZOPTIONS] ' + line)
+    if mode == 'live':
+        _zo_place_live(leg, close_side, pos['qty'], price, cfg)
+    leg['position'] = None
+    leg['last_exit_time'] = int(_zd_time.time())
+
+def _zo_apply_breakers(cfg, mode):
+    """Global circuit breakers across both legs. Closes all open legs + stops."""
+    trades   = zo_ai_state['trades']
+    realized = sum(t['pnl'] for t in trades)
+    unreal   = 0.0
+    for leg in zo_ai_state['legs']:
+        pos = leg.get('position'); lt = leg.get('last_tick') or {}
+        if pos and lt.get('price'):
+            unreal += _zd_calc_pnl(pos['entryPrice'], lt['price'], pos['qty'], pos['side'])
+    max_consec = int(cfg.get('maxConsec', 3))
+    max_loss   = float(cfg.get('maxLoss', 2000))
+    max_profit = float(cfg.get('maxProfit', 0) or 0)
+    trip = None
+    if zo_ai_state['consec_losses'] >= max_consec:        trip = 'Max consecutive losses'
+    elif realized < -abs(max_loss):                        trip = 'Max daily loss'
+    elif max_profit > 0 and (realized + unreal) >= max_profit: trip = 'Max daily profit'
+    if not trip:
+        return
+    for leg in zo_ai_state['legs']:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _zo_close_leg(leg, px, trip, cfg, mode)
+    zo_ai_state['running'] = False
+    _zo_log('[STOP] ' + trip + ' — all legs closed, bot stopped.')
+    _persist_log_line('[ZOPTIONS] [STOP] ' + trip)
+
+def _zo_bot_tick():
+    cfg = zo_ai_state.get('config') or {}
+    if not cfg: return
+    mode     = cfg.get('mode', 'paper')
+    interval = cfg.get('tf', '5m')
+    algos    = _bot_build_algos(cfg)
+    buyer    = bool(cfg.get('optionBuyer'))
+    seller   = bool(cfg.get('optionSeller'))
+    for leg in list(zo_ai_state['legs']):
+        symbol = leg['symbol']
+        if not symbol: continue
+        try:
+            data = _bot_signal_data(symbol, interval, 'kite', algos, api_key=cfg.get('api_key'))
+        except Exception as e:
+            _zo_log('[Tick] ' + symbol + ' data error: ' + str(e)); continue
+        candles = data.get('candles') or []
+        if not candles:
+            with zo_ai_lock:
+                leg['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
+            _zo_log('[Tick] no Kite candles for ' + symbol); continue
+        price  = candles[-1]['close']
+        regime = _bot_detect_regime(candles)
+        strat  = _bot_select_strategy(regime, data.get('signalSummary') or {}, cfg)
+        sig    = strat['signal']
+        with zo_ai_lock:
+            leg['last_candles'] = candles[-150:]
+            leg['last_tick'] = {
+                'time': int(_zd_time.time()), 'price': price,
+                'strategy': strat['name'], 'signal': sig, 'score': strat['score'],
+                'reason': strat['reason'],
+                'regime': '{} vol, {}'.format(regime['volatility'],
+                    'trending ' + regime['direction'] if regime['trending'] else 'range'),
+            }
+            pos = leg.get('position')
+            if pos:
+                is_long = pos['side'] == 'BUY'
+                reason = None
+                if is_long and price <= pos['sl']:        reason = 'SL hit'
+                elif is_long and price >= pos['tp']:      reason = 'TP hit'
+                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
+                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
+                elif is_long and sig == 'SELL':            reason = 'signal reversal'
+                elif (not is_long) and sig == 'BUY':       reason = 'signal reversal'
+                if reason:
+                    _zo_close_leg(leg, price, reason, cfg, mode)
+                else:
+                    _zo_log('[Tick] {} px={} (in {} from {}, strat={})'.format(
+                        symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name']))
+            else:
+                open_side = None
+                if sig == 'BUY' and buyer:    open_side = 'BUY'    # long the option
+                elif sig == 'SELL' and seller: open_side = 'SELL'  # short the option
+                if open_side:
+                    cooldown = int(cfg.get('cooldownSec', 60) or 0)
+                    last_exit = leg.get('last_exit_time') or 0
+                    if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
+                        _zo_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, open_side, cooldown))
+                    else:
+                        ok, qreason = _bot_entry_quality(open_side, candles, regime, cfg)
+                        if ok:
+                            _zo_open_leg(leg, open_side, price, strat, cfg, mode)
+                        else:
+                            _zo_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, open_side, qreason))
+                else:
+                    why = strat['reason']
+                    if sig == 'BUY' and not buyer:   why = 'BUY signal but Option Buyer is off'
+                    if sig == 'SELL' and not seller: why = 'SELL signal but Option Seller is off'
+                    _zo_log('[Tick] {} px={} HOLD — {}'.format(symbol, round(price, 2), why))
+    with zo_ai_lock:
+        _zo_apply_breakers(cfg, mode)
+
+def _zo_bot_loop():
+    while True:
+        with zo_ai_lock:
+            running = zo_ai_state.get('running', False)
+            paused  = zo_ai_state.get('paused', False)
+        if not running: break
+        if not paused:
+            try: _zo_bot_tick()
+            except Exception as e:
+                _zo_log('[Tick] ERROR: ' + str(e))
+        _zd_time.sleep(15)
+
+@app.route('/api/aibot/zoptions/start', methods=['POST'])
+@login_required
+def zo_aibot_start():
+    data = request.json or {}
+    with zo_ai_lock:
+        if zo_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+        legs = []
+        for n in ('1', '2'):
+            sym = (data.get('sym' + n) or '').upper().strip()
+            if sym:
+                legs.append({'symbol': sym, 'exchange': (data.get('exch' + n) or '').upper().strip(),
+                             'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
+        if not legs:
+            return jsonify({'success': False, 'error': 'Select at least one option instrument'}), 400
+        buyer  = bool(data.get('optionBuyer', True))
+        seller = bool(data.get('optionSeller', False))
+        if not buyer and not seller:
+            return jsonify({'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}), 400
+        zo_ai_state['config'] = {
+            'sym1': legs[0]['symbol'], 'exch1': legs[0]['exchange'],
+            'sym2': legs[1]['symbol'] if len(legs) > 1 else '',
+            'exch2': legs[1]['exchange'] if len(legs) > 1 else '',
+            'qty':        int(data.get('qty', 1) or 1),
+            'tf':         data.get('tf', '5m'),
+            'mode':       data.get('mode', 'paper'),
+            'optionBuyer':  buyer,
+            'optionSeller': seller,
+            'slPct':      float(data.get('slPct', 10.0)),
+            'tpPct':      float(data.get('tpPct', 10.0)),
+            'maxConsec':  int(data.get('maxConsec', 3) or 3),
+            'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
+            'maxProfit':  float(data.get('maxProfit', 0) or 0),
+            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
+            'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'qualityFilter': bool(data.get('qualityFilter', True)),
+            'includeMM':  bool(data.get('includeMM', False)),
+            'includeMMA': bool(data.get('includeMMA', False)),
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'api_key':    (data.get('api_key') or '').strip(),
+        }
+        zo_ai_state['legs']          = legs
+        zo_ai_state['trades']        = []
+        zo_ai_state['consec_losses'] = 0
+        zo_ai_state['log_buffer']    = []
+        zo_ai_state['running']       = True
+        zo_ai_state['paused']        = False
+        t = _threading.Thread(target=_zo_bot_loop, daemon=True, name='zoptions-aibot')
+        zo_ai_state['thread'] = t
+        t.start()
+    cfg = zo_ai_state['config']
+    syms = ', '.join(l['symbol'] for l in legs)
+    modes = ('buyer' if cfg['optionBuyer'] else '') + ('+seller' if cfg['optionSeller'] else '')
+    _zo_log('Options Bot started SERVER-SIDE {} mode [{}] for {} qty={} TF={}. Tick every 15s.'.format(
+        cfg['mode'].upper(), modes.strip('+'), syms, cfg['qty'], cfg['tf']))
+    _persist_log_line('[ZOPTIONS] [{}] BOT START {} ({}) qty={} TF={} (server-side)'.format(
+        cfg['mode'].upper(), syms, modes.strip('+'), cfg['qty'], cfg['tf']))
+    return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/zoptions/pause', methods=['POST'])
+@login_required
+def zo_aibot_pause():
+    with zo_ai_lock:
+        if not zo_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is not running'}), 400
+        zo_ai_state['paused'] = not zo_ai_state.get('paused', False)
+        paused = zo_ai_state['paused']
+    _zo_log('Options Bot ' + ('paused' if paused else 'resumed'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/zoptions/stop', methods=['POST'])
+@login_required
+def zo_aibot_stop():
+    with zo_ai_lock:
+        was_running = zo_ai_state.get('running')
+        zo_ai_state['running'] = False
+        zo_ai_state['paused']  = False
+        cfg  = zo_ai_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        for leg in zo_ai_state.get('legs', []):
+            if leg.get('position'):
+                lt = leg.get('last_tick') or {}
+                px = lt.get('price') or leg['position']['entryPrice']
+                _zo_close_leg(leg, px, 'bot stop', cfg, mode)
+    if was_running:
+        _zo_log('Options Bot stopped.')
+        _persist_log_line('[ZOPTIONS] [{}] BOT STOP'.format(mode.upper()))
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/zoptions/status', methods=['GET'])
+@login_required
+def zo_aibot_status():
+    with zo_ai_lock:
+        cfg     = dict(zo_ai_state.get('config') or {})
+        cfg.pop('api_key', None)
+        legs_raw = zo_ai_state.get('legs', [])
+        legs = [{'symbol': l['symbol'], 'exchange': l.get('exchange', ''),
+                 'position': l.get('position'), 'last_tick': dict(l.get('last_tick', {})),
+                 'last_candles': list(l.get('last_candles', []))} for l in legs_raw]
+        trades  = list(zo_ai_state.get('trades', []))
+        log_buf = list(zo_ai_state.get('log_buffer', []))[-200:]
+        running = zo_ai_state.get('running', False)
+        paused  = zo_ai_state.get('paused', False)
+        consec  = zo_ai_state.get('consec_losses', 0)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unreal   = 0.0
+    for l in legs:
+        p = l.get('position'); lt = l.get('last_tick') or {}
+        if p and lt.get('price'):
+            unreal += _zd_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'])
+    return jsonify({
+        'success': True, 'running': running, 'paused': paused, 'config': cfg,
+        'legs': legs, 'log': log_buf,
+        'stats': {
+            'realized': round(realized, 2), 'unrealized': round(unreal, 2),
+            'tradeCount': len(trades),
+            'winRate': round(wins / len(trades) * 100.0, 1) if trades else None,
+            'wins': wins, 'consecLosses': consec,
+        },
+    })
+
+@app.route('/api/aibot/zoptions/apply_config', methods=['POST'])
+@login_required
+def zo_aibot_apply_config():
+    patch = (request.json or {}).get('patch') or {}
+    clean, rejected = _sanitize_delta_patch(patch)
+    if not clean:
+        return jsonify({'success': False, 'error': 'No valid tunable keys in patch', 'rejected': rejected}), 400
+    with zo_ai_lock:
+        cfg = zo_ai_state.get('config')
+        if not cfg:
+            zo_ai_state['config'] = cfg = {}
+        before = {k: cfg.get(k) for k in clean}
+        cfg.update(clean)
+        out = {k: v for k, v in cfg.items() if k != 'api_key'}
+    changes = ', '.join('{}: {}→{}'.format(k, before.get(k), v) for k, v in clean.items())
+    _zo_log('[Config] Applied: ' + changes)
+    _persist_log_line('[ZOPTIONS] [Config] ' + changes)
+    return jsonify({'success': True, 'config': out, 'applied': clean, 'rejected': rejected})
+
+@app.route('/api/aibot/zoptions/chat', methods=['POST'])
+@login_required
+def zo_aibot_chat():
+    data    = request.json or {}
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    history = data.get('history') or []
+    with zo_ai_lock:
+        cfg     = {k: v for k, v in (zo_ai_state.get('config') or {}).items() if k != 'api_key'}
+        trades  = list(zo_ai_state.get('trades', []))[-20:]
+        legs    = [{'symbol': l['symbol'], 'position': l.get('position'),
+                    'lastTick': {k: v for k, v in (l.get('last_tick') or {}).items()}}
+                   for l in zo_ai_state.get('legs', [])]
+        running = zo_ai_state.get('running', False)
+        paused  = zo_ai_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    winrate  = round(wins / len(trades) * 100.0, 1) if trades else None
+    trade_brief = [{'sym': t.get('symbol'), 'strat': t.get('strategy'), 'side': t.get('side'),
+                    'pnl': round(t.get('pnl', 0), 2), 'reason': t.get('reason')} for t in trades]
+    import json as _json
+    system = (
+        "You are the strategy co-pilot for a server-side Zerodha (Kite) OPTIONS trading bot. It trades up to two "
+        "option contracts independently, each from its own Kite candles. Per leg: in Option Buyer mode it opens a "
+        "LONG on a BUY signal (exit SELL); in Option Seller mode it opens a SHORT on a SELL signal (exit BUY); with "
+        "both enabled it can do either. Your single goal: help reach a SUSTAINED win rate above 80% while protecting "
+        "capital — option selling has large/undefined risk, so be conservative. Be concise and concrete. The active "
+        "strategy pool is a core (trend, momentum, breakout, price-action, smart-money, order-flow) PLUS the "
+        "user-selected strategies in config.allowedStrategies; you cannot change which strategies/legs are enabled.\n\n"
+        "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
+        "minScore, scoreBuffer, cooldownSec, qualityFilter, includeMM, includeMMA. You CANNOT change the option "
+        "symbols, qty, buyer/seller mode, trading mode, or API keys.\n\n"
+        "When (and only when) you want to change settings, end your reply with a single fenced code block:\n"
+        "```json\n{\"configPatch\": {\"minScore\": 5.0}, \"summary\": \"one-line description\"}\n```\n"
+        "Omit the block if no change is warranted.\n\n"
+        "CURRENT BOT STATE:\n" + _json.dumps({
+            'running': running, 'paused': paused, 'config': cfg, 'legs': legs,
+            'recentTrades': trade_brief, 'realizedPnlINR': round(realized, 2), 'winRatePct': winrate,
+        }, default=str)[:6000]
+    )
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        content = str(h.get('content', ''))[:4000]
+        if content: msgs.append({'role': role, 'content': content})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    patch, summary, clean_text = _extract_config_patch(text or '')
+    safe_patch, rejected = _sanitize_delta_patch(patch) if patch else ({}, [])
+    return jsonify({'success': True, 'reply': clean_text or text,
+                    'configPatch': safe_patch or None, 'summary': summary, 'rejected': rejected})
+
+# ============================================================================
+# MetaTrader 5 (MT5) integration — pluggable backend.
+#   MT5_BACKEND=metatrader5  -> official MetaTrader5 pip package (local Windows
+#                               terminal must run on the same host as this app)
+#   MT5_BACKEND=metaapi      -> MetaApi.cloud REST bridge (scaffolded; wire calls)
+#   unset                    -> "not configured" (panel works, no live trading)
+# Data/charts for the MT5 AI bot route through fetch_mt5_data() below.
+# ============================================================================
+mt5_sessions = {}   # session_id -> {backend, login, server, connected}
+_MT5_TF = {'1m': 'M1', '3m': 'M3', '5m': 'M5', '15m': 'M15', '30m': 'M30', '1h': 'H1', '1d': 'D1'}
+
+def _mt5_backend():
+    return (os.environ.get('MT5_BACKEND', '') or '').strip().lower()
+
+def _mt5_pkg():
+    import importlib
+    return importlib.import_module('MetaTrader5')
+
+def _mt5_connect(creds):
+    backend = _mt5_backend()
+    if backend == 'metatrader5':
+        try:
+            mt5 = _mt5_pkg()
+        except Exception:
+            return {'success': False, 'error': 'MetaTrader5 package not installed. Run "pip install MetaTrader5" (Windows only) on the host running this app.'}
+        login    = creds.get('login')
+        password = creds.get('password')
+        server   = creds.get('server')
+        try:
+            if login:
+                ok = mt5.initialize(login=int(login), password=password or '', server=server or '')
+            else:
+                ok = mt5.initialize()
+        except Exception as e:
+            return {'success': False, 'error': 'MT5 initialize error: ' + str(e)}
+        if not ok:
+            return {'success': False, 'error': 'MT5 initialize failed: ' + str(mt5.last_error())}
+        info = None
+        try: info = mt5.account_info()
+        except Exception: pass
+        acc = info._asdict() if info else {}
+        sid = 'mt5-' + str(login or acc.get('login') or 'default')
+        mt5_sessions[sid] = {'backend': 'metatrader5', 'login': login, 'server': server, 'connected': True}
+        return {'success': True, 'id': sid, 'account': {
+            'login': acc.get('login'), 'balance': acc.get('balance'),
+            'currency': acc.get('currency'), 'server': acc.get('server') or server}}
+    elif backend == 'metaapi':
+        return {'success': False, 'error': 'MetaApi backend is scaffolded but not wired yet — implement the MetaApi REST calls in _mt5_connect/fetch_mt5_data/_mt5_place_order, or use MT5_BACKEND=metatrader5.'}
+    return {'success': False, 'error': 'MT5 backend not configured. Set MT5_BACKEND=metatrader5 (local Windows terminal) or metaapi (cloud) in the environment, then reconnect.'}
+
+def fetch_mt5_data(interval, symbol, session_id=None):
+    """Return candles [{time,open,high,low,close,volume}] from MT5, or []."""
+    backend = _mt5_backend()
+    if backend == 'metatrader5':
+        try:
+            mt5 = _mt5_pkg()
+        except Exception:
+            return []
+        try:
+            tf = getattr(mt5, 'TIMEFRAME_' + _MT5_TF.get(interval, 'M5'))
+            mt5.symbol_select(symbol, True)
+            rates = mt5.copy_rates_from_pos(symbol, tf, 0, 300)
+        except Exception:
+            return []
+        if rates is None:
+            return []
+        out = []
+        for r in rates:
+            try:
+                out.append({'time': int(r['time']), 'open': float(r['open']),
+                            'high': float(r['high']), 'low': float(r['low']),
+                            'close': float(r['close']), 'volume': float(r['tick_volume'])})
+            except Exception:
+                continue
+        return out
+    return []
+
+def _mt5_place_order(session_id, symbol, side, qty, price):
+    """Market deal on MT5. Returns (ok, msg). NOTE: uses simple BUY/SELL deals —
+    on netting accounts these open/close net; on hedging accounts a close may
+    open an opposite position. Refine per account type when going live."""
+    backend = _mt5_backend()
+    if backend == 'metatrader5':
+        try:
+            mt5 = _mt5_pkg()
+        except Exception:
+            return False, 'MetaTrader5 not installed'
+        try:
+            mt5.symbol_select(symbol, True)
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return False, 'no tick for ' + symbol
+            otype = mt5.ORDER_TYPE_BUY if side == 'BUY' else mt5.ORDER_TYPE_SELL
+            px    = tick.ask if side == 'BUY' else tick.bid
+            req = {'action': mt5.TRADE_ACTION_DEAL, 'symbol': symbol, 'volume': float(qty),
+                   'type': otype, 'price': px, 'deviation': 20,
+                   'type_filling': mt5.ORDER_FILLING_IOC, 'type_time': mt5.ORDER_TIME_GTC,
+                   'comment': 'mangalview-mt5-bot'}
+            res = mt5.order_send(req)
+            if res is None:
+                return False, 'order_send None: ' + str(mt5.last_error())
+            if res.retcode == mt5.TRADE_RETCODE_DONE:
+                return True, str(res.order)
+            return False, 'retcode ' + str(res.retcode) + ' ' + str(getattr(res, 'comment', ''))
+        except Exception as e:
+            return False, str(e)
+    return False, 'MT5 backend not configured'
+
+@app.route('/api/mt5/connect', methods=['POST'])
+@login_required
+def mt5_connect_route():
+    data = request.json or {}
+    res = _mt5_connect({'login': data.get('login'), 'password': data.get('password'),
+                        'server': data.get('server'), 'token': data.get('token'),
+                        'account_id': data.get('account_id')})
+    return jsonify(res), (200 if res.get('success') else 400)
+
+@app.route('/api/mt5/status', methods=['GET'])
+@login_required
+def mt5_status_route():
+    return jsonify({'success': True, 'backend': _mt5_backend() or None,
+                    'sessions': list(mt5_sessions.keys())})
+
+@app.route('/api/mt5/candles', methods=['GET'])
+@login_required
+def mt5_candles_route():
+    symbol   = (request.args.get('symbol') or '').upper()
+    interval = request.args.get('interval', '5m')
+    if not symbol:
+        return jsonify({'success': False, 'error': 'symbol required', 'candles': []}), 400
+    candles = fetch_mt5_data(interval, symbol, request.args.get('mt5_id'))
+    return jsonify({'success': True, 'candles': candles,
+                    'data_source': 'mt5:' + (_mt5_backend() or 'not-configured'),
+                    'backend': _mt5_backend() or None})
+
+# ---- Server-side MT5 AI bot (mirrors the Zerodha bot; single instrument) ----
+mt_ai_state = {
+    'running': False, 'paused': False, 'thread': None, 'config': None,
+    'position': None, 'trades': [], 'consec_losses': 0, 'last_exit_time': 0,
+    'last_tick': {}, 'log_buffer': [], 'last_candles': [],
+}
+mt_ai_lock = _threading.RLock()
+
+def _mt_log(msg):
+    ts = _bot_log_ts()
+    with mt_ai_lock:
+        buf = mt_ai_state.setdefault('log_buffer', [])
+        buf.append('[' + ts + '] ' + msg)
+        if len(buf) > 500:
+            del buf[:len(buf) - 500]
+
+def _mt_bot_place_live(side, qty, price, cfg):
+    ok, msg = _mt5_place_order(cfg.get('mt5_id'), cfg.get('symbol'), side, qty, price)
+    if ok:
+        _mt_log('[LIVE] MT5 order #' + msg)
+        _persist_log_line('[MT5] [LIVE] MT5 order #' + msg)
+    else:
+        _mt_log('[LIVE] MT5 order failed: ' + msg)
+        _persist_log_line('[MT5] [LIVE] MT5 order failed: ' + msg)
+
+def _mt_bot_open(side, price, strat, mode):
+    cfg    = mt_ai_state['config']
+    qty    = float(cfg.get('qty', 1))
+    sl_pct = float(cfg.get('slPct', 1.0))
+    tp_pct = float(cfg.get('tpPct', 2.0))
+    sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
+    tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    mt_ai_state['position'] = {
+        'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+        'qty': qty, 'sl': round(sl, 5), 'tp': round(tp, 5),
+        'strategy': strat['name'], 'mode': mode,
+    }
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+        mode.upper(), side, qty, cfg['symbol'], round(price, 5),
+        round(sl, 5), round(tp, 5), strat['name'], strat['score'])
+    _mt_log(line)
+    _persist_log_line('[MT5] ' + line)
+    if mode == 'live':
+        _mt_bot_place_live(side, qty, price, cfg)
+
+def _mt_bot_close(price, reason, mode):
+    pos = mt_ai_state.get('position')
+    if not pos: return
+    pnl = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
+    closed = dict(pos)
+    closed.update({'exitPrice': round(price, 5), 'exitTime': int(_zd_time.time()),
+                   'pnl': round(pnl, 5), 'reason': reason})
+    mt_ai_state['trades'].append(closed)
+    if pnl < 0: mt_ai_state['consec_losses'] = mt_ai_state.get('consec_losses', 0) + 1
+    else:       mt_ai_state['consec_losses'] = 0
+    cfg = mt_ai_state['config']
+    line = '[{}] EXIT {} {} {} @ {} (entry {}) PnL={}{:.5f} reason={} strat={}'.format(
+        mode.upper(), 'SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], cfg['symbol'],
+        round(price, 5), pos['entryPrice'], '+' if pnl >= 0 else '', pnl, reason, pos['strategy'])
+    _mt_log(line)
+    _persist_log_line('[MT5] ' + line)
+    if mode == 'live':
+        _mt_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg)
+    mt_ai_state['position'] = None
+    mt_ai_state['last_exit_time'] = int(_zd_time.time())
+    realized   = sum(t['pnl'] for t in mt_ai_state['trades'])
+    max_consec = int(cfg.get('maxConsec', 3))
+    max_loss   = float(cfg.get('maxLoss', 2000))
+    max_profit = float(cfg.get('maxProfit', 0) or 0)
+    if mt_ai_state['consec_losses'] >= max_consec:
+        _mt_log('[STOP] Max consecutive losses ({}) reached. Bot stopped.'.format(max_consec))
+        _persist_log_line('[MT5] [STOP] Max consecutive losses')
+        mt_ai_state['running'] = False
+    elif realized < -abs(max_loss):
+        _mt_log('[STOP] Max daily loss {} breached (realised {:.2f}). Bot stopped.'.format(max_loss, realized))
+        _persist_log_line('[MT5] [STOP] Max daily loss')
+        mt_ai_state['running'] = False
+    elif max_profit > 0 and realized >= max_profit:
+        _mt_log('[STOP] Max daily profit {} hit (realised {:.2f}). Bot stopped.'.format(max_profit, realized))
+        _persist_log_line('[MT5] [STOP] Max daily profit')
+        mt_ai_state['running'] = False
+
+def _mt_bot_tick():
+    cfg = mt_ai_state.get('config') or {}
+    if not cfg: return
+    symbol   = (cfg.get('symbol') or '').upper()
+    interval = cfg.get('tf', '5m')
+    if not symbol: return
+    algos = _bot_build_algos(cfg)
+    try:
+        data = _bot_signal_data(symbol, interval, 'mt5', algos, api_key=cfg.get('mt5_id'))
+    except Exception as e:
+        _mt_log('[Tick] ERROR fetching MT5 data: ' + str(e)); return
+    candles   = data.get('candles') or []
+    summaries = data.get('signalSummary') or {}
+    if not candles:
+        with mt_ai_lock:
+            mt_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
+        _mt_log('[Tick] no MT5 candles for ' + symbol + ' — check MT5 connection / symbol / MT5_BACKEND')
+        return
+    price  = candles[-1]['close']
+    regime = _bot_detect_regime(candles)
+    strat  = _bot_select_strategy(regime, summaries, cfg)
+    mode   = cfg.get('mode', 'paper')
+    with mt_ai_lock:
+        mt_ai_state['last_candles'] = candles[-150:]
+        mt_ai_state['last_tick'] = {
+            'time': int(_zd_time.time()), 'price': price, 'strategy': strat['name'],
+            'signal': strat['signal'], 'score': strat['score'], 'reason': strat['reason'],
+            'regime': '{} vol, {}'.format(regime['volatility'],
+                'trending ' + regime['direction'] if regime['trending'] else 'range'),
+        }
+        pos = mt_ai_state.get('position')
+        if pos:
+            is_long = pos['side'] == 'BUY'
+            max_profit = float(cfg.get('maxProfit', 0) or 0)
+            reason = None
+            if max_profit > 0:
+                realized_now = sum(t.get('pnl', 0) for t in mt_ai_state['trades'])
+                unreal_now   = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
+                if realized_now + unreal_now >= max_profit:
+                    reason = 'max daily profit'
+            if reason is None:
+                if is_long and price <= pos['sl']:        reason = 'SL hit'
+                elif is_long and price >= pos['tp']:      reason = 'TP hit'
+                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
+                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
+                elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+            if reason:
+                _mt_bot_close(price, reason, mode)
+            else:
+                _mt_log('[Tick] {} px={} (in position {} from {}, strat={})'.format(
+                    symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name']))
+        else:
+            if strat['signal'] in ('BUY', 'SELL'):
+                cooldown = int(cfg.get('cooldownSec', 60) or 0)
+                last_exit = mt_ai_state.get('last_exit_time') or 0
+                if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
+                    _mt_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, strat['signal'], cooldown))
+                else:
+                    ok, qreason = _bot_entry_quality(strat['signal'], candles, regime, cfg)
+                    if ok:
+                        _mt_bot_open(strat['signal'], price, strat, mode)
+                    else:
+                        _mt_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
+            else:
+                _mt_log('[Tick] {} px={} HOLD — {}'.format(symbol, round(price, 5), strat['reason']))
+
+def _mt_bot_loop():
+    while True:
+        with mt_ai_lock:
+            running = mt_ai_state.get('running', False)
+            paused  = mt_ai_state.get('paused', False)
+        if not running: break
+        if not paused:
+            try: _mt_bot_tick()
+            except Exception as e:
+                _mt_log('[Tick] ERROR: ' + str(e))
+        _zd_time.sleep(15)
+
+@app.route('/api/aibot/mt5/start', methods=['POST'])
+@login_required
+def mt_aibot_start():
+    data = request.json or {}
+    with mt_ai_lock:
+        if mt_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+        mt_ai_state['config'] = {
+            'symbol':     (data.get('symbol') or '').upper(),
+            'qty':        float(data.get('qty', 1) or 1),
+            'tf':         data.get('tf', '5m'),
+            'mode':       data.get('mode', 'paper'),
+            'slPct':      float(data.get('slPct', 1.0)),
+            'tpPct':      float(data.get('tpPct', 2.0)),
+            'maxConsec':  int(data.get('maxConsec', 3) or 3),
+            'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
+            'maxProfit':  float(data.get('maxProfit', 0) or 0),
+            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
+            'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'qualityFilter': bool(data.get('qualityFilter', True)),
+            'includeMM':  bool(data.get('includeMM', False)),
+            'includeMMA': bool(data.get('includeMMA', False)),
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'mt5_id':     (data.get('mt5_id') or '').strip(),
+        }
+        if not mt_ai_state['config']['symbol']:
+            return jsonify({'success': False, 'error': 'Symbol required (e.g. EURUSD, XAUUSD)'}), 400
+        mt_ai_state['position']       = None
+        mt_ai_state['trades']         = []
+        mt_ai_state['consec_losses']  = 0
+        mt_ai_state['last_exit_time'] = 0
+        mt_ai_state['log_buffer']     = []
+        mt_ai_state['last_tick']      = {}
+        mt_ai_state['last_candles']   = []
+        mt_ai_state['running']        = True
+        mt_ai_state['paused']         = False
+        t = _threading.Thread(target=_mt_bot_loop, daemon=True, name='mt5-aibot')
+        mt_ai_state['thread'] = t
+        t.start()
+    cfg = mt_ai_state['config']
+    _mt_log('MT5 Bot started SERVER-SIDE {} mode for {} qty={} TF={}. Tick every 15s.'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _persist_log_line('[MT5] [{}] BOT START {} qty={} TF={} (server-side)'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    if not _mt5_backend():
+        _mt_log('[Note] MT5_BACKEND not set — running but no live data/orders. Set MT5_BACKEND=metatrader5 and reconnect.')
+    return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/mt5/pause', methods=['POST'])
+@login_required
+def mt_aibot_pause():
+    with mt_ai_lock:
+        if not mt_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is not running'}), 400
+        mt_ai_state['paused'] = not mt_ai_state.get('paused', False)
+        paused = mt_ai_state['paused']
+    _mt_log('MT5 Bot ' + ('paused' if paused else 'resumed'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/mt5/stop', methods=['POST'])
+@login_required
+def mt_aibot_stop():
+    with mt_ai_lock:
+        was_running = mt_ai_state.get('running')
+        mt_ai_state['running'] = False
+        mt_ai_state['paused']  = False
+        cfg  = mt_ai_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        pos  = mt_ai_state.get('position')
+        last_price = (mt_ai_state.get('last_tick') or {}).get('price') or (pos.get('entryPrice') if pos else 0)
+        if pos:
+            _mt_bot_close(last_price, 'bot stop', mode)
+    if was_running:
+        _mt_log('MT5 Bot stopped.')
+        _persist_log_line('[MT5] [{}] BOT STOP'.format(mode.upper()))
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/mt5/status', methods=['GET'])
+@login_required
+def mt_aibot_status():
+    with mt_ai_lock:
+        cfg       = dict(mt_ai_state.get('config') or {})
+        cfg.pop('mt5_id', None)
+        pos       = mt_ai_state.get('position')
+        trades    = list(mt_ai_state.get('trades', []))
+        last_tick = dict(mt_ai_state.get('last_tick', {}))
+        log_buf   = list(mt_ai_state.get('log_buffer', []))[-200:]
+        candles   = list(mt_ai_state.get('last_candles', []))
+        running   = mt_ai_state.get('running', False)
+        paused    = mt_ai_state.get('paused', False)
+        consec    = mt_ai_state.get('consec_losses', 0)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unreal   = 0.0
+    if pos and last_tick.get('price'):
+        unreal = _zd_calc_pnl(pos['entryPrice'], last_tick['price'], pos['qty'], pos['side'])
+    return jsonify({
+        'success': True, 'running': running, 'paused': paused, 'config': cfg,
+        'position': pos, 'last_tick': last_tick, 'last_candles': candles, 'log': log_buf,
+        'stats': {
+            'realized': round(realized, 5), 'unrealized': round(unreal, 5),
+            'tradeCount': len(trades),
+            'winRate': round(wins / len(trades) * 100.0, 1) if trades else None,
+            'wins': wins, 'consecLosses': consec,
+        },
+    })
+
+@app.route('/api/aibot/mt5/apply_config', methods=['POST'])
+@login_required
+def mt_aibot_apply_config():
+    patch = (request.json or {}).get('patch') or {}
+    clean, rejected = _sanitize_delta_patch(patch)
+    if not clean:
+        return jsonify({'success': False, 'error': 'No valid tunable keys in patch', 'rejected': rejected}), 400
+    with mt_ai_lock:
+        cfg = mt_ai_state.get('config')
+        if not cfg:
+            mt_ai_state['config'] = cfg = {}
+        before = {k: cfg.get(k) for k in clean}
+        cfg.update(clean)
+        out = {k: v for k, v in cfg.items() if k != 'mt5_id'}
+    changes = ', '.join('{}: {}→{}'.format(k, before.get(k), v) for k, v in clean.items())
+    _mt_log('[Config] Applied: ' + changes)
+    _persist_log_line('[MT5] [Config] ' + changes)
+    return jsonify({'success': True, 'config': out, 'applied': clean, 'rejected': rejected})
+
+@app.route('/api/aibot/mt5/chat', methods=['POST'])
+@login_required
+def mt_aibot_chat():
+    data    = request.json or {}
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    history = data.get('history') or []
+    with mt_ai_lock:
+        cfg     = {k: v for k, v in (mt_ai_state.get('config') or {}).items() if k != 'mt5_id'}
+        trades  = list(mt_ai_state.get('trades', []))[-20:]
+        last    = dict(mt_ai_state.get('last_tick', {}))
+        running = mt_ai_state.get('running', False)
+        paused  = mt_ai_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    winrate  = round(wins / len(trades) * 100.0, 1) if trades else None
+    trade_brief = [{'strat': t.get('strategy'), 'side': t.get('side'),
+                    'pnl': round(t.get('pnl', 0), 5), 'reason': t.get('reason')} for t in trades]
+    import json as _json
+    system = (
+        "You are the strategy co-pilot for a server-side MetaTrader 5 (forex/CFD/metals) trading bot. It scores "
+        "several algos each tick and trades the strongest signal that passes a quality gate. Your single goal: help "
+        "the user reach a SUSTAINED win rate above 80% while protecting capital. Be concise and concrete. The active "
+        "strategy pool is a core (trend, momentum, breakout, price-action, smart-money, order-flow) PLUS the "
+        "user-selected strategies in config.allowedStrategies; you cannot change which strategies are enabled.\n\n"
+        "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
+        "minScore, scoreBuffer, cooldownSec, qualityFilter, includeMM, includeMMA. You CANNOT change symbol, qty, "
+        "trading mode, or the MT5 connection.\n\n"
+        "When (and only when) you want to change settings, end your reply with a single fenced code block:\n"
+        "```json\n{\"configPatch\": {\"minScore\": 5.0}, \"summary\": \"one-line description\"}\n```\n"
+        "Omit the block if no change is warranted.\n\n"
+        "CURRENT BOT STATE:\n" + _json.dumps({
+            'running': running, 'paused': paused, 'config': cfg, 'lastTick': last,
+            'recentTrades': trade_brief, 'realizedPnl': round(realized, 5), 'winRatePct': winrate,
         }, default=str)[:6000]
     )
     msgs = []
@@ -12589,8 +13503,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="automation-item" id="btnZerodhaAuto">&#129302; Zerodha Automation</button>
       <button class="automation-item" id="btnTradingView">&#128200; TradingView</button>
       <button class="automation-item" id="btnAIBot">&#129504; Zerodha AI Bot</button>
+      <button class="automation-item" id="btnZOptionsBot">&#127919; Zerodha Options AI Bot</button>
       <button class="automation-item" id="btnDeltaLogin">&#128272; Delta Login</button>
       <button class="automation-item" id="btnDeltaBot">&#129504; Delta AI Bot</button>
+      <button class="automation-item" id="btnMT5Login">&#128272; MT5 Login</button>
+      <button class="automation-item" id="btnMT5Bot">&#129504; MT5 AI Bot</button>
     </div>
   </div>
   <div class="separator"></div>
@@ -13178,9 +14095,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- Optional strategies the bot is allowed to select -->
       <div class="ai-strat-bar">
         <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
+          <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+        </span>
         <label title="Mean-reversion bid-ask Market Making strategy. Best in range/sideways markets."><input type="checkbox" id="aiBotIncludeMM"> Market Making</label>
         <label title="Advanced Market Making with spread analysis. Best in range markets with stable volatility."><input type="checkbox" id="aiBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(uncheck to exclude from active-strategy selection)</span>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
 
       <!-- Risk controls -->
@@ -13190,7 +14118,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
-        <label title="Min algo score to enter (regime-adjusted automatically)">Min score: <input type="number" id="aiBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Min algo score to enter">Min score: <input type="number" id="aiBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
       </div>
@@ -13253,6 +14182,149 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div style="margin-top:10px;font-size:11px;color:#787b86;background:#131722;border:1px solid #2a2e39;border-radius:6px;padding:8px 10px">
         <b style="color:#d1d4dc">Get credentials:</b> https://www.delta.exchange/app/account/manage-api-keys —
         create a key with Read + Trading permissions. Unlike Kite, Delta uses API Key + API Secret directly (no daily token rotation).
+      </div>
+    </div>
+  </div>
+
+  <!-- MT5 Login Panel -->
+  <div class="zerodha-panel" id="mt5LoginPanel" style="width:700px">
+    <div class="zd-header" id="mt5LoginHeader">
+      <h3><span style="color:#1e6ec8">&#128272;</span> MetaTrader 5 Login</h3>
+      <div class="zd-header-actions">
+        <button class="zd-close" id="mt5LoginClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-credentials">
+        <div class="zd-cred-row">
+          <div class="zd-cred-group"><label for="mt5Login">Login (account #)</label><input type="text" id="mt5Login" placeholder="e.g. 51234567" autocomplete="off" spellcheck="false"></div>
+          <div class="zd-cred-group"><label for="mt5Password">Password</label><input type="password" id="mt5Password" placeholder="MT5 password" autocomplete="off"></div>
+        </div>
+        <div class="zd-cred-row">
+          <div class="zd-cred-group" style="flex:2"><label for="mt5Server">Server</label><input type="text" id="mt5Server" placeholder="e.g. MetaQuotes-Demo / YourBroker-Live" autocomplete="off" spellcheck="false"></div>
+          <button class="zd-connect-btn" id="mt5ConnectBtn">Connect</button>
+        </div>
+        <div class="zd-cred-row" id="mt5MetaapiRow" style="display:none">
+          <div class="zd-cred-group"><label for="mt5Token">MetaApi Token</label><input type="password" id="mt5Token" placeholder="MetaApi token (cloud backend)" autocomplete="off"></div>
+          <div class="zd-cred-group"><label for="mt5AccountId">MetaApi Account ID</label><input type="text" id="mt5AccountId" placeholder="provisioned account id" autocomplete="off"></div>
+        </div>
+      </div>
+      <div class="zd-status-bar">
+        <span class="zd-status-dot" id="mt5LoginStatusDot"></span>
+        <span id="mt5LoginStatusText">Not connected</span>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:#787b86;background:#131722;border:1px solid #2a2e39;border-radius:6px;padding:8px 10px">
+        <b style="color:#d1d4dc">Backend:</b> set <code>MT5_BACKEND=metatrader5</code> (local Windows terminal — needs <code>pip install MetaTrader5</code> and the MT5 terminal running on this host) or <code>MT5_BACKEND=metaapi</code> (cloud). Without it the panel works but won't fetch data or trade. Data &amp; charts come from MT5.
+      </div>
+    </div>
+  </div>
+
+  <!-- MT5 AI Bot Panel -->
+  <div class="zerodha-panel" id="mtBotPanel" style="width:920px">
+    <div class="zd-header" id="mtBotHeader">
+      <h3><span style="color:#00897b">&#129504;</span> MT5 AI Bot</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="mtBotMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="mtBotPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="mtBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-status-bar" id="mtBotStatusBar" style="margin-bottom:10px">
+        <span class="zd-status-dot" id="mtBotStatusDot"></span>
+        <span id="mtBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">MT5 Login</b> from the Automation menu to enable data + live orders</span>
+      </div>
+
+      <div class="ai-disclaimer">
+        <b>&#9888; Reality check:</b> forex/CFD/metals move fast with leverage &mdash; gaps and slippage happen.
+        Same strict risk management as the other bots (SL on every trade, max-consec-loss + max-daily-loss breakers). Always paper trade first.
+      </div>
+
+      <div class="ai-mode-bar">
+        <label><input type="radio" name="mtBotMode" value="paper" checked> &#128221; Paper Trading <span style="color:#787b86;font-size:11px">(simulated, no MT5 orders)</span></label>
+        <label class="live"><input type="radio" name="mtBotMode" value="live"> &#9888; Live Trading <span style="color:#787b86;font-size:11px">(real MT5 orders)</span></label>
+      </div>
+
+      <div class="ai-input-bar">
+        <label><span>Symbol</span><input type="text" id="mtBotSymbol" value="EURUSD" placeholder="e.g. EURUSD, XAUUSD, US30" style="min-width:200px"></label>
+        <label><span>Volume (lots)</span><input type="number" id="mtBotQty" value="0.1" min="0.01" step="0.01" style="width:90px"></label>
+        <label>
+          <span>Timeframe</span>
+          <select id="mtBotTF">
+            <option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option><option value="15m">15m</option><option value="30m">30m</option><option value="1h">1h</option><option value="1d">1d</option>
+          </select>
+        </label>
+        <button class="zd-add-btn" id="mtBotLoadBtn" style="padding:7px 14px">&#128202; Load Chart</button>
+        <button class="bot-log-btn" id="mtBotLogBtn" title="Open log.txt in a new tab">&#128196; log.txt</button>
+        <button class="bot-log-btn" id="mtBotLogDownloadBtn" title="Download log.txt">&#11015; Download log</button>
+      </div>
+
+      <div class="bot-chart-wrap">
+        <div id="mtBotChart"></div>
+        <div class="bot-price-overlay" id="mtBotPriceOverlay" style="display:none"><div class="sym" id="mtBotPxSym">&mdash;</div><div class="px" id="mtBotPxVal">&mdash;</div></div>
+      </div>
+
+      <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Active Strategy</span><span class="val" id="mtBotStrategy">&mdash;</span></div>
+        <div class="cell"><span class="lab">Market Regime</span><span class="val" id="mtBotRegime">&mdash;</span></div>
+        <div class="cell"><span class="lab">Position</span><span class="val" id="mtBotPosition">FLAT</span></div>
+        <div class="cell"><span class="lab">Entry Price</span><span class="val" id="mtBotEntryPx">&mdash;</span></div>
+        <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="mtBotRealizedPnl">0.00</span></div>
+        <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="mtBotUnrealPnl">0.00</span></div>
+        <div class="cell"><span class="lab">Trades</span><span class="val" id="mtBotTradeCount">0</span></div>
+        <div class="cell"><span class="lab">Win Rate</span><span class="val" id="mtBotWinRate">&mdash;</span></div>
+      </div>
+
+      <div class="ai-strat-bar">
+        <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
+          <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+        </span>
+        <label title="Market Making — range markets"><input type="checkbox" id="mtBotIncludeMM"> Market Making</label>
+        <label title="MM Advanced"><input type="checkbox" id="mtBotIncludeMMA"> MM Advanced</label>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
+      </div>
+
+      <div class="ai-risk-bar">
+        <label title="Stop-Loss % from entry">SL %: <input type="number" id="mtBotSlPct" value="1.0" min="0.05" step="0.05"></label>
+        <label title="Target % from entry">Target %: <input type="number" id="mtBotTpPct" value="2.0" min="0.05" step="0.05"></label>
+        <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="mtBotMaxConsec" value="3" min="1"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Max daily loss: <input type="number" id="mtBotMaxLoss" value="2000" min="10"></label>
+        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
+        <label title="Min algo score to enter">Min score: <input type="number" id="mtBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
+        <label title="Seconds to wait after an exit before re-entering">Cooldown s: <input type="number" id="mtBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="mtBotQualityFilter" checked> Quality filter</label>
+      </div>
+
+      <div class="zd-footer">
+        <button class="zd-start-btn start"  id="mtBotStartBtn">&#9654; Start Bot</button>
+        <button class="zd-start-btn pause"  id="mtBotPauseBtn" disabled>&#9208; Pause</button>
+        <button class="zd-start-btn stop"   id="mtBotStopBtn" disabled>&#9632; Stop Bot</button>
+      </div>
+
+      <div class="zd-log" id="mtBotLog" style="max-height:180px"><span class="log-info">MT5 bot ready. Paper Trading default. Connect MT5, enter a symbol (EURUSD/XAUUSD), Load Chart, then Start Bot.</span></div>
+
+      <div class="dbot-chat">
+        <div class="dbot-chat-head">
+          <span>&#129302; Claude strategy co-pilot</span>
+          <span class="dbot-chat-hint">Ask for a higher win rate, risk tweaks, or trade analysis. Changes apply only when you click Apply.</span>
+        </div>
+        <div class="dbot-chat-msgs" id="mtChatMsgs">
+          <div class="dbot-msg bot">Hi! I can see your live MT5 bot state, trades and P/L. Ask me things like <em>"why did the last trades lose?"</em> or <em>"tune for an 80%+ win rate"</em>.</div>
+        </div>
+        <div class="dbot-chat-input">
+          <input type="text" id="mtChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
+          <button class="dbot-chat-send" id="mtChatSend">Send</button>
+        </div>
       </div>
     </div>
   </div>
@@ -13331,9 +14403,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <div class="ai-strat-bar">
         <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
+          <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+        </span>
         <label title="Mean-reversion bid-ask Market Making. Best in range/sideways crypto."><input type="checkbox" id="deltaBotIncludeMM"> Market Making</label>
         <label title="Advanced Market Making with spread analysis."><input type="checkbox" id="deltaBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(uncheck to exclude from active-strategy selection)</span>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
 
       <div class="ai-risk-bar">
@@ -13343,6 +14426,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>Max daily loss: <input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
         <label>Min score: <input type="number" id="deltaBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
       </div>
@@ -13367,6 +14451,154 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="dbot-chat-input">
           <input type="text" id="deltaChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
           <button class="dbot-chat-send" id="deltaChatSend">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Zerodha Options AI Bot Panel -->
+  <div class="zerodha-panel" id="zoBotPanel" style="width:980px">
+    <div class="zd-header" id="zoBotHeader">
+      <h3><span style="color:#26a69a">&#127919;</span> Zerodha Options AI Bot</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="zoBotMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="zoBotPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="zoBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-status-bar" id="zoBotStatusBar" style="margin-bottom:10px">
+        <span class="zd-status-dot" id="zoBotStatusDot"></span>
+        <span id="zoBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders</span>
+      </div>
+
+      <div class="ai-disclaimer">
+        <b>&#9888; Reality check:</b> trades two option contracts independently from their own Kite charts.
+        <b>Option selling carries large/undefined risk</b> if the underlying moves against you &mdash; SL on every trade,
+        max-consecutive-loss and max-daily-loss breakers apply, but losing trades are inevitable. Always paper trade first.
+      </div>
+
+      <div class="ai-mode-bar">
+        <label><input type="radio" name="zoBotMode" value="paper" checked> &#128221; Paper Trading <span style="color:#787b86;font-size:11px">(simulated, no Kite orders)</span></label>
+        <label class="live"><input type="radio" name="zoBotMode" value="live"> &#9888; Live Trading <span style="color:#787b86;font-size:11px">(real Kite orders)</span></label>
+      </div>
+
+      <div class="ai-strat-bar">
+        <span class="lbl">&#127919; Options mode:</span>
+        <label title="Open LONG by BUYing the option, exit by SELLing. Acts on BUY signals."><input type="checkbox" id="zoBotBuyer" checked> Option Buyer (buy&rarr;sell)</label>
+        <label title="Open SHORT by SELLing the option, exit by BUYing. Acts on SELL signals."><input type="checkbox" id="zoBotSeller"> Option Seller (sell&rarr;buy)</label>
+        <span style="color:#787b86;font-size:10px">(tick both to allow long + short simultaneously across the two legs)</span>
+      </div>
+
+      <div class="ai-input-bar">
+        <label>
+          <span>Option 1</span>
+          <span style="display:flex;gap:6px">
+            <input type="text" id="zoBotSym1" placeholder="e.g. NIFTY26JUN24000CE" style="min-width:200px">
+            <button class="zd-add-inst-btn" id="zoBotAddInst1" type="button" title="Pick instrument" style="white-space:nowrap">&#43; Add</button>
+          </span>
+        </label>
+        <label>
+          <span>Exchange</span>
+          <select id="zoBotExch1">
+            <option value="">Auto</option><option value="NFO">NFO</option><option value="BFO">BFO</option><option value="MCX">MCX</option><option value="NSE">NSE</option><option value="CDS">CDS</option>
+          </select>
+        </label>
+        <label>
+          <span>Option 2</span>
+          <span style="display:flex;gap:6px">
+            <input type="text" id="zoBotSym2" placeholder="e.g. NIFTY26JUN24000PE" style="min-width:200px">
+            <button class="zd-add-inst-btn" id="zoBotAddInst2" type="button" title="Pick instrument" style="white-space:nowrap">&#43; Add</button>
+          </span>
+        </label>
+        <label>
+          <span>Exchange</span>
+          <select id="zoBotExch2">
+            <option value="">Auto</option><option value="NFO">NFO</option><option value="BFO">BFO</option><option value="MCX">MCX</option><option value="NSE">NSE</option><option value="CDS">CDS</option>
+          </select>
+        </label>
+        <label><span>Qty</span><input type="number" id="zoBotQty" value="1" min="1" style="width:70px"></label>
+        <label>
+          <span>Timeframe</span>
+          <select id="zoBotTF">
+            <option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option><option value="15m">15m</option><option value="30m">30m</option><option value="1h">1h</option>
+          </select>
+        </label>
+        <button class="zd-add-btn" id="zoBotLoadBtn" style="padding:7px 14px">&#128202; Load Charts</button>
+        <button class="bot-log-btn" id="zoBotLogBtn" title="Open log.txt in a new tab">&#128196; log.txt</button>
+        <button class="bot-log-btn" id="zoBotLogDownloadBtn" title="Download log.txt">&#11015; Download log</button>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <div class="bot-chart-wrap" style="flex:1;min-width:380px">
+          <div id="zoBotChart1"></div>
+          <div class="bot-price-overlay" id="zoBotPx1" style="display:none"><div class="sym" id="zoBotPx1Sym">&mdash;</div><div class="px" id="zoBotPx1Val">&mdash;</div></div>
+        </div>
+        <div class="bot-chart-wrap" style="flex:1;min-width:380px">
+          <div id="zoBotChart2"></div>
+          <div class="bot-price-overlay" id="zoBotPx2" style="display:none"><div class="sym" id="zoBotPx2Sym">&mdash;</div><div class="px" id="zoBotPx2Val">&mdash;</div></div>
+        </div>
+      </div>
+
+      <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Option 1</span><span class="val" id="zoBotLeg1">FLAT</span></div>
+        <div class="cell"><span class="lab">Option 2</span><span class="val" id="zoBotLeg2">FLAT</span></div>
+        <div class="cell"><span class="lab">Market Regime</span><span class="val" id="zoBotRegime">&mdash;</span></div>
+        <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="zoBotRealizedPnl">&#8377;0.00</span></div>
+        <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="zoBotUnrealPnl">&#8377;0.00</span></div>
+        <div class="cell"><span class="lab">Trades</span><span class="val" id="zoBotTradeCount">0</span></div>
+        <div class="cell"><span class="lab">Win Rate</span><span class="val" id="zoBotWinRate">&mdash;</span></div>
+      </div>
+
+      <div class="ai-strat-bar">
+        <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
+          <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+        </span>
+        <label title="Market Making — range markets"><input type="checkbox" id="zoBotIncludeMM"> Market Making</label>
+        <label title="MM Advanced"><input type="checkbox" id="zoBotIncludeMMA"> MM Advanced</label>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
+      </div>
+
+      <div class="ai-risk-bar">
+        <label title="Stop-Loss % from entry (option premium)">SL %: <input type="number" id="zoBotSlPct" value="10" min="0.1" step="0.5"></label>
+        <label title="Target % from entry (option premium)">Target %: <input type="number" id="zoBotTpPct" value="10" min="0.1" step="0.5"></label>
+        <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="zoBotMaxConsec" value="3" min="1"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="zoBotMaxLoss" value="2000" min="100"></label>
+        <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
+        <label title="Min algo score to enter">Min score: <input type="number" id="zoBotMinScore" value="4.0" min="0.5" step="0.1"></label>
+        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="zoBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
+        <label title="Seconds to wait after an exit before re-entering that leg">Cooldown s: <input type="number" id="zoBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="zoBotQualityFilter" checked> Quality filter</label>
+      </div>
+
+      <div class="zd-footer">
+        <button class="zd-start-btn start"  id="zoBotStartBtn">&#9654; Start Bot</button>
+        <button class="zd-start-btn pause"  id="zoBotPauseBtn" disabled>&#9208; Pause</button>
+        <button class="zd-start-btn stop"   id="zoBotStopBtn" disabled>&#9632; Stop Bot</button>
+      </div>
+
+      <div class="zd-log" id="zoBotLog" style="max-height:180px"><span class="log-info">Options bot ready. Paper Trading default. Connect Zerodha, pick two option contracts (+ Add), choose Buyer/Seller, then Start Bot.</span></div>
+
+      <div class="dbot-chat">
+        <div class="dbot-chat-head">
+          <span>&#129302; Claude strategy co-pilot</span>
+          <span class="dbot-chat-hint">Ask for a higher win rate, risk tweaks, or trade analysis. Changes apply only when you click Apply.</span>
+        </div>
+        <div class="dbot-chat-msgs" id="zoChatMsgs">
+          <div class="dbot-msg bot">Hi! I can see both option legs, your trades and P/L. Ask me things like <em>"why did the last trades lose?"</em> or <em>"tune for an 80%+ win rate"</em>.</div>
+        </div>
+        <div class="dbot-chat-input">
+          <input type="text" id="zoChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
+          <button class="dbot-chat-send" id="zoChatSend">Send</button>
         </div>
       </div>
     </div>
@@ -18786,6 +20018,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const maxLossEl   = document.getElementById('aiBotMaxLoss');
     const maxProfitEl = document.getElementById('aiBotMaxProfit');
     const minScoreEl  = document.getElementById('aiBotMinScore');
+    const scoreBufferEl = document.getElementById('aiBotScoreBuffer');
     const cooldownEl  = document.getElementById('aiBotCooldown');
     const qualityChk  = document.getElementById('aiBotQualityFilter');
     const startBtn = document.getElementById('aiBotStartBtn');
@@ -18848,6 +20081,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function _mmEnabled()  { return !!incMMChk.checked; }
     function _mmaEnabled() { return !!incMMAChk.checked; }
+
+    // ---- Configurable strategy checkboxes (extras on the always-on core) ----
+    const STRAT_KEY = 'mangalview_aibot_strategies_v1';
+    const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
+    try {
+      const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null');
+      if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; });
+    } catch(e) {}
+    function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
+    function _saveStrategies() { try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} }
+    stratChks.forEach(c => c.addEventListener('change', _saveStrategies));
 
     // ---- Open / Close ----
     document.getElementById('btnAIBot').addEventListener('click', function() {
@@ -19260,8 +20504,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
         if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
         if (c.minScore != null)  minScoreEl.value  = c.minScore;
+        if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        if (Array.isArray(c.allowedStrategies)) panel.querySelectorAll('.strat-chk').forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
       }
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
@@ -19323,10 +20569,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxLoss:     parseFloat(maxLossEl.value) || 2000,
         maxProfit:   parseFloat(maxProfitEl.value) || 0,
         minScore:    parseFloat(minScoreEl.value) || 4.0,
+        scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0,
         qualityFilter: !!qualityChk.checked,
         includeMM:   !!incMMChk.checked,
         includeMMA:  !!incMMAChk.checked,
+        allowedStrategies: _collectStrategies(),
         api_key:     s.apiKey || ''
       };
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -19477,6 +20725,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
               if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
               if (c.minScore != null)  minScoreEl.value  = c.minScore;
+              if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
               if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
               if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
               logLine('[Claude] Applied config: ' + Object.keys(res.applied||{}).map(k=>k+'='+res.applied[k]).join(', '), 'info');
@@ -19530,6 +20779,732 @@ HTML_PAGE = r"""<!DOCTYPE html>
     setInterval(function() {
       fetch('/api/ping').catch(() => {});
     }, 10 * 60 * 1000);
+  })();
+
+  // ---- Zerodha Options AI Bot Panel (two legs, buyer/seller) ----
+  (function() {
+    const panel    = document.getElementById('zoBotPanel');
+    if (!panel) return;
+    const header   = document.getElementById('zoBotHeader');
+    const closeBtn = document.getElementById('zoBotClose');
+    const maxBtn   = document.getElementById('zoBotMaximizeBtn');
+    const popBtn   = document.getElementById('zoBotPopoutBtn');
+    const symEls   = [document.getElementById('zoBotSym1'), document.getElementById('zoBotSym2')];
+    const exchEls  = [document.getElementById('zoBotExch1'), document.getElementById('zoBotExch2')];
+    const qtyEl    = document.getElementById('zoBotQty');
+    const tfEl     = document.getElementById('zoBotTF');
+    const chartDivs= [document.getElementById('zoBotChart1'), document.getElementById('zoBotChart2')];
+    const pxWraps  = [document.getElementById('zoBotPx1'), document.getElementById('zoBotPx2')];
+    const pxSyms   = [document.getElementById('zoBotPx1Sym'), document.getElementById('zoBotPx2Sym')];
+    const pxVals   = [document.getElementById('zoBotPx1Val'), document.getElementById('zoBotPx2Val')];
+    const legEls   = [document.getElementById('zoBotLeg1'), document.getElementById('zoBotLeg2')];
+    const regimeEl = document.getElementById('zoBotRegime');
+    const realPnlEl= document.getElementById('zoBotRealizedPnl');
+    const unrPnlEl = document.getElementById('zoBotUnrealPnl');
+    const tcEl     = document.getElementById('zoBotTradeCount');
+    const wrEl     = document.getElementById('zoBotWinRate');
+    const buyerChk = document.getElementById('zoBotBuyer');
+    const sellerChk= document.getElementById('zoBotSeller');
+    const incMMChk = document.getElementById('zoBotIncludeMM');
+    const incMMAChk= document.getElementById('zoBotIncludeMMA');
+    const slPctEl  = document.getElementById('zoBotSlPct');
+    const tpPctEl  = document.getElementById('zoBotTpPct');
+    const maxConsecEl = document.getElementById('zoBotMaxConsec');
+    const maxLossEl   = document.getElementById('zoBotMaxLoss');
+    const maxProfitEl = document.getElementById('zoBotMaxProfit');
+    const minScoreEl  = document.getElementById('zoBotMinScore');
+    const scoreBufferEl = document.getElementById('zoBotScoreBuffer');
+    const cooldownEl  = document.getElementById('zoBotCooldown');
+    const qualityChk  = document.getElementById('zoBotQualityFilter');
+    const startBtn = document.getElementById('zoBotStartBtn');
+    const pauseBtn = document.getElementById('zoBotPauseBtn');
+    const stopBtn  = document.getElementById('zoBotStopBtn');
+    const logEl    = document.getElementById('zoBotLog');
+    const statusDot  = document.getElementById('zoBotStatusDot');
+    const statusText = document.getElementById('zoBotStatusText');
+
+    let botRunning = false, botPaused = false, botMaximized = false;
+    const charts = [null, null], series = [null, null];
+    let lastRenderedLogLen = 0, statusPoller = null;
+
+    function logLine(msg, type) {
+      const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
+      const now = new Date().toLocaleTimeString();
+      logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function currentMode() {
+      const r = document.querySelector('input[name="zoBotMode"]:checked');
+      return r ? r.value : 'paper';
+    }
+
+    // ---- Persistence (buyer/seller, strategies, MM) ----
+    const ZO_PREF = 'mangalview_zoptions_prefs_v1';
+    const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
+    try {
+      const p = JSON.parse(localStorage.getItem(ZO_PREF) || 'null');
+      if (p) {
+        if (typeof p.buyer === 'boolean')  buyerChk.checked  = p.buyer;
+        if (typeof p.seller === 'boolean') sellerChk.checked = p.seller;
+        if (typeof p.mm === 'boolean')  incMMChk.checked  = p.mm;
+        if (typeof p.mma === 'boolean') incMMAChk.checked = p.mma;
+        if (Array.isArray(p.strats)) stratChks.forEach(c => { c.checked = p.strats.indexOf(c.dataset.strat) !== -1; });
+      }
+    } catch(e) {}
+    function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
+    function _savePrefs() {
+      try { localStorage.setItem(ZO_PREF, JSON.stringify({
+        buyer: buyerChk.checked, seller: sellerChk.checked,
+        mm: incMMChk.checked, mma: incMMAChk.checked, strats: _collectStrategies()
+      })); } catch(e) {}
+    }
+    [buyerChk, sellerChk, incMMChk, incMMAChk].concat(stratChks).forEach(c => c.addEventListener('change', _savePrefs));
+
+    // ---- Open / drag / maximize ----
+    document.getElementById('btnZOptionsBot').addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refreshStatus();
+      if (!charts[0]) initCharts();
+      loadCharts();
+      syncOnOpen();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+    (function() {
+      let dr=false,sx,sy,ol,ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        if (panel.classList.contains('maximized')) return;
+        dr=true; panel.style.transform='none';
+        const r = panel.getBoundingClientRect();
+        ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
+        panel.style.left=ol+'px'; panel.style.top=ot+'px'; e.preventDefault();
+      });
+      document.addEventListener('mousemove', e => { if (dr) { panel.style.left=(ol+e.clientX-sx)+'px'; panel.style.top=(ot+e.clientY-sy)+'px'; }});
+      document.addEventListener('mouseup', () => { dr=false; });
+    })();
+    maxBtn.addEventListener('click', function() {
+      botMaximized = !botMaximized;
+      panel.classList.toggle('maximized', botMaximized);
+      this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
+      setTimeout(resizeCharts, 60);
+    });
+    popBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('zoBotPopout', '1');
+      window.open(url.toString(), 'zoBotPopout', 'width=1200,height=950,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('zoBotPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window');
+      panel.classList.add('open');
+      maxBtn.style.display='none'; popBtn.style.display='none'; closeBtn.style.display='none';
+      document.title = '🎯 Zerodha Options AI Bot — Mangal View';
+    }
+
+    function refreshStatus() {
+      const s = ZerodhaStore.getSession();
+      if (s.connected && s.apiKey) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>';
+      } else {
+        statusDot.classList.remove('connected');
+        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
+      }
+    }
+    window.addEventListener('zerodha-session-change', refreshStatus);
+
+    // ---- Charts ----
+    function initCharts() {
+      if (typeof LightweightCharts === 'undefined') return;
+      for (let i = 0; i < 2; i++) {
+        charts[i] = LightweightCharts.createChart(chartDivs[i], {
+          width: chartDivs[i].clientWidth || 440, height: 240,
+          layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+          grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+          timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
+          rightPriceScale: { borderColor: '#2a2e39' },
+          crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+        });
+        series[i] = charts[i].addCandlestickSeries({
+          upColor: '#26a69a', downColor: '#ef5350', borderUpColor: '#26a69a',
+          borderDownColor: '#ef5350', wickUpColor: '#26a69a', wickDownColor: '#ef5350'
+        });
+      }
+      window.addEventListener('resize', resizeCharts);
+    }
+    function resizeCharts() { for (let i = 0; i < 2; i++) if (charts[i]) charts[i].applyOptions({ width: chartDivs[i].clientWidth }); }
+    function updatePx(i, price) {
+      if (price == null || isNaN(price)) return;
+      pxWraps[i].style.display = '';
+      pxSyms[i].textContent = symEls[i].value.trim().toUpperCase();
+      pxVals[i].textContent = Math.abs(price) >= 100 ? price.toFixed(2) : price.toFixed(4);
+    }
+    function loadCharts() {
+      const s = ZerodhaStore.getSession();
+      if (!s.connected || !s.apiKey) { logLine('[Chart] Connect Zerodha — options charts use Kite only.', 'info'); return; }
+      const tf = tfEl.value;
+      for (let i = 0; i < 2; i++) {
+        const sym = symEls[i].value.trim().toUpperCase();
+        if (!sym) continue;
+        const url = '/api/candles?symbol=' + encodeURIComponent(sym) + '&interval=' + encodeURIComponent(tf) +
+                    '&source=kite&api_key=' + encodeURIComponent(s.apiKey);
+        (function(idx, symbol) {
+          fetch(url).then(r => r.json()).then(function(d) {
+            if (!d.candles || !d.candles.length) { logLine('[Chart] No Kite candles for ' + symbol, 'info'); return; }
+            if (series[idx]) series[idx].setData(d.candles);
+            if (charts[idx]) charts[idx].timeScale().fitContent();
+            const lc = d.candles[d.candles.length - 1];
+            if (lc && lc.close != null) updatePx(idx, lc.close);
+            logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + symbol, 'info');
+          }).catch(() => logLine('[Chart] Fetch failed for ' + symbol, 'info'));
+        })(i, sym);
+      }
+    }
+    document.getElementById('zoBotLoadBtn').addEventListener('click', loadCharts);
+
+    // ---- Add Instrument (reuse shared modal) ----
+    document.getElementById('zoBotAddInst1').addEventListener('click', function() {
+      window.zdInstTarget = { sym: 'zoBotSym1', exch: 'zoBotExch1' };
+      if (typeof window.openZdInstModal === 'function') window.openZdInstModal();
+    });
+    document.getElementById('zoBotAddInst2').addEventListener('click', function() {
+      window.zdInstTarget = { sym: 'zoBotSym2', exch: 'zoBotExch2' };
+      if (typeof window.openZdInstModal === 'function') window.openZdInstModal();
+    });
+    document.getElementById('zoBotLogBtn').addEventListener('click', function() { window.open('/api/aibot/log_download', '_blank'); });
+    document.getElementById('zoBotLogDownloadBtn').addEventListener('click', function() {
+      const a = document.createElement('a'); a.href = '/api/aibot/log_download?download=1'; a.download = 'log.txt';
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+
+    // ---- Server controller ----
+    function _renderPauseBtn() {
+      if (botPaused) { pauseBtn.innerHTML = '▶ Resume'; pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume'); }
+      else           { pauseBtn.innerHTML = '⏸ Pause';  pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause'); }
+    }
+    function _serverStarted() { botRunning = true; botPaused = false; startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false; _renderPauseBtn(); startStatusPoll(); }
+    function _serverStopped() { botRunning = false; botPaused = false; startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true; _renderPauseBtn(); stopStatusPoll(); }
+    function startStatusPoll() { if (statusPoller) return; pollStatus(); statusPoller = setInterval(pollStatus, 5000); }
+    function stopStatusPoll()  { if (statusPoller) { clearInterval(statusPoller); statusPoller = null; } }
+    function pollStatus() { fetch('/api/aibot/zoptions/status').then(r => r.json()).then(applyStatus).catch(() => {}); }
+    function fmtLeg(leg) {
+      const p = leg.position;
+      if (!p) return leg.symbol + ': FLAT';
+      return leg.symbol + ': ' + (p.side === 'BUY' ? 'LONG' : 'SHORT') + ' @ ' + p.entryPrice + ' (' + p.strategy + ')';
+    }
+    function applyStatus(s) {
+      if (!s || !s.success) return;
+      botRunning = !!s.running; botPaused = !!s.paused;
+      startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
+      _renderPauseBtn();
+      if (!botRunning) stopStatusPoll();
+      if (botRunning && s.config) {
+        const c = s.config;
+        if (c.slPct != null) slPctEl.value = c.slPct;
+        if (c.tpPct != null) tpPctEl.value = c.tpPct;
+        if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+        if (c.maxLoss != null) maxLossEl.value = c.maxLoss;
+        if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+        if (c.minScore != null) minScoreEl.value = c.minScore;
+        if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
+        if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        if (typeof c.optionBuyer === 'boolean') buyerChk.checked = c.optionBuyer;
+        if (typeof c.optionSeller === 'boolean') sellerChk.checked = c.optionSeller;
+        if (Array.isArray(c.allowedStrategies)) stratChks.forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
+      }
+      const log = s.log || [];
+      if (log.length > lastRenderedLogLen) {
+        log.slice(lastRenderedLogLen).forEach(line => { logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>'; });
+        logEl.scrollTop = logEl.scrollHeight; lastRenderedLogLen = log.length;
+      }
+      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      const legs = s.legs || [];
+      for (let i = 0; i < 2; i++) {
+        const leg = legs[i];
+        if (!leg) { legEls[i].textContent = '—'; continue; }
+        if (leg.last_candles && leg.last_candles.length && series[i]) {
+          series[i].setData(leg.last_candles);
+          const lc = leg.last_candles[leg.last_candles.length - 1];
+          if (lc && lc.close != null) updatePx(i, lc.close);
+        }
+        legEls[i].textContent = fmtLeg(leg);
+        legEls[i].className = 'val ' + (leg.position ? (leg.position.side === 'BUY' ? 'bull' : 'bear') : '');
+      }
+      if (legs[0] && legs[0].last_tick && legs[0].last_tick.regime) regimeEl.textContent = legs[0].last_tick.regime;
+      const st = s.stats || {};
+      if (st.realized != null) {
+        realPnlEl.textContent = (st.realized >= 0 ? '+₹' : '-₹') + Math.abs(st.realized).toFixed(2);
+        realPnlEl.className = 'val ' + (st.realized > 0 ? 'bull' : st.realized < 0 ? 'bear' : '');
+      }
+      if (st.unrealized != null) {
+        unrPnlEl.textContent = (st.unrealized >= 0 ? '+₹' : '-₹') + Math.abs(st.unrealized).toFixed(2);
+        unrPnlEl.className = 'val ' + (st.unrealized > 0 ? 'bull' : st.unrealized < 0 ? 'bear' : '');
+      }
+      tcEl.textContent = (st.tradeCount != null) ? st.tradeCount : '—';
+      wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
+    }
+
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const s = ZerodhaStore.getSession();
+      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
+      const sym1 = symEls[0].value.trim().toUpperCase();
+      const sym2 = symEls[1].value.trim().toUpperCase();
+      if (!sym1 && !sym2) { logLine('Pick at least one option (+ Add).', 'info'); return; }
+      if (!buyerChk.checked && !sellerChk.checked) { logLine('Enable Option Buyer and/or Option Seller.', 'info'); return; }
+      const cfg = {
+        sym1: sym1, exch1: (exchEls[0].value || '').trim().toUpperCase(),
+        sym2: sym2, exch2: (exchEls[1].value || '').trim().toUpperCase(),
+        qty: parseInt(qtyEl.value) || 1,
+        tf: tfEl.value, mode: currentMode(),
+        optionBuyer: !!buyerChk.checked, optionSeller: !!sellerChk.checked,
+        slPct: parseFloat(slPctEl.value) || 10.0,
+        tpPct: parseFloat(tpPctEl.value) || 10.0,
+        maxConsec: parseInt(maxConsecEl.value) || 3,
+        maxLoss: parseFloat(maxLossEl.value) || 2000,
+        maxProfit: parseFloat(maxProfitEl.value) || 0,
+        minScore: parseFloat(minScoreEl.value) || 4.0,
+        scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
+        cooldownSec: parseInt(cooldownEl.value) || 0,
+        qualityFilter: !!qualityChk.checked,
+        includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
+        allowedStrategies: _collectStrategies(),
+        api_key: s.apiKey || ''
+      };
+      logLine('Starting Options Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' [' +
+              (cfg.optionBuyer ? 'buyer' : '') + (cfg.optionSeller ? (cfg.optionBuyer ? '+seller' : 'seller') : '') + '] ' +
+              [sym1, sym2].filter(Boolean).join(', ') + ' qty=' + cfg.qty + ' TF=' + cfg.tf + ' …', 'info');
+      lastRenderedLogLen = 0;
+      fetch('/api/aibot/zoptions/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) })
+        .then(r => r.json()).then(res => {
+          if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
+          _serverStarted();
+          logLine('Bot running on the server. Safe to close this tab — it keeps ticking.', 'info');
+        }).catch(e => logLine('Start request error: ' + e.message, 'info'));
+    });
+    pauseBtn.addEventListener('click', function() {
+      if (!botRunning) return;
+      fetch('/api/aibot/zoptions/pause', { method: 'POST' }).then(r => r.json()).then(res => {
+        if (res.success) { botPaused = !!res.paused; _renderPauseBtn(); logLine(botPaused ? 'Bot paused (server).' : 'Bot resumed (server).', 'info'); }
+      });
+    });
+    stopBtn.addEventListener('click', function() {
+      fetch('/api/aibot/zoptions/stop', { method: 'POST' }).then(r => r.json()).then(() => { _serverStopped(); logLine('Bot stopped on server.', 'info'); });
+    });
+    function syncOnOpen() {
+      fetch('/api/aibot/zoptions/status').then(r => r.json()).then(s => {
+        if (s && s.success && s.running) {
+          logLine('A server-side Options Bot is already running. Resuming UI sync…', 'info');
+          if (s.config) { if (s.config.sym1) symEls[0].value = s.config.sym1; if (s.config.sym2) symEls[1].value = s.config.sym2; }
+          _serverStarted(); applyStatus(s);
+        }
+      }).catch(() => {});
+    }
+
+    // ---- Claude co-pilot chat ----
+    (function() {
+      const msgsEl = document.getElementById('zoChatMsgs');
+      const inputEl = document.getElementById('zoChatInput');
+      const sendEl = document.getElementById('zoChatSend');
+      if (!msgsEl || !inputEl || !sendEl) return;
+      const history = [];
+      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function addMsg(text, cls) { const d = document.createElement('div'); d.className = 'dbot-msg ' + (cls || 'bot'); d.innerHTML = esc(text); msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d; }
+      function addPatchCard(patch, summary) {
+        const card = document.createElement('div'); card.className = 'dbot-patch';
+        const pairs = Object.keys(patch).map(k => k + ' → ' + patch[k]).join(', ');
+        card.innerHTML = '<div>' + (summary ? esc(summary) + '<br>' : '') + 'Proposed change: <code>' + esc(pairs) + '</code></div>';
+        const btn = document.createElement('button'); btn.className = 'dbot-patch-apply'; btn.textContent = 'Apply to bot';
+        btn.addEventListener('click', function() {
+          btn.disabled = true; btn.textContent = 'Applying…';
+          fetch('/api/aibot/zoptions/apply_config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ patch }) })
+            .then(r => r.json()).then(res => {
+              if (res.success) {
+                btn.textContent = '✓ Applied';
+                const c = res.config || {};
+                if (c.slPct != null) slPctEl.value = c.slPct;
+                if (c.tpPct != null) tpPctEl.value = c.tpPct;
+                if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+                if (c.maxLoss != null) maxLossEl.value = c.maxLoss;
+                if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+                if (c.minScore != null) minScoreEl.value = c.minScore;
+                if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
+                if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+                if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+                logLine('[Claude] Applied config: ' + Object.keys(res.applied||{}).map(k=>k+'='+res.applied[k]).join(', '), 'info');
+              } else { btn.disabled = false; btn.textContent = 'Apply to bot'; addMsg('Apply failed: ' + (res.error || 'unknown'), 'err'); }
+            }).catch(e => { btn.disabled = false; btn.textContent = 'Apply to bot'; addMsg('Apply error: ' + e.message, 'err'); });
+        });
+        card.appendChild(btn); msgsEl.appendChild(card); msgsEl.scrollTop = msgsEl.scrollHeight;
+      }
+      function send() {
+        const msg = inputEl.value.trim(); if (!msg) return;
+        addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
+        inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
+        const thinking = addMsg('Thinking…', 'bot');
+        fetch('/api/aibot/zoptions/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1) }) })
+          .then(r => r.json()).then(res => {
+            thinking.remove();
+            if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
+            const reply = res.reply || '(no reply)'; addMsg(reply, 'bot'); history.push({ role: 'assistant', content: reply });
+            if (res.configPatch && Object.keys(res.configPatch).length) addPatchCard(res.configPatch, res.summary);
+          }).catch(e => { thinking.remove(); addMsg('Chat error: ' + e.message, 'err'); })
+          .finally(() => { sendEl.disabled = false; inputEl.disabled = false; inputEl.focus(); });
+      }
+      sendEl.addEventListener('click', send);
+      inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+    })();
+
+    refreshStatus();
+  })();
+
+  // ---- MT5 shared store (mirrors ZerodhaStore) ----
+  const MT5Store = {
+    SESSION_KEY: 'mangalview_mt5_session_v1',
+    getSession() {
+      try { return JSON.parse(localStorage.getItem(this.SESSION_KEY) || 'null') || {connected:false, id:''}; }
+      catch(e) { return {connected:false, id:''}; }
+    },
+    setSession(s) { localStorage.setItem(this.SESSION_KEY, JSON.stringify(s)); try { window.dispatchEvent(new Event('mt5-session-change')); } catch(e) {} },
+    clearSession() { localStorage.removeItem(this.SESSION_KEY); try { window.dispatchEvent(new Event('mt5-session-change')); } catch(e) {} }
+  };
+
+  // ---- MT5 Login Panel ----
+  (function() {
+    const panel = document.getElementById('mt5LoginPanel');
+    if (!panel) return;
+    const closeBtn = document.getElementById('mt5LoginClose');
+    const connectBtn = document.getElementById('mt5ConnectBtn');
+    const statusDot = document.getElementById('mt5LoginStatusDot');
+    const statusText = document.getElementById('mt5LoginStatusText');
+    const loginInp = document.getElementById('mt5Login');
+    const pwInp = document.getElementById('mt5Password');
+    const srvInp = document.getElementById('mt5Server');
+    const tokInp = document.getElementById('mt5Token');
+    const accInp = document.getElementById('mt5AccountId');
+    function refresh() {
+      const s = MT5Store.getSession();
+      if (s.connected && s.id) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected to MT5 <span style="color:#787b86;font-size:11px">(' + (s.login || s.id) + (s.server ? ' @ ' + s.server : '') + ')</span>';
+        connectBtn.textContent = 'Connected'; connectBtn.classList.add('connected');
+      } else {
+        statusDot.classList.remove('connected'); statusText.textContent = 'Not connected';
+        connectBtn.textContent = 'Connect'; connectBtn.classList.remove('connected');
+      }
+    }
+    // Reveal MetaApi fields if backend hints metaapi
+    fetch('/api/mt5/status').then(r => r.json()).then(s => {
+      if (s && s.backend === 'metaapi') document.getElementById('mt5MetaapiRow').style.display = '';
+    }).catch(() => {});
+    document.getElementById('btnMT5Login').addEventListener('click', function() {
+      automationDropdown.classList.remove('open'); panel.classList.add('open'); refresh();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+    connectBtn.addEventListener('click', function() {
+      statusText.textContent = 'Connecting…';
+      fetch('/api/mt5/connect', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ login: loginInp.value.trim(), password: pwInp.value, server: srvInp.value.trim(),
+                               token: tokInp ? tokInp.value.trim() : '', account_id: accInp ? accInp.value.trim() : '' }) })
+        .then(r => r.json()).then(res => {
+          if (res.success) {
+            MT5Store.setSession({ connected: true, id: res.id, login: loginInp.value.trim(), server: srvInp.value.trim() });
+            refresh();
+            const a = res.account || {};
+            statusText.innerHTML = 'Connected <span style="color:#26a69a">' + (a.login || res.id) + '</span>' +
+              (a.balance != null ? ' — bal ' + a.balance + ' ' + (a.currency || '') : '');
+          } else {
+            statusDot.classList.remove('connected');
+            statusText.innerHTML = '<span style="color:#ef5350">' + (res.error || 'Connection failed') + '</span>';
+          }
+        }).catch(e => { statusText.innerHTML = '<span style="color:#ef5350">Request error: ' + e.message + '</span>'; });
+    });
+    refresh();
+  })();
+
+  // ---- MT5 AI Bot Panel (server-side, mirrors Delta/Zerodha) ----
+  (function() {
+    const panel = document.getElementById('mtBotPanel');
+    if (!panel) return;
+    const header = document.getElementById('mtBotHeader');
+    const closeBtn = document.getElementById('mtBotClose');
+    const maxBtn = document.getElementById('mtBotMaximizeBtn');
+    const popBtn = document.getElementById('mtBotPopoutBtn');
+    const symEl = document.getElementById('mtBotSymbol');
+    const qtyEl = document.getElementById('mtBotQty');
+    const tfEl = document.getElementById('mtBotTF');
+    const chartDiv = document.getElementById('mtBotChart');
+    const stratEl = document.getElementById('mtBotStrategy');
+    const regimeEl = document.getElementById('mtBotRegime');
+    const posEl = document.getElementById('mtBotPosition');
+    const entryPxEl = document.getElementById('mtBotEntryPx');
+    const realPnlEl = document.getElementById('mtBotRealizedPnl');
+    const unrPnlEl = document.getElementById('mtBotUnrealPnl');
+    const tcEl = document.getElementById('mtBotTradeCount');
+    const wrEl = document.getElementById('mtBotWinRate');
+    const slPctEl = document.getElementById('mtBotSlPct');
+    const tpPctEl = document.getElementById('mtBotTpPct');
+    const maxConsecEl = document.getElementById('mtBotMaxConsec');
+    const maxLossEl = document.getElementById('mtBotMaxLoss');
+    const maxProfitEl = document.getElementById('mtBotMaxProfit');
+    const minScoreEl = document.getElementById('mtBotMinScore');
+    const scoreBufferEl = document.getElementById('mtBotScoreBuffer');
+    const cooldownEl = document.getElementById('mtBotCooldown');
+    const qualityChk = document.getElementById('mtBotQualityFilter');
+    const incMMChk = document.getElementById('mtBotIncludeMM');
+    const incMMAChk = document.getElementById('mtBotIncludeMMA');
+    const startBtn = document.getElementById('mtBotStartBtn');
+    const pauseBtn = document.getElementById('mtBotPauseBtn');
+    const stopBtn = document.getElementById('mtBotStopBtn');
+    const logEl = document.getElementById('mtBotLog');
+    const statusDot = document.getElementById('mtBotStatusDot');
+    const statusText = document.getElementById('mtBotStatusText');
+    const pxOverlay = document.getElementById('mtBotPriceOverlay');
+    const pxSymEl = document.getElementById('mtBotPxSym');
+    const pxValEl = document.getElementById('mtBotPxVal');
+
+    let botRunning = false, botPaused = false, botMaximized = false;
+    let botChart = null, botCandleSeries = null, lastRenderedLogLen = 0, statusPoller = null;
+
+    function logLine(msg, type) {
+      const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
+      logEl.innerHTML += '<br><span class="' + cls + '">[' + new Date().toLocaleTimeString() + '] ' + msg + '</span>';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function currentMode() { const r = document.querySelector('input[name="mtBotMode"]:checked'); return r ? r.value : 'paper'; }
+
+    const STRAT_KEY = 'mangalview_mt5_strategies_v1';
+    const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
+    try { const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null'); if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; }); } catch(e) {}
+    function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
+    stratChks.forEach(c => c.addEventListener('change', function(){ try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} }));
+
+    document.getElementById('btnMT5Bot').addEventListener('click', function() {
+      automationDropdown.classList.remove('open'); panel.classList.add('open');
+      refreshStatus(); if (!botChart) initChart(); loadChart(); syncOnOpen();
+    });
+    closeBtn.addEventListener('click', () => panel.classList.remove('open'));
+    (function() {
+      let dr=false,sx,sy,ol,ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button')) return;
+        if (panel.classList.contains('maximized')) return;
+        dr=true; panel.style.transform='none';
+        const r = panel.getBoundingClientRect(); ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
+        panel.style.left=ol+'px'; panel.style.top=ot+'px'; e.preventDefault();
+      });
+      document.addEventListener('mousemove', e => { if (dr) { panel.style.left=(ol+e.clientX-sx)+'px'; panel.style.top=(ot+e.clientY-sy)+'px'; }});
+      document.addEventListener('mouseup', () => { dr=false; });
+    })();
+    maxBtn.addEventListener('click', function() {
+      botMaximized = !botMaximized; panel.classList.toggle('maximized', botMaximized);
+      this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
+      if (botChart) setTimeout(() => botChart.applyOptions({ width: chartDiv.clientWidth }), 50);
+    });
+    popBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href); url.searchParams.set('mtBotPopout', '1');
+      window.open(url.toString(), 'mtBotPopout', 'width=1100,height=900,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('mtBotPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window'); panel.classList.add('open');
+      maxBtn.style.display='none'; popBtn.style.display='none'; closeBtn.style.display='none';
+      document.title = '🧠 MT5 AI Bot — Mangal View';
+    }
+
+    function refreshStatus() {
+      const s = MT5Store.getSession();
+      if (s.connected && s.id) {
+        statusDot.classList.add('connected');
+        statusText.innerHTML = 'Connected to MT5 <span style="color:#787b86;font-size:11px">(' + (s.login || s.id) + ')</span>';
+      } else {
+        statusDot.classList.remove('connected');
+        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">MT5 Login</b> to enable data + live orders';
+      }
+    }
+    window.addEventListener('mt5-session-change', refreshStatus);
+
+    function initChart() {
+      if (typeof LightweightCharts === 'undefined') return;
+      botChart = LightweightCharts.createChart(chartDiv, {
+        width: chartDiv.clientWidth || 880, height: 280,
+        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+        timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
+        rightPriceScale: { borderColor: '#2a2e39' }, crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+      });
+      botCandleSeries = botChart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350', borderUpColor: '#26a69a', borderDownColor: '#ef5350', wickUpColor: '#26a69a', wickDownColor: '#ef5350' });
+      window.addEventListener('resize', () => { if (botChart) botChart.applyOptions({ width: chartDiv.clientWidth }); });
+    }
+    function updatePx(price) {
+      if (price == null || isNaN(price)) return;
+      pxOverlay.style.display = ''; pxSymEl.textContent = symEl.value.trim().toUpperCase();
+      pxValEl.textContent = Math.abs(price) >= 100 ? price.toFixed(2) : price.toFixed(5);
+    }
+    function loadChart() {
+      const sym = symEl.value.trim().toUpperCase(); const tf = tfEl.value;
+      if (!sym) return;
+      const s = MT5Store.getSession();
+      const url = '/api/mt5/candles?symbol=' + encodeURIComponent(sym) + '&interval=' + encodeURIComponent(tf) + (s.id ? '&mt5_id=' + encodeURIComponent(s.id) : '');
+      fetch(url).then(r => r.json()).then(function(d) {
+        if (!d.candles || !d.candles.length) {
+          logLine('[Chart] No MT5 candles for ' + sym + ' (' + (d.data_source || 'mt5') + '). Connect MT5 and set MT5_BACKEND.', 'info'); return;
+        }
+        if (botCandleSeries) botCandleSeries.setData(d.candles);
+        if (botChart) botChart.timeScale().fitContent();
+        const lc = d.candles[d.candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
+        logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + sym + ' (' + (d.data_source || 'mt5') + ')', 'info');
+      }).catch(() => logLine('[Chart] Fetch failed for ' + sym, 'info'));
+    }
+    document.getElementById('mtBotLoadBtn').addEventListener('click', loadChart);
+    document.getElementById('mtBotLogBtn').addEventListener('click', function() { window.open('/api/aibot/log_download', '_blank'); });
+    document.getElementById('mtBotLogDownloadBtn').addEventListener('click', function() {
+      const a = document.createElement('a'); a.href = '/api/aibot/log_download?download=1'; a.download = 'log.txt';
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+
+    function _renderPauseBtn() {
+      if (botPaused) { pauseBtn.innerHTML = '▶ Resume'; pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume'); }
+      else           { pauseBtn.innerHTML = '⏸ Pause';  pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause'); }
+    }
+    function _serverStarted() { botRunning = true; botPaused = false; startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false; _renderPauseBtn(); startStatusPoll(); }
+    function _serverStopped() { botRunning = false; botPaused = false; startBtn.disabled = false; pauseBtn.disabled = true; stopBtn.disabled = true; _renderPauseBtn(); stopStatusPoll(); }
+    function startStatusPoll() { if (statusPoller) return; pollStatus(); statusPoller = setInterval(pollStatus, 5000); }
+    function stopStatusPoll() { if (statusPoller) { clearInterval(statusPoller); statusPoller = null; } }
+    function pollStatus() { fetch('/api/aibot/mt5/status').then(r => r.json()).then(applyStatus).catch(() => {}); }
+    function applyStatus(s) {
+      if (!s || !s.success) return;
+      botRunning = !!s.running; botPaused = !!s.paused;
+      startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
+      _renderPauseBtn(); if (!botRunning) stopStatusPoll();
+      if (botRunning && s.config) {
+        const c = s.config;
+        if (c.slPct != null) slPctEl.value = c.slPct;
+        if (c.tpPct != null) tpPctEl.value = c.tpPct;
+        if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+        if (c.maxLoss != null) maxLossEl.value = c.maxLoss;
+        if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+        if (c.minScore != null) minScoreEl.value = c.minScore;
+        if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
+        if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        if (Array.isArray(c.allowedStrategies)) stratChks.forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
+      }
+      const log = s.log || [];
+      if (log.length > lastRenderedLogLen) {
+        log.slice(lastRenderedLogLen).forEach(line => { logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>'; });
+        logEl.scrollTop = logEl.scrollHeight; lastRenderedLogLen = log.length;
+      }
+      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      if (s.last_candles && s.last_candles.length && botCandleSeries) {
+        botCandleSeries.setData(s.last_candles);
+        const lc = s.last_candles[s.last_candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
+      }
+      const lt = s.last_tick || {};
+      if (lt.strategy) { stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']'; stratEl.className = 'val ' + (lt.signal === 'BUY' ? 'bull' : lt.signal === 'SELL' ? 'bear' : ''); }
+      if (lt.regime) regimeEl.textContent = lt.regime;
+      const p = s.position;
+      if (p) { posEl.textContent = p.side === 'BUY' ? 'LONG' : 'SHORT'; posEl.className = 'val ' + (p.side === 'BUY' ? 'bull' : 'bear'); entryPxEl.textContent = p.entryPrice; }
+      else { posEl.textContent = 'FLAT'; posEl.className = 'val'; entryPxEl.textContent = '—'; }
+      const st = s.stats || {};
+      if (st.realized != null) { realPnlEl.textContent = (st.realized >= 0 ? '+' : '') + st.realized.toFixed(2); realPnlEl.className = 'val ' + (st.realized > 0 ? 'bull' : st.realized < 0 ? 'bear' : ''); }
+      if (st.unrealized != null) { unrPnlEl.textContent = (st.unrealized >= 0 ? '+' : '') + st.unrealized.toFixed(2); unrPnlEl.className = 'val ' + (st.unrealized > 0 ? 'bull' : st.unrealized < 0 ? 'bear' : ''); }
+      tcEl.textContent = (st.tradeCount != null) ? st.tradeCount : '—';
+      wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
+    }
+
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const sym = symEl.value.trim().toUpperCase(); if (!sym) { logLine('Enter a symbol first (e.g. EURUSD).', 'info'); return; }
+      const s = MT5Store.getSession();
+      const cfg = {
+        symbol: sym, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
+        slPct: parseFloat(slPctEl.value) || 1.0, tpPct: parseFloat(tpPctEl.value) || 2.0,
+        maxConsec: parseInt(maxConsecEl.value) || 3, maxLoss: parseFloat(maxLossEl.value) || 2000,
+        maxProfit: parseFloat(maxProfitEl.value) || 0, minScore: parseFloat(minScoreEl.value) || 4.0,
+        scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
+        cooldownSec: parseInt(cooldownEl.value) || 0, qualityFilter: !!qualityChk.checked,
+        includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
+        allowedStrategies: _collectStrategies(), mt5_id: s.id || ''
+      };
+      if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
+      logLine('Starting MT5 Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / vol=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
+      lastRenderedLogLen = 0;
+      fetch('/api/aibot/mt5/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) })
+        .then(r => r.json()).then(res => {
+          if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
+          _serverStarted(); logLine('Bot running on the server. Safe to close this tab — it keeps ticking.', 'info');
+        }).catch(e => logLine('Start request error: ' + e.message, 'info'));
+    });
+    pauseBtn.addEventListener('click', function() {
+      if (!botRunning) return;
+      fetch('/api/aibot/mt5/pause', { method: 'POST' }).then(r => r.json()).then(res => {
+        if (res.success) { botPaused = !!res.paused; _renderPauseBtn(); logLine(botPaused ? 'Bot paused (server).' : 'Bot resumed (server).', 'info'); }
+      });
+    });
+    stopBtn.addEventListener('click', function() {
+      fetch('/api/aibot/mt5/stop', { method: 'POST' }).then(r => r.json()).then(() => { _serverStopped(); logLine('Bot stopped on server.', 'info'); });
+    });
+    function syncOnOpen() {
+      fetch('/api/aibot/mt5/status').then(r => r.json()).then(s => {
+        if (s && s.success && s.running) { logLine('A server-side MT5 Bot is already running. Resuming UI sync…', 'info'); _serverStarted(); applyStatus(s); }
+      }).catch(() => {});
+    }
+
+    // ---- Claude co-pilot chat ----
+    (function() {
+      const msgsEl = document.getElementById('mtChatMsgs');
+      const inputEl = document.getElementById('mtChatInput');
+      const sendEl = document.getElementById('mtChatSend');
+      if (!msgsEl || !inputEl || !sendEl) return;
+      const history = [];
+      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function addMsg(text, cls) { const d = document.createElement('div'); d.className = 'dbot-msg ' + (cls || 'bot'); d.innerHTML = esc(text); msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d; }
+      function addPatchCard(patch, summary) {
+        const card = document.createElement('div'); card.className = 'dbot-patch';
+        const pairs = Object.keys(patch).map(k => k + ' → ' + patch[k]).join(', ');
+        card.innerHTML = '<div>' + (summary ? esc(summary) + '<br>' : '') + 'Proposed change: <code>' + esc(pairs) + '</code></div>';
+        const btn = document.createElement('button'); btn.className = 'dbot-patch-apply'; btn.textContent = 'Apply to bot';
+        btn.addEventListener('click', function() {
+          btn.disabled = true; btn.textContent = 'Applying…';
+          fetch('/api/aibot/mt5/apply_config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ patch }) })
+            .then(r => r.json()).then(res => {
+              if (res.success) {
+                btn.textContent = '✓ Applied'; const c = res.config || {};
+                if (c.slPct != null) slPctEl.value = c.slPct;
+                if (c.tpPct != null) tpPctEl.value = c.tpPct;
+                if (c.maxConsec != null) maxConsecEl.value = c.maxConsec;
+                if (c.maxLoss != null) maxLossEl.value = c.maxLoss;
+                if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
+                if (c.minScore != null) minScoreEl.value = c.minScore;
+                if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
+                if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+                if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+                logLine('[Claude] Applied config: ' + Object.keys(res.applied||{}).map(k=>k+'='+res.applied[k]).join(', '), 'info');
+              } else { btn.disabled = false; btn.textContent = 'Apply to bot'; addMsg('Apply failed: ' + (res.error || 'unknown'), 'err'); }
+            }).catch(e => { btn.disabled = false; btn.textContent = 'Apply to bot'; addMsg('Apply error: ' + e.message, 'err'); });
+        });
+        card.appendChild(btn); msgsEl.appendChild(card); msgsEl.scrollTop = msgsEl.scrollHeight;
+      }
+      function send() {
+        const msg = inputEl.value.trim(); if (!msg) return;
+        addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
+        inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
+        const thinking = addMsg('Thinking…', 'bot');
+        fetch('/api/aibot/mt5/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1) }) })
+          .then(r => r.json()).then(res => {
+            thinking.remove();
+            if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
+            const reply = res.reply || '(no reply)'; addMsg(reply, 'bot'); history.push({ role: 'assistant', content: reply });
+            if (res.configPatch && Object.keys(res.configPatch).length) addPatchCard(res.configPatch, res.summary);
+          }).catch(e => { thinking.remove(); addMsg('Chat error: ' + e.message, 'err'); })
+          .finally(() => { sendEl.disabled = false; inputEl.disabled = false; inputEl.focus(); });
+      }
+      sendEl.addEventListener('click', send);
+      inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+    })();
+
+    refreshStatus();
   })();
 
   // ---- Delta Exchange shared store (mirrors ZerodhaStore) ----
@@ -19668,6 +21643,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const maxLossEl   = document.getElementById('deltaBotMaxLoss');
     const maxProfitEl = document.getElementById('deltaBotMaxProfit');
     const minScoreEl  = document.getElementById('deltaBotMinScore');
+    const scoreBufferEl = document.getElementById('deltaBotScoreBuffer');
     const cooldownEl  = document.getElementById('deltaBotCooldown');
     const qualityChk  = document.getElementById('deltaBotQualityFilter');
     const startBtn = document.getElementById('deltaBotStartBtn');
@@ -19803,6 +21779,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function _dMMEnabled()  { return !!dIncMMChk.checked; }
     function _dMMAEnabled() { return !!dIncMMAChk.checked; }
+
+    // ---- Configurable strategy checkboxes (extras on the always-on core) ----
+    const D_STRAT_KEY = 'mangalview_delta_aibot_strategies_v1';
+    const dStratChks = Array.from(panel.querySelectorAll('.strat-chk'));
+    try {
+      const saved = JSON.parse(localStorage.getItem(D_STRAT_KEY) || 'null');
+      if (Array.isArray(saved)) dStratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; });
+    } catch(e) {}
+    function _dCollectStrategies() { return dStratChks.filter(c => c.checked).map(c => c.dataset.strat); }
+    function _dSaveStrategies() { try { localStorage.setItem(D_STRAT_KEY, JSON.stringify(_dCollectStrategies())); } catch(e) {} }
+    dStratChks.forEach(c => c.addEventListener('change', _dSaveStrategies));
 
     // ---- Regime + strategy (same as Zerodha bot) ----
     function detectRegime(candles) {
@@ -20116,8 +22103,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
         if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
         if (c.minScore != null)  minScoreEl.value  = c.minScore;
+        if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        if (Array.isArray(c.allowedStrategies)) panel.querySelectorAll('.strat-chk').forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
       }
 
       // New log lines (server's log_buffer is a rolling tail)
@@ -20185,10 +22174,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxLoss:    parseFloat(maxLossEl.value) || 200,
         maxProfit:  parseFloat(maxProfitEl.value) || 0,
         minScore:   parseFloat(minScoreEl.value) || 4.0,
+        scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0,
         qualityFilter: !!qualityChk.checked,
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
+        allowedStrategies: _dCollectStrategies(),
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -20266,6 +22257,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               if (c.maxLoss != null)   maxLossEl.value   = c.maxLoss;
               if (c.maxProfit != null) maxProfitEl.value = c.maxProfit;
               if (c.minScore != null)  minScoreEl.value  = c.minScore;
+              if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
               if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
               if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
               logLine('[Claude] Applied config: ' + Object.keys(res.applied||{}).map(k=>k+'='+res.applied[k]).join(', '), 'info');
