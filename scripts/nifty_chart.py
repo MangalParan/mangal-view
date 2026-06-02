@@ -21207,7 +21207,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fetch('/api/mt5/connect', { method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ login: loginInp.value.trim(), password: pwInp.value, server: srvInp.value.trim(),
                                token: tokInp ? tokInp.value.trim() : '', account_id: accInp ? accInp.value.trim() : '' }) })
-        .then(r => r.json()).then(res => {
+        .then(async r => {
+          // Defensive parse: if the server returns HTML (404 from an old deploy,
+          // or a login redirect), .json() throws "Unexpected token '<'". Detect
+          // that and show a useful message instead.
+          const text = await r.text();
+          let res;
+          try { res = JSON.parse(text); }
+          catch(e) {
+            const looksHtml = text.trim().startsWith('<');
+            throw new Error(looksHtml
+              ? ('Server returned a web page, not JSON (HTTP ' + r.status + '). The MT5 routes are probably not deployed on this server yet — redeploy the latest commit on Render, or your session expired (re-login).')
+              : ('Bad response (HTTP ' + r.status + '): ' + text.slice(0, 120)));
+          }
           if (res.success) {
             MT5Store.setSession({ connected: true, id: res.id, login: loginInp.value.trim(), server: srvInp.value.trim() });
             refresh();
@@ -21218,7 +21230,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             statusDot.classList.remove('connected');
             statusText.innerHTML = '<span style="color:#ef5350">' + (res.error || 'Connection failed') + '</span>';
           }
-        }).catch(e => { statusText.innerHTML = '<span style="color:#ef5350">Request error: ' + e.message + '</span>'; });
+        }).catch(e => { statusDot.classList.remove('connected'); statusText.innerHTML = '<span style="color:#ef5350">' + e.message + '</span>'; });
     });
     refresh();
   })();
