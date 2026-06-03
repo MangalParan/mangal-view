@@ -20608,7 +20608,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
-        if (Array.isArray(c.allowedStrategies)) panel.querySelectorAll('.strat-chk').forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
+        // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
@@ -21110,9 +21110,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
-        if (typeof c.optionBuyer === 'boolean') buyerChk.checked = c.optionBuyer;
-        if (typeof c.optionSeller === 'boolean') sellerChk.checked = c.optionSeller;
-        if (Array.isArray(c.allowedStrategies)) stratChks.forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
+        // NOTE: do NOT mirror strategy/buyer/seller selections from the running
+        // config — those are user choices and must not be auto-ticked.
       }
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
@@ -21501,7 +21500,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
-        if (Array.isArray(c.allowedStrategies)) stratChks.forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
+        // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
@@ -22219,7 +22218,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
-        if (Array.isArray(c.allowedStrategies)) panel.querySelectorAll('.strat-chk').forEach(ch => { ch.checked = c.allowedStrategies.indexOf(ch.dataset.strat) !== -1; });
+        // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
 
       // New log lines (server's log_buffer is a rolling tail)
