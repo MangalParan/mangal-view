@@ -2055,7 +2055,7 @@ def delta_aibot_start():
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
-            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
         if not delta_ai_state['config']['symbol']:
@@ -2562,7 +2562,7 @@ def zd_aibot_start():
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
-            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
         if not zd_ai_state['config']['symbol']:
@@ -2983,7 +2983,7 @@ def zo_aibot_start():
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
-            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
         zo_ai_state['legs']          = legs
@@ -3460,7 +3460,7 @@ def mt_aibot_start():
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
-            'allowedStrategies': [s for s in (data.get('allowedStrategies') or _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'mt5_id':     (data.get('mt5_id') or '').strip(),
         }
         if not mt_ai_state['config']['symbol']:
