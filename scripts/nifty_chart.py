@@ -3671,6 +3671,56 @@ def aibot_log_read():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+_BOT_DEFAULTS_CACHE = {'ts': 0.0, 'data': None}
+
+def _load_bot_defaults():
+    """Parse default.csv at the project root into per-bot default panel settings.
+    Columns: name, SL, TP, Max consec losses, Max daily loss, Max daily profit,
+    min score, Score buffer, Cool down, Quality filter. SL/TP may carry a '%'.
+    Cached for 60s. Returns {} on any problem (panels keep their HTML defaults)."""
+    import time as _t, csv as _csv
+    if _BOT_DEFAULTS_CACHE['data'] is not None and (_t.time() - _BOT_DEFAULTS_CACHE['ts'] < 60):
+        return _BOT_DEFAULTS_CACHE['data']
+    # Render is Linux (case-sensitive) — accept any casing of the filename.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = next((os.path.join(root, n) for n in ('default.csv', 'Default.csv', 'DEFAULT.csv')
+                 if os.path.exists(os.path.join(root, n))), os.path.join(root, 'default.csv'))
+    name_map = {
+        'zerodha ai bot': 'zerodha',
+        'zerodha options ai bot': 'zoptions',
+        'delta ai bot': 'delta',
+        'mt5 ai bot': 'mt5',
+    }
+    def _num(s):
+        s = (s or '').strip().replace('%', '')
+        try: return float(s)
+        except (TypeError, ValueError): return None
+    out = {}
+    try:
+        with open(path, newline='', encoding='utf-8-sig') as f:
+            for row in _csv.reader(f):
+                if not row: continue
+                key = name_map.get((row[0] or '').strip().lower())
+                if not key: continue
+                c = (list(row) + [''] * 10)[:10]
+                out[key] = {
+                    'slPct': _num(c[1]), 'tpPct': _num(c[2]), 'maxConsec': _num(c[3]),
+                    'maxLoss': _num(c[4]), 'maxProfit': _num(c[5]), 'minScore': _num(c[6]),
+                    'scoreBuffer': _num(c[7]), 'cooldownSec': _num(c[8]),
+                    'qualityFilter': (c[9] or '').strip().lower() in ('checked', 'true', 'yes', '1', 'on'),
+                }
+    except Exception:
+        pass
+    _BOT_DEFAULTS_CACHE['data'] = out
+    _BOT_DEFAULTS_CACHE['ts']   = _t.time()
+    return out
+
+@app.route('/api/bot_defaults', methods=['GET'])
+@login_required
+def bot_defaults_route():
+    """Per-bot default panel settings from default.csv (applied client-side)."""
+    return jsonify({'success': True, 'defaults': _load_bot_defaults()})
+
 @app.route('/api/ping', methods=['GET'])
 def api_ping():
     """Lightweight keep-alive endpoint for external uptime monitors
@@ -14103,17 +14153,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#129504; Allow strategies:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
           <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
-        <label title="Mean-reversion bid-ask Market Making strategy. Best in range/sideways markets."><input type="checkbox" id="aiBotIncludeMM"> Market Making</label>
+        <label title="Mean-reversion bid-ask Market Making strategy. Best in range/sideways markets."><input type="checkbox" id="aiBotIncludeMM" checked> Market Making</label>
         <label title="Advanced Market Making with spread analysis. Best in range markets with stable volatility."><input type="checkbox" id="aiBotIncludeMMA"> MM Advanced</label>
         <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
@@ -14285,17 +14335,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#129504; Allow strategies:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
           <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
-        <label title="Market Making — range markets"><input type="checkbox" id="mtBotIncludeMM"> Market Making</label>
+        <label title="Market Making — range markets"><input type="checkbox" id="mtBotIncludeMM" checked> Market Making</label>
         <label title="MM Advanced"><input type="checkbox" id="mtBotIncludeMMA"> MM Advanced</label>
         <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
@@ -14411,17 +14461,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#129504; Allow strategies:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
           <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
-        <label title="Mean-reversion bid-ask Market Making. Best in range/sideways crypto."><input type="checkbox" id="deltaBotIncludeMM"> Market Making</label>
+        <label title="Mean-reversion bid-ask Market Making. Best in range/sideways crypto."><input type="checkbox" id="deltaBotIncludeMM" checked> Market Making</label>
         <label title="Advanced Market Making with spread analysis."><input type="checkbox" id="deltaBotIncludeMMA"> MM Advanced</label>
         <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
@@ -14560,17 +14610,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#129504; Allow strategies:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor" checked> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet" checked> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping" checked> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant" checked> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid" checked> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution" checked> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb" checked> StatArb</label>
+          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
+          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
+          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
+          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
+          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
+          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
+          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
           <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
-        <label title="Market Making — range markets"><input type="checkbox" id="zoBotIncludeMM"> Market Making</label>
+        <label title="Market Making — range markets"><input type="checkbox" id="zoBotIncludeMM" checked> Market Making</label>
         <label title="MM Advanced"><input type="checkbox" id="zoBotIncludeMMA"> MM Advanced</label>
         <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
@@ -20015,6 +20065,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
   }
 
+  // Apply per-bot default panel values from default.csv (via /api/bot_defaults).
+  // These set the INITIAL field values on load; the user can still edit them and
+  // the edited values are what's sent on Start. While a bot is running, its live
+  // config (status poll) takes over the inputs.
+  (function applyBotDefaults() {
+    const prefix = { zerodha: 'aiBot', zoptions: 'zoBot', delta: 'deltaBot', mt5: 'mtBot' };
+    fetch('/api/bot_defaults').then(r => r.json()).then(function(res) {
+      if (!res || !res.success || !res.defaults) return;
+      Object.keys(prefix).forEach(function(botKey) {
+        const d = res.defaults[botKey]; if (!d) return;
+        const p = prefix[botKey];
+        function setV(id, v) { const el = document.getElementById(id); if (el && v != null) el.value = v; }
+        function setC(id, v) { const el = document.getElementById(id); if (el && v != null) el.checked = !!v; }
+        setV(p + 'SlPct', d.slPct);
+        setV(p + 'TpPct', d.tpPct);
+        setV(p + 'MaxConsec', d.maxConsec);
+        setV(p + 'MaxLoss', d.maxLoss);
+        setV(p + 'MaxProfit', d.maxProfit);
+        setV(p + 'MinScore', d.minScore);
+        setV(p + 'ScoreBuffer', d.scoreBuffer);
+        setV(p + 'Cooldown', d.cooldownSec);
+        setC(p + 'QualityFilter', d.qualityFilter);
+      });
+    }).catch(function() {});
+  })();
+
   // ---- Zerodha AI Bot Panel ----
   (function() {
     const panel    = document.getElementById('aiBotPanel');
@@ -20089,11 +20165,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     //      persisted in localStorage so the choice survives reloads.
     const incMMChk  = document.getElementById('aiBotIncludeMM');
     const incMMAChk = document.getElementById('aiBotIncludeMMA');
-    const INC_MM_KEY  = 'mangalview_aibot_inc_mm_v1';
-    const INC_MMA_KEY = 'mangalview_aibot_inc_mma_v1';
+    const INC_MM_KEY  = 'mangalview_aibot_inc_mm_v2';
+    const INC_MMA_KEY = 'mangalview_aibot_inc_mma_v2';
     try {
-      if (localStorage.getItem(INC_MM_KEY)  === '1') incMMChk.checked  = true;
-      if (localStorage.getItem(INC_MMA_KEY) === '1') incMMAChk.checked = true;
+      // honor saved value both ways; if unset, keep the HTML default (MM on)
+      const _mm = localStorage.getItem(INC_MM_KEY);  if (_mm  !== null) incMMChk.checked  = (_mm  === '1');
+      const _mma = localStorage.getItem(INC_MMA_KEY); if (_mma !== null) incMMAChk.checked = (_mma === '1');
     } catch(e) {}
     incMMChk.addEventListener('change',  function() { try { localStorage.setItem(INC_MM_KEY,  this.checked ? '1' : '0'); } catch(e) {} });
     incMMAChk.addEventListener('change', function() { try { localStorage.setItem(INC_MMA_KEY, this.checked ? '1' : '0'); } catch(e) {} });
@@ -20107,7 +20184,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function _mmaEnabled() { return !!incMMAChk.checked; }
 
     // ---- Configurable strategy checkboxes (extras on the always-on core) ----
-    const STRAT_KEY = 'mangalview_aibot_strategies_v1';
+    const STRAT_KEY = 'mangalview_aibot_strategies_v2';
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null');
@@ -20863,7 +20940,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // ---- Persistence (buyer/seller, strategies, MM) ----
-    const ZO_PREF = 'mangalview_zoptions_prefs_v1';
+    const ZO_PREF = 'mangalview_zoptions_prefs_v2';
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const p = JSON.parse(localStorage.getItem(ZO_PREF) || 'null');
@@ -21310,7 +21387,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function currentMode() { const r = document.querySelector('input[name="mtBotMode"]:checked'); return r ? r.value : 'paper'; }
 
-    const STRAT_KEY = 'mangalview_mt5_strategies_v1';
+    const STRAT_KEY = 'mangalview_mt5_strategies_v2';
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try { const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null'); if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; }); } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
@@ -21799,11 +21876,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // ---- Optional strategies (MM / MMA) for Delta — persisted in localStorage
     const dIncMMChk  = document.getElementById('deltaBotIncludeMM');
     const dIncMMAChk = document.getElementById('deltaBotIncludeMMA');
-    const D_INC_MM_KEY  = 'mangalview_delta_aibot_inc_mm_v1';
-    const D_INC_MMA_KEY = 'mangalview_delta_aibot_inc_mma_v1';
+    const D_INC_MM_KEY  = 'mangalview_delta_aibot_inc_mm_v2';
+    const D_INC_MMA_KEY = 'mangalview_delta_aibot_inc_mma_v2';
     try {
-      if (localStorage.getItem(D_INC_MM_KEY)  === '1') dIncMMChk.checked  = true;
-      if (localStorage.getItem(D_INC_MMA_KEY) === '1') dIncMMAChk.checked = true;
+      const _mm = localStorage.getItem(D_INC_MM_KEY);  if (_mm  !== null) dIncMMChk.checked  = (_mm  === '1');
+      const _mma = localStorage.getItem(D_INC_MMA_KEY); if (_mma !== null) dIncMMAChk.checked = (_mma === '1');
     } catch(e) {}
     dIncMMChk.addEventListener('change',  function() { try { localStorage.setItem(D_INC_MM_KEY,  this.checked ? '1' : '0'); } catch(e) {} });
     dIncMMAChk.addEventListener('change', function() { try { localStorage.setItem(D_INC_MMA_KEY, this.checked ? '1' : '0'); } catch(e) {} });
@@ -21817,7 +21894,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function _dMMAEnabled() { return !!dIncMMAChk.checked; }
 
     // ---- Configurable strategy checkboxes (extras on the always-on core) ----
-    const D_STRAT_KEY = 'mangalview_delta_aibot_strategies_v1';
+    const D_STRAT_KEY = 'mangalview_delta_aibot_strategies_v2';
     const dStratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const saved = JSON.parse(localStorage.getItem(D_STRAT_KEY) || 'null');
