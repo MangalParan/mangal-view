@@ -51,4 +51,6 @@ Trendline , patterns, fibonacci , short long positions
  9. fetch chart data from kite\
  10. implement all delta ai bot into zerodha ai bot
  11. Add download button for log.txt -done
-12. Add IST in log instead of UTC
+12. Add IST in log instead of UTC\
+
+13. default all strategies unselected

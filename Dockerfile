@@ -20,4 +20,8 @@ ENV DB_PATH=/data/users.db
 
 EXPOSE 8080
 
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+# Single worker keeps memory under Render's 512MB cap AND keeps the in-process
+# server-side bot state consistent (multiple workers = duplicated/!shared state).
+# Threads provide request concurrency. Do NOT add --max-requests: recycling the
+# worker would kill the running AI-bot threads.
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120

@@ -22,10 +22,11 @@ import functools
 from datetime import datetime, timedelta
 
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
+# scikit-learn is heavy (~100MB resident) and only used by the mpredict ML
+# forecaster (predict_next_candles). Import it lazily there so the web workers
+# don't each load it at startup — critical to stay under Render's 512MB cap.
 import websocket
-import yfinance as yf
+# yfinance imported lazily (it pulls in heavy pandas) — see fetch_nifty_data / api_search
 from curl_cffi import requests as cffi_requests
 
 from flask import Flask, jsonify, request, Response, redirect, session, g
@@ -4499,6 +4500,7 @@ def fetch_nifty_data(interval_key, symbol_key="NIFTY50"):
         yticker = sym["ticker"]
     else:
         yticker = symbol_key  # raw Yahoo Finance ticker
+    import yfinance as yf   # lazy: keeps pandas out of startup memory
     ticker = yf.Ticker(yticker)
     df = ticker.history(period=config["period"], interval=config["interval"])
 
@@ -10322,6 +10324,10 @@ def predict_next_candles(candles, interval="5m", n_predict=5):
     # Handle NaN/Inf
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Lazy import — keeps sklearn out of memory unless ML predictions are used.
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
@@ -10685,6 +10691,7 @@ def api_search():
     if "." not in q:
         candidates.append(q + ".NS")
         candidates.append(q + ".BO")
+    import yfinance as yf   # lazy: keeps pandas out of startup memory
     for cand in candidates:
         try:
             t = yf.Ticker(cand)
@@ -19115,7 +19122,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
       const now = new Date().toLocaleTimeString();
       logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
-      logEl.scrollTop = logEl.scrollHeight;
+      logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
     }
 
     // Start / Stop \u2014 separate buttons; one is always disabled depending on state
@@ -19991,6 +19998,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     loadWatch();
   })();
 
+  // Cap an on-screen bot log to the last `max` lines (default 200) so a panel
+  // left open for hours doesn't bloat the browser DOM. Each line is a direct
+  // child <span>; <br> separators are interleaved. Shared by all bot panels.
+  function _capLog(el, max) {
+    if (!el) return;
+    max = max || 200;
+    var kids = el.children, spanCount = 0;
+    for (var i = 0; i < kids.length; i++) if (kids[i].tagName === 'SPAN') spanCount++;
+    var toRemove = spanCount - max;
+    while (toRemove > 0 && el.firstChild) {
+      var node = el.firstChild;
+      var isSpan = node.nodeType === 1 && node.tagName === 'SPAN';
+      el.removeChild(node);
+      if (isSpan) toRemove--;
+    }
+  }
+
   // ---- Zerodha AI Bot Panel ----
   (function() {
     const panel    = document.getElementById('aiBotPanel');
@@ -20514,7 +20538,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         log.slice(lastRenderedLogLen).forEach(line => {
           logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>';
         });
-        logEl.scrollTop = logEl.scrollHeight;
+        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
         lastRenderedLogLen = log.length;
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
@@ -20644,7 +20668,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
       const now = new Date().toLocaleTimeString();
       logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
-      logEl.scrollTop = logEl.scrollHeight;
+      logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
       // log.txt persistence is opt-in via explicit persistLog() calls — only
       // trade events (entries, exits, live responses, circuit breakers,
       // start/stop) hit the file. Per-tick UI noise is excluded.
@@ -20831,7 +20855,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
       const now = new Date().toLocaleTimeString();
       logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
-      logEl.scrollTop = logEl.scrollHeight;
+      logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
     }
     function currentMode() {
       const r = document.querySelector('input[name="zoBotMode"]:checked');
@@ -21016,7 +21040,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
         log.slice(lastRenderedLogLen).forEach(line => { logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>'; });
-        logEl.scrollTop = logEl.scrollHeight; lastRenderedLogLen = log.length;
+        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200); lastRenderedLogLen = log.length;
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
       const legs = s.legs || [];
@@ -21282,7 +21306,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function logLine(msg, type) {
       const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
       logEl.innerHTML += '<br><span class="' + cls + '">[' + new Date().toLocaleTimeString() + '] ' + msg + '</span>';
-      logEl.scrollTop = logEl.scrollHeight;
+      logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
     }
     function currentMode() { const r = document.querySelector('input[name="mtBotMode"]:checked'); return r ? r.value : 'paper'; }
 
@@ -21405,7 +21429,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const log = s.log || [];
       if (log.length > lastRenderedLogLen) {
         log.slice(lastRenderedLogLen).forEach(line => { logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>'; });
-        logEl.scrollTop = logEl.scrollHeight; lastRenderedLogLen = log.length;
+        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200); lastRenderedLogLen = log.length;
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
       if (s.last_candles && s.last_candles.length && botCandleSeries) {
@@ -21875,7 +21899,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const cls = type === 'buy' ? 'log-buy' : type === 'sell' ? 'log-sell' : 'log-info';
       const now = new Date().toLocaleTimeString();
       logEl.innerHTML += '<br><span class="' + cls + '">[' + now + '] ' + msg + '</span>';
-      logEl.scrollTop = logEl.scrollHeight;
+      logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
       // log.txt persistence is opt-in via explicit persistLog() calls — only
       // trade events (entries, exits, live responses, circuit breakers,
       // start/stop) hit the file. Per-tick UI noise is excluded.
@@ -22128,7 +22152,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         fresh.forEach(line => {
           logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>';
         });
-        logEl.scrollTop = logEl.scrollHeight;
+        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
         lastRenderedLogLen = log.length;
       }
       // If the server cleared its buffer (e.g., new start), reset our cursor
