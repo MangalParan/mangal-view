@@ -1750,17 +1750,25 @@ def _bot_entry_quality(side, candles, regime, cfg):
 
 # Always-on reliable strategies (the "core") + the user-configurable opt-ins
 # exposed as checkboxes in both AI bot panels.
-_BOT_CORE_ALGOS         = ['trend', 'momentum', 'breakout', 'priceaction', 'smartmoney', 'orderflow']
-_BOT_CONFIGURABLE_ALGOS = ['mfactor', 'mstreet', 'sniper', 'scalping', 'quant', 'hybrid', 'mpredict', 'institution', 'statarb']
+_BOT_CORE_ALGOS         = ['trend', 'momentum', 'breakout', 'smartmoney', 'orderflow']
+_BOT_CONFIGURABLE_ALGOS = ['mfactor', 'mstreet', 'sniper', 'scalping', 'quant', 'hybrid', 'mpredict', 'institution', 'statarb', 'priceaction', 'claude']
 # Default opt-ins when a client doesn't send allowedStrategies (preserves the
 # pre-checkbox behaviour: the old always-on set minus sniper, which caused the
 # biggest losses, and mpredict, which is only a chart overlay).
 _BOT_DEFAULT_ALLOWED    = ['mfactor', 'mstreet', 'scalping', 'quant', 'hybrid', 'institution', 'statarb']
 
+def _bot_is_claude(cfg):
+    """True when the 'Claude AI' strategy is selected — Claude decides trades on
+    its own and NONE of the core/algo strategies are used."""
+    return 'claude' in (cfg.get('allowedStrategies') or [])
+
 def _bot_build_algos(cfg):
     """Candidate algo pool = always-on core + user-selected configurable
     strategies (+ MM/MMA opt-ins). 'mpredict' is dropped — it has no trading
-    signal (chart prediction overlay only), so it can never be active."""
+    signal (chart prediction overlay only). When Claude AI mode is on, NO algos
+    are computed (Claude trades independently)."""
+    if _bot_is_claude(cfg):
+        return []
     algos = list(_BOT_CORE_ALGOS)
     allowed = cfg.get('allowedStrategies')
     if allowed is None:
@@ -1770,7 +1778,50 @@ def _bot_build_algos(cfg):
             algos.append(s)
     if cfg.get('includeMM'):  algos.append('marketmaking')
     if cfg.get('includeMMA'): algos.append('mma')
-    return [a for a in algos if a != 'mpredict']
+    return [a for a in algos if a not in ('mpredict', 'claude')]
+
+def _claude_trade_signal(symbol, candles, tf, cfg):
+    """Autonomous Claude strategy: send recent OHLC to Claude and get a trade
+    decision. Returns {name:'claude', signal, score, reason}. Does not use any
+    of the core/algo strategies. Falls back to HOLD on any error / missing key."""
+    if not candles or len(candles) < 20:
+        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: not enough data'}
+    import json as _json, re as _re
+    recent = candles[-40:]
+    closes = [c['close'] for c in recent]
+    last   = closes[-1]
+    sma20  = sum(closes[-20:]) / 20.0
+    chg    = ((last - recent[0]['close']) / recent[0]['close'] * 100.0) if recent[0]['close'] else 0.0
+    hi     = max(c['high'] for c in recent)
+    lo     = min(c['low'] for c in recent)
+    ohlc   = [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5)] for c in recent]
+    min_enter = float(cfg.get('minScore', 4.0)) + float(cfg.get('scoreBuffer', 1.0) or 0)
+    system = (
+        "You are an autonomous intraday trading strategy. Decide the next action for the instrument from its recent "
+        "OHLC candles. Your ONLY goal is a HIGH WIN RATE with controlled risk — prefer HOLD unless there is a clear, "
+        "high-probability setup. Weigh trend, support/resistance, momentum, over-extension and mean reversion. Do NOT "
+        "rely on any external indicators or named strategies — use your own judgment from the price data. Respond with "
+        "STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<number -10..10>,\"reason\":\"<=140 chars\"}. "
+        "The score sign must match the signal (BUY positive, SELL negative, HOLD near 0). Only choose BUY or SELL when "
+        "your conviction |score| >= " + str(min_enter) + "."
+    )
+    user = _json.dumps({'symbol': symbol, 'tf': tf, 'lastPrice': round(last, 5), 'sma20': round(sma20, 5),
+                        'changePct': round(chg, 2), 'recentHigh': round(hi, 5), 'recentLow': round(lo, 5),
+                        'ohlc': ohlc})
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=300)
+    if err:
+        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:90]}
+    sig, score, reason = 'HOLD', 0.0, ''
+    try:
+        m = _re.search(r'\{.*\}', text or '', _re.DOTALL)
+        obj = _json.loads(m.group(0)) if m else {}
+        sig = str(obj.get('signal', 'HOLD')).upper()
+        if sig not in ('BUY', 'SELL', 'HOLD'): sig = 'HOLD'
+        score = float(obj.get('score', 0) or 0)
+        reason = str(obj.get('reason', ''))[:160]
+    except Exception:
+        sig, score, reason = 'HOLD', 0.0, 'parse error: ' + (text or '')[:80]
+    return {'name': 'claude', 'signal': sig, 'score': score, 'reason': 'Claude: ' + reason}
 
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
@@ -1911,7 +1962,7 @@ def _delta_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _bot_select_strategy(regime, summaries, cfg)
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, summaries, cfg)
     mode   = cfg.get('mode', 'paper')
 
     # --- LIVE mode: pull authoritative position/P&L from Delta ---
@@ -2008,7 +2059,7 @@ def _delta_bot_tick():
                     _bot_log('[Tick] [delta] {} {} skipped — cooldown {}s after last exit'.format(
                         symbol, strat['signal'], cooldown))
                 else:
-                    ok, qreason = _bot_entry_quality(strat['signal'], candles, regime, cfg)
+                    ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _delta_bot_open(strat['signal'], price, strat, mode)
                     else:
@@ -2232,7 +2283,7 @@ def delta_aibot_chat():
         "The bot scores several algos each tick and trades the strongest signal that passes a quality gate. "
         "Your single goal: help the user reach a SUSTAINED win rate above 80% while protecting capital. "
         "Be concise and concrete. Prefer fewer, higher-conviction trades. The active strategy pool is an "
-        "always-on core (trend, momentum, breakout, price-action, smart-money, order-flow) PLUS the user-selected "
+        "always-on core (trend, momentum, breakout, smart-money, order-flow) PLUS the user-selected "
         "strategies in config.allowedStrategies (panel checkboxes) — only those compete to be the active strategy. "
         "'sniper' is off by default (it chased extended moves and caused the biggest past losses); 'mpredict' is a "
         "chart overlay that does not trade. You cannot change which strategies are enabled — only the user can.\n\n"
@@ -2477,7 +2528,7 @@ def _zd_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _bot_select_strategy(regime, summaries, cfg)
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, summaries, cfg)
     mode   = cfg.get('mode', 'paper')
 
     with zd_ai_lock:
@@ -2518,7 +2569,7 @@ def _zd_bot_tick():
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _zd_log('[Tick] {} {} skipped — cooldown {}s after last exit'.format(symbol, strat['signal'], cooldown))
                 else:
-                    ok, qreason = _bot_entry_quality(strat['signal'], candles, regime, cfg)
+                    ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _zd_bot_open(strat['signal'], price, strat, mode)
                     else:
@@ -2692,7 +2743,7 @@ def zd_aibot_chat():
         "equities, index/stock F&O and MCX commodities. The bot scores several algos each tick and trades "
         "the strongest signal that passes a quality gate. Your single goal: help the user reach a SUSTAINED "
         "win rate above 80% while protecting capital. Be concise and concrete. Prefer fewer, higher-conviction "
-        "trades. The active strategy pool is an always-on core (trend, momentum, breakout, price-action, "
+        "trades. The active strategy pool is an always-on core (trend, momentum, breakout, "
         "smart-money, order-flow) PLUS the user-selected strategies in config.allowedStrategies (panel checkboxes) "
         "— only those compete to be the active strategy. 'sniper' is off by default (it chased extended moves and "
         "caused the biggest past losses); 'mpredict' is a chart overlay that does not trade. You cannot change "
@@ -2883,7 +2934,7 @@ def _zo_bot_tick():
             _zo_log('[Tick] no Kite candles for ' + symbol); continue
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
-        strat  = _bot_select_strategy(regime, data.get('signalSummary') or {}, cfg)
+        strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, data.get('signalSummary') or {}, cfg)
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
@@ -2919,7 +2970,7 @@ def _zo_bot_tick():
                     if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                         _zo_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, open_side, cooldown))
                     else:
-                        ok, qreason = _bot_entry_quality(open_side, candles, regime, cfg)
+                        ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(open_side, candles, regime, cfg)
                         if ok:
                             _zo_open_leg(leg, open_side, price, strat, cfg, mode)
                         else:
@@ -3114,7 +3165,7 @@ def zo_aibot_chat():
         "LONG on a BUY signal (exit SELL); in Option Seller mode it opens a SHORT on a SELL signal (exit BUY); with "
         "both enabled it can do either. Your single goal: help reach a SUSTAINED win rate above 80% while protecting "
         "capital — option selling has large/undefined risk, so be conservative. Be concise and concrete. The active "
-        "strategy pool is a core (trend, momentum, breakout, price-action, smart-money, order-flow) PLUS the "
+        "strategy pool is a core (trend, momentum, breakout, smart-money, order-flow) PLUS the "
         "user-selected strategies in config.allowedStrategies; you cannot change which strategies/legs are enabled.\n\n"
         "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
         "minScore, scoreBuffer, cooldownSec, qualityFilter, includeMM, includeMMA. You CANNOT change the option "
@@ -3378,7 +3429,7 @@ def _mt_bot_tick():
         return
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _bot_select_strategy(regime, summaries, cfg)
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, summaries, cfg)
     mode   = cfg.get('mode', 'paper')
     with mt_ai_lock:
         mt_ai_state['last_candles'] = candles[-150:]
@@ -3417,7 +3468,7 @@ def _mt_bot_tick():
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _mt_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, strat['signal'], cooldown))
                 else:
-                    ok, qreason = _bot_entry_quality(strat['signal'], candles, regime, cfg)
+                    ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _mt_bot_open(strat['signal'], price, strat, mode)
                     else:
@@ -3588,7 +3639,7 @@ def mt_aibot_chat():
         "You are the strategy co-pilot for a server-side MetaTrader 5 (forex/CFD/metals) trading bot. It scores "
         "several algos each tick and trades the strongest signal that passes a quality gate. Your single goal: help "
         "the user reach a SUSTAINED win rate above 80% while protecting capital. Be concise and concrete. The active "
-        "strategy pool is a core (trend, momentum, breakout, price-action, smart-money, order-flow) PLUS the "
+        "strategy pool is a core (trend, momentum, breakout, smart-money, order-flow) PLUS the "
         "user-selected strategies in config.allowedStrategies; you cannot change which strategies are enabled.\n\n"
         "You may propose changes to these tunable settings ONLY: slPct, tpPct, maxConsec, maxLoss, maxProfit, "
         "minScore, scoreBuffer, cooldownSec, qualityFilter, includeMM, includeMMA. You CANNOT change symbol, qty, "
@@ -3614,6 +3665,42 @@ def mt_aibot_chat():
     safe_patch, rejected = _sanitize_delta_patch(patch) if patch else ({}, [])
     return jsonify({'success': True, 'reply': clean_text or text,
                     'configPatch': safe_patch or None, 'summary': summary, 'rejected': rejected})
+
+# --- Manual SL/TP adjustment for the open position (chart drag) --------------
+def _update_levels(state, lock, log_fn, persist_tag, ndigits):
+    """Set the open position's sl/tp from a request. Honored by the next tick."""
+    data = request.json or {}
+    with lock:
+        pos = state.get('position')
+        if not pos:
+            return jsonify({'success': False, 'error': 'No open position'}), 400
+        changed = []
+        if data.get('sl') is not None:
+            try: pos['sl'] = round(float(data['sl']), ndigits); changed.append('SL=' + str(pos['sl']))
+            except (TypeError, ValueError): pass
+        if data.get('tp') is not None:
+            try: pos['tp'] = round(float(data['tp']), ndigits); changed.append('TP=' + str(pos['tp']))
+            except (TypeError, ValueError): pass
+        sl, tp = pos.get('sl'), pos.get('tp')
+    if changed:
+        log_fn('[Levels] Manual ' + ', '.join(changed))
+        _persist_log_line('[' + persist_tag + '] [Levels] ' + ', '.join(changed))
+    return jsonify({'success': True, 'sl': sl, 'tp': tp})
+
+@app.route('/api/aibot/zerodha/update_levels', methods=['POST'])
+@login_required
+def zd_update_levels():
+    return _update_levels(zd_ai_state, zd_ai_lock, _zd_log, 'ZERODHA', 2)
+
+@app.route('/api/aibot/delta/update_levels', methods=['POST'])
+@login_required
+def delta_update_levels():
+    return _update_levels(delta_ai_state, delta_ai_lock, _bot_log, 'DELTA', 4)
+
+@app.route('/api/aibot/mt5/update_levels', methods=['POST'])
+@login_required
+def mt_update_levels():
+    return _update_levels(mt_ai_state, mt_ai_lock, _mt_log, 'MT5', 5)
 
 @app.route('/api/aibot/log_append', methods=['POST'])
 @login_required
@@ -14160,12 +14247,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
           <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
           <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
+          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
+          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
           <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
         <label title="Mean-reversion bid-ask Market Making strategy. Best in range/sideways markets."><input type="checkbox" id="aiBotIncludeMM" checked> Market Making</label>
         <label title="Advanced Market Making with spread analysis. Best in range markets with stable volatility."><input type="checkbox" id="aiBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
 
       <!-- Risk controls -->
@@ -14179,6 +14268,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
+        <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="aiBotMovable"> Movable TP/SL</label>
       </div>
 
       <!-- Control buttons -->
@@ -14342,12 +14432,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
           <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
           <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
+          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
+          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
           <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
         <label title="Market Making — range markets"><input type="checkbox" id="mtBotIncludeMM" checked> Market Making</label>
         <label title="MM Advanced"><input type="checkbox" id="mtBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
 
       <div class="ai-risk-bar">
@@ -14360,6 +14452,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering">Cooldown s: <input type="number" id="mtBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="mtBotQualityFilter" checked> Quality filter</label>
+        <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
       </div>
 
       <div class="zd-footer">
@@ -14468,12 +14561,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
           <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
           <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
+          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
+          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
           <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
         <label title="Mean-reversion bid-ask Market Making. Best in range/sideways crypto."><input type="checkbox" id="deltaBotIncludeMM" checked> Market Making</label>
         <label title="Advanced Market Making with spread analysis."><input type="checkbox" id="deltaBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
 
       <div class="ai-risk-bar">
@@ -14486,6 +14581,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
+        <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
       </div>
 
       <div class="zd-footer">
@@ -14617,12 +14713,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
           <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
           <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
+          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
+          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
           <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
           <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
         </span>
         <label title="Market Making — range markets"><input type="checkbox" id="zoBotIncludeMM" checked> Market Making</label>
         <label title="MM Advanced"><input type="checkbox" id="zoBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/price-action/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
       </div>
 
       <div class="ai-risk-bar">
@@ -20065,6 +20163,70 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
   }
 
+  // Draw + manage the 4 price lines on a bot chart (current=blue, entry=yellow,
+  // TP=green, SL=red) and make TP/SL draggable when the Movable checkbox is on.
+  // On drag-end it POSTs the new level to `endpoint`, which updates the live bot.
+  function _botPriceLines(chart, series, container, movableChk, endpoint, logFn) {
+    if (!chart || !series || !container) return { update: function(){} };
+    const LS = (typeof LightweightCharts !== 'undefined' && LightweightCharts.LineStyle) ? LightweightCharts.LineStyle.Solid : 0;
+    const lines = { cur: null, entry: null, tp: null, sl: null };
+    let drag = null, pending = { tp: null, sl: null }, lastPos = null;
+    function rm(k){ if (lines[k]) { try { series.removePriceLine(lines[k]); } catch(e){} lines[k] = null; } }
+    function setLine(k, price, color, title) {
+      if (price == null || isNaN(price)) { rm(k); return; }
+      if (lines[k]) lines[k].applyOptions({ price: price });
+      else lines[k] = series.createPriceLine({ price: price, color: color, lineWidth: 2, lineStyle: LS, axisLabelVisible: true, title: title });
+    }
+    function update(state) {
+      lastPos = state.position || null;
+      setLine('cur', state.current, '#2962ff', 'Price');
+      if (lastPos) {
+        setLine('entry', lastPos.entryPrice, '#f0b429', 'Entry');
+        setLine('tp', (drag === 'tp' ? pending.tp : lastPos.tp), '#26a69a', 'TP');
+        setLine('sl', (drag === 'sl' ? pending.sl : lastPos.sl), '#ef5350', 'SL');
+      } else { rm('entry'); rm('tp'); rm('sl'); }
+    }
+    function near(y, price) { const c = series.priceToCoordinate(price); return c != null && Math.abs(c - y) <= 6; }
+    container.addEventListener('mousedown', function(e) {
+      if (!movableChk || !movableChk.checked || !lastPos) return;
+      const y = e.clientY - container.getBoundingClientRect().top;
+      if (lastPos.tp != null && near(y, lastPos.tp)) drag = 'tp';
+      else if (lastPos.sl != null && near(y, lastPos.sl)) drag = 'sl';
+      else return;
+      pending.tp = lastPos.tp; pending.sl = lastPos.sl;
+      chart.applyOptions({ handleScroll: false, handleScale: false });
+      container.style.cursor = 'ns-resize';
+      e.preventDefault(); e.stopPropagation();
+    });
+    document.addEventListener('mousemove', function(e) {
+      if (!drag) return;
+      const p = series.coordinateToPrice(e.clientY - container.getBoundingClientRect().top);
+      if (p == null) return;
+      pending[drag] = p;
+      if (lines[drag]) lines[drag].applyOptions({ price: p });
+    });
+    document.addEventListener('mouseup', function() {
+      if (!drag) return;
+      const moved = drag, val = pending[drag];
+      drag = null;
+      chart.applyOptions({ handleScroll: true, handleScale: true });
+      container.style.cursor = '';
+      if (val == null || !lastPos) return;
+      const body = {}; body[moved] = val;
+      fetch(endpoint, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+        .then(r => r.json()).then(res => {
+          if (res.success) {
+            if (res.tp != null && lastPos) lastPos.tp = res.tp;
+            if (res.sl != null && lastPos) lastPos.sl = res.sl;
+            if (lines.tp && res.tp != null) lines.tp.applyOptions({ price: res.tp });
+            if (lines.sl && res.sl != null) lines.sl.applyOptions({ price: res.sl });
+            if (logFn) logFn('[Levels] ' + moved.toUpperCase() + ' moved to ' + (moved === 'tp' ? res.tp : res.sl), 'info');
+          } else if (logFn) logFn('[Levels] update failed: ' + (res.error || 'unknown'), 'info');
+        }).catch(() => { if (logFn) logFn('[Levels] update request error', 'info'); });
+    });
+    return { update: update };
+  }
+
   // Apply per-bot default panel values from default.csv (via /api/bot_defaults).
   // These set the INITIAL field values on load; the user can still edit them and
   // the edited values are what's sent on Start. While a bot is running, its live
@@ -20121,6 +20283,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('aiBotScoreBuffer');
     const cooldownEl  = document.getElementById('aiBotCooldown');
     const qualityChk  = document.getElementById('aiBotQualityFilter');
+    const movableChk  = document.getElementById('aiBotMovable');
+    let priceLines = null;
     const startBtn = document.getElementById('aiBotStartBtn');
     const pauseBtn = document.getElementById('aiBotPauseBtn');
     const stopBtn  = document.getElementById('aiBotStopBtn');
@@ -20310,6 +20474,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (botChart) botChart.timeScale().fitContent();
         const lc = d.candles[d.candles.length - 1];
         if (lc && lc.close != null) updatePriceOverlay(lc.close);
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/zerodha/update_levels', logLine);
+        if (priceLines && lc && lc.close != null) priceLines.update({ current: lc.close, position: null });
         logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + sym + ' (source: ' + (d.data_source || src) + ')', 'info');
       }).catch(function() {
         logLine('[Chart] Fetch failed for ' + sym, 'info');
@@ -20624,6 +20790,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const lc = s.last_candles[s.last_candles.length - 1];
         if (lc && lc.close != null) updatePriceOverlay(lc.close);
       }
+      if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/zerodha/update_levels', logLine);
+      if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       const lt = s.last_tick || {};
       if (lt.strategy) {
         stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']';
@@ -21364,6 +21532,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('mtBotScoreBuffer');
     const cooldownEl = document.getElementById('mtBotCooldown');
     const qualityChk = document.getElementById('mtBotQualityFilter');
+    const movableChk = document.getElementById('mtBotMovable');
+    let priceLines = null;
     const incMMChk = document.getElementById('mtBotIncludeMM');
     const incMMAChk = document.getElementById('mtBotIncludeMMA');
     const startBtn = document.getElementById('mtBotStartBtn');
@@ -21465,6 +21635,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (botCandleSeries) botCandleSeries.setData(d.candles);
         if (botChart) botChart.timeScale().fitContent();
         const lc = d.candles[d.candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/mt5/update_levels', logLine);
+        if (priceLines && lc && lc.close != null) priceLines.update({ current: lc.close, position: null });
         logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + sym + ' (' + (d.data_source || 'mt5') + ')', 'info');
       }).catch(() => logLine('[Chart] Fetch failed for ' + sym, 'info'));
     }
@@ -21512,6 +21684,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         botCandleSeries.setData(s.last_candles);
         const lc = s.last_candles[s.last_candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
       }
+      if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/mt5/update_levels', logLine);
+      if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       const lt = s.last_tick || {};
       if (lt.strategy) { stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']'; stratEl.className = 'val ' + (lt.signal === 'BUY' ? 'bull' : lt.signal === 'SELL' ? 'bear' : ''); }
       if (lt.regime) regimeEl.textContent = lt.regime;
@@ -21758,6 +21932,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('deltaBotScoreBuffer');
     const cooldownEl  = document.getElementById('deltaBotCooldown');
     const qualityChk  = document.getElementById('deltaBotQualityFilter');
+    const movableChk  = document.getElementById('deltaBotMovable');
+    let priceLines = null;
     const startBtn = document.getElementById('deltaBotStartBtn');
     const pauseBtn = document.getElementById('deltaBotPauseBtn');
     const stopBtn  = document.getElementById('deltaBotStopBtn');
@@ -21866,6 +22042,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (botChart) botChart.timeScale().fitContent();
         const lc = d.candles[d.candles.length - 1];
         if (lc && lc.close != null) updatePriceOverlay(lc.close);
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/delta/update_levels', logLine);
+        if (priceLines && lc && lc.close != null) priceLines.update({ current: lc.close, position: null });
         logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' Delta candles for ' + sym +
                 (d.data_source ? ' (' + d.data_source + ')' : ''), 'info');
       }).catch(() => logLine('[Chart] Delta fetch failed for ' + sym, 'info'));
@@ -22240,6 +22418,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const lc = s.last_candles[s.last_candles.length - 1];
         if (lc && lc.close != null) updatePriceOverlay(lc.close);
       }
+      if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/delta/update_levels', logLine);
+      if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       // Strategy / regime
       const lt = s.last_tick || {};
       if (lt.strategy) {
