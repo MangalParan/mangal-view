@@ -20224,7 +20224,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           } else if (logFn) logFn('[Levels] update failed: ' + (res.error || 'unknown'), 'info');
         }).catch(() => { if (logFn) logFn('[Levels] update request error', 'info'); });
     });
-    return { update: update };
+    function clear(){ rm('cur'); rm('entry'); rm('tp'); rm('sl'); lastPos = null; }
+    return { update: update, clear: clear };
   }
 
   // Apply per-bot default panel values from default.csv (via /api/bot_defaults).
@@ -20470,11 +20471,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
           logLine('[Chart] No Kite candles for ' + sym + '. Check symbol/exchange and that Zerodha is connected.', 'info');
           return;
         }
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/zerodha/update_levels', logLine);
+        if (priceLines) priceLines.clear();   // drop stale lines so they don't pin the old price scale
         if (botCandleSeries) botCandleSeries.setData(d.candles);
-        if (botChart) botChart.timeScale().fitContent();
+        if (botChart) { botChart.timeScale().fitContent(); try { botChart.priceScale('right').applyOptions({ autoScale: true }); } catch(e){} }
         const lc = d.candles[d.candles.length - 1];
         if (lc && lc.close != null) updatePriceOverlay(lc.close);
-        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/zerodha/update_levels', logLine);
         if (priceLines && lc && lc.close != null) priceLines.update({ current: lc.close, position: null });
         logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + sym + ' (source: ' + (d.data_source || src) + ')', 'info');
       }).catch(function() {
@@ -20785,13 +20787,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         lastRenderedLogLen = log.length;
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
-      if (s.last_candles && s.last_candles.length && botCandleSeries) {
-        botCandleSeries.setData(s.last_candles);
-        const lc = s.last_candles[s.last_candles.length - 1];
-        if (lc && lc.close != null) updatePriceOverlay(lc.close);
+      const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
+      const _viewSym = symEl.value.trim().toUpperCase();
+      if (!_botSym || _viewSym === _botSym) {   // don't clobber a chart you've loaded for a different symbol
+        if (s.last_candles && s.last_candles.length && botCandleSeries) {
+          botCandleSeries.setData(s.last_candles);
+          const lc = s.last_candles[s.last_candles.length - 1];
+          if (lc && lc.close != null) updatePriceOverlay(lc.close);
+        }
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/zerodha/update_levels', logLine);
+        if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       }
-      if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/zerodha/update_levels', logLine);
-      if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       const lt = s.last_tick || {};
       if (lt.strategy) {
         stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']';
@@ -21632,10 +21638,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (!d.candles || !d.candles.length) {
           logLine('[Chart] No MT5 candles for ' + sym + ' (' + (d.data_source || 'mt5') + '). Connect MT5 and set MT5_BACKEND.', 'info'); return;
         }
-        if (botCandleSeries) botCandleSeries.setData(d.candles);
-        if (botChart) botChart.timeScale().fitContent();
-        const lc = d.candles[d.candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
         if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/mt5/update_levels', logLine);
+        if (priceLines) priceLines.clear();   // drop stale lines so they don't pin the old price scale
+        if (botCandleSeries) botCandleSeries.setData(d.candles);
+        if (botChart) { botChart.timeScale().fitContent(); try { botChart.priceScale('right').applyOptions({ autoScale: true }); } catch(e){} }
+        const lc = d.candles[d.candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
         if (priceLines && lc && lc.close != null) priceLines.update({ current: lc.close, position: null });
         logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + sym + ' (' + (d.data_source || 'mt5') + ')', 'info');
       }).catch(() => logLine('[Chart] Fetch failed for ' + sym, 'info'));
@@ -21680,12 +21687,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200); lastRenderedLogLen = log.length;
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
-      if (s.last_candles && s.last_candles.length && botCandleSeries) {
-        botCandleSeries.setData(s.last_candles);
-        const lc = s.last_candles[s.last_candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
+      const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
+      const _viewSym = symEl.value.trim().toUpperCase();
+      if (!_botSym || _viewSym === _botSym) {   // don't clobber a chart you've loaded for a different symbol
+        if (s.last_candles && s.last_candles.length && botCandleSeries) {
+          botCandleSeries.setData(s.last_candles);
+          const lc = s.last_candles[s.last_candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
+        }
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/mt5/update_levels', logLine);
+        if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       }
-      if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/mt5/update_levels', logLine);
-      if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       const lt = s.last_tick || {};
       if (lt.strategy) { stratEl.textContent = lt.strategy + ' [' + (lt.signal || 'HOLD') + ']'; stratEl.className = 'val ' + (lt.signal === 'BUY' ? 'bull' : lt.signal === 'SELL' ? 'bear' : ''); }
       if (lt.regime) regimeEl.textContent = lt.regime;
@@ -22038,11 +22049,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                   ' &mdash; verified working symbols: <code>BTCUSD</code>, <code>ETHUSD</code>, <code>SOLUSD</code> on Delta India; <code>BTCUSDT</code>, <code>ETHUSDT</code> on Delta Global. Check the Delta web app for your exact symbol.', 'info');
           return;
         }
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/delta/update_levels', logLine);
+        if (priceLines) priceLines.clear();   // drop stale lines so they don't pin the old price scale
         if (botCandleSeries) botCandleSeries.setData(d.candles);
-        if (botChart) botChart.timeScale().fitContent();
+        if (botChart) { botChart.timeScale().fitContent(); try { botChart.priceScale('right').applyOptions({ autoScale: true }); } catch(e){} }
         const lc = d.candles[d.candles.length - 1];
         if (lc && lc.close != null) updatePriceOverlay(lc.close);
-        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/delta/update_levels', logLine);
         if (priceLines && lc && lc.close != null) priceLines.update({ current: lc.close, position: null });
         logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' Delta candles for ' + sym +
                 (d.data_source ? ' (' + d.data_source + ')' : ''), 'info');
@@ -22413,13 +22425,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
 
       // Chart from server's last candles
-      if (s.last_candles && s.last_candles.length && botCandleSeries) {
-        botCandleSeries.setData(s.last_candles);
-        const lc = s.last_candles[s.last_candles.length - 1];
-        if (lc && lc.close != null) updatePriceOverlay(lc.close);
+      const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
+      const _viewSym = symEl.value.trim().toUpperCase();
+      if (!_botSym || _viewSym === _botSym) {   // don't clobber a chart you've loaded for a different symbol
+        if (s.last_candles && s.last_candles.length && botCandleSeries) {
+          botCandleSeries.setData(s.last_candles);
+          const lc = s.last_candles[s.last_candles.length - 1];
+          if (lc && lc.close != null) updatePriceOverlay(lc.close);
+        }
+        if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/delta/update_levels', logLine);
+        if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       }
-      if (!priceLines && botChart && botCandleSeries) priceLines = _botPriceLines(botChart, botCandleSeries, chartDiv, movableChk, '/api/aibot/delta/update_levels', logLine);
-      if (priceLines) priceLines.update({ current: ((s.last_tick||{}).price != null ? s.last_tick.price : (s.last_candles && s.last_candles.length ? s.last_candles[s.last_candles.length-1].close : null)), position: s.position });
       // Strategy / regime
       const lt = s.last_tick || {};
       if (lt.strategy) {
