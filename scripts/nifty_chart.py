@@ -1869,9 +1869,9 @@ def _delta_bot_open(side, price, strat, mode):
         'strategy': strat['name'], 'mode': mode,
     }
     tag  = '[DELTA-' + mode.upper() + ']'
-    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
         tag, side, qty, cfg['symbol'], price, round(sl, 4), round(tp, 4),
-        strat['name'], strat['score'])
+        strat['name'], strat['score'], strat.get('reason', ''))
     _bot_log(line)
     _persist_log_line('[DELTA] ' + line)
     if mode == 'live':
@@ -2075,8 +2075,8 @@ def _delta_bot_tick():
             if reason:
                 _delta_bot_close(price, reason, mode)
             else:
-                _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={} score={:.1f})'.format(
-                    symbol, price, pos['side'], pos['entryPrice'], strat['name'], strat['score']))
+                _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
+                    symbol, price, pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 # Re-entry cooldown: avoid whipsaw churn right after an exit
@@ -2129,7 +2129,7 @@ def delta_aibot_start():
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 200) or 200),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
-            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'qualityFilter': bool(data.get('qualityFilter', True)),
@@ -2437,9 +2437,9 @@ def _zd_bot_open(side, price, strat, mode):
         'strategy': strat['name'], 'mode': mode,
     }
     tag  = '[' + mode.upper() + ']'
-    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
         tag, side, qty, cfg['symbol'], round(price, 2), round(sl, 2), round(tp, 2),
-        strat['name'], strat['score'])
+        strat['name'], strat['score'], strat.get('reason', ''))
     _zd_log(line)
     _persist_log_line('[ZERODHA] ' + line)
     if mode == 'live':
@@ -2584,8 +2584,8 @@ def _zd_bot_tick():
             if reason:
                 _zd_bot_close(price, reason, mode)
             else:
-                _zd_log('[Tick] {} price={} (in position {} from {}, strat={} score={:.1f})'.format(
-                    symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score']))
+                _zd_log('[Tick] {} price={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
+                    symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -2632,7 +2632,7 @@ def zd_aibot_start():
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
-            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'qualityFilter': bool(data.get('qualityFilter', True)),
@@ -2881,9 +2881,9 @@ def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
         'strategy': strat['name'], 'mode': mode,
     }
     kind = 'BUY-to-open (long)' if is_long else 'SELL-to-open (short)'
-    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
         mode.upper(), kind, qty, leg['symbol'], round(price, 2),
-        round(sl, 2), round(tp, 2), strat['name'], strat['score'])
+        round(sl, 2), round(tp, 2), strat['name'], strat['score'], strat.get('reason', ''))
     _zo_log(line)
     _persist_log_line('[ZOPTIONS] ' + line)
     if mode == 'live':
@@ -2981,8 +2981,8 @@ def _zo_bot_tick():
                 if reason:
                     _zo_close_leg(leg, price, reason, cfg, mode)
                 else:
-                    _zo_log('[Tick] {} px={} (in {} from {}, strat={} score={:.1f})'.format(
-                        symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score']))
+                    _zo_log('[Tick] {} px={} (in {} from {}, strat={} score={:.1f}) — {}'.format(
+                        symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
             else:
                 open_side = None
                 if sig == 'BUY' and buyer:    open_side = 'BUY'    # long the option
@@ -3052,7 +3052,7 @@ def zo_aibot_start():
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
-            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'qualityFilter': bool(data.get('qualityFilter', True)),
@@ -3388,9 +3388,9 @@ def _mt_bot_open(side, price, strat, mode):
         'qty': qty, 'sl': round(sl, 5), 'tp': round(tp, 5),
         'strategy': strat['name'], 'mode': mode,
     }
-    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}'.format(
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
         mode.upper(), side, qty, cfg['symbol'], round(price, 5),
-        round(sl, 5), round(tp, 5), strat['name'], strat['score'])
+        round(sl, 5), round(tp, 5), strat['name'], strat['score'], strat.get('reason', ''))
     _mt_log(line)
     _persist_log_line('[MT5] ' + line)
     if mode == 'live':
@@ -3480,8 +3480,8 @@ def _mt_bot_tick():
             if reason:
                 _mt_bot_close(price, reason, mode)
             else:
-                _mt_log('[Tick] {} px={} (in position {} from {}, strat={} score={:.1f})'.format(
-                    symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name'], strat['score']))
+                _mt_log('[Tick] {} px={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
+                    symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -3527,7 +3527,7 @@ def mt_aibot_start():
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
-            'minScore':   float(data.get('minScore', 4.0) or 4.0),
+            'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'qualityFilter': bool(data.get('qualityFilter', True)),
@@ -14276,8 +14276,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
-        <label title="Min algo score to enter">Min score: <input type="number" id="aiBotMinScore" value="4.0" min="0.5" step="0.1"></label>
-        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
+        <label title="Min algo score to enter">Min score: <input type="number" id="aiBotMinScore" value="0" min="0" step="0.1"></label>
+        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="aiBotMovable"> Movable TP/SL</label>
@@ -14449,8 +14449,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="mtBotMaxConsec" value="3" min="1"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Max daily loss: <input type="number" id="mtBotMaxLoss" value="2000" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
-        <label title="Min algo score to enter">Min score: <input type="number" id="mtBotMinScore" value="4.0" min="0.5" step="0.1"></label>
-        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
+        <label title="Min algo score to enter">Min score: <input type="number" id="mtBotMinScore" value="0" min="0" step="0.1"></label>
+        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering">Cooldown s: <input type="number" id="mtBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="mtBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
@@ -14567,8 +14567,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>Max consec losses: <input type="number" id="deltaBotMaxConsec" value="3" min="1"></label>
         <label>Max daily loss: <input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
-        <label>Min score: <input type="number" id="deltaBotMinScore" value="4.0" min="0.5" step="0.1"></label>
-        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
+        <label>Min score: <input type="number" id="deltaBotMinScore" value="0" min="0" step="0.1"></label>
+        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
@@ -14708,8 +14708,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="zoBotMaxConsec" value="3" min="1"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="zoBotMaxLoss" value="2000" min="100"></label>
         <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
-        <label title="Min algo score to enter">Min score: <input type="number" id="zoBotMinScore" value="4.0" min="0.5" step="0.1"></label>
-        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="zoBotScoreBuffer" value="1.0" min="0" step="0.1"></label>
+        <label title="Min algo score to enter">Min score: <input type="number" id="zoBotMinScore" value="0" min="0" step="0.1"></label>
+        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="zoBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering that leg">Cooldown s: <input type="number" id="zoBotCooldown" value="60" min="0" step="5"></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="zoBotQualityFilter" checked> Quality filter</label>
       </div>
@@ -20822,7 +20822,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxConsec:   parseInt(maxConsecEl.value) || 3,
         maxLoss:     parseFloat(maxLossEl.value) || 2000,
         maxProfit:   parseFloat(maxProfitEl.value) || 0,
-        minScore:    parseFloat(minScoreEl.value) || 4.0,
+        minScore:    (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0,
         qualityFilter: !!qualityChk.checked,
@@ -21317,7 +21317,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxConsec: parseInt(maxConsecEl.value) || 3,
         maxLoss: parseFloat(maxLossEl.value) || 2000,
         maxProfit: parseFloat(maxProfitEl.value) || 0,
-        minScore: parseFloat(minScoreEl.value) || 4.0,
+        minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0,
         qualityFilter: !!qualityChk.checked,
@@ -21697,7 +21697,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         symbol: sym, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
         slPct: parseFloat(slPctEl.value) || 1.0, tpPct: parseFloat(tpPctEl.value) || 2.0,
         maxConsec: parseInt(maxConsecEl.value) || 3, maxLoss: parseFloat(maxLossEl.value) || 2000,
-        maxProfit: parseFloat(maxProfitEl.value) || 0, minScore: parseFloat(minScoreEl.value) || 4.0,
+        maxProfit: parseFloat(maxProfitEl.value) || 0, minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, qualityFilter: !!qualityChk.checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
@@ -22460,7 +22460,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxConsec:  parseInt(maxConsecEl.value) || 3,
         maxLoss:    parseFloat(maxLossEl.value) || 200,
         maxProfit:  parseFloat(maxProfitEl.value) || 0,
-        minScore:   parseFloat(minScoreEl.value) || 4.0,
+        minScore:   (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0,
         qualityFilter: !!qualityChk.checked,
