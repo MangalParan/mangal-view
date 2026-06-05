@@ -1805,62 +1805,105 @@ def _bot_build_algos(cfg):
     if cfg.get('includeMMA'): algos.append('mma')
     return [a for a in algos if a not in ('mpredict', 'claude')]
 
-def _claude_trade_signal(symbol, candles, tf, cfg):
-    """Autonomous Claude strategy: send recent OHLC to Claude and get a trade
-    decision. Returns {name:'claude', signal, score, reason}. Does not use any
-    of the core/algo strategies. Falls back to HOLD on any error / missing key."""
+def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None):
+    """Autonomous Claude strategy. Sends recent OHLCV plus market context (multi-
+    window trend, volume/liquidity, volatility), the CURRENT position (so it
+    doesn't whipsaw) and recent closed trades (so it learns) and gets a decision.
+    Returns {name:'claude', signal, score, reason, slPct?, tpPct?}. HOLD on error."""
     if not candles or len(candles) < 20:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: not enough data'}
     import json as _json, re as _re
-    recent = candles[-40:]
-    closes = [c['close'] for c in recent]
+    win    = candles[-60:]
+    closes = [c['close'] for c in win]
+    vols   = [float(c.get('volume', 0) or 0) for c in win]
     last   = closes[-1]
-    sma20  = sum(closes[-20:]) / 20.0
-    chg    = ((last - recent[0]['close']) / recent[0]['close'] * 100.0) if recent[0]['close'] else 0.0
-    hi     = max(c['high'] for c in recent)
-    lo     = min(c['low'] for c in recent)
-    ohlc   = [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5)] for c in recent]
+    def _sma(n): return sum(closes[-n:]) / n if len(closes) >= n else (sum(closes) / len(closes))
+    sma10, sma20, sma50 = _sma(10), _sma(20), _sma(50)
+    trend_short = ((closes[-1] - closes[-10]) / closes[-10] * 100.0) if len(closes) >= 10 and closes[-10] else 0.0
+    trend_med   = ((closes[-1] - closes[0]) / closes[0] * 100.0) if closes[0] else 0.0
+    hi20 = max(c['high'] for c in win[-20:]); lo20 = min(c['low'] for c in win[-20:])
+    range_pct = ((hi20 - lo20) / last * 100.0) if last else 0.0
+    vol_avg    = (sum(vols[-20:]) / min(20, len(vols))) if vols else 0.0
+    vol_recent = (sum(vols[-3:]) / 3.0) if len(vols) >= 3 else vol_avg
+    vol_ratio  = round(vol_recent / vol_avg, 2) if vol_avg else 0.0
+    # Overall trend label (the "market direction" the user wants weighed first)
+    if last > sma20 > sma50 and trend_med > 0.1:   regime = 'uptrend'
+    elif last < sma20 < sma50 and trend_med < -0.1: regime = 'downtrend'
+    else:                                           regime = 'range/choppy'
+    ohlcv = [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5),
+              int(c.get('volume', 0) or 0)] for c in win[-36:]]
+
+    pos_ctx = None
+    if position:
+        ep = position.get('entryPrice') or 0
+        side = position.get('side')
+        unreal_pct = (((last - ep) / ep * 100.0) * (1 if side == 'BUY' else -1)) if ep else 0.0
+        pos_ctx = {'side': side, 'entryPrice': ep, 'unrealizedPct': round(unreal_pct, 2)}
+    trades_ctx = [{'side': t.get('side'), 'pnl': round(t.get('pnl', 0), 2), 'reason': t.get('reason')}
+                  for t in (recent_trades or [])[-8:]]
+    wins = sum(1 for t in trades_ctx if t['pnl'] > 0)
+
     min_enter = float(cfg.get('minScore', 4.0)) + float(cfg.get('scoreBuffer', 1.0) or 0)
-    # When Min score and Score buffer are both 0, drop the conviction threshold
-    # entirely — Claude trades purely on its own judgment.
     if min_enter <= 0:
-        gate = ("There is NO conviction threshold — decide BUY, SELL or HOLD entirely on your own judgment and act "
-                "whenever you see a tradable setup (still HOLD if genuinely unclear).")
+        gate = ("There is NO fixed conviction threshold — use your own judgment. Still prefer HOLD unless the edge is real.")
     else:
-        gate = ("The score sign must match the signal (BUY positive, SELL negative, HOLD near 0). Only choose BUY or "
-                "SELL when your conviction |score| >= " + str(min_enter) + ".")
+        gate = ("Only choose BUY or SELL when your conviction |score| >= " + str(min_enter) + " (score sign matches signal).")
     system = (
-        "You are an autonomous intraday trading strategy. Decide the next action for the instrument from its recent "
-        "OHLC candles. Your ONLY goal is a HIGH WIN RATE with controlled risk — prefer HOLD unless there is a clear, "
-        "high-probability setup. Weigh trend, support/resistance, momentum, over-extension and mean reversion. Do NOT "
-        "rely on any external indicators or named strategies — use your own judgment from the price data. Respond with "
-        "STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<number -10..10>,\"reason\":\"<=140 chars\"}. "
-        + gate
+        "You are an autonomous intraday trading strategy. Decide the next action from recent OHLCV candles and the "
+        "supplied market context. Goal: HIGH WIN RATE with controlled risk and steady profit.\n"
+        "METHOD (in order):\n"
+        "1) MARKET DIRECTION: read the overall trend from regime/SMAs/trend%. Trade WITH the higher-timeframe trend. "
+        "In a 'range/choppy' regime, default to HOLD — do NOT trade chop; only act on a clean breakout/breakdown of the "
+        "20-bar range CONFIRMED by rising volume (volRatio > 1.2).\n"
+        "2) LIQUIDITY: weigh volume. Avoid entries on weak/declining volume (thin = whipsaw). Prefer participation.\n"
+        "3) ENTRY: require a clear setup with an obvious invalidation level and reward:risk >= 1.5. Otherwise HOLD.\n"
+        "4) ANTI-WHIPSAW: if you already hold a position (see 'position'), DEFAULT to staying — return HOLD to keep it, "
+        "or a signal in the SAME direction. Only return the OPPOSITE signal when there is a genuine, strong reversal. "
+        "Do NOT flip side on minor noise — repeated flipping loses money to costs.\n"
+        "5) LEARN: review 'recentTrades'. If recent trades (especially exits by 'signal reversal') lost in conditions "
+        "like now, be MORE selective and HOLD more; tighten only when the edge is clear.\n"
+        "You MAY set slPct and tpPct (percent from entry) for this trade based on structure (e.g. SL beyond the "
+        "invalidation level); omit them to use the panel defaults.\n"
+        "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
+        "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
     )
-    user = _json.dumps({'symbol': symbol, 'tf': tf, 'lastPrice': round(last, 5), 'sma20': round(sma20, 5),
-                        'changePct': round(chg, 2), 'recentHigh': round(hi, 5), 'recentLow': round(lo, 5),
-                        'ohlc': ohlc})
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=300)
+    user = _json.dumps({
+        'symbol': symbol, 'tf': tf, 'regime': regime, 'lastPrice': round(last, 5),
+        'sma10': round(sma10, 5), 'sma20': round(sma20, 5), 'sma50': round(sma50, 5),
+        'trendShortPct': round(trend_short, 2), 'trendMediumPct': round(trend_med, 2),
+        'rangePct20': round(range_pct, 2), 'recentHigh20': round(hi20, 5), 'recentLow20': round(lo20, 5),
+        'volAvg20': round(vol_avg, 1), 'volRecent3': round(vol_recent, 1), 'volRatio': vol_ratio,
+        'position': pos_ctx, 'recentTrades': trades_ctx, 'recentWinRate': (round(wins/len(trades_ctx)*100) if trades_ctx else None),
+        'ohlcv': ohlcv,
+    }, default=str)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400)
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:220]}
-    sig, score, reason = 'HOLD', 0.0, ''
+    sig, score, reason, sl_pct, tp_pct = 'HOLD', 0.0, '', None, None
     try:
         m = _re.search(r'\{.*\}', text or '', _re.DOTALL)
         obj = _json.loads(m.group(0)) if m else {}
         sig = str(obj.get('signal', 'HOLD')).upper()
         if sig not in ('BUY', 'SELL', 'HOLD'): sig = 'HOLD'
         score = float(obj.get('score', 0) or 0)
-        reason = str(obj.get('reason', ''))[:160]
+        reason = str(obj.get('reason', ''))[:180]
+        if obj.get('slPct') is not None:
+            sl_pct = min(50.0, max(0.2, float(obj.get('slPct'))))
+        if obj.get('tpPct') is not None:
+            tp_pct = min(50.0, max(0.2, float(obj.get('tpPct'))))
     except Exception:
         sig, score, reason = 'HOLD', 0.0, 'parse error: ' + (text or '')[:80]
-    return {'name': 'claude', 'signal': sig, 'score': score, 'reason': 'Claude: ' + reason}
+    out = {'name': 'claude', 'signal': sig, 'score': score, 'reason': 'Claude: ' + reason}
+    if sl_pct is not None: out['slPct'] = sl_pct
+    if tp_pct is not None: out['tpPct'] = tp_pct
+    return out
 
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
     cfg    = delta_ai_state['config']
     qty    = int(cfg.get('qty', 1))
-    sl_pct = float(cfg.get('slPct', 1.0))
-    tp_pct = float(cfg.get('tpPct', 2.0))
+    sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.0))   # Claude can set its own SL/TP
+    tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
     delta_ai_state['position'] = {
@@ -1990,7 +2033,7 @@ def _delta_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
 
     # --- LIVE mode: pull authoritative position/P&L from Delta ---
@@ -2427,8 +2470,8 @@ def _zd_calc_pnl(entry, exit_, qty, side):
 def _zd_bot_open(side, price, strat, mode):
     cfg    = zd_ai_state['config']
     qty    = int(cfg.get('qty', 1))
-    sl_pct = float(cfg.get('slPct', 1.5))
-    tp_pct = float(cfg.get('tpPct', 3.0))
+    sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.5))   # Claude can set its own SL/TP
+    tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 3.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
     zd_ai_state['position'] = {
@@ -2552,7 +2595,7 @@ def _zd_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
 
     with zd_ai_lock:
@@ -2870,8 +2913,8 @@ def _zo_place_live(leg, side, qty, price, cfg):
 def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
     """open_side 'BUY' = long the option (exit SELL); 'SELL' = short (exit BUY)."""
     qty    = int(cfg.get('qty', 1))
-    sl_pct = float(cfg.get('slPct', 10.0))
-    tp_pct = float(cfg.get('tpPct', 10.0))
+    sl_pct = float(strat.get('slPct') or cfg.get('slPct', 10.0))   # Claude can set its own SL/TP
+    tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 10.0))
     is_long = open_side == 'BUY'
     sl = price * (1 - sl_pct/100.0) if is_long else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if is_long else price * (1 - tp_pct/100.0)
@@ -2957,7 +3000,7 @@ def _zo_bot_tick():
             _zo_log('[Tick] no Kite candles for ' + symbol); continue
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
-        strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        strat  = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
@@ -3379,8 +3422,8 @@ def _mt_bot_place_live(side, qty, price, cfg):
 def _mt_bot_open(side, price, strat, mode):
     cfg    = mt_ai_state['config']
     qty    = float(cfg.get('qty', 1))
-    sl_pct = float(cfg.get('slPct', 1.0))
-    tp_pct = float(cfg.get('tpPct', 2.0))
+    sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.0))   # Claude can set its own SL/TP
+    tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
     mt_ai_state['position'] = {
@@ -3450,7 +3493,7 @@ def _mt_bot_tick():
         return
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
     with mt_ai_lock:
         mt_ai_state['last_candles'] = candles[-150:]
