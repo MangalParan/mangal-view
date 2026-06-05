@@ -24,4 +24,4 @@ EXPOSE 8080
 # server-side bot state consistent (multiple workers = duplicated/!shared state).
 # Threads provide request concurrency. Do NOT add --max-requests: recycling the
 # worker would kill the running AI-bot threads.
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 3 --timeout 120

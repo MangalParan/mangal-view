@@ -1773,6 +1773,11 @@ def _bot_fetch_candles(symbol, interval, source, api_key=None):
     except Exception:
         return []
 
+# Seconds between bot ticks. In Claude-AI mode each tick = one Anthropic API
+# call per running bot/leg, so this directly drives API credit usage:
+# 15s=240 calls/hr, 30s=120, 60s=60. Override via BOT_TICK_SEC (min 5).
+_BOT_TICK_SEC = max(5, int(os.environ.get('BOT_TICK_SEC', '30') or 30))
+
 import gc as _gc
 def _bot_gc_tick(_c=[0]):
     """Throttled gc.collect() called from each bot loop — returns freed memory to
@@ -1816,14 +1821,21 @@ def _claude_trade_signal(symbol, candles, tf, cfg):
     lo     = min(c['low'] for c in recent)
     ohlc   = [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5)] for c in recent]
     min_enter = float(cfg.get('minScore', 4.0)) + float(cfg.get('scoreBuffer', 1.0) or 0)
+    # When Min score and Score buffer are both 0, drop the conviction threshold
+    # entirely — Claude trades purely on its own judgment.
+    if min_enter <= 0:
+        gate = ("There is NO conviction threshold — decide BUY, SELL or HOLD entirely on your own judgment and act "
+                "whenever you see a tradable setup (still HOLD if genuinely unclear).")
+    else:
+        gate = ("The score sign must match the signal (BUY positive, SELL negative, HOLD near 0). Only choose BUY or "
+                "SELL when your conviction |score| >= " + str(min_enter) + ".")
     system = (
         "You are an autonomous intraday trading strategy. Decide the next action for the instrument from its recent "
         "OHLC candles. Your ONLY goal is a HIGH WIN RATE with controlled risk — prefer HOLD unless there is a clear, "
         "high-probability setup. Weigh trend, support/resistance, momentum, over-extension and mean reversion. Do NOT "
         "rely on any external indicators or named strategies — use your own judgment from the price data. Respond with "
         "STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<number -10..10>,\"reason\":\"<=140 chars\"}. "
-        "The score sign must match the signal (BUY positive, SELL negative, HOLD near 0). Only choose BUY or SELL when "
-        "your conviction |score| >= " + str(min_enter) + "."
+        + gate
     )
     user = _json.dumps({'symbol': symbol, 'tf': tf, 'lastPrice': round(last, 5), 'sma20': round(sma20, 5),
                         'changePct': round(chg, 2), 'recentHigh': round(hi, 5), 'recentLow': round(lo, 5),
@@ -2063,8 +2075,8 @@ def _delta_bot_tick():
             if reason:
                 _delta_bot_close(price, reason, mode)
             else:
-                _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={})'.format(
-                    symbol, price, pos['side'], pos['entryPrice'], strat['name']))
+                _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={} score={:.1f})'.format(
+                    symbol, price, pos['side'], pos['entryPrice'], strat['name'], strat['score']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 # Re-entry cooldown: avoid whipsaw churn right after an exit
@@ -2082,7 +2094,7 @@ def _delta_bot_tick():
                         _bot_log('[Tick] [delta] {} {} skipped — entry quality: {}'.format(
                             symbol, strat['signal'], qreason))
             else:
-                _bot_log('[Tick] [delta] {} price={} HOLD — {}'.format(symbol, price, strat['reason']))
+                _bot_log('[Tick] [delta] {} price={} HOLD — {} (score {:.1f})'.format(symbol, price, strat['reason'], strat['score']))
 
 def _delta_bot_loop():
     while True:
@@ -2095,7 +2107,7 @@ def _delta_bot_loop():
             except Exception as e:
                 _bot_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(15)
+        _zd_time.sleep(_BOT_TICK_SEC)
 
 # Need timedelta/timezone for IST log timestamps
 import datetime as _tz_module
@@ -2141,8 +2153,8 @@ def delta_aibot_start():
         delta_ai_state['thread'] = t
         t.start()
     cfg = delta_ai_state['config']
-    _bot_log('Delta Bot started SERVER-SIDE in {} mode for {} qty={} TF={}. Tick every 15s — runs even when you close this tab.'.format(
-        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _bot_log('Delta Bot started SERVER-SIDE in {} mode for {} qty={} TF={}. Tick every {}s — runs even when you close this tab.'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[DELTA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
     return jsonify({'success': True, 'message': 'Bot started server-side'})
@@ -2399,19 +2411,9 @@ def delta_aibot_status():
 # Trades NSE/BSE/NFO/BFO/MCX via Kite Connect. Data + charts always from Kite.
 # ============================================================================
 def _zd_infer_exchange(symbol):
-    """Resolve a tradingsymbol to its exchange via the instrument tables."""
-    sym_u = (symbol or '').upper()
-    candidates = []
-    try:
-        for src in (_load_kite_all_instruments() or [], _load_csv_instruments() or []):
-            candidates.extend([r for r in src if (r.get('symbol') or '').upper() == sym_u])
-            if candidates:
-                break
-    except Exception:
-        return ''
-    _prio = {'NSE':0, 'BSE':1, 'NFO':2, 'BFO':3, 'MCX':4, 'CDS':5, 'BCD':6, 'NCO':7}
-    candidates.sort(key=lambda r: _prio.get((r.get('exchange') or '').strip().upper(), 99))
-    return (candidates[0].get('exchange') or '').strip().upper() if candidates else ''
+    """Resolve a tradingsymbol to its exchange via the streaming Kite lookup."""
+    info = _resolve_kite_instrument(symbol)
+    return (info or {}).get('exchange', '') or ''
 
 def _zd_calc_pnl(entry, exit_, qty, side):
     """Equity/F&O P/L in INR: (exit-entry)*qty*direction."""
@@ -2582,8 +2584,8 @@ def _zd_bot_tick():
             if reason:
                 _zd_bot_close(price, reason, mode)
             else:
-                _zd_log('[Tick] {} price={} (in position {} from {}, strat={})'.format(
-                    symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name']))
+                _zd_log('[Tick] {} price={} (in position {} from {}, strat={} score={:.1f})'.format(
+                    symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -2597,7 +2599,7 @@ def _zd_bot_tick():
                     else:
                         _zd_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
             else:
-                _zd_log('[Tick] {} price={} HOLD — {}'.format(symbol, round(price, 2), strat['reason']))
+                _zd_log('[Tick] {} price={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 2), strat['reason'], strat['score']))
 
 def _zd_bot_loop():
     while True:
@@ -2610,7 +2612,7 @@ def _zd_bot_loop():
             except Exception as e:
                 _zd_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(15)
+        _zd_time.sleep(_BOT_TICK_SEC)
 
 @app.route('/api/aibot/zerodha/start', methods=['POST'])
 @login_required
@@ -2654,8 +2656,8 @@ def zd_aibot_start():
         zd_ai_state['thread'] = t
         t.start()
     cfg = zd_ai_state['config']
-    _zd_log('Zerodha Bot started SERVER-SIDE in {} mode for {} qty={} TF={}. Tick every 15s — runs even when you close this tab.'.format(
-        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _zd_log('Zerodha Bot started SERVER-SIDE in {} mode for {} qty={} TF={}. Tick every {}s — runs even when you close this tab.'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[ZERODHA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
     return jsonify({'success': True, 'message': 'Bot started server-side'})
@@ -2979,8 +2981,8 @@ def _zo_bot_tick():
                 if reason:
                     _zo_close_leg(leg, price, reason, cfg, mode)
                 else:
-                    _zo_log('[Tick] {} px={} (in {} from {}, strat={})'.format(
-                        symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name']))
+                    _zo_log('[Tick] {} px={} (in {} from {}, strat={} score={:.1f})'.format(
+                        symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score']))
             else:
                 open_side = None
                 if sig == 'BUY' and buyer:    open_side = 'BUY'    # long the option
@@ -3000,7 +3002,7 @@ def _zo_bot_tick():
                     why = strat['reason']
                     if sig == 'BUY' and not buyer:   why = 'BUY signal but Option Buyer is off'
                     if sig == 'SELL' and not seller: why = 'SELL signal but Option Seller is off'
-                    _zo_log('[Tick] {} px={} HOLD — {}'.format(symbol, round(price, 2), why))
+                    _zo_log('[Tick] {} px={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 2), why, strat['score']))
     with zo_ai_lock:
         _zo_apply_breakers(cfg, mode)
 
@@ -3015,7 +3017,7 @@ def _zo_bot_loop():
             except Exception as e:
                 _zo_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(15)
+        _zd_time.sleep(_BOT_TICK_SEC)
 
 @app.route('/api/aibot/zoptions/start', methods=['POST'])
 @login_required
@@ -3071,8 +3073,8 @@ def zo_aibot_start():
     cfg = zo_ai_state['config']
     syms = ', '.join(l['symbol'] for l in legs)
     modes = ('buyer' if cfg['optionBuyer'] else '') + ('+seller' if cfg['optionSeller'] else '')
-    _zo_log('Options Bot started SERVER-SIDE {} mode [{}] for {} qty={} TF={}. Tick every 15s.'.format(
-        cfg['mode'].upper(), modes.strip('+'), syms, cfg['qty'], cfg['tf']))
+    _zo_log('Options Bot started SERVER-SIDE {} mode [{}] for {} qty={} TF={}. Tick every {}s.'.format(
+        cfg['mode'].upper(), modes.strip('+'), syms, cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[ZOPTIONS] [{}] BOT START {} ({}) qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), syms, modes.strip('+'), cfg['qty'], cfg['tf']))
     return jsonify({'success': True, 'message': 'Bot started server-side'})
@@ -3478,8 +3480,8 @@ def _mt_bot_tick():
             if reason:
                 _mt_bot_close(price, reason, mode)
             else:
-                _mt_log('[Tick] {} px={} (in position {} from {}, strat={})'.format(
-                    symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name']))
+                _mt_log('[Tick] {} px={} (in position {} from {}, strat={} score={:.1f})'.format(
+                    symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name'], strat['score']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -3493,7 +3495,7 @@ def _mt_bot_tick():
                     else:
                         _mt_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
             else:
-                _mt_log('[Tick] {} px={} HOLD — {}'.format(symbol, round(price, 5), strat['reason']))
+                _mt_log('[Tick] {} px={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 5), strat['reason'], strat['score']))
 
 def _mt_bot_loop():
     while True:
@@ -3506,7 +3508,7 @@ def _mt_bot_loop():
             except Exception as e:
                 _mt_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(15)
+        _zd_time.sleep(_BOT_TICK_SEC)
 
 @app.route('/api/aibot/mt5/start', methods=['POST'])
 @login_required
@@ -3549,8 +3551,8 @@ def mt_aibot_start():
         mt_ai_state['thread'] = t
         t.start()
     cfg = mt_ai_state['config']
-    _mt_log('MT5 Bot started SERVER-SIDE {} mode for {} qty={} TF={}. Tick every 15s.'.format(
-        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _mt_log('MT5 Bot started SERVER-SIDE {} mode for {} qty={} TF={}. Tick every {}s.'.format(
+        cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[MT5] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
     if not _mt5_backend():
@@ -4253,39 +4255,11 @@ _ZD_CSV_PATH  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 _ZD_CSV_CACHE = {'mtime': 0.0, 'data': []}
 
 def _load_csv_instruments():
-    """Lazily load instruments.csv into memory; reload if file mtime changes."""
-    try:
-        mtime = os.path.getmtime(_ZD_CSV_PATH)
-    except OSError:
-        return []
-    if mtime == _ZD_CSV_CACHE['mtime'] and _ZD_CSV_CACHE['data']:
-        return _ZD_CSV_CACHE['data']
-    rows = []
-    try:
-        with open(_ZD_CSV_PATH, 'r', encoding='utf-8', newline='') as f:
-            reader = _csv.DictReader(f)
-            for row in reader:
-                sym = (row.get('tradingsymbol') or '').strip()
-                if not sym:
-                    continue
-                rows.append({
-                    'instrument_token': (row.get('instrument_token') or '').strip(),
-                    'symbol':       sym,
-                    'name':         (row.get('name') or '').strip(),
-                    'expiry':       (row.get('expiry') or '').strip(),
-                    'strike':       (row.get('strike') or '').strip(),
-                    'tick_size':    (row.get('tick_size') or '').strip(),
-                    'type':         (row.get('instrument_type') or '').strip(),
-                    'lot_size':     (row.get('lot_size') or '').strip(),
-                    'segment':      (row.get('segment') or '').strip(),
-                    'exchange':     (row.get('exchange') or '').strip(),
-                    'seg':          'ZERODHA_CSV',
-                })
-    except Exception:
-        return _ZD_CSV_CACHE.get('data', [])
-    _ZD_CSV_CACHE['mtime'] = mtime
-    _ZD_CSV_CACHE['data']  = rows
-    return rows
+    """DISABLED — the bundled instruments.csv (144k rows) used to be parsed into
+    ~130MB of dicts and cached forever, which blew Render's 512MB cap. Instrument
+    resolution/search now uses the live Kite dump only. Returns [] so every caller
+    falls back to Kite (or the curated list)."""
+    return []
 
 @app.route('/api/zerodha/csv/search')
 @login_required
@@ -4425,6 +4399,42 @@ def _load_kite_all_instruments():
         return rows
     except Exception:
         return _ZD_KITE_CACHE.get('data', [])
+
+# Per-symbol token/exchange resolver — used by the bots & order paths so they
+# DON'T pull the full ~90k-row Kite dump into memory (~100MB) just to find one
+# instrument. Streams the dump once per new symbol and caches only that symbol.
+_KITE_ONE_CACHE = {}   # 'SYMBOL' -> {token, exchange, tick_size, lot_size} | None
+def _resolve_kite_instrument(symbol):
+    sym_u = (symbol or '').upper().strip()
+    if not sym_u:
+        return None
+    if sym_u in _KITE_ONE_CACHE:
+        return _KITE_ONE_CACHE[sym_u]
+    info = None
+    try:
+        req = _zd_urllib.Request('https://api.kite.trade/instruments', headers={'User-Agent': 'Mozilla/5.0'})
+        with _kite_urlopen(req, timeout=30) as resp:
+            content = resp.read().decode('utf-8')
+        reader = _csv.reader(_io.StringIO(content))
+        header = next(reader, None) or []
+        idx = {name.strip(): i for i, name in enumerate(header)}
+        ts_i  = idx.get('tradingsymbol', 2);  tk_i = idx.get('instrument_token', 0)
+        ex_i  = idx.get('exchange', 11);      tick_i = idx.get('tick_size', 7); lot_i = idx.get('lot_size', 8)
+        for row in reader:
+            if len(row) > ts_i and row[ts_i].strip().upper() == sym_u:
+                info = {
+                    'token':     row[tk_i].strip()  if len(row) > tk_i  else '',
+                    'exchange':  row[ex_i].strip().upper() if len(row) > ex_i else '',
+                    'tick_size': row[tick_i].strip() if len(row) > tick_i else '',
+                    'lot_size':  row[lot_i].strip()  if len(row) > lot_i  else '',
+                }
+                break
+        del content
+    except Exception:
+        info = None
+    if len(_KITE_ONE_CACHE) < 2000:
+        _KITE_ONE_CACHE[sym_u] = info
+    return info
 
 @app.route('/api/zerodha/kite/search')
 @login_required
@@ -4839,15 +4849,8 @@ def fetch_kite_data(interval_key, symbol, api_key=None):
     sym_u = (symbol or '').upper().strip()
     if not sym_u:
         return []
-    inst_token = None
-    for rows in (_load_kite_all_instruments() or [], _load_csv_instruments() or []):
-        for r in rows:
-            if (r.get('symbol') or '').upper() == sym_u:
-                inst_token = (r.get('instrument_token') or '').strip()
-                if inst_token:
-                    break
-        if inst_token:
-            break
+    _ki = _resolve_kite_instrument(sym_u)   # streaming single-symbol lookup (low memory)
+    inst_token = (_ki or {}).get('token') or None
     if not inst_token:
         return []
 
