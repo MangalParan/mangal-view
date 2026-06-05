@@ -1762,6 +1762,26 @@ def _bot_is_claude(cfg):
     its own and NONE of the core/algo strategies are used."""
     return 'claude' in (cfg.get('allowedStrategies') or [])
 
+def _bot_fetch_candles(symbol, interval, source, api_key=None):
+    """Lightweight candle fetch for the bots. Claude-only mode needs raw candles,
+    NOT the 14-indicator bundle _bot_signal_data builds every tick — skipping it
+    cuts per-tick memory churn massively (was OOMing Render after a couple hours)."""
+    try:
+        if source == 'kite':  return fetch_kite_data(interval, symbol, api_key=api_key) or []
+        if source == 'mt5':   return fetch_mt5_data(interval, symbol, api_key) or []
+        return fetch_delta_data(interval, symbol) or []
+    except Exception:
+        return []
+
+import gc as _gc
+def _bot_gc_tick(_c=[0]):
+    """Throttled gc.collect() called from each bot loop — returns freed memory to
+    the heap so long-running bots don't slowly climb toward Render's 512MB cap."""
+    _c[0] += 1
+    if _c[0] % 16 == 0:
+        try: _gc.collect()
+        except Exception: pass
+
 def _bot_build_algos(cfg):
     """Candidate algo pool = always-on core + user-selected configurable
     strategies (+ MM/MMA opt-ins). 'mpredict' is dropped — it has no trading
@@ -1810,7 +1830,7 @@ def _claude_trade_signal(symbol, candles, tf, cfg):
                         'ohlc': ohlc})
     text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=300)
     if err:
-        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:90]}
+        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:220]}
     sig, score, reason = 'HOLD', 0.0, ''
     try:
         m = _re.search(r'\{.*\}', text or '', _re.DOTALL)
@@ -1945,15 +1965,11 @@ def _delta_bot_tick():
     interval = cfg.get('tf', '5m')
     if not symbol: return
 
-    algos = _bot_build_algos(cfg)   # core + user-selected configurable strategies
-
     try:
-        data = _bot_signal_data(symbol, interval, 'delta', algos)
+        candles = _bot_fetch_candles(symbol, interval, 'delta')
     except Exception as e:
         _bot_log('[Tick] ERROR fetching data: ' + str(e))
         return
-    candles   = data.get('candles') or []
-    summaries = data.get('signalSummary') or {}
     if not candles:
         with delta_ai_lock:
             delta_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
@@ -1962,7 +1978,7 @@ def _delta_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, summaries, cfg)
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
 
     # --- LIVE mode: pull authoritative position/P&L from Delta ---
@@ -2078,6 +2094,7 @@ def _delta_bot_loop():
             try: _delta_bot_tick()
             except Exception as e:
                 _bot_log('[Tick] ERROR: ' + str(e))
+        _bot_gc_tick()
         _zd_time.sleep(15)
 
 # Need timedelta/timezone for IST log timestamps
@@ -2210,7 +2227,16 @@ def _call_claude(system, messages, max_tokens=1024):
         detail = ''
         try: detail = e.read().decode('utf-8')   # type: ignore[attr-defined]
         except Exception: pass
-        return None, 'Claude API error: {} {}'.format(e, detail)[:500]
+        # Surface Anthropic's human-readable reason (e.g. "Your credit balance is
+        # too low…") instead of a truncated raw blob.
+        msg = ''
+        try:
+            msg = ((_json.loads(detail) or {}).get('error') or {}).get('message', '')
+        except Exception:
+            pass
+        if msg:
+            return None, 'Claude API error: ' + msg
+        return None, ('Claude API error: {} {}'.format(e, detail))[:500]
     parts = data.get('content') or []
     text  = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
     return text, None
@@ -2511,15 +2537,11 @@ def _zd_bot_tick():
     interval = cfg.get('tf', '5m')
     if not symbol: return
 
-    algos = _bot_build_algos(cfg)   # core + user-selected configurable strategies
-
     try:
-        data = _bot_signal_data(symbol, interval, 'kite', algos, api_key=cfg.get('api_key'))
+        candles = _bot_fetch_candles(symbol, interval, 'kite', api_key=cfg.get('api_key'))
     except Exception as e:
         _zd_log('[Tick] ERROR fetching Kite data: ' + str(e))
         return
-    candles   = data.get('candles') or []
-    summaries = data.get('signalSummary') or {}
     if not candles:
         with zd_ai_lock:
             zd_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
@@ -2528,7 +2550,7 @@ def _zd_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, summaries, cfg)
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
 
     with zd_ai_lock:
@@ -2587,6 +2609,7 @@ def _zd_bot_loop():
             try: _zd_bot_tick()
             except Exception as e:
                 _zd_log('[Tick] ERROR: ' + str(e))
+        _bot_gc_tick()
         _zd_time.sleep(15)
 
 @app.route('/api/aibot/zerodha/start', methods=['POST'])
@@ -2917,24 +2940,22 @@ def _zo_bot_tick():
     if not cfg: return
     mode     = cfg.get('mode', 'paper')
     interval = cfg.get('tf', '5m')
-    algos    = _bot_build_algos(cfg)
     buyer    = bool(cfg.get('optionBuyer'))
     seller   = bool(cfg.get('optionSeller'))
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
         try:
-            data = _bot_signal_data(symbol, interval, 'kite', algos, api_key=cfg.get('api_key'))
+            candles = _bot_fetch_candles(symbol, interval, 'kite', api_key=cfg.get('api_key'))
         except Exception as e:
             _zo_log('[Tick] ' + symbol + ' data error: ' + str(e)); continue
-        candles = data.get('candles') or []
         if not candles:
             with zo_ai_lock:
                 leg['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
             _zo_log('[Tick] no Kite candles for ' + symbol); continue
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
-        strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, data.get('signalSummary') or {}, cfg)
+        strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
@@ -2993,6 +3014,7 @@ def _zo_bot_loop():
             try: _zo_bot_tick()
             except Exception as e:
                 _zo_log('[Tick] ERROR: ' + str(e))
+        _bot_gc_tick()
         _zd_time.sleep(15)
 
 @app.route('/api/aibot/zoptions/start', methods=['POST'])
@@ -3415,13 +3437,10 @@ def _mt_bot_tick():
     symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
     if not symbol: return
-    algos = _bot_build_algos(cfg)
     try:
-        data = _bot_signal_data(symbol, interval, 'mt5', algos, api_key=cfg.get('mt5_id'))
+        candles = _bot_fetch_candles(symbol, interval, 'mt5', api_key=cfg.get('mt5_id'))
     except Exception as e:
         _mt_log('[Tick] ERROR fetching MT5 data: ' + str(e)); return
-    candles   = data.get('candles') or []
-    summaries = data.get('signalSummary') or {}
     if not candles:
         with mt_ai_lock:
             mt_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
@@ -3429,7 +3448,7 @@ def _mt_bot_tick():
         return
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else _bot_select_strategy(regime, summaries, cfg)
+    strat  = _claude_trade_signal(symbol, candles, interval, cfg) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
     with mt_ai_lock:
         mt_ai_state['last_candles'] = candles[-150:]
@@ -3486,6 +3505,7 @@ def _mt_bot_loop():
             try: _mt_bot_tick()
             except Exception as e:
                 _mt_log('[Tick] ERROR: ' + str(e))
+        _bot_gc_tick()
         _zd_time.sleep(15)
 
 @app.route('/api/aibot/mt5/start', methods=['POST'])
@@ -13584,8 +13604,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="period-item" data-tf="1mo" data-label="1M" data-name="1 Month">&#8203; 1 Month</button>
     </div>
   </div>
-  <div class="separator"></div>
-  <div class="indicators-dropdown-wrapper">
+  <div class="separator" style="display:none"></div>
+  <div class="indicators-dropdown-wrapper" style="display:none">
     <button class="ind-btn" id="btnIndicators"><span class="dot" style="background:#2962ff"></span>Indicators &#9662;</button>
     <div class="indicators-dropdown" id="indicatorsDropdown">
       <label class="ind-item" data-ind="ST"><span class="dot" style="background:#ff9800"></span><span>SuperTrend</span><input type="checkbox"></label>
@@ -13607,8 +13627,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="ind-item" id="btnIndSettings" style="cursor:pointer;border:none;background:none;color:#d1d4dc;padding:8px 12px;width:100%;text-align:left;font-size:13px">&#9881; Indicator Settings</button>
     </div>
   </div>
-  <div class="separator"></div>
-  <div class="algo-dropdown-wrapper">
+  <div class="separator" style="display:none"></div>
+  <div class="algo-dropdown-wrapper" style="display:none">
     <button class="ind-btn" id="btnAlgo"><span class="dot" style="background:#ff9100"></span>Algo &#9662;</button>
     <div class="algo-dropdown" id="algoDropdown">
       <button class="algo-item" data-algo="trend" data-label="Trend">&#8203; Trend</button>
@@ -14238,23 +14258,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Optional strategies the bot is allowed to select -->
       <div class="ai-strat-bar">
-        <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
-          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
-          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
-          <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
-          <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
         </span>
-        <label title="Mean-reversion bid-ask Market Making strategy. Best in range/sideways markets."><input type="checkbox" id="aiBotIncludeMM" checked> Market Making</label>
-        <label title="Advanced Market Making with spread analysis. Best in range markets with stable volatility."><input type="checkbox" id="aiBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
+        <span style="display:none"><input type="checkbox" id="aiBotIncludeMM"><input type="checkbox" id="aiBotIncludeMMA"></span>
       </div>
 
       <!-- Risk controls -->
@@ -14423,23 +14432,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-strat-bar">
-        <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
-          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
-          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
-          <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
-          <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
         </span>
-        <label title="Market Making — range markets"><input type="checkbox" id="mtBotIncludeMM" checked> Market Making</label>
-        <label title="MM Advanced"><input type="checkbox" id="mtBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
+        <span style="display:none"><input type="checkbox" id="mtBotIncludeMM"><input type="checkbox" id="mtBotIncludeMMA"></span>
       </div>
 
       <div class="ai-risk-bar">
@@ -14552,23 +14550,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-strat-bar">
-        <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
-          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
-          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
-          <label title="Sniper — aggressive momentum entries (off by default; chased tops in past losses)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
-          <label title="MPredict — ML price-prediction overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
         </span>
-        <label title="Mean-reversion bid-ask Market Making. Best in range/sideways crypto."><input type="checkbox" id="deltaBotIncludeMM" checked> Market Making</label>
-        <label title="Advanced Market Making with spread analysis."><input type="checkbox" id="deltaBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
+        <span style="display:none"><input type="checkbox" id="deltaBotIncludeMM"><input type="checkbox" id="deltaBotIncludeMMA"></span>
       </div>
 
       <div class="ai-risk-bar">
@@ -14704,23 +14691,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-strat-bar">
-        <span class="lbl">&#129504; Allow strategies:</span>
+        <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Mean-reversion factor model"><input type="checkbox" class="strat-chk" data-strat="mfactor"> MFactor</label>
-          <label title="MStreet mean-reversion"><input type="checkbox" class="strat-chk" data-strat="mstreet"> MStreet</label>
-          <label title="Scalping"><input type="checkbox" class="strat-chk" data-strat="scalping"> Scalping</label>
-          <label title="Quant composite"><input type="checkbox" class="strat-chk" data-strat="quant"> Quant</label>
-          <label title="Hybrid multi-signal"><input type="checkbox" class="strat-chk" data-strat="hybrid"> Hybrid</label>
-          <label title="Institutional flow"><input type="checkbox" class="strat-chk" data-strat="institution"> Institution</label>
-          <label title="Statistical arbitrage"><input type="checkbox" class="strat-chk" data-strat="statarb"> StatArb</label>
-          <label title="Price-action structure / candles — selectable (not core)"><input type="checkbox" class="strat-chk" data-strat="priceaction"> PriceAction</label>
-          <label title="Claude AI decides trades on its own from price data — when selected it IGNORES all core/other strategies. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude"> &#129302; Claude AI</label>
-          <label title="Sniper — aggressive momentum entries (off by default)"><input type="checkbox" class="strat-chk" data-strat="sniper"> Sniper</label>
-          <label title="MPredict — ML overlay; does not place trades on its own"><input type="checkbox" class="strat-chk" data-strat="mpredict"> MPredict</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
         </span>
-        <label title="Market Making — range markets"><input type="checkbox" id="zoBotIncludeMM" checked> Market Making</label>
-        <label title="MM Advanced"><input type="checkbox" id="zoBotIncludeMMA"> MM Advanced</label>
-        <span style="color:#787b86;font-size:10px">(core trend/momentum/breakout/smart-money/order-flow always on; tick a box to add it)</span>
+        <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
+        <span style="display:none"><input type="checkbox" id="zoBotIncludeMM"><input type="checkbox" id="zoBotIncludeMMA"></span>
       </div>
 
       <div class="ai-risk-bar">
@@ -14948,8 +14924,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="zm-item" id="zoomReset">&#8634; &nbsp; Reset / Fit All</button>
     </div>
   </div>
-  <div class="separator"></div>
-  <div class="help-dropdown-wrapper">
+  <div class="separator" style="display:none"></div>
+  <div class="help-dropdown-wrapper" style="display:none">
     <button class="ind-btn" id="btnHelp"><span class="dot" style="background:#66bb6a"></span>Help &#9662;</button>
     <div class="help-dropdown" id="helpDropdown">
       <a class="help-item" href="/help/algos" target="_blank">&#128202; Algos</a>
@@ -20349,7 +20325,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function _mmaEnabled() { return !!incMMAChk.checked; }
 
     // ---- Configurable strategy checkboxes (extras on the always-on core) ----
-    const STRAT_KEY = 'mangalview_aibot_strategies_v2';
+    const STRAT_KEY = 'mangalview_aibot_strategies_v3';
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null');
@@ -21114,7 +21090,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // ---- Persistence (buyer/seller, strategies, MM) ----
-    const ZO_PREF = 'mangalview_zoptions_prefs_v2';
+    const ZO_PREF = 'mangalview_zoptions_prefs_v3';
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const p = JSON.parse(localStorage.getItem(ZO_PREF) || 'null');
@@ -21562,7 +21538,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function currentMode() { const r = document.querySelector('input[name="mtBotMode"]:checked'); return r ? r.value : 'paper'; }
 
-    const STRAT_KEY = 'mangalview_mt5_strategies_v2';
+    const STRAT_KEY = 'mangalview_mt5_strategies_v3';
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try { const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null'); if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; }); } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
@@ -22083,7 +22059,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function _dMMAEnabled() { return !!dIncMMAChk.checked; }
 
     // ---- Configurable strategy checkboxes (extras on the always-on core) ----
-    const D_STRAT_KEY = 'mangalview_delta_aibot_strategies_v2';
+    const D_STRAT_KEY = 'mangalview_delta_aibot_strategies_v3';
     const dStratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const saved = JSON.parse(localStorage.getItem(D_STRAT_KEY) || 'null');
