@@ -1935,6 +1935,37 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
     if tp_pct is not None: out['tpPct'] = tp_pct
     return out
 
+# Curated liquid universes for Auto-Symbol mode (Claude picks from these).
+_BOT_UNIVERSE = {
+    'delta': ['BTCUSD', 'ETHUSD', 'SOLUSD', 'BNBUSD', 'XRPUSD', 'AVAXUSD'],
+    'kite':  ['RELIANCE', 'HDFCBANK', 'ICICIBANK', 'INFY', 'TCS', 'SBIN', 'TATAMOTORS'],
+    'mt5':   ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'AUDUSD', 'USDCAD'],
+}
+
+def _bot_candidates(source, cfg):
+    """Symbols scanned when flat: Auto-Symbol → curated universe; else the user
+    watchlist; else the single configured symbol."""
+    if cfg.get('autoSymbol'):
+        return list(_BOT_UNIVERSE.get(source, []))
+    syms = [s for s in (cfg.get('symbols') or []) if s]
+    if syms:
+        return syms
+    s = (cfg.get('symbol') or '').strip()
+    return [s] if s else []
+
+def _bot_pick_symbol(state, cfg, source):
+    """1-position-at-a-time autopilot: while FLAT, round-robin the active symbol
+    across candidates so Claude scans one per tick. While IN a trade, keep the
+    position's symbol (set cfg['symbol']) so management/close use the right one."""
+    if state.get('position'):
+        return
+    cands = _bot_candidates(source, cfg)
+    if not cands:
+        return
+    idx = int(state.get('scan_idx', 0)) % len(cands)
+    cfg['symbol'] = cands[idx].upper()
+    state['scan_idx'] = idx + 1
+
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
     cfg    = delta_ai_state['config']
@@ -2053,6 +2084,7 @@ def _delta_bot_place_live(side, qty, cfg):
 def _delta_bot_tick():
     cfg = delta_ai_state.get('config') or {}
     if not cfg: return
+    _bot_pick_symbol(delta_ai_state, cfg, 'delta')   # autopilot: scan watchlist/universe while flat
     symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
     if not symbol: return
@@ -2201,6 +2233,8 @@ def delta_aibot_start():
             return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
         delta_ai_state['config'] = {
             'symbol':     (data.get('symbol') or '').upper(),
+            'symbols':    [s.strip().upper() for s in (data.get('symbols') or []) if s and str(s).strip()],
+            'autoSymbol': bool(data.get('autoSymbol', False)),
             'qty':        int(data.get('qty', 1) or 1),
             'tf':         data.get('tf', '5m'),
             'mode':       data.get('mode', 'paper'),
@@ -2219,8 +2253,10 @@ def delta_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
-        if not delta_ai_state['config']['symbol']:
-            return jsonify({'success': False, 'error': 'Symbol required'}), 400
+        _c = delta_ai_state['config']
+        if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
+            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
+        delta_ai_state['scan_idx']      = 0
         delta_ai_state['position']      = None
         delta_ai_state['trades']        = []
         delta_ai_state['consec_losses'] = 0
@@ -2672,6 +2708,7 @@ def _zd_bot_place_live(side, qty, price, cfg):
 def _zd_bot_tick():
     cfg = zd_ai_state.get('config') or {}
     if not cfg: return
+    _bot_pick_symbol(zd_ai_state, cfg, 'kite')   # autopilot: scan watchlist/universe while flat
     symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
     if not symbol: return
@@ -2760,6 +2797,8 @@ def zd_aibot_start():
             return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
         zd_ai_state['config'] = {
             'symbol':     (data.get('symbol') or '').upper(),
+            'symbols':    [s.strip().upper() for s in (data.get('symbols') or []) if s and str(s).strip()],
+            'autoSymbol': bool(data.get('autoSymbol', False)),
             'exchange':   (data.get('exchange') or '').upper(),
             'qty':        int(data.get('qty', 1) or 1),
             'tf':         data.get('tf', '5m'),
@@ -2779,8 +2818,10 @@ def zd_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'api_key':    (data.get('api_key') or '').strip(),
         }
-        if not zd_ai_state['config']['symbol']:
-            return jsonify({'success': False, 'error': 'Symbol required'}), 400
+        _c = zd_ai_state['config']
+        if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
+            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
+        zd_ai_state['scan_idx']       = 0
         zd_ai_state['position']       = None
         zd_ai_state['trades']         = []
         zd_ai_state['consec_losses']  = 0
@@ -3593,6 +3634,7 @@ def _mt_bot_close(price, reason, mode):
 def _mt_bot_tick():
     cfg = mt_ai_state.get('config') or {}
     if not cfg: return
+    _bot_pick_symbol(mt_ai_state, cfg, 'mt5')   # autopilot: scan watchlist/universe while flat
     symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
     if not symbol: return
@@ -3676,6 +3718,8 @@ def mt_aibot_start():
             return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
         mt_ai_state['config'] = {
             'symbol':     (data.get('symbol') or '').upper(),
+            'symbols':    [s.strip().upper() for s in (data.get('symbols') or []) if s and str(s).strip()],
+            'autoSymbol': bool(data.get('autoSymbol', False)),
             'qty':        float(data.get('qty', 1) or 1),
             'tf':         data.get('tf', '5m'),
             'mode':       data.get('mode', 'paper'),
@@ -3694,8 +3738,10 @@ def mt_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'mt5_id':     (data.get('mt5_id') or '').strip(),
         }
-        if not mt_ai_state['config']['symbol']:
-            return jsonify({'success': False, 'error': 'Symbol required (e.g. EURUSD, XAUUSD)'}), 400
+        _c = mt_ai_state['config']
+        if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
+            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
+        mt_ai_state['scan_idx']       = 0
         mt_ai_state['position']       = None
         mt_ai_state['trades']         = []
         mt_ai_state['consec_losses']  = 0
@@ -3881,6 +3927,53 @@ def delta_update_levels():
 @login_required
 def mt_update_levels():
     return _update_levels(mt_ai_state, mt_ai_lock, _mt_log, 'MT5', 5)
+
+@app.route('/api/aibot/suggest_symbols', methods=['POST'])
+@login_required
+def aibot_suggest_symbols():
+    """Claude scans the curated universe (recent trend/volatility/liquidity per
+    symbol) and suggests the best few to trade now, given the user's capital."""
+    import json as _json, re as _re
+    data    = request.json or {}
+    broker  = (data.get('broker') or 'delta').lower()
+    source  = {'delta': 'delta', 'zerodha': 'kite', 'mt5': 'mt5'}.get(broker, 'delta')
+    capital = data.get('capital')
+    api_key = data.get('api_key')
+    universe = _BOT_UNIVERSE.get(source, [])
+    summ = []
+    for sym in universe:
+        try:
+            c = _bot_fetch_candles(sym, '15m', source, api_key=api_key)
+        except Exception:
+            c = []
+        if not c or len(c) < 10:
+            continue
+        cl = [x['close'] for x in c[-30:]]
+        vols = [float(x.get('volume', 0) or 0) for x in c[-20:]]
+        last = cl[-1]
+        chg = ((cl[-1] - cl[0]) / cl[0] * 100.0) if cl[0] else 0.0
+        rng = ((max(x['high'] for x in c[-20:]) - min(x['low'] for x in c[-20:])) / last * 100.0) if last else 0.0
+        summ.append({'symbol': sym, 'last': round(last, 5), 'changePct': round(chg, 2),
+                     'rangePct': round(rng, 2), 'avgVol': round(sum(vols)/max(1, len(vols)), 1)})
+    if not summ:
+        return jsonify({'success': False, 'error': 'No market data — is ' + broker + ' connected?'}), 502
+    system = (
+        "You are a trading scout. From the candidate instruments and their recent 15m stats, pick the BEST 3-5 to "
+        "trade now for a HIGH win rate, weighing trend strength, volatility and liquidity"
+        + (" and the trader's capital" if capital else "") + ". Respond STRICT JSON ONLY: "
+        "{\"picks\":[{\"symbol\":\"..\",\"side\":\"BUY\"|\"SELL\"|\"WATCH\",\"reason\":\"<=120 chars\"}],\"summary\":\"<=160\"}.")
+    user = _json.dumps({'broker': broker, 'capitalUSD': capital, 'candidates': summ})
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    try:
+        obj = _json.loads(_re.search(r'\{.*\}', text or '', _re.DOTALL).group(0))
+        valid = {s['symbol'] for s in summ}
+        picks = [p for p in (obj.get('picks') or []) if p.get('symbol') in valid][:8]
+        summary = str(obj.get('summary', ''))[:200]
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Could not parse Claude reply: ' + str(e)[:100]}), 502
+    return jsonify({'success': True, 'picks': picks, 'summary': summary, 'universe': [s['symbol'] for s in summ]})
 
 @app.route('/api/aibot/log_append', methods=['POST'])
 @login_required
@@ -13174,12 +13267,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flex: 1; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
     font-weight: 700; cursor: pointer; transition: background 0.2s;
   }
-  .zd-start-btn.start { background: #26a69a; color: #fff; }
-  .zd-start-btn.start:hover { background: #1de9b6; }
-  .zd-start-btn.stop { background: #ef5350; color: #fff; }
-  .zd-start-btn.stop:hover { background: #ff1744; }
-  .zd-start-btn.pause { background: #f0b429; color: #131722; }
-  .zd-start-btn.pause:hover { background: #ffca28; }
+  /* Start / Stop / Pause / Resume — all blue per request */
+  .zd-start-btn.start { background: #2962ff; color: #fff; }
+  .zd-start-btn.start:hover { background: #448aff; }
+  .zd-start-btn.stop { background: #2962ff; color: #fff; }
+  .zd-start-btn.stop:hover { background: #448aff; }
+  .zd-start-btn.pause { background: #2962ff; color: #fff; }
+  .zd-start-btn.pause:hover { background: #448aff; }
   .zd-start-btn.resume { background: #2962ff; color: #fff; }
   .zd-start-btn.resume:hover { background: #448aff; }
   .zd-start-btn:disabled, .zd-start-btn:disabled:hover {
@@ -14396,6 +14490,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="bot-log-btn" id="aiBotLogDownloadBtn" title="Download log.txt to your computer">&#11015; Download log</button>
       </div>
 
+      <!-- Autopilot: Claude symbol selection / auto-symbol (1 trade at a time) -->
+      <div class="ai-input-bar">
+        <label title="Let Claude pick which symbol to trade from a curated liquid list."><input type="checkbox" id="aiBotAutoSym"> Auto symbol (Claude picks)</label>
+        <button class="zd-add-btn" id="aiBotSuggestBtn" type="button" title="Claude scans the market &amp; suggests symbols">&#128269; Suggest Symbols</button>
+        <label style="flex:1;min-width:240px"><span>Watchlist (scans 1 trade at a time)</span><input type="text" id="aiBotWatchlist" placeholder="RELIANCE,INFY,TCS — blank = single symbol above"></label>
+      </div>
+      <div id="aiBotPicks" class="sym-picks" style="display:none;background:#131722;border:1px solid #2a2e39;border-radius:6px;margin:0 0 10px"></div>
+
       <!-- Chart -->
       <div class="bot-chart-wrap">
         <div id="aiBotChart"></div>
@@ -14577,6 +14679,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="bot-log-btn" id="mtBotLogDownloadBtn" title="Download log.txt">&#11015; Download log</button>
       </div>
 
+      <!-- Autopilot: Claude symbol selection / auto-symbol (1 trade at a time) -->
+      <div class="ai-input-bar">
+        <label title="Let Claude pick which symbol to trade from a curated liquid list."><input type="checkbox" id="mtBotAutoSym"> Auto symbol (Claude picks)</label>
+        <button class="zd-add-btn" id="mtBotSuggestBtn" type="button" title="Claude scans the market &amp; suggests symbols">&#128269; Suggest Symbols</button>
+        <label style="flex:1;min-width:240px"><span>Watchlist (scans 1 trade at a time)</span><input type="text" id="mtBotWatchlist" placeholder="EURUSD,XAUUSD,GBPUSD — blank = single symbol above"></label>
+      </div>
+      <div id="mtBotPicks" class="sym-picks" style="display:none;background:#131722;border:1px solid #2a2e39;border-radius:6px;margin:0 0 10px"></div>
+
       <div class="bot-chart-wrap">
         <div id="mtBotChart"></div>
         <div class="bot-price-overlay" id="mtBotPriceOverlay" style="display:none"><div class="sym" id="mtBotPxSym">&mdash;</div><div class="px" id="mtBotPxVal">&mdash;</div></div>
@@ -14692,6 +14802,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="bot-log-btn" id="deltaBotLogBtn" title="Open log.txt in a new tab (all bot events for both Zerodha and Delta)">&#128196; log.txt</button>
         <button class="bot-log-btn" id="deltaBotLogDownloadBtn" title="Download log.txt to your computer">&#11015; Download log</button>
       </div>
+
+      <!-- Autopilot: Claude symbol selection / auto-symbol (1 trade at a time) -->
+      <div class="ai-input-bar">
+        <label title="Let Claude pick which symbol to trade from a curated liquid list."><input type="checkbox" id="deltaBotAutoSym"> Auto symbol (Claude picks)</label>
+        <button class="zd-add-btn" id="deltaBotSuggestBtn" type="button" title="Claude scans the market &amp; suggests symbols based on your capital">&#128269; Suggest Symbols</button>
+        <label style="flex:1;min-width:240px"><span>Watchlist (scans 1 trade at a time)</span><input type="text" id="deltaBotWatchlist" placeholder="BTCUSD,ETHUSD,SOLUSD — blank = single symbol above"></label>
+      </div>
+      <div id="deltaBotPicks" class="sym-picks" style="display:none;background:#131722;border:1px solid #2a2e39;border-radius:6px;margin:0 0 10px"></div>
 
       <div class="bot-chart-wrap">
         <div id="deltaBotChart"></div>
@@ -20321,6 +20439,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
       .catch(function(){ paint(false); });
   }
 
+  // Claude symbol scout: fetch suggestions, render a checklist in `container`,
+  // and on "Use selected" write a comma-list into `watchInput`.
+  function _suggestSymbols(container, watchInput, broker, capital, apiKey, logFn) {
+    function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    container.style.display = '';
+    container.innerHTML = '<div style="color:#787b86;font-size:12px;padding:8px">&#129302; Claude is scanning the market…</div>';
+    fetch('/api/aibot/suggest_symbols', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ broker: broker, capital: capital, api_key: apiKey || '' }) })
+      .then(function(r){ return r.json(); }).then(function(res){
+        if (!res.success) { container.innerHTML = '<div style="color:#ef5350;font-size:12px;padding:8px">' + esc(res.error || 'Failed') + '</div>'; return; }
+        var picks = res.picks || [];
+        if (!picks.length) { container.innerHTML = '<div style="color:#787b86;font-size:12px;padding:8px">No strong setups right now — try again later.</div>'; return; }
+        var html = (res.summary ? '<div style="font-size:11px;color:#9aa0aa;padding:6px 8px">' + esc(res.summary) + '</div>' : '');
+        picks.forEach(function(p){
+          var col = p.side === 'BUY' ? '#26a69a' : p.side === 'SELL' ? '#ef5350' : '#787b86';
+          html += '<label style="display:flex;gap:8px;align-items:flex-start;padding:5px 8px;font-size:12px;cursor:pointer">'
+            + '<input type="checkbox" class="sym-pick-chk" value="' + esc(p.symbol) + '" checked>'
+            + '<span><b>' + esc(p.symbol) + '</b> <span style="color:' + col + '">' + esc(p.side || '') + '</span><br>'
+            + '<span style="color:#787b86">' + esc(p.reason || '') + '</span></span></label>';
+        });
+        html += '<div style="padding:6px 8px"><button class="zd-add-btn" type="button" id="' + container.id + '_use">Use selected</button> '
+             +  '<button class="bot-log-btn" type="button" id="' + container.id + '_cancel">Cancel</button></div>';
+        container.innerHTML = html;
+        container.querySelector('#' + container.id + '_use').addEventListener('click', function(){
+          var sel = Array.prototype.map.call(container.querySelectorAll('.sym-pick-chk:checked'), function(c){ return c.value; });
+          watchInput.value = sel.join(',');
+          container.style.display = 'none';
+          if (logFn) logFn('[Symbols] Watchlist set: ' + (sel.join(', ') || '(none)'), 'info');
+        });
+        container.querySelector('#' + container.id + '_cancel').addEventListener('click', function(){ container.style.display = 'none'; });
+      }).catch(function(e){ container.innerHTML = '<div style="color:#ef5350;font-size:12px;padding:8px">Error: ' + esc(e.message) + '</div>'; });
+  }
+
   // Draw + manage the 4 price lines on a bot chart (current=blue, entry=yellow,
   // TP=green, SL=red) and make TP/SL draggable when the Movable checkbox is on.
   // On drag-end it POSTs the new level to `endpoint`, which updates the live bot.
@@ -20986,12 +21137,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
-      if (!sym) { logLine('Enter a tradingsymbol first (or use + Add).', 'info'); return; }
+      if (!sym && !document.getElementById('aiBotAutoSym').checked && !(document.getElementById('aiBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
       const s = ZerodhaStore.getSession();
       const mode = currentMode();
       if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
       const cfg = {
         symbol:      sym,
+        symbols:     (document.getElementById('aiBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
+        autoSymbol:  !!document.getElementById('aiBotAutoSym').checked,
         exchange:    (exchEl.value || '').trim().toUpperCase(),
         qty:         parseInt(qtyEl.value) || 1,
         tf:          tfEl.value,
@@ -21110,6 +21263,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     document.getElementById('aiBotLogBtn').addEventListener('click', function() {
       window.open('/api/aibot/log_download', '_blank');
     });
+    (function(){ var b=document.getElementById('aiBotSuggestBtn'); if (b) b.addEventListener('click', function(){
+      _suggestSymbols(document.getElementById('aiBotPicks'), document.getElementById('aiBotWatchlist'),
+        'zerodha', null, (ZerodhaStore.getSession().apiKey || ''), logLine); }); })();
     document.getElementById('aiBotLogDownloadBtn').addEventListener('click', function() {
       const a = document.createElement('a');
       a.href = '/api/aibot/log_download?download=1';
@@ -21799,6 +21955,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     document.getElementById('mtBotLoadBtn').addEventListener('click', loadChart);
     document.getElementById('mtBotLogBtn').addEventListener('click', function() { window.open('/api/aibot/log_download', '_blank'); });
+    (function(){ var b=document.getElementById('mtBotSuggestBtn'); if (b) b.addEventListener('click', function(){
+      _suggestSymbols(document.getElementById('mtBotPicks'), document.getElementById('mtBotWatchlist'),
+        'mt5', null, (MT5Store.getSession().id || ''), logLine); }); })();
     document.getElementById('mtBotLogDownloadBtn').addEventListener('click', function() {
       const a = document.createElement('a'); a.href = '/api/aibot/log_download?download=1'; a.download = 'log.txt';
       document.body.appendChild(a); a.click(); a.remove();
@@ -21863,10 +22022,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
-      const sym = symEl.value.trim().toUpperCase(); if (!sym) { logLine('Enter a symbol first (e.g. EURUSD).', 'info'); return; }
+      const sym = symEl.value.trim().toUpperCase(); if (!sym && !document.getElementById('mtBotAutoSym').checked && !(document.getElementById('mtBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
       const s = MT5Store.getSession();
       const cfg = {
-        symbol: sym, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
+        symbol: sym, symbols: (document.getElementById('mtBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean), autoSymbol: !!document.getElementById('mtBotAutoSym').checked, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
         slPct: parseFloat(slPctEl.value) || 1.0, tpPct: parseFloat(tpPctEl.value) || 2.0,
         maxConsec: parseInt(maxConsecEl.value) || 3, maxLoss: parseFloat(maxLossEl.value) || 2000,
         maxProfit: parseFloat(maxProfitEl.value) || 0, minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
@@ -22358,6 +22517,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const calcBtn  = document.getElementById('deltaBotCalcBtn');
     const capEl    = document.getElementById('deltaBotCapital');
     const sizingEl = document.getElementById('deltaBotSizing');
+    const sugBtn   = document.getElementById('deltaBotSuggestBtn');
+    if (sugBtn) sugBtn.addEventListener('click', function() {
+      _suggestSymbols(document.getElementById('deltaBotPicks'), document.getElementById('deltaBotWatchlist'),
+        'delta', (parseFloat(capEl.value) || null), (DeltaStore.getSession().apiKey || ''), logLine);
+    });
     if (calcBtn) calcBtn.addEventListener('click', function() {
       const sym = symEl.value.trim().toUpperCase();
       const cap = parseFloat(capEl.value) || 0;
@@ -22641,9 +22805,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
-      if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
+      if (!sym && !document.getElementById('deltaBotAutoSym').checked && !(document.getElementById('deltaBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
       const cfg = {
         symbol:     sym,
+        symbols:    (document.getElementById('deltaBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
+        autoSymbol: !!document.getElementById('deltaBotAutoSym').checked,
         qty:        parseInt(qtyEl.value) || 1,
         tf:         tfEl.value,
         mode:       currentMode(),
