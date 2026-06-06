@@ -693,6 +693,31 @@ def zerodha_connect():
     }
     return jsonify({'success': True, 'message': 'Connected to Zerodha'})
 
+@app.route('/api/zerodha/verify', methods=['GET'])
+@login_required
+def zerodha_verify():
+    """Real connection check — confirms the stored Kite access_token still works
+    by hitting /user/profile. Returns {connected: bool, user?}."""
+    import json as _json
+    api_key = request.args.get('api_key', '').strip()
+    if not api_key or api_key not in zerodha_sessions:
+        return jsonify({'connected': False, 'error': 'no server session'})
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        return jsonify({'connected': False, 'error': 'no access token'})
+    try:
+        req = _zd_urllib.Request('https://api.kite.trade/user/profile',
+            headers={'X-Kite-Version': '3', 'Authorization': 'token {}:{}'.format(api_key, access_token),
+                     'User-Agent': 'Mozilla/5.0'}, method='GET')
+        with _kite_urlopen(req, timeout=12) as resp:
+            data = _json.loads(resp.read().decode('utf-8') or '{}')
+        if data.get('status') == 'success':
+            u = data.get('data', {}) or {}
+            return jsonify({'connected': True, 'user': u.get('user_name') or u.get('user_id') or ''})
+        return jsonify({'connected': False, 'error': data.get('message', 'invalid session')})
+    except Exception as e:
+        return jsonify({'connected': False, 'error': str(e)[:140]})
+
 @app.route('/api/zerodha/order', methods=['POST'])
 @login_required
 def zerodha_order():
@@ -1425,6 +1450,18 @@ def _delta_diag_hint(last_attempt):
             'Common fixes: try the other regional host (delta.exchange ↔ india.delta.exchange), '
             're-copy keys, enable Trading permission, wait 10 min if the key is brand new.')
 
+@app.route('/api/delta/verify', methods=['GET'])
+@login_required
+def delta_verify():
+    """Real connection check — confirms the stored Delta key still authenticates
+    via /v2/wallet/balances. Returns {connected: bool}."""
+    api_key = request.args.get('api_key', '').strip()
+    if not api_key or api_key not in delta_v2_sessions:
+        return jsonify({'connected': False, 'error': 'no server session'})
+    sess = delta_v2_sessions[api_key]
+    res = _delta_request(api_key, sess['api_secret'], 'GET', '/v2/wallet/balances', base_url=sess.get('base_url'))
+    return jsonify({'connected': bool(res.get('success')), 'error': res.get('error', '')})
+
 @app.route('/api/delta/products')
 @login_required
 def delta_products():
@@ -2150,7 +2187,7 @@ def _delta_bot_loop():
             except Exception as e:
                 _bot_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(_BOT_TICK_SEC)
+        _zd_time.sleep(max(5, int((delta_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
 
 # Need timedelta/timezone for IST log timestamps
 import datetime as _tz_module
@@ -2175,6 +2212,7 @@ def delta_aibot_start():
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
@@ -2312,6 +2350,62 @@ def _extract_config_patch(text):
         except Exception:
             pass
     return patch, summary, text
+
+@app.route('/api/aibot/delta/sizing', methods=['POST'])
+@login_required
+def delta_aibot_sizing():
+    """Given Capital + current market, Claude picks a safe leverage and SL%/TP%
+    (and we size qty in contracts). Applied live if the bot is running; the panel
+    also seeds the inputs so a (re)start uses them. SL/TP stay dynamic per tick."""
+    import json as _json, re as _re
+    data    = request.json or {}
+    capital = float(data.get('capital') or 0)
+    symbol  = (data.get('symbol') or '').upper()
+    tf      = data.get('tf', '5m')
+    if capital <= 0 or not symbol:
+        return jsonify({'success': False, 'error': 'Enter Capital and a symbol first'}), 400
+    candles = fetch_delta_data(tf, symbol)
+    if not candles:
+        return jsonify({'success': False, 'error': 'No Delta market data for ' + symbol}), 502
+    win    = candles[-40:]
+    closes = [c['close'] for c in win]
+    price  = closes[-1]
+    sma20  = sum(closes[-20:]) / 20.0
+    chg    = ((closes[-1] - closes[0]) / closes[0] * 100.0) if closes[0] else 0.0
+    hi     = max(c['high'] for c in win); lo = min(c['low'] for c in win)
+    system = (
+        "You are a risk manager and strategist for crypto derivatives. Given the trader's capital, the current market "
+        "and recent OHLC, choose a SAFE leverage and SL%/TP% to maximize win rate while protecting capital. Use LOWER "
+        "leverage when volatility/range is high. Place SL beyond market structure (below support for longs, above "
+        "resistance for shorts); set TP at a realistic target with reward:risk >= 1.5. Respond STRICT JSON ONLY: "
+        "{\"leverage\":<1-50>,\"slPct\":<0.2-50>,\"tpPct\":<0.2-50>,\"reason\":\"<=160 chars\"}.")
+    user = _json.dumps({'symbol': symbol, 'capitalUSD': capital, 'lastPrice': round(price, 5),
+                        'sma20': round(sma20, 5), 'changePct': round(chg, 2),
+                        'recentHigh': round(hi, 5), 'recentLow': round(lo, 5),
+                        'ohlc': [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5)] for c in win]})
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=300)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    try:
+        obj = _json.loads(_re.search(r'\{.*\}', text or '', _re.DOTALL).group(0))
+        lev = min(50.0, max(1.0, float(obj.get('leverage', 5))))
+        slp = min(50.0, max(0.2, float(obj.get('slPct', 1))))
+        tpp = min(50.0, max(0.2, float(obj.get('tpPct', 2))))
+        reason = str(obj.get('reason', ''))[:200]
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Could not parse Claude reply: ' + str(e)[:100]}), 502
+    prod = _load_delta_products().get(symbol)
+    cv   = float((prod or {}).get('contract_value', 1.0) or 1.0)
+    qty  = max(1, int((capital * lev) / (price * cv))) if price > 0 else 1
+    with delta_ai_lock:
+        cfg = delta_ai_state.get('config')
+        if cfg:   # bot running → apply live
+            cfg['slPct'] = slp; cfg['tpPct'] = tpp; cfg['qty'] = qty
+            cfg['capital'] = capital; cfg['leverage'] = lev
+    _bot_log('[Sizing] capital=${} leverage={}x qty={} SL={}% TP={}% — {}'.format(capital, lev, qty, slp, tpp, reason))
+    _persist_log_line('[DELTA] [Sizing] cap=${} lev={}x qty={} SL={}% TP={}%'.format(capital, lev, qty, slp, tpp))
+    return jsonify({'success': True, 'capital': capital, 'leverage': lev, 'slPct': slp, 'tpPct': tpp,
+                    'qty': qty, 'price': round(price, 5), 'reason': reason})
 
 @app.route('/api/aibot/delta/apply_config', methods=['POST'])
 @login_required
@@ -2655,7 +2749,7 @@ def _zd_bot_loop():
             except Exception as e:
                 _zd_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(_BOT_TICK_SEC)
+        _zd_time.sleep(max(5, int((zd_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
 
 @app.route('/api/aibot/zerodha/start', methods=['POST'])
 @login_required
@@ -2678,6 +2772,7 @@ def zd_aibot_start():
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
@@ -3060,7 +3155,7 @@ def _zo_bot_loop():
             except Exception as e:
                 _zo_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(_BOT_TICK_SEC)
+        _zd_time.sleep(max(5, int((zo_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
 
 @app.route('/api/aibot/zoptions/start', methods=['POST'])
 @login_required
@@ -3098,6 +3193,7 @@ def zo_aibot_start():
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
@@ -3382,6 +3478,24 @@ def mt5_status_route():
     return jsonify({'success': True, 'backend': _mt5_backend() or None,
                     'sessions': list(mt5_sessions.keys())})
 
+@app.route('/api/mt5/verify', methods=['GET'])
+@login_required
+def mt5_verify():
+    """Real connection check for MT5 (depends on backend)."""
+    backend = _mt5_backend()
+    if backend == 'metatrader5':
+        try:
+            mt5 = _mt5_pkg()
+            info = mt5.account_info()
+            if info:
+                return jsonify({'connected': True, 'login': getattr(info, 'login', '')})
+            return jsonify({'connected': False, 'error': 'no MT5 terminal session'})
+        except Exception as e:
+            return jsonify({'connected': False, 'error': str(e)[:140]})
+    if backend == 'metaapi':
+        return jsonify({'connected': bool(mt5_sessions), 'error': '' if mt5_sessions else 'metaapi not connected'})
+    return jsonify({'connected': False, 'error': 'MT5 backend not configured'})
+
 @app.route('/api/mt5/candles', methods=['GET'])
 @login_required
 def mt5_candles_route():
@@ -3551,7 +3665,7 @@ def _mt_bot_loop():
             except Exception as e:
                 _mt_log('[Tick] ERROR: ' + str(e))
         _bot_gc_tick()
-        _zd_time.sleep(_BOT_TICK_SEC)
+        _zd_time.sleep(max(5, int((mt_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
 
 @app.route('/api/aibot/mt5/start', methods=['POST'])
 @login_required
@@ -3573,6 +3687,7 @@ def mt_aibot_start():
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
@@ -14322,6 +14437,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Min algo score to enter">Min score: <input type="number" id="aiBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="aiBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="aiBotMovable"> Movable TP/SL</label>
       </div>
@@ -14495,6 +14611,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Min algo score to enter">Min score: <input type="number" id="mtBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering">Cooldown s: <input type="number" id="mtBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="mtBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="mtBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
       </div>
@@ -14613,8 +14730,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>Min score: <input type="number" id="deltaBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="deltaBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
+      </div>
+
+      <!-- Capital-based sizing: Claude picks leverage + SL/TP from the market -->
+      <div class="ai-risk-bar">
+        <label title="Trading capital (USD). Claude sizes leverage, SL/TP and quantity from this + live market.">Capital $: <input type="number" id="deltaBotCapital" value="100" min="1" step="1"></label>
+        <button class="zd-add-btn" id="deltaBotCalcBtn" type="button" title="Ask Claude to compute leverage, SL%, TP% and quantity for this capital and the current market">&#129302; Calculate SL/TP</button>
+        <span id="deltaBotSizing" style="color:#787b86;font-size:11px">Capital &mdash; · Leverage &mdash; · SL &mdash; · TP &mdash; · Qty &mdash;</span>
       </div>
 
       <div class="zd-footer">
@@ -14754,6 +14879,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Min algo score to enter">Min score: <input type="number" id="zoBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="zoBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering that leg">Cooldown s: <input type="number" id="zoBotCooldown" value="60" min="0" step="5"></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="zoBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="zoBotQualityFilter" checked> Quality filter</label>
       </div>
 
@@ -18493,18 +18619,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function refreshStatus() {
       const s = ZerodhaStore.getSession();
-      if (s.connected && s.apiKey) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>';
-        connectBtn.textContent = 'Connected';
-        connectBtn.classList.add('connected');
-        if (!apiKeyInp.value) apiKeyInp.value = s.apiKey;
-      } else {
-        statusDot.classList.remove('connected');
-        statusText.textContent = 'Not connected';
-        connectBtn.textContent = 'Connect';
-        connectBtn.classList.remove('connected');
+      if (s.apiKey && !apiKeyInp.value) apiKeyInp.value = s.apiKey;
+      if (!s.apiKey) {
+        statusDot.classList.remove('connected'); statusText.textContent = 'Not connected';
+        connectBtn.textContent = 'Connect'; connectBtn.classList.remove('connected'); return;
       }
+      _liveConn({ url: '/api/zerodha/verify', apiKey: s.apiKey, dot: statusDot, text: statusText, connectBtn: connectBtn,
+        connectedHTML: 'Connected <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>',
+        disconnectedHTML: 'Not connected &mdash; token expired or invalid, re-login' });
     }
 
     // Open via menu item
@@ -20185,6 +20307,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
   }
 
+  // Real connection check — pings the broker via /api/<broker>/verify and sets a
+  // status dot/text (and optional Connect button) from the TRUTH, not localStorage.
+  function _liveConn(opts) {
+    if (opts.text) opts.text.innerHTML = 'Checking connection…';
+    var q = opts.apiKey ? ('?api_key=' + encodeURIComponent(opts.apiKey)) : '';
+    function paint(ok) {
+      if (opts.dot) opts.dot.classList.toggle('connected', ok);
+      if (opts.text) opts.text.innerHTML = ok ? (opts.connectedHTML || 'Connected') : (opts.disconnectedHTML || 'Not connected');
+      if (opts.connectBtn) { opts.connectBtn.textContent = ok ? 'Connected' : 'Connect'; opts.connectBtn.classList.toggle('connected', ok); }
+    }
+    fetch(opts.url + q).then(function(r){ return r.json(); }).then(function(d){ paint(!!d.connected); })
+      .catch(function(){ paint(false); });
+  }
+
   // Draw + manage the 4 price lines on a bot chart (current=blue, entry=yellow,
   // TP=green, SL=red) and make TP/SL draggable when the Movable checkbox is on.
   // On drag-end it POSTs the new level to `endpoint`, which updates the live bot.
@@ -20305,6 +20441,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const minScoreEl  = document.getElementById('aiBotMinScore');
     const scoreBufferEl = document.getElementById('aiBotScoreBuffer');
     const cooldownEl  = document.getElementById('aiBotCooldown');
+    const tickSecEl   = document.getElementById('aiBotTickSec');
     const qualityChk  = document.getElementById('aiBotQualityFilter');
     const movableChk  = document.getElementById('aiBotMovable');
     let priceLines = null;
@@ -20441,13 +20578,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // ---- Connection status (mirror Zerodha session) ----
     function refreshStatus() {
       const s = ZerodhaStore.getSession();
-      if (s.connected && s.apiKey) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>';
-      } else {
-        statusDot.classList.remove('connected');
-        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
-      }
+      const dis = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
+      if (!s.apiKey) { statusDot.classList.remove('connected'); statusText.innerHTML = dis; return; }
+      _liveConn({ url: '/api/zerodha/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
+        connectedHTML: 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>',
+        disconnectedHTML: dis });
     }
     window.addEventListener('zerodha-session-change', refreshStatus);
     window.addEventListener('storage', e => { if (e.key === ZerodhaStore.SESSION_KEY) refreshStatus(); });
@@ -20797,6 +20932,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.minScore != null)  minScoreEl.value  = c.minScore;
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.tickSec != null) tickSecEl.value = c.tickSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
@@ -20867,7 +21003,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxProfit:   parseFloat(maxProfitEl.value) || 0,
         minScore:    (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
-        cooldownSec: parseInt(cooldownEl.value) || 0,
+        cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
         qualityFilter: !!qualityChk.checked,
         includeMM:   !!incMMChk.checked,
         includeMMA:  !!incMMAChk.checked,
@@ -21112,6 +21248,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const minScoreEl  = document.getElementById('zoBotMinScore');
     const scoreBufferEl = document.getElementById('zoBotScoreBuffer');
     const cooldownEl  = document.getElementById('zoBotCooldown');
+    const tickSecEl   = document.getElementById('zoBotTickSec');
     const qualityChk  = document.getElementById('zoBotQualityFilter');
     const startBtn = document.getElementById('zoBotStartBtn');
     const pauseBtn = document.getElementById('zoBotPauseBtn');
@@ -21200,13 +21337,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function refreshStatus() {
       const s = ZerodhaStore.getSession();
-      if (s.connected && s.apiKey) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>';
-      } else {
-        statusDot.classList.remove('connected');
-        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
-      }
+      const dis = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
+      if (!s.apiKey) { statusDot.classList.remove('connected'); statusText.innerHTML = dis; return; }
+      _liveConn({ url: '/api/zerodha/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
+        connectedHTML: 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>',
+        disconnectedHTML: dis });
     }
     window.addEventListener('zerodha-session-change', refreshStatus);
 
@@ -21305,6 +21440,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.minScore != null) minScoreEl.value = c.minScore;
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.tickSec != null) tickSecEl.value = c.tickSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         // NOTE: do NOT mirror strategy/buyer/seller selections from the running
         // config — those are user choices and must not be auto-ticked.
@@ -21362,7 +21498,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxProfit: parseFloat(maxProfitEl.value) || 0,
         minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
-        cooldownSec: parseInt(cooldownEl.value) || 0,
+        cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
         qualityFilter: !!qualityChk.checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(),
@@ -21481,14 +21617,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const accInp = document.getElementById('mt5AccountId');
     function refresh() {
       const s = MT5Store.getSession();
-      if (s.connected && s.id) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected to MT5 <span style="color:#787b86;font-size:11px">(' + (s.login || s.id) + (s.server ? ' @ ' + s.server : '') + ')</span>';
-        connectBtn.textContent = 'Connected'; connectBtn.classList.add('connected');
-      } else {
-        statusDot.classList.remove('connected'); statusText.textContent = 'Not connected';
-        connectBtn.textContent = 'Connect'; connectBtn.classList.remove('connected');
-      }
+      _liveConn({ url: '/api/mt5/verify', dot: statusDot, text: statusText, connectBtn: connectBtn,
+        connectedHTML: 'Connected to MT5 <span style="color:#787b86;font-size:11px">(' + (s.login || s.id || '') + (s.server ? ' @ ' + s.server : '') + ')</span>',
+        disconnectedHTML: 'Not connected' });
     }
     // Reveal MetaApi fields if backend hints metaapi
     fetch('/api/mt5/status').then(r => r.json()).then(s => {
@@ -21559,6 +21690,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const minScoreEl = document.getElementById('mtBotMinScore');
     const scoreBufferEl = document.getElementById('mtBotScoreBuffer');
     const cooldownEl = document.getElementById('mtBotCooldown');
+    const tickSecEl  = document.getElementById('mtBotTickSec');
     const qualityChk = document.getElementById('mtBotQualityFilter');
     const movableChk = document.getElementById('mtBotMovable');
     let priceLines = null;
@@ -21624,13 +21756,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function refreshStatus() {
       const s = MT5Store.getSession();
-      if (s.connected && s.id) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected to MT5 <span style="color:#787b86;font-size:11px">(' + (s.login || s.id) + ')</span>';
-      } else {
-        statusDot.classList.remove('connected');
-        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">MT5 Login</b> to enable data + live orders';
-      }
+      _liveConn({ url: '/api/mt5/verify', dot: statusDot, text: statusText,
+        connectedHTML: 'Connected to MT5 <span style="color:#787b86;font-size:11px">(' + (s.login || s.id || '') + ')</span>',
+        disconnectedHTML: 'Not connected &mdash; open <b style="color:#1e6ec8">MT5 Login</b> to enable data + live orders' });
     }
     window.addEventListener('mt5-session-change', refreshStatus);
 
@@ -21700,6 +21828,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.minScore != null) minScoreEl.value = c.minScore;
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.tickSec != null) tickSecEl.value = c.tickSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
@@ -21742,7 +21871,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxConsec: parseInt(maxConsecEl.value) || 3, maxLoss: parseFloat(maxLossEl.value) || 2000,
         maxProfit: parseFloat(maxProfitEl.value) || 0, minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
-        cooldownSec: parseInt(cooldownEl.value) || 0, qualityFilter: !!qualityChk.checked,
+        cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30, qualityFilter: !!qualityChk.checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(), mt5_id: s.id || ''
       };
@@ -21856,18 +21985,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function refresh() {
       const s = DeltaStore.getSession();
-      if (s.connected && s.apiKey) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected to Delta <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>';
-        connectBtn.textContent = 'Connected';
-        connectBtn.classList.add('connected');
-        if (!apiKeyInp.value) apiKeyInp.value = s.apiKey;
-      } else {
-        statusDot.classList.remove('connected');
-        statusText.textContent = 'Not connected';
-        connectBtn.textContent = 'Connect';
-        connectBtn.classList.remove('connected');
+      if (s.apiKey && !apiKeyInp.value) apiKeyInp.value = s.apiKey;
+      if (!s.apiKey) {
+        statusDot.classList.remove('connected'); statusText.textContent = 'Not connected';
+        connectBtn.textContent = 'Connect'; connectBtn.classList.remove('connected'); return;
       }
+      _liveConn({ url: '/api/delta/verify', apiKey: s.apiKey, dot: statusDot, text: statusText, connectBtn: connectBtn,
+        connectedHTML: 'Connected to Delta <span style="color:#787b86;font-size:11px">(api_key: ' + s.apiKey + ')</span>',
+        disconnectedHTML: 'Not connected &mdash; key invalid or server restarted, re-connect' });
     }
     document.getElementById('btnDeltaLogin').addEventListener('click', function() {
       automationDropdown.classList.remove('open');
@@ -21964,6 +22089,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const minScoreEl  = document.getElementById('deltaBotMinScore');
     const scoreBufferEl = document.getElementById('deltaBotScoreBuffer');
     const cooldownEl  = document.getElementById('deltaBotCooldown');
+    const tickSecEl   = document.getElementById('deltaBotTickSec');
     const qualityChk  = document.getElementById('deltaBotQualityFilter');
     const movableChk  = document.getElementById('deltaBotMovable');
     let priceLines = null;
@@ -22027,13 +22153,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function refreshStatus() {
       const s = DeltaStore.getSession();
-      if (s.connected && s.apiKey) {
-        statusDot.classList.add('connected');
-        statusText.innerHTML = 'Connected to Delta <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>';
-      } else {
-        statusDot.classList.remove('connected');
-        statusText.innerHTML = 'Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> to enable live orders';
-      }
+      const dis = 'Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> to enable live orders';
+      if (!s.apiKey) { statusDot.classList.remove('connected'); statusText.innerHTML = dis; return; }
+      _liveConn({ url: '/api/delta/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
+        connectedHTML: 'Connected to Delta <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>',
+        disconnectedHTML: dis });
     }
     window.addEventListener('delta-session-change', refreshStatus);
     window.addEventListener('storage', e => { if (e.key === DeltaStore.SESSION_KEY) refreshStatus(); });
@@ -22228,6 +22352,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       a.href = '/api/aibot/log_download?download=1';
       a.download = 'log.txt';
       document.body.appendChild(a); a.click(); a.remove();
+    });
+
+    // ---- Capital-based sizing: Claude picks leverage + SL/TP from the market ----
+    const calcBtn  = document.getElementById('deltaBotCalcBtn');
+    const capEl    = document.getElementById('deltaBotCapital');
+    const sizingEl = document.getElementById('deltaBotSizing');
+    if (calcBtn) calcBtn.addEventListener('click', function() {
+      const sym = symEl.value.trim().toUpperCase();
+      const cap = parseFloat(capEl.value) || 0;
+      if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
+      if (cap <= 0) { logLine('Enter Capital ($) first.', 'info'); return; }
+      const s = DeltaStore.getSession();
+      calcBtn.disabled = true; sizingEl.textContent = 'Asking Claude…';
+      fetch('/api/aibot/delta/sizing', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ capital: cap, symbol: sym, tf: tfEl.value, api_key: (s.apiKey || '') }) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { sizingEl.textContent = 'Sizing failed: ' + (res.error || 'unknown'); return; }
+          sizingEl.innerHTML = 'Capital $' + res.capital + ' · Leverage <b>' + res.leverage + 'x</b> · SL <b>' + res.slPct +
+            '%</b> · TP <b>' + res.tpPct + '%</b> · Qty <b>' + res.qty + '</b>';
+          // Seed the inputs so a (re)start uses them; if running, server already applied live.
+          slPctEl.value = res.slPct; tpPctEl.value = res.tpPct; qtyEl.value = res.qty;
+          logLine('[Sizing] Claude: ' + (res.reason || '') + ' (lev ' + res.leverage + 'x, qty ' + res.qty + ')', 'info');
+        }).catch(e => { sizingEl.textContent = 'Sizing error: ' + e.message; })
+        .finally(() => { calcBtn.disabled = false; });
     });
 
     function openPosition(side, price, strategy, mode) {
@@ -22429,6 +22577,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.minScore != null)  minScoreEl.value  = c.minScore;
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
+        if (c.tickSec != null) tickSecEl.value = c.tickSec;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
@@ -22505,7 +22654,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxProfit:  parseFloat(maxProfitEl.value) || 0,
         minScore:   (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
-        cooldownSec: parseInt(cooldownEl.value) || 0,
+        cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
         qualityFilter: !!qualityChk.checked,
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
