@@ -2038,13 +2038,16 @@ def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
     if not cands:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: no market data', 'symbol': cfg.get('symbol', '')}
     trades_ctx = [{'sym': t.get('symbol'), 'pnl': round(t.get('pnl', 0), 4), 'reason': t.get('reason')} for t in (recent_trades or [])[-6:]]
+    cap = cfg.get('capital')
     system = (
         "You are an autonomous trader. From the candidate instruments below, pick the SINGLE BEST one to trade RIGHT "
         "NOW for a high win rate — weigh trend strength, volatility and liquidity (volRatio). Then give the trade "
         "decision for that one symbol. Prefer HOLD (no trade) if none has a clear edge; do not force a trade in chop. "
-        "You may set slPct/tpPct from structure. Respond STRICT JSON ONLY: {\"symbol\":\"..\",\"signal\":\"BUY\"|"
-        "\"SELL\"|\"HOLD\",\"score\":<-10..10>,\"reason\":\"<=160 chars\",\"slPct\":<optional>,\"tpPct\":<optional>}.")
-    user = _json.dumps({'candidates': cands, 'recentTrades': trades_ctx}, default=str)
+        "Set slPct/tpPct from structure for a strong reward:risk. Also choose a SAFE leverage 1-20 (LOWER in high "
+        "volatility) used to size the position from capital. Respond STRICT JSON ONLY: {\"symbol\":\"..\",\"signal\":"
+        "\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,\"reason\":\"<=160 chars\",\"slPct\":<optional>,\"tpPct\":"
+        "<optional>,\"leverage\":<1-20>}.")
+    user = _json.dumps({'candidates': cands, 'recentTrades': trades_ctx, 'capitalUSD': cap}, default=str)
     text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400)
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:160], 'symbol': cands[0]['symbol']}
@@ -2060,6 +2063,7 @@ def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
                'reason': 'Claude(auto→' + sym + '): ' + str(obj.get('reason', ''))[:180]}
         if obj.get('slPct') is not None: out['slPct'] = min(50.0, max(0.2, float(obj['slPct'])))
         if obj.get('tpPct') is not None: out['tpPct'] = min(50.0, max(0.2, float(obj['tpPct'])))
+        if obj.get('leverage') is not None: out['leverage'] = min(20.0, max(1.0, float(obj['leverage'])))
         return out
     except Exception:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: parse error', 'symbol': cands[0]['symbol']}
@@ -2067,7 +2071,17 @@ def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
     cfg    = delta_ai_state['config']
-    qty    = int(cfg.get('qty', 1))
+    # Capital-based auto sizing: qty = capital × leverage ÷ (price × contract_value).
+    # Leverage = Claude's pick (capped 1-20x); falls back to the Qty field if no capital.
+    capital = float(cfg.get('capital') or 0)
+    lev     = min(20.0, max(1.0, float(strat.get('leverage') or cfg.get('leverage') or 5)))
+    if capital > 0 and price > 0:
+        prod = _load_delta_products().get((cfg.get('symbol') or '').upper())
+        cv   = float((prod or {}).get('contract_value', 1.0) or 1.0)
+        qty  = max(1, int((capital * lev) / (price * cv)))
+        cfg['leverage'] = lev
+    else:
+        qty = int(cfg.get('qty', 1))
     sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.0))   # Claude can set its own SL/TP
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
@@ -2078,9 +2092,10 @@ def _delta_bot_open(side, price, strat, mode):
         'strategy': strat['name'], 'mode': mode,
     }
     tag  = '[DELTA-' + mode.upper() + ']'
-    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
+    _cap_note = (' [cap $' + str(capital) + ' ×' + str(lev) + 'x]') if capital > 0 else ''
+    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}{} — {}'.format(
         tag, side, qty, cfg['symbol'], price, round(sl, 4), round(tp, 4),
-        strat['name'], strat['score'], strat.get('reason', ''))
+        strat['name'], strat['score'], _cap_note, strat.get('reason', ''))
     _bot_log(line)
     _persist_log_line('[DELTA] ' + line)
     if mode == 'live':
@@ -2352,6 +2367,7 @@ def delta_aibot_start():
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 200) or 200),
             'tokens':     bool(data.get('tokens', False)),   # Delta only: trade top-gainer tokens in auto mode
+            'capital':    float(data.get('capital') or 0),   # Delta only: auto-size leverage & qty from this
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
@@ -14935,6 +14951,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Autopilot: Claude symbol selection / auto-symbol (1 trade at a time) -->
       <div class="ai-input-bar">
+        <label title="Your trading capital (USD). Claude auto-sizes leverage &amp; quantity from this — enter only capital and Start."><span>Capital $</span><input type="number" id="deltaBotCapital" value="10" min="1" step="1" style="width:90px"></label>
         <label title="Let Claude pick which symbol to trade from a curated liquid list."><input type="checkbox" id="deltaBotAutoSym"> Auto symbol (Claude picks)</label>
         <label title="Trade the top-gaining Delta tokens (high-momentum movers) — Claude auto-picks the best one. Overrides the curated majors."><input type="checkbox" id="deltaBotTokens"> &#128640; Tokens (top gainers)</label>
         <button class="zd-add-btn" id="deltaBotSuggestBtn" type="button" title="Claude scans the market &amp; suggests symbols based on your capital">&#128269; Suggest Symbols</button>
@@ -14984,10 +15001,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
       </div>
 
-      <!-- Capital-based sizing: Claude picks leverage + SL/TP from the market -->
+      <!-- Capital-based sizing preview (optional — autopilot does this automatically on Start) -->
       <div class="ai-risk-bar">
-        <label title="Trading capital (USD). Claude sizes leverage, SL/TP and quantity from this + live market.">Capital $: <input type="number" id="deltaBotCapital" value="100" min="1" step="1"></label>
-        <button class="zd-add-btn" id="deltaBotCalcBtn" type="button" title="Ask Claude to compute leverage, SL%, TP% and quantity for this capital and the current market">&#129302; Calculate SL/TP</button>
+        <button class="zd-add-btn" id="deltaBotCalcBtn" type="button" title="Preview: ask Claude for leverage, SL%, TP% &amp; quantity for your Capital and the current market (autopilot does this automatically when you Start)">&#129302; Preview sizing</button>
         <span id="deltaBotSizing" style="color:#787b86;font-size:11px">Capital &mdash; · Leverage &mdash; · SL &mdash; · TP &mdash; · Qty &mdash;</span>
       </div>
 
@@ -21228,8 +21244,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
       const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
+      const _auto = !!(s.config && (s.config.autoSymbol || s.config.tokens));
+      if (_auto && _botSym) symEl.value = _botSym;   // reflect Claude's auto-picked symbol
+      if (s.position && s.position.qty != null) qtyEl.value = s.position.qty;   // show live quantity
       const _viewSym = symEl.value.trim().toUpperCase();
-      if (!_botSym || _viewSym === _botSym) {   // don't clobber a chart you've loaded for a different symbol
+      if (_auto || !_botSym || _viewSym === _botSym) {   // auto mode: always follow the bot's symbol
         if (s.last_candles && s.last_candles.length && botCandleSeries) {
           botCandleSeries.setData(s.last_candles);
           const lc = s.last_candles[s.last_candles.length - 1];
@@ -22129,8 +22148,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
       const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
+      const _auto = !!(s.config && (s.config.autoSymbol || s.config.tokens));
+      if (_auto && _botSym) symEl.value = _botSym;   // reflect Claude's auto-picked symbol
+      if (s.position && s.position.qty != null) qtyEl.value = s.position.qty;   // show live quantity
       const _viewSym = symEl.value.trim().toUpperCase();
-      if (!_botSym || _viewSym === _botSym) {   // don't clobber a chart you've loaded for a different symbol
+      if (_auto || !_botSym || _viewSym === _botSym) {   // auto mode: always follow the bot's symbol
         if (s.last_candles && s.last_candles.length && botCandleSeries) {
           botCandleSeries.setData(s.last_candles);
           const lc = s.last_candles[s.last_candles.length - 1]; if (lc && lc.close != null) updatePx(lc.close);
@@ -22892,8 +22914,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       // Chart from server's last candles
       const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
+      const _auto = !!(s.config && (s.config.autoSymbol || s.config.tokens));
+      if (_auto && _botSym) symEl.value = _botSym;   // reflect Claude's auto-picked symbol
+      if (s.position && s.position.qty != null) qtyEl.value = s.position.qty;   // show live quantity
       const _viewSym = symEl.value.trim().toUpperCase();
-      if (!_botSym || _viewSym === _botSym) {   // don't clobber a chart you've loaded for a different symbol
+      if (_auto || !_botSym || _viewSym === _botSym) {   // auto mode: always follow the bot's symbol
         if (s.last_candles && s.last_candles.length && botCandleSeries) {
           botCandleSeries.setData(s.last_candles);
           const lc = s.last_candles[s.last_candles.length - 1];
@@ -22942,6 +22967,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         symbols:    (document.getElementById('deltaBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
         autoSymbol: !!document.getElementById('deltaBotAutoSym').checked,
         tokens:     !!document.getElementById('deltaBotTokens').checked,
+        capital:    parseFloat(document.getElementById('deltaBotCapital').value) || 0,
         qty:        parseInt(qtyEl.value) || 1,
         tf:         tfEl.value,
         mode:       currentMode(),
