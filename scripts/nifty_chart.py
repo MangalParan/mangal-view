@@ -1966,6 +1966,104 @@ def _bot_pick_symbol(state, cfg, source):
     cfg['symbol'] = cands[idx].upper()
     state['scan_idx'] = idx + 1
 
+_DELTA_GAINERS_CACHE = {'ts': 0.0, 'data': []}
+def _delta_top_gainers(n=8):
+    """Top-gaining Delta perpetuals by 24h change (decent volume). Cached 5 min.
+    Used by the Delta bot's 'Tokens' mode to chase high-momentum movers."""
+    now = _zd_time.time()
+    if now - _DELTA_GAINERS_CACHE['ts'] < 300 and _DELTA_GAINERS_CACHE['data']:
+        return _DELTA_GAINERS_CACHE['data']
+    rows = None
+    for base in _DELTA_BASES:
+        resp = _delta_get_public('/v2/tickers', base_url=base)
+        if resp.get('success'):
+            rows = resp.get('result') or []
+            break
+    if not rows:
+        return _DELTA_GAINERS_CACHE['data']
+    items = []
+    for t in rows:
+        sym = (t.get('symbol') or '').upper()
+        if not sym or not (sym.endswith('USD') or sym.endswith('USDT')):
+            continue
+        ctype = (t.get('contract_type') or '').lower()
+        if ctype and 'perpetual' not in ctype:   # perps only (skip options/spot/futures)
+            continue
+        try:    chg = float(t.get('mark_change_24h') if t.get('mark_change_24h') is not None else (t.get('change_24h') or 0))
+        except (TypeError, ValueError): chg = 0.0
+        try:    vol = float(t.get('turnover_usd') or t.get('turnover') or t.get('volume') or 0)
+        except (TypeError, ValueError): vol = 0.0
+        if vol <= 0:
+            continue
+        items.append((sym, chg, vol))
+    if not items:
+        return _DELTA_GAINERS_CACHE['data']
+    # require some liquidity (top half by volume), then rank by 24h gain
+    items.sort(key=lambda x: x[2], reverse=True)
+    liquid = items[:max(n * 4, 20)]
+    liquid.sort(key=lambda x: x[1], reverse=True)
+    syms = [s for s, _, _ in liquid[:n]]
+    if syms:
+        _DELTA_GAINERS_CACHE.update({'ts': now, 'data': syms})
+    return syms
+
+def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
+    """Auto-symbol mode: in ONE Claude call, scan the universe and return the
+    SINGLE best symbol to trade now PLUS the trade decision. Returns a strat dict
+    {name, symbol, signal, score, reason, slPct?, tpPct?} (HOLD on any issue)."""
+    import json as _json, re as _re
+    if source == 'delta' and cfg.get('tokens'):
+        universe = _delta_top_gainers() or _BOT_UNIVERSE.get('delta', [])
+    else:
+        universe = _BOT_UNIVERSE.get(source, [])
+    cands = []
+    for sym in universe:
+        try:
+            c = _bot_fetch_candles(sym, interval, source, api_key=api_key)
+        except Exception:
+            c = []
+        if not c or len(c) < 15:
+            continue
+        cl = [x['close'] for x in c[-30:]]
+        vols = [float(x.get('volume', 0) or 0) for x in c[-20:]]
+        last = cl[-1]
+        cands.append({
+            'symbol': sym, 'last': round(last, 5),
+            'trendShortPct': round((cl[-1]-cl[-10])/cl[-10]*100.0, 2) if len(cl) >= 10 and cl[-10] else 0.0,
+            'trendMedPct':   round((cl[-1]-cl[0])/cl[0]*100.0, 2) if cl[0] else 0.0,
+            'rangePct':      round((max(x['high'] for x in c[-20:]) - min(x['low'] for x in c[-20:]))/last*100.0, 2) if last else 0.0,
+            'volRatio':      round((sum(vols[-3:])/3.0)/(sum(vols)/max(1, len(vols))), 2) if vols and sum(vols) > 0 else 0.0,
+            'ohlc': [[round(x['open'], 5), round(x['high'], 5), round(x['low'], 5), round(x['close'], 5)] for x in c[-15:]],
+        })
+    if not cands:
+        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: no market data', 'symbol': cfg.get('symbol', '')}
+    trades_ctx = [{'sym': t.get('symbol'), 'pnl': round(t.get('pnl', 0), 4), 'reason': t.get('reason')} for t in (recent_trades or [])[-6:]]
+    system = (
+        "You are an autonomous trader. From the candidate instruments below, pick the SINGLE BEST one to trade RIGHT "
+        "NOW for a high win rate — weigh trend strength, volatility and liquidity (volRatio). Then give the trade "
+        "decision for that one symbol. Prefer HOLD (no trade) if none has a clear edge; do not force a trade in chop. "
+        "You may set slPct/tpPct from structure. Respond STRICT JSON ONLY: {\"symbol\":\"..\",\"signal\":\"BUY\"|"
+        "\"SELL\"|\"HOLD\",\"score\":<-10..10>,\"reason\":\"<=160 chars\",\"slPct\":<optional>,\"tpPct\":<optional>}.")
+    user = _json.dumps({'candidates': cands, 'recentTrades': trades_ctx}, default=str)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400)
+    if err:
+        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:160], 'symbol': cands[0]['symbol']}
+    try:
+        obj = _json.loads(_re.search(r'\{.*\}', text or '', _re.DOTALL).group(0))
+        valid = {c['symbol'] for c in cands}
+        sym = str(obj.get('symbol', '')).upper()
+        if sym not in valid:
+            sym = cands[0]['symbol']
+        sig = str(obj.get('signal', 'HOLD')).upper()
+        if sig not in ('BUY', 'SELL', 'HOLD'): sig = 'HOLD'
+        out = {'name': 'claude', 'symbol': sym, 'signal': sig, 'score': float(obj.get('score', 0) or 0),
+               'reason': 'Claude(auto→' + sym + '): ' + str(obj.get('reason', ''))[:180]}
+        if obj.get('slPct') is not None: out['slPct'] = min(50.0, max(0.2, float(obj['slPct'])))
+        if obj.get('tpPct') is not None: out['tpPct'] = min(50.0, max(0.2, float(obj['tpPct'])))
+        return out
+    except Exception:
+        return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: parse error', 'symbol': cands[0]['symbol']}
+
 # --- Position management (caller must hold delta_ai_lock) ---
 def _delta_bot_open(side, price, strat, mode):
     cfg    = delta_ai_state['config']
@@ -2084,9 +2182,15 @@ def _delta_bot_place_live(side, qty, cfg):
 def _delta_bot_tick():
     cfg = delta_ai_state.get('config') or {}
     if not cfg: return
-    _bot_pick_symbol(delta_ai_state, cfg, 'delta')   # autopilot: scan watchlist/universe while flat
-    symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
+    # Auto-symbol: while flat, Claude picks the SINGLE best symbol (+ decision).
+    _autopick = (_claude_auto_pick('delta', interval, cfg, None, delta_ai_state.get('trades'))
+                 if (_bot_is_claude(cfg) and (cfg.get('autoSymbol') or cfg.get('tokens')) and not delta_ai_state.get('position')) else None)
+    if _autopick is not None:
+        cfg['symbol'] = (_autopick.get('symbol') or cfg.get('symbol') or '').upper()
+    else:
+        _bot_pick_symbol(delta_ai_state, cfg, 'delta')   # watchlist round-robin / hold position symbol
+    symbol   = (cfg.get('symbol') or '').upper()
     if not symbol: return
 
     try:
@@ -2102,7 +2206,12 @@ def _delta_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+    if _autopick is not None:
+        strat = _autopick
+    elif _bot_is_claude(cfg):
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'))
+    else:
+        strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
 
     # --- LIVE mode: pull authoritative position/P&L from Delta ---
@@ -2242,6 +2351,7 @@ def delta_aibot_start():
             'tpPct':      float(data.get('tpPct', 2.0)),
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 200) or 200),
+            'tokens':     bool(data.get('tokens', False)),   # Delta only: trade top-gainer tokens in auto mode
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
@@ -2254,8 +2364,8 @@ def delta_aibot_start():
             'api_key':    (data.get('api_key') or '').strip(),
         }
         _c = delta_ai_state['config']
-        if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
-            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
+        if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol'] and not _c.get('tokens'):
+            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol / Tokens'}), 400
         delta_ai_state['scan_idx']      = 0
         delta_ai_state['position']      = None
         delta_ai_state['trades']        = []
@@ -2708,9 +2818,14 @@ def _zd_bot_place_live(side, qty, price, cfg):
 def _zd_bot_tick():
     cfg = zd_ai_state.get('config') or {}
     if not cfg: return
-    _bot_pick_symbol(zd_ai_state, cfg, 'kite')   # autopilot: scan watchlist/universe while flat
-    symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
+    _autopick = (_claude_auto_pick('kite', interval, cfg, cfg.get('api_key'), zd_ai_state.get('trades'))
+                 if (_bot_is_claude(cfg) and cfg.get('autoSymbol') and not zd_ai_state.get('position')) else None)
+    if _autopick is not None:
+        cfg['symbol'] = (_autopick.get('symbol') or cfg.get('symbol') or '').upper()
+    else:
+        _bot_pick_symbol(zd_ai_state, cfg, 'kite')   # watchlist round-robin / hold position symbol
+    symbol   = (cfg.get('symbol') or '').upper()
     if not symbol: return
 
     try:
@@ -2726,7 +2841,12 @@ def _zd_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+    if _autopick is not None:
+        strat = _autopick
+    elif _bot_is_claude(cfg):
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'))
+    else:
+        strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
 
     with zd_ai_lock:
@@ -3634,9 +3754,14 @@ def _mt_bot_close(price, reason, mode):
 def _mt_bot_tick():
     cfg = mt_ai_state.get('config') or {}
     if not cfg: return
-    _bot_pick_symbol(mt_ai_state, cfg, 'mt5')   # autopilot: scan watchlist/universe while flat
-    symbol   = (cfg.get('symbol') or '').upper()
     interval = cfg.get('tf', '5m')
+    _autopick = (_claude_auto_pick('mt5', interval, cfg, cfg.get('mt5_id'), mt_ai_state.get('trades'))
+                 if (_bot_is_claude(cfg) and cfg.get('autoSymbol') and not mt_ai_state.get('position')) else None)
+    if _autopick is not None:
+        cfg['symbol'] = (_autopick.get('symbol') or cfg.get('symbol') or '').upper()
+    else:
+        _bot_pick_symbol(mt_ai_state, cfg, 'mt5')   # watchlist round-robin / hold position symbol
+    symbol   = (cfg.get('symbol') or '').upper()
     if not symbol: return
     try:
         candles = _bot_fetch_candles(symbol, interval, 'mt5', api_key=cfg.get('mt5_id'))
@@ -3649,7 +3774,12 @@ def _mt_bot_tick():
         return
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    strat  = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+    if _autopick is not None:
+        strat = _autopick
+    elif _bot_is_claude(cfg):
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'))
+    else:
+        strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
     with mt_ai_lock:
         mt_ai_state['last_candles'] = candles[-150:]
@@ -14806,6 +14936,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- Autopilot: Claude symbol selection / auto-symbol (1 trade at a time) -->
       <div class="ai-input-bar">
         <label title="Let Claude pick which symbol to trade from a curated liquid list."><input type="checkbox" id="deltaBotAutoSym"> Auto symbol (Claude picks)</label>
+        <label title="Trade the top-gaining Delta tokens (high-momentum movers) — Claude auto-picks the best one. Overrides the curated majors."><input type="checkbox" id="deltaBotTokens"> &#128640; Tokens (top gainers)</label>
         <button class="zd-add-btn" id="deltaBotSuggestBtn" type="button" title="Claude scans the market &amp; suggests symbols based on your capital">&#128269; Suggest Symbols</button>
         <label style="flex:1;min-width:240px"><span>Watchlist (scans 1 trade at a time)</span><input type="text" id="deltaBotWatchlist" placeholder="BTCUSD,ETHUSD,SOLUSD — blank = single symbol above"></label>
       </div>
@@ -22805,11 +22936,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
-      if (!sym && !document.getElementById('deltaBotAutoSym').checked && !(document.getElementById('deltaBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
+      if (!sym && !document.getElementById('deltaBotAutoSym').checked && !document.getElementById('deltaBotTokens').checked && !(document.getElementById('deltaBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol / Tokens.', 'info'); return; }
       const cfg = {
         symbol:     sym,
         symbols:    (document.getElementById('deltaBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
         autoSymbol: !!document.getElementById('deltaBotAutoSym').checked,
+        tokens:     !!document.getElementById('deltaBotTokens').checked,
         qty:        parseInt(qtyEl.value) || 1,
         tf:         tfEl.value,
         mode:       currentMode(),
