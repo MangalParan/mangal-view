@@ -1842,11 +1842,12 @@ def _bot_build_algos(cfg):
     if cfg.get('includeMMA'): algos.append('mma')
     return [a for a in algos if a not in ('mpredict', 'claude')]
 
-def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None):
+def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None, extra_ctx=None):
     """Autonomous Claude strategy. Sends recent OHLCV plus market context (multi-
     window trend, volume/liquidity, volatility), the CURRENT position (so it
     doesn't whipsaw) and recent closed trades (so it learns) and gets a decision.
-    Returns {name:'claude', signal, score, reason, slPct?, tpPct?}. HOLD on error."""
+    `extra_ctx` (e.g. the underlying spot/trend for an option leg) is merged into
+    the payload. Returns {name:'claude', signal, score, reason, slPct?, tpPct?}. HOLD on error."""
     if not candles or len(candles) < 20:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude: not enough data'}
     import json as _json, re as _re
@@ -1899,12 +1900,16 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "Do NOT flip side on minor noise — repeated flipping loses money to costs.\n"
         "5) LEARN: review 'recentTrades'. If recent trades (especially exits by 'signal reversal') lost in conditions "
         "like now, be MORE selective and HOLD more; tighten only when the edge is clear.\n"
-        "You MAY set slPct and tpPct (percent from entry) for this trade based on structure (e.g. SL beyond the "
-        "invalidation level); omit them to use the panel defaults.\n"
-        "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
+        "RISK: You OWN risk management — ALWAYS set slPct and tpPct (percent from entry) for this trade from market "
+        "structure (SL just beyond the invalidation level, TP at a realistic target with reward:risk >= 1.5). These "
+        "override the panel's SL/TP. Never omit them on a BUY/SELL.\n"
+        + ("OPTION: This instrument is an OPTION on the underlying in 'underlying'. Weigh 'underlyingTrendPct' — a "
+           "CALL (CE) gains when the underlying RISES, a PUT (PE) gains when it FALLS. Trade the leg WITH the "
+           "underlying's direction; HOLD a CE in a falling underlying and a PE in a rising one.\n" if (extra_ctx and extra_ctx.get('underlying')) else "")
+        + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
     )
-    user = _json.dumps({
+    _payload = {
         'symbol': symbol, 'tf': tf, 'regime': regime, 'lastPrice': round(last, 5),
         'sma10': round(sma10, 5), 'sma20': round(sma20, 5), 'sma50': round(sma50, 5),
         'trendShortPct': round(trend_short, 2), 'trendMediumPct': round(trend_med, 2),
@@ -1912,8 +1917,11 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         'volAvg20': round(vol_avg, 1), 'volRecent3': round(vol_recent, 1), 'volRatio': vol_ratio,
         'position': pos_ctx, 'recentTrades': trades_ctx, 'recentWinRate': (round(wins/len(trades_ctx)*100) if trades_ctx else None),
         'ohlcv': ohlcv,
-    }, default=str)
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400)
+    }
+    if extra_ctx:
+        _payload.update(extra_ctx)
+    user = _json.dumps(_payload, default=str)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'))
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:220]}
     sig, score, reason, sl_pct, tp_pct = 'HOLD', 0.0, '', None, None
@@ -2048,7 +2056,7 @@ def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
         "\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,\"reason\":\"<=160 chars\",\"slPct\":<optional>,\"tpPct\":"
         "<optional>,\"leverage\":<1-20>}.")
     user = _json.dumps({'candidates': cands, 'recentTrades': trades_ctx, 'capitalUSD': cap}, default=str)
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'))
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:160], 'symbol': cands[0]['symbol']}
     try:
@@ -2377,6 +2385,7 @@ def delta_aibot_start():
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'api_key':    (data.get('api_key') or '').strip(),
         }
         _c = delta_ai_state['config']
@@ -2459,13 +2468,31 @@ def _sanitize_delta_patch(patch):
             rejected.append(k)
     return clean, rejected
 
-def _call_claude(system, messages, max_tokens=1024):
+# Friendly model names chosen in each AI bot panel → Anthropic model IDs.
+_CLAUDE_MODEL_IDS = {
+    'haiku':  'claude-haiku-4-5-20251001',
+    'sonnet': 'claude-sonnet-4-6',
+    'opus':   'claude-opus-4-8',
+}
+
+def _resolve_claude_model(name):
+    """Map a panel model choice (haiku/sonnet/opus) to an Anthropic model ID.
+    Accepts a full 'claude-*' id as-is. Falls back to CLAUDE_MODEL env / sonnet."""
+    key = (name or '').strip().lower()
+    if key in _CLAUDE_MODEL_IDS:
+        return _CLAUDE_MODEL_IDS[key]
+    if key.startswith('claude-'):
+        return key
+    return os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6').strip() or 'claude-sonnet-4-6'
+
+def _call_claude(system, messages, max_tokens=1024, model=None):
     """Call the Anthropic Messages API via stdlib only (no SDK dependency).
-    Reads ANTHROPIC_API_KEY from the environment. Returns (text, error)."""
+    Reads ANTHROPIC_API_KEY from the environment. `model` is a panel choice
+    (haiku/sonnet/opus) or full id; None uses the env default. Returns (text, error)."""
     api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
     if not api_key:
         return None, 'ANTHROPIC_API_KEY is not set on the server. Add it in your environment (Render → Environment) and redeploy.'
-    model = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6').strip() or 'claude-sonnet-4-6'
+    model = _resolve_claude_model(model)
     import urllib.request as _ur, json as _json
     body = _json.dumps({
         'model': model, 'max_tokens': max_tokens,
@@ -2545,7 +2572,8 @@ def delta_aibot_sizing():
                         'sma20': round(sma20, 5), 'changePct': round(chg, 2),
                         'recentHigh': round(hi, 5), 'recentLow': round(lo, 5),
                         'ohlc': [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5)] for c in win]})
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=300)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=300,
+                             model=(data.get('model') or (delta_ai_state.get('config') or {}).get('model')))
     if err:
         return jsonify({'success': False, 'error': err}), 502
     try:
@@ -2644,7 +2672,7 @@ def delta_aibot_chat():
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
 
-    text, err = _call_claude(system, msgs)
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -2725,7 +2753,15 @@ def _zd_calc_pnl(entry, exit_, qty, side):
 
 def _zd_bot_open(side, price, strat, mode):
     cfg    = zd_ai_state['config']
-    qty    = int(cfg.get('qty', 1))
+    # Capital-based auto sizing in Auto-symbol mode: qty = capital × leverage ÷ price
+    # (leverage = Claude's pick, capped 1-20x). Otherwise use the manual Qty field.
+    capital = float(cfg.get('capital') or 0)
+    lev     = min(20.0, max(1.0, float(strat.get('leverage') or cfg.get('leverage') or 5)))
+    if capital > 0 and price > 0 and cfg.get('autoSymbol'):
+        qty = max(1, int((capital * lev) / price))
+        cfg['leverage'] = lev
+    else:
+        qty = int(cfg.get('qty', 1))
     sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.5))   # Claude can set its own SL/TP
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 3.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
@@ -2736,9 +2772,10 @@ def _zd_bot_open(side, price, strat, mode):
         'strategy': strat['name'], 'mode': mode,
     }
     tag  = '[' + mode.upper() + ']'
-    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
+    _cap_note = (' [cap ₹' + str(capital) + ' ×' + str(lev) + 'x]') if (capital > 0 and cfg.get('autoSymbol')) else ''
+    line = '{} ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}{} — {}'.format(
         tag, side, qty, cfg['symbol'], round(price, 2), round(sl, 2), round(tp, 2),
-        strat['name'], strat['score'], strat.get('reason', ''))
+        strat['name'], strat['score'], _cap_note, strat.get('reason', ''))
     _zd_log(line)
     _persist_log_line('[ZERODHA] ' + line)
     if mode == 'live':
@@ -2941,6 +2978,7 @@ def zd_aibot_start():
             'mode':       data.get('mode', 'paper'),
             'slPct':      float(data.get('slPct', 1.5)),
             'tpPct':      float(data.get('tpPct', 3.0)),
+            'capital':    float(data.get('capital') or 0),   # Auto-symbol: Claude sizes qty & leverage from this
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
             'maxLoss':    float(data.get('maxLoss', 2000) or 2000),
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
@@ -2952,6 +2990,7 @@ def zd_aibot_start():
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'api_key':    (data.get('api_key') or '').strip(),
         }
         _c = zd_ai_state['config']
@@ -3107,7 +3146,7 @@ def zd_aibot_chat():
         content = str(h.get('content', ''))[:4000]
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
-    text, err = _call_claude(system, msgs)
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -3252,6 +3291,136 @@ def _zo_apply_breakers(cfg, mode):
     _zo_log('[STOP] ' + trip + ' — all legs closed, bot stopped.')
     _persist_log_line('[ZOPTIONS] [STOP] ' + trip)
 
+# --- Options Auto-strike: underlying base → CE/PE option symbols ---
+# name → (spot tradingsymbol, spot exchange, options F&O segment). Stocks default
+# to NSE cash + NFO options.
+_ZO_BASE_MAP = {
+    'NIFTY':      ('NIFTY 50',          'NSE', 'NFO'),
+    'BANKNIFTY':  ('NIFTY BANK',        'NSE', 'NFO'),
+    'FINNIFTY':   ('NIFTY FIN SERVICE', 'NSE', 'NFO'),
+    'MIDCPNIFTY': ('NIFTY MID SELECT',  'NSE', 'NFO'),
+    'SENSEX':     ('SENSEX',            'BSE', 'BFO'),
+    'BANKEX':     ('BANKEX',            'BSE', 'BFO'),
+}
+_ZO_OPT_CACHE = {}        # {exchange: {'ts': float, 'data': [...]}} for non-NFO chains
+_ZO_OPT_TTL   = 1800
+
+def _zo_base_meta(base):
+    """(spot tradingsymbol, spot exchange, options segment) for an underlying base."""
+    return _ZO_BASE_MAP.get((base or '').upper().strip(), ((base or '').upper().strip(), 'NSE', 'NFO'))
+
+def _zo_load_opt_instruments(exchange):
+    """CE/PE option instruments for a Kite F&O segment (NFO/BFO). Cached."""
+    exchange = (exchange or 'NFO').upper()
+    if exchange == 'NFO':
+        return _load_nfo_instruments()
+    ent = _ZO_OPT_CACHE.get(exchange) or {}
+    now = _zd_time.time()
+    if ent.get('data') and now - ent.get('ts', 0) < _ZO_OPT_TTL:
+        return ent['data']
+    try:
+        req = _zd_urllib.Request('https://api.kite.trade/instruments/' + exchange,
+                                 headers={'User-Agent': 'Mozilla/5.0'})
+        with _kite_urlopen(req, timeout=20) as resp:
+            content = resp.read().decode('utf-8')
+        reader = _csv.DictReader(_io.StringIO(content))
+        rows = []
+        for row in reader:
+            if row.get('instrument_type', '') not in ('CE', 'PE'):
+                continue
+            rows.append({'symbol': row.get('tradingsymbol', ''), 'name': row.get('name', ''),
+                         'expiry': row.get('expiry', ''), 'strike': float(row.get('strike') or 0),
+                         'type': row.get('instrument_type', ''), 'exchange': exchange})
+        _ZO_OPT_CACHE[exchange] = {'ts': now, 'data': rows}
+        return rows
+    except Exception:
+        return ent.get('data', [])
+
+def _zo_base_spot(spot_sym, api_key, interval='5m'):
+    """Last price of the underlying from Kite candles. Returns float or 0."""
+    try:
+        candles = _bot_fetch_candles(spot_sym, interval, 'kite', api_key=api_key)
+        if candles:
+            return float(candles[-1]['close'])
+    except Exception:
+        pass
+    return 0.0
+
+def _zo_resolve_auto_strikes(cfg):
+    """Pick CE & PE option tradingsymbols near the money for the configured base.
+    Claude chooses the strikes from ATM±3 candidates (falls back to ATM). Returns
+    (ce_symbol, pe_symbol, opt_exchange, info_str). On failure ce/pe are None and
+    info_str is the reason."""
+    import json as _json, re as _re
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    if not base:
+        return None, None, 'NFO', 'no underlying base set'
+    spot_sym, spot_exch, opt_exch = _zo_base_meta(base)
+    spot = _zo_base_spot(spot_sym, cfg.get('api_key'), cfg.get('tf', '5m'))
+    if spot <= 0:
+        return None, None, opt_exch, 'could not read spot for ' + base + ' (' + spot_sym + ') — check Kite connection'
+    chain_all = [i for i in _zo_load_opt_instruments(opt_exch) if i.get('name', '').upper() == base]
+    if not chain_all:
+        return None, None, opt_exch, 'no option chain for ' + base + ' on ' + opt_exch
+    today    = datetime.now().strftime('%Y-%m-%d')
+    expiries = sorted({i['expiry'] for i in chain_all if i.get('expiry') and i['expiry'] >= today}) \
+               or sorted({i['expiry'] for i in chain_all if i.get('expiry')})
+    if not expiries:
+        return None, None, opt_exch, 'no expiries for ' + base
+    expiry  = expiries[0]
+    chain   = [i for i in chain_all if i.get('expiry') == expiry]
+    strikes = sorted({i['strike'] for i in chain if i['strike'] > 0})
+    if not strikes:
+        return None, None, opt_exch, 'no strikes for ' + base
+    atm  = min(strikes, key=lambda s: abs(s - spot))
+    ai   = strikes.index(atm)
+    cand = strikes[max(0, ai - 3): ai + 4]   # ATM ±3 strikes
+    ce_strike = pe_strike = atm
+    try:
+        if _bot_is_claude(cfg):
+            system = ("You select option strikes for an intraday options bot. Given the underlying spot and the "
+                      "available strikes for the nearest expiry, choose ONE strike for the CE (call) leg and ONE "
+                      "for the PE (put) leg to trade now — ATM or slightly OTM for a good risk:reward. Respond "
+                      "STRICT JSON ONLY: {\"ceStrike\":<number>,\"peStrike\":<number>,\"reason\":\"<=120 chars\"}.")
+            user = _json.dumps({'underlying': base, 'spot': round(spot, 2), 'atm': atm,
+                                'availableStrikes': cand, 'expiry': expiry})
+            text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=200, model=cfg.get('model'))
+            if not err and text:
+                obj = _json.loads(_re.search(r'\{.*\}', text, _re.DOTALL).group(0))
+                cs  = float(obj.get('ceStrike') or atm); ps = float(obj.get('peStrike') or atm)
+                ce_strike = min(cand, key=lambda s: abs(s - cs))
+                pe_strike = min(cand, key=lambda s: abs(s - ps))
+    except Exception:
+        ce_strike = pe_strike = atm
+    ce_row = next((i for i in chain if i['type'] == 'CE' and abs(i['strike'] - ce_strike) < 1e-6), None)
+    pe_row = next((i for i in chain if i['type'] == 'PE' and abs(i['strike'] - pe_strike) < 1e-6), None)
+    if not ce_row or not pe_row:
+        return None, None, opt_exch, 'could not map strikes to symbols for ' + base
+    info = '{} spot {:.1f} → CE {} / PE {} (exp {})'.format(base, spot, int(ce_strike), int(pe_strike), expiry)
+    return ce_row['symbol'], pe_row['symbol'], opt_exch, info
+
+def _zo_underlying_ctx(cfg):
+    """Recent underlying trend context for the option legs' Claude calls. {} if N/A."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    if not base:
+        return {}
+    spot_sym, _se, _oe = _zo_base_meta(base)
+    try:
+        candles = _bot_fetch_candles(spot_sym, cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+    except Exception:
+        candles = []
+    cap = float(cfg.get('capital') or 0)
+    if not candles or len(candles) < 10:
+        return {'underlying': base, 'capital': cap} if cap else {'underlying': base}
+    cl = [c['close'] for c in candles[-30:]]
+    trend_short = ((cl[-1] - cl[-10]) / cl[-10] * 100.0) if len(cl) >= 10 and cl[-10] else 0.0
+    trend_med   = ((cl[-1] - cl[0]) / cl[0] * 100.0) if cl[0] else 0.0
+    ctx = {'underlying': base, 'underlyingSpot': round(cl[-1], 2),
+           'underlyingTrendPct': round(trend_short, 2), 'underlyingTrendMedPct': round(trend_med, 2)}
+    if cap:
+        ctx['capital'] = cap
+    return ctx
+
 def _zo_bot_tick():
     cfg = zo_ai_state.get('config') or {}
     if not cfg: return
@@ -3259,6 +3428,7 @@ def _zo_bot_tick():
     interval = cfg.get('tf', '5m')
     buyer    = bool(cfg.get('optionBuyer'))
     seller   = bool(cfg.get('optionSeller'))
+    base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and _bot_is_claude(cfg)) else None
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -3272,7 +3442,7 @@ def _zo_bot_tick():
             _zo_log('[Tick] no Kite candles for ' + symbol); continue
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
-        strat  = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades')) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        strat  = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=base_ctx) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
@@ -3341,19 +3511,41 @@ def zo_aibot_start():
     with zo_ai_lock:
         if zo_ai_state.get('running'):
             return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
-        legs = []
-        for n in ('1', '2'):
-            sym = (data.get('sym' + n) or '').upper().strip()
-            if sym:
-                legs.append({'symbol': sym, 'exchange': (data.get('exch' + n) or '').upper().strip(),
-                             'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
-        if not legs:
-            return jsonify({'success': False, 'error': 'Select at least one option instrument'}), 400
         buyer  = bool(data.get('optionBuyer', True))
         seller = bool(data.get('optionSeller', False))
         if not buyer and not seller:
             return jsonify({'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}), 400
+        auto_strikes = bool(data.get('autoStrikes', False))
+        base_symbol  = (data.get('baseSymbol') or '').upper().strip()
+        opt_exch_auto = ''
+        auto_info     = ''
+        legs = []
+        if auto_strikes:
+            if not base_symbol:
+                return jsonify({'success': False, 'error': 'Pick an Underlying base for Auto strikes'}), 400
+            _rcfg = {'baseSymbol': base_symbol, 'tf': data.get('tf', '5m'),
+                     'api_key': (data.get('api_key') or '').strip(),
+                     'model': (data.get('model') or '').strip(),
+                     'allowedStrategies': [s for s in (data.get('allowedStrategies') or ['claude']) if s in _BOT_CONFIGURABLE_ALGOS] or ['claude']}
+            ce_sym, pe_sym, opt_exch_auto, auto_info = _zo_resolve_auto_strikes(_rcfg)
+            if not ce_sym or not pe_sym:
+                return jsonify({'success': False, 'error': 'Auto strikes failed: ' + str(auto_info)}), 502
+            legs = [
+                {'symbol': ce_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
+                {'symbol': pe_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
+            ]
+        else:
+            for n in ('1', '2'):
+                sym = (data.get('sym' + n) or '').upper().strip()
+                if sym:
+                    legs.append({'symbol': sym, 'exchange': (data.get('exch' + n) or '').upper().strip(),
+                                 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
+            if not legs:
+                return jsonify({'success': False, 'error': 'Select at least one option instrument (or enable Auto strikes)'}), 400
         zo_ai_state['config'] = {
+            'autoStrikes':  auto_strikes,
+            'baseSymbol':   base_symbol,
+            'capital':      float(data.get('capital') or 0),   # context for Claude (qty is manual here)
             'sym1': legs[0]['symbol'], 'exch1': legs[0]['exchange'],
             'sym2': legs[1]['symbol'] if len(legs) > 1 else '',
             'exch2': legs[1]['exchange'] if len(legs) > 1 else '',
@@ -3375,6 +3567,7 @@ def zo_aibot_start():
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'api_key':    (data.get('api_key') or '').strip(),
         }
         zo_ai_state['legs']          = legs
@@ -3389,6 +3582,9 @@ def zo_aibot_start():
     cfg = zo_ai_state['config']
     syms = ', '.join(l['symbol'] for l in legs)
     modes = ('buyer' if cfg['optionBuyer'] else '') + ('+seller' if cfg['optionSeller'] else '')
+    if auto_strikes and auto_info:
+        _zo_log('[Auto] ' + auto_info)
+        _persist_log_line('[ZOPTIONS] [Auto] ' + auto_info)
     _zo_log('Options Bot started SERVER-SIDE {} mode [{}] for {} qty={} TF={}. Tick every {}s.'.format(
         cfg['mode'].upper(), modes.strip('+'), syms, cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[ZOPTIONS] [{}] BOT START {} ({}) qty={} TF={} (server-side)'.format(
@@ -3524,7 +3720,7 @@ def zo_aibot_chat():
         content = str(h.get('content', ''))[:4000]
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
-    text, err = _call_claude(system, msgs)
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -3712,7 +3908,16 @@ def _mt_bot_place_live(side, qty, price, cfg):
 
 def _mt_bot_open(side, price, strat, mode):
     cfg    = mt_ai_state['config']
-    qty    = float(cfg.get('qty', 1))
+    # Capital-based auto sizing in Auto-symbol mode: lots = capital × leverage ÷
+    # (price × 100k contract size), leverage = Claude's pick (1-20x). FX-sized
+    # approximation; otherwise use the manual Volume (lots) field.
+    capital = float(cfg.get('capital') or 0)
+    lev     = min(20.0, max(1.0, float(strat.get('leverage') or cfg.get('leverage') or 5)))
+    if capital > 0 and price > 0 and cfg.get('autoSymbol'):
+        qty = max(0.01, round((capital * lev) / (price * 100000.0), 2))
+        cfg['leverage'] = lev
+    else:
+        qty = float(cfg.get('qty', 1))
     sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.0))   # Claude can set its own SL/TP
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
@@ -3722,9 +3927,10 @@ def _mt_bot_open(side, price, strat, mode):
         'qty': qty, 'sl': round(sl, 5), 'tp': round(tp, 5),
         'strategy': strat['name'], 'mode': mode,
     }
-    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
+    _cap_note = (' [cap ' + str(capital) + ' ×' + str(lev) + 'x]') if (capital > 0 and cfg.get('autoSymbol')) else ''
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f}{} — {}'.format(
         mode.upper(), side, qty, cfg['symbol'], round(price, 5),
-        round(sl, 5), round(tp, 5), strat['name'], strat['score'], strat.get('reason', ''))
+        round(sl, 5), round(tp, 5), strat['name'], strat['score'], _cap_note, strat.get('reason', ''))
     _mt_log(line)
     _persist_log_line('[MT5] ' + line)
     if mode == 'live':
@@ -3882,6 +4088,8 @@ def mt_aibot_start():
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
+            'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
+            'capital':    float(data.get('capital') or 0),   # Auto-symbol: Claude sizes lots & leverage from this
             'mt5_id':     (data.get('mt5_id') or '').strip(),
         }
         _c = mt_ai_state['config']
@@ -4030,7 +4238,7 @@ def mt_aibot_chat():
         content = str(h.get('content', ''))[:4000]
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
-    text, err = _call_claude(system, msgs)
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -4109,7 +4317,7 @@ def aibot_suggest_symbols():
         + (" and the trader's capital" if capital else "") + ". Respond STRICT JSON ONLY: "
         "{\"picks\":[{\"symbol\":\"..\",\"side\":\"BUY\"|\"SELL\"|\"WATCH\",\"reason\":\"<=120 chars\"}],\"summary\":\"<=160\"}.")
     user = _json.dumps({'broker': broker, 'capitalUSD': capital, 'candidates': summ})
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700, model=data.get('model'))
     if err:
         return jsonify({'success': False, 'error': err}), 502
     try:
@@ -12361,7 +12569,11 @@ def index():
     Returns:
         Response: HTML page with content-type text/html.
     """
-    return Response(HTML_PAGE, content_type="text/html")
+    resp = Response(HTML_PAGE, content_type="text/html")
+    # Always serve fresh HTML so UI changes show up without a manual hard-refresh.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/candles")
@@ -13081,6 +13293,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .zd-close { background: none; border: none; color: #787b86; font-size: 22px; cursor: pointer; }
   .zd-close:hover { color: #fff; }
   .zd-header-actions { display: flex; align-items: center; gap: 2px; }
+  /* Model + Tick selectors pinned to the top-right of each AI bot header */
+  .bot-head-ctrls { display: flex; align-items: center; gap: 10px; margin-left: auto; margin-right: 10px; }
+  .bot-head-ctrls label {
+    display: flex; align-items: center; gap: 5px; font-size: 11px; color: #9aa0ac;
+    white-space: nowrap; cursor: pointer;
+  }
+  .bot-head-ctrls select {
+    background: #131722; color: #d1d4dc; border: 1px solid #2a2e39; border-radius: 4px;
+    padding: 3px 6px; font-size: 11px; font-family: inherit; cursor: pointer;
+  }
+  .bot-head-ctrls select:focus { outline: none; border-color: #2962ff; }
+  /* Top control line of each AI bot body: Capital, Daily loss, Daily profit, Model, Tick */
+  .bot-top-line {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+    padding: 9px 12px; margin-bottom: 10px;
+    background: #23273a; border: 1px solid #2a2e39; border-radius: 8px;
+  }
+  .bot-top-line label {
+    display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9aa0ac;
+    white-space: nowrap; cursor: pointer; font-weight: 600;
+  }
+  .bot-top-line input[type="number"], .bot-top-line input[type="text"] {
+    background: #131722; color: #d1d4dc; border: 1px solid #2a2e39; border-radius: 4px;
+    padding: 4px 7px; font-size: 12px; font-family: inherit; width: 92px;
+  }
+  .bot-top-line select {
+    background: #131722; color: #d1d4dc; border: 1px solid #2a2e39; border-radius: 4px;
+    padding: 4px 7px; font-size: 12px; font-family: inherit; cursor: pointer;
+  }
+  .bot-top-line input:focus, .bot-top-line select:focus { outline: none; border-color: #2962ff; }
+  .bot-top-line .sep { width: 1px; align-self: stretch; background: #2a2e39; margin: 2px 0; }
   .zd-header-btn {
     background: none; border: none; color: #787b86; cursor: pointer;
     font-size: 14px; padding: 4px 9px; border-radius: 3px;
@@ -14576,6 +14819,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="zd-body">
+      <!-- Top control line: Capital, Daily loss/profit limits, Model, Tick -->
+      <div class="bot-top-line">
+        <label title="Your trading capital (₹). When Auto symbol is on, Claude sizes quantity &amp; leverage from this.">Capital &#8377;<input type="number" id="aiBotCapital" value="100000" min="0" step="1000"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Daily loss &#8377;<input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
+        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
+        <span class="sep"></span>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="aiBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+      </div>
       <!-- Connection status -->
       <div class="zd-status-bar" id="aiBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="aiBotStatusDot"></span>
@@ -14680,12 +14932,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Stop-Loss % from entry">SL %: <input type="number" id="aiBotSlPct" value="1.5" min="0.1" step="0.1"></label>
         <label title="Target % from entry">Target %: <input type="number" id="aiBotTpPct" value="3.0" min="0.1" step="0.1"></label>
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
-        <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
-        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
         <label title="Min algo score to enter">Min score: <input type="number" id="aiBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="aiBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="aiBotMovable"> Movable TP/SL</label>
       </div>
@@ -14796,6 +15045,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="zd-body">
+      <!-- Top control line: Capital, Daily loss/profit limits, Model, Tick -->
+      <div class="bot-top-line">
+        <label title="Your trading capital. When Auto symbol is on, Claude sizes volume (lots) &amp; leverage from this.">Capital<input type="number" id="mtBotCapital" value="1000" min="0" step="100"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Daily loss<input type="number" id="mtBotMaxLoss" value="2000" min="10"></label>
+        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
+        <span class="sep"></span>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="mtBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+      </div>
       <div class="zd-status-bar" id="mtBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="mtBotStatusDot"></span>
         <span id="mtBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">MT5 Login</b> from the Automation menu to enable data + live orders</span>
@@ -14862,12 +15120,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Stop-Loss % from entry">SL %: <input type="number" id="mtBotSlPct" value="1.0" min="0.05" step="0.05"></label>
         <label title="Target % from entry">Target %: <input type="number" id="mtBotTpPct" value="2.0" min="0.05" step="0.05"></label>
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="mtBotMaxConsec" value="3" min="1"></label>
-        <label title="Bot auto-stops when realised P/L drops below this">Max daily loss: <input type="number" id="mtBotMaxLoss" value="2000" min="10"></label>
-        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
         <label title="Min algo score to enter">Min score: <input type="number" id="mtBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering">Cooldown s: <input type="number" id="mtBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="mtBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="mtBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
       </div>
@@ -14907,6 +15162,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="zd-body">
+      <!-- Top control line: Capital, Daily loss/profit limits, Model, Tick -->
+      <div class="bot-top-line">
+        <label title="Your trading capital (USD). When Auto symbol is on, Claude sizes leverage &amp; quantity from this.">Capital $<input type="number" id="deltaBotCapital" value="10" min="1" step="1"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Daily loss<input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
+        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
+        <span class="sep"></span>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="deltaBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+      </div>
       <div class="zd-status-bar" id="deltaBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="deltaBotStatusDot"></span>
         <span id="deltaBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> from the Automation menu to enable live trading</span>
@@ -14951,7 +15215,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Autopilot: Claude symbol selection / auto-symbol (1 trade at a time) -->
       <div class="ai-input-bar">
-        <label title="Your trading capital (USD). Claude auto-sizes leverage &amp; quantity from this — enter only capital and Start."><span>Capital $</span><input type="number" id="deltaBotCapital" value="10" min="1" step="1" style="width:90px"></label>
         <label title="Let Claude pick which symbol to trade from a curated liquid list."><input type="checkbox" id="deltaBotAutoSym"> Auto symbol (Claude picks)</label>
         <label title="Trade the top-gaining Delta tokens (high-momentum movers) — Claude auto-picks the best one. Overrides the curated majors."><input type="checkbox" id="deltaBotTokens"> &#128640; Tokens (top gainers)</label>
         <button class="zd-add-btn" id="deltaBotSuggestBtn" type="button" title="Claude scans the market &amp; suggests symbols based on your capital">&#128269; Suggest Symbols</button>
@@ -14991,12 +15254,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>SL %: <input type="number" id="deltaBotSlPct" value="1.0" min="0.1" step="0.1"></label>
         <label>Target %: <input type="number" id="deltaBotTpPct" value="2.0" min="0.1" step="0.1"></label>
         <label>Max consec losses: <input type="number" id="deltaBotMaxConsec" value="3" min="1"></label>
-        <label>Max daily loss: <input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
-        <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit: <input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
         <label>Min score: <input type="number" id="deltaBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="deltaBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
       </div>
@@ -15043,6 +15303,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="zd-body">
+      <!-- Top control line: Capital, Daily loss/profit limits, Model, Tick -->
+      <div class="bot-top-line">
+        <label title="Your trading capital (₹) — context for Claude. Quantity is set manually in this Options bot.">Capital &#8377;<input type="number" id="zoBotCapital" value="100000" min="0" step="1000"></label>
+        <label title="Bot auto-stops when realised P/L drops below this">Daily loss &#8377;<input type="number" id="zoBotMaxLoss" value="2000" min="100"></label>
+        <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
+        <span class="sep"></span>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="zoBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+      </div>
       <div class="zd-status-bar" id="zoBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="zoBotStatusDot"></span>
         <span id="zoBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders</span>
@@ -15066,9 +15335,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span style="color:#787b86;font-size:10px">(tick both to allow long + short simultaneously across the two legs)</span>
       </div>
 
+      <!-- Underlying base + Auto strike selection -->
       <div class="ai-input-bar">
+        <label title="Underlying instrument Claude analyses to trade its options. Pick an index or type any stock. No chart is shown for the base — it only feeds the Claude strategy.">
+          <span>Underlying base</span>
+          <span style="display:flex;gap:6px">
+            <select id="zoBotBaseSel">
+              <option value="NIFTY" selected>NIFTY</option>
+              <option value="BANKNIFTY">BANKNIFTY</option>
+              <option value="FINNIFTY">FINNIFTY</option>
+              <option value="MIDCPNIFTY">MIDCPNIFTY</option>
+              <option value="SENSEX">SENSEX</option>
+              <option value="BANKEX">BANKEX</option>
+              <option value="__custom">Other (stock)&hellip;</option>
+            </select>
+            <input type="text" id="zoBotBaseCustom" placeholder="e.g. RELIANCE" style="min-width:140px;display:none">
+          </span>
+        </label>
+        <label title="Auto: Claude picks the CE &amp; PE strike prices near the money from the base spot. Off: enter the CE/PE option symbols yourself."><input type="checkbox" id="zoBotAutoStrikes" checked> &#129302; Auto strikes (Claude picks CE/PE)</label>
+        <span id="zoBotAutoStrikeInfo" style="color:#787b86;font-size:11px">Claude will pick CE/PE strikes near ATM at the nearest expiry.</span>
+      </div>
+
+      <div class="ai-input-bar">
+        <span id="zoBotManualStrikes" style="display:contents">
         <label>
-          <span>Option 1</span>
+          <span>CE option</span>
           <span style="display:flex;gap:6px">
             <input type="text" id="zoBotSym1" placeholder="e.g. NIFTY26JUN24000CE" style="min-width:200px">
             <button class="zd-add-inst-btn" id="zoBotAddInst1" type="button" title="Pick instrument" style="white-space:nowrap">&#43; Add</button>
@@ -15081,7 +15372,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </select>
         </label>
         <label>
-          <span>Option 2</span>
+          <span>PE option</span>
           <span style="display:flex;gap:6px">
             <input type="text" id="zoBotSym2" placeholder="e.g. NIFTY26JUN24000PE" style="min-width:200px">
             <button class="zd-add-inst-btn" id="zoBotAddInst2" type="button" title="Pick instrument" style="white-space:nowrap">&#43; Add</button>
@@ -15093,6 +15384,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <option value="">Auto</option><option value="NFO">NFO</option><option value="BFO">BFO</option><option value="MCX">MCX</option><option value="NSE">NSE</option><option value="CDS">CDS</option>
           </select>
         </label>
+        </span>
         <label><span>Qty</span><input type="number" id="zoBotQty" value="1" min="1" style="width:70px"></label>
         <label>
           <span>Timeframe</span>
@@ -15139,12 +15431,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Stop-Loss % from entry (option premium)">SL %: <input type="number" id="zoBotSlPct" value="10" min="0.1" step="0.5"></label>
         <label title="Target % from entry (option premium)">Target %: <input type="number" id="zoBotTpPct" value="10" min="0.1" step="0.5"></label>
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="zoBotMaxConsec" value="3" min="1"></label>
-        <label title="Bot auto-stops when realised P/L drops below this">Max daily loss &#8377;: <input type="number" id="zoBotMaxLoss" value="2000" min="100"></label>
-        <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Max daily profit &#8377;: <input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
         <label title="Min algo score to enter">Min score: <input type="number" id="zoBotMinScore" value="0" min="0" step="0.1"></label>
         <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="zoBotScoreBuffer" value="0" min="0" step="0.1"></label>
         <label title="Seconds to wait after an exit before re-entering that leg">Cooldown s: <input type="number" id="zoBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick: <select id="zoBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
         <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="zoBotQualityFilter" checked> Quality filter</label>
       </div>
 
@@ -18955,7 +19244,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dragging = false, sx, sy, ol, ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         dragging = true; panel.style.transform = 'none';
         const r = panel.getBoundingClientRect();
         ol = r.left; ot = r.top; sx = e.clientX; sy = e.clientY;
@@ -19290,7 +19579,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let isDragging = false, startX, startY, origLeft, origTop;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;            // any header button skips drag
+        if (e.target.closest('button, select, input, label')) return;            // any header button skips drag
         if (panel.classList.contains('maximized')) return;  // no dragging when maximized
         if (isZerodhaPopout) return;                        // no dragging inside popout window
         isDragging = true;
@@ -20201,7 +20490,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dragging = false, sx, sy, ol, ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         if (panel.classList.contains('maximized')) return;
         dragging = true; panel.style.transform = 'none';
         const r = panel.getBoundingClientRect();
@@ -20592,8 +20881,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
     container.style.display = '';
     container.innerHTML = '<div style="color:#787b86;font-size:12px;padding:8px">&#129302; Claude is scanning the market…</div>';
+    var _mEl = document.getElementById({ delta: 'deltaBotModel', zerodha: 'aiBotModel', mt5: 'mtBotModel' }[broker] || '');
     fetch('/api/aibot/suggest_symbols', { method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ broker: broker, capital: capital, api_key: apiKey || '' }) })
+      body: JSON.stringify({ broker: broker, capital: capital, api_key: apiKey || '', model: (_mEl ? _mEl.value : '') }) })
       .then(function(r){ return r.json(); }).then(function(res){
         if (!res.success) { container.innerHTML = '<div style="color:#ef5350;font-size:12px;padding:8px">' + esc(res.error || 'Failed') + '</div>'; return; }
         var picks = res.picks || [];
@@ -20740,6 +21030,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('aiBotScoreBuffer');
     const cooldownEl  = document.getElementById('aiBotCooldown');
     const tickSecEl   = document.getElementById('aiBotTickSec');
+    const modelEl     = document.getElementById('aiBotModel');
     const qualityChk  = document.getElementById('aiBotQualityFilter');
     const movableChk  = document.getElementById('aiBotMovable');
     let priceLines = null;
@@ -20814,7 +21105,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
     function _saveStrategies() { try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} }
-    stratChks.forEach(c => c.addEventListener('change', _saveStrategies));
+    // When the Claude AI strategy is selected, Claude owns SL/TP (set per trade
+    // from market structure) — disable the manual SL/Target inputs to make that clear.
+    const _claudeChk = stratChks.find(c => c.dataset.strat === 'claude');
+    function _syncClaudeSLTP() {
+      const on = !_claudeChk || _claudeChk.checked;
+      [slPctEl, tpPctEl].forEach(function(el) {
+        if (!el) return;
+        el.disabled = on;
+        el.title = on ? 'Claude sets SL/TP per trade from market structure (Claude AI strategy is selected).' : 'Stop-Loss / Target % from entry';
+        const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
+      });
+    }
+    stratChks.forEach(c => c.addEventListener('change', function(){ _saveStrategies(); _syncClaudeSLTP(); }));
+    _syncClaudeSLTP();
 
     // ---- Open / Close ----
     document.getElementById('btnAIBot').addEventListener('click', function() {
@@ -20832,7 +21136,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dragging = false, sx, sy, ol, ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         if (panel.classList.contains('maximized')) return;
         dragging = true; panel.style.transform = 'none';
         const r = panel.getBoundingClientRect();
@@ -21231,7 +21535,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.tickSec != null) tickSecEl.value = c.tickSec;
+        if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        { const _cEl = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'Capital')); if (_cEl && c.capital != null) _cEl.value = c.capital; }
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
@@ -21295,6 +21601,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         symbol:      sym,
         symbols:     (document.getElementById('aiBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
         autoSymbol:  !!document.getElementById('aiBotAutoSym').checked,
+        capital:     parseFloat((document.getElementById('aiBotCapital')||{}).value) || 0,
         exchange:    (exchEl.value || '').trim().toUpperCase(),
         qty:         parseInt(qtyEl.value) || 1,
         tf:          tfEl.value,
@@ -21307,6 +21614,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         minScore:    (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
+        model:       modelEl ? modelEl.value : 'sonnet',
         qualityFilter: !!qualityChk.checked,
         includeMM:   !!incMMChk.checked,
         includeMMA:  !!incMMAChk.checked,
@@ -21484,7 +21792,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const thinking = addMsg('Thinking…', 'bot');
         fetch('/api/aibot/zerodha/chat', {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ message: msg, history: history.slice(0, -1) })
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') })
         }).then(r => r.json()).then(res => {
           thinking.remove();
           if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
@@ -21555,6 +21863,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('zoBotScoreBuffer');
     const cooldownEl  = document.getElementById('zoBotCooldown');
     const tickSecEl   = document.getElementById('zoBotTickSec');
+    const modelEl     = document.getElementById('zoBotModel');
     const qualityChk  = document.getElementById('zoBotQualityFilter');
     const startBtn = document.getElementById('zoBotStartBtn');
     const pauseBtn = document.getElementById('zoBotPauseBtn');
@@ -21599,6 +21908,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
       })); } catch(e) {}
     }
     [buyerChk, sellerChk, incMMChk, incMMAChk].concat(stratChks).forEach(c => c.addEventListener('change', _savePrefs));
+    // Claude owns SL/TP when its strategy is selected — disable the manual inputs.
+    const _claudeChk = stratChks.find(c => c.dataset.strat === 'claude');
+    function _syncClaudeSLTP() {
+      const on = !_claudeChk || _claudeChk.checked;
+      [slPctEl, tpPctEl].forEach(function(el) {
+        if (!el) return;
+        el.disabled = on;
+        el.title = on ? 'Claude sets SL/TP per trade from market structure (Claude AI strategy is selected).' : 'Stop-Loss / Target % from entry (option premium)';
+        const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
+      });
+    }
+    stratChks.forEach(c => c.addEventListener('change', _syncClaudeSLTP));
+    _syncClaudeSLTP();
+
+    // ---- Auto strikes + Underlying base wiring ----
+    const _zoAutoChk   = document.getElementById('zoBotAutoStrikes');
+    const _zoBaseSel   = document.getElementById('zoBotBaseSel');
+    const _zoBaseCust  = document.getElementById('zoBotBaseCustom');
+    const _zoManual    = document.getElementById('zoBotManualStrikes');
+    const _zoAutoInfo  = document.getElementById('zoBotAutoStrikeInfo');
+    function _zoSyncAuto() {
+      const on = !!(_zoAutoChk && _zoAutoChk.checked);
+      if (_zoManual)   _zoManual.style.display = on ? 'none' : 'contents';
+      if (_zoAutoInfo) _zoAutoInfo.style.display = on ? '' : 'none';
+    }
+    function _zoSyncBase() {
+      if (_zoBaseCust && _zoBaseSel) _zoBaseCust.style.display = (_zoBaseSel.value === '__custom') ? '' : 'none';
+    }
+    if (_zoAutoChk) _zoAutoChk.addEventListener('change', _zoSyncAuto);
+    if (_zoBaseSel) _zoBaseSel.addEventListener('change', _zoSyncBase);
+    _zoSyncAuto(); _zoSyncBase();
 
     // ---- Open / drag / maximize ----
     document.getElementById('btnZOptionsBot').addEventListener('click', function() {
@@ -21613,7 +21953,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dr=false,sx,sy,ol,ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         if (panel.classList.contains('maximized')) return;
         dr=true; panel.style.transform='none';
         const r = panel.getBoundingClientRect();
@@ -21747,7 +22087,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.tickSec != null) tickSecEl.value = c.tickSec;
+        if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        { const cap = document.getElementById('zoBotCapital'); if (cap && c.capital != null) cap.value = c.capital; }
+        { const ac = document.getElementById('zoBotAutoStrikes'); if (ac && c.autoStrikes != null) ac.checked = !!c.autoStrikes; }
+        { const bs = document.getElementById('zoBotBaseSel'); if (bs && c.baseSymbol) {
+            const opt = Array.from(bs.options).some(o => o.value === c.baseSymbol);
+            if (opt) { bs.value = c.baseSymbol; } else { bs.value = '__custom'; const bc = document.getElementById('zoBotBaseCustom'); if (bc) bc.value = c.baseSymbol; } } }
+        if (typeof _zoSyncAuto === 'function') _zoSyncAuto();
+        if (typeof _zoSyncBase === 'function') _zoSyncBase();
         // NOTE: do NOT mirror strategy/buyer/seller selections from the running
         // config — those are user choices and must not be auto-ticked.
       }
@@ -21789,11 +22137,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
       const sym1 = symEls[0].value.trim().toUpperCase();
       const sym2 = symEls[1].value.trim().toUpperCase();
-      if (!sym1 && !sym2) { logLine('Pick at least one option (+ Add).', 'info'); return; }
+      const autoStrikes = !!(document.getElementById('zoBotAutoStrikes') || {}).checked;
+      const baseSelEl = document.getElementById('zoBotBaseSel');
+      let baseSymbol = baseSelEl ? baseSelEl.value : '';
+      if (baseSymbol === '__custom') baseSymbol = ((document.getElementById('zoBotBaseCustom') || {}).value || '').trim().toUpperCase();
+      if (autoStrikes) {
+        if (!baseSymbol) { logLine('Pick an Underlying base for Auto strikes.', 'info'); return; }
+      } else if (!sym1 && !sym2) {
+        logLine('Pick at least one option (+ Add), or enable Auto strikes.', 'info'); return;
+      }
       if (!buyerChk.checked && !sellerChk.checked) { logLine('Enable Option Buyer and/or Option Seller.', 'info'); return; }
+      if (autoStrikes) logLine('Resolving CE/PE strikes for ' + baseSymbol + ' via Claude…', 'info');
       const cfg = {
         sym1: sym1, exch1: (exchEls[0].value || '').trim().toUpperCase(),
         sym2: sym2, exch2: (exchEls[1].value || '').trim().toUpperCase(),
+        autoStrikes: autoStrikes, baseSymbol: baseSymbol,
+        capital: parseFloat((document.getElementById('zoBotCapital') || {}).value) || 0,
         qty: parseInt(qtyEl.value) || 1,
         tf: tfEl.value, mode: currentMode(),
         optionBuyer: !!buyerChk.checked, optionSeller: !!sellerChk.checked,
@@ -21805,6 +22164,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
+        model: modelEl ? modelEl.value : 'sonnet',
         qualityFilter: !!qualityChk.checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(),
@@ -21881,7 +22241,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
         inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
         const thinking = addMsg('Thinking…', 'bot');
-        fetch('/api/aibot/zoptions/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1) }) })
+        fetch('/api/aibot/zoptions/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') }) })
           .then(r => r.json()).then(res => {
             thinking.remove();
             if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
@@ -21997,6 +22357,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('mtBotScoreBuffer');
     const cooldownEl = document.getElementById('mtBotCooldown');
     const tickSecEl  = document.getElementById('mtBotTickSec');
+    const modelEl    = document.getElementById('mtBotModel');
     const qualityChk = document.getElementById('mtBotQualityFilter');
     const movableChk = document.getElementById('mtBotMovable');
     let priceLines = null;
@@ -22026,7 +22387,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try { const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null'); if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; }); } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
-    stratChks.forEach(c => c.addEventListener('change', function(){ try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} }));
+    // Claude owns SL/TP when its strategy is selected — disable the manual inputs.
+    const _claudeChk = stratChks.find(c => c.dataset.strat === 'claude');
+    function _syncClaudeSLTP() {
+      const on = !_claudeChk || _claudeChk.checked;
+      [slPctEl, tpPctEl].forEach(function(el) {
+        if (!el) return;
+        el.disabled = on;
+        el.title = on ? 'Claude sets SL/TP per trade from market structure (Claude AI strategy is selected).' : 'Stop-Loss / Target % from entry';
+        const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
+      });
+    }
+    stratChks.forEach(c => c.addEventListener('change', function(){ try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} _syncClaudeSLTP(); }));
+    _syncClaudeSLTP();
 
     document.getElementById('btnMT5Bot').addEventListener('click', function() {
       automationDropdown.classList.remove('open'); panel.classList.add('open');
@@ -22036,7 +22409,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dr=false,sx,sy,ol,ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         if (panel.classList.contains('maximized')) return;
         dr=true; panel.style.transform='none';
         const r = panel.getBoundingClientRect(); ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
@@ -22138,7 +22511,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.tickSec != null) tickSecEl.value = c.tickSec;
+        if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        { const _cEl = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'Capital')); if (_cEl && c.capital != null) _cEl.value = c.capital; }
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
@@ -22178,12 +22553,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const sym = symEl.value.trim().toUpperCase(); if (!sym && !document.getElementById('mtBotAutoSym').checked && !(document.getElementById('mtBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
       const s = MT5Store.getSession();
       const cfg = {
-        symbol: sym, symbols: (document.getElementById('mtBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean), autoSymbol: !!document.getElementById('mtBotAutoSym').checked, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
+        symbol: sym, symbols: (document.getElementById('mtBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean), autoSymbol: !!document.getElementById('mtBotAutoSym').checked, capital: parseFloat((document.getElementById('mtBotCapital')||{}).value) || 0, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
         slPct: parseFloat(slPctEl.value) || 1.0, tpPct: parseFloat(tpPctEl.value) || 2.0,
         maxConsec: parseInt(maxConsecEl.value) || 3, maxLoss: parseFloat(maxLossEl.value) || 2000,
         maxProfit: parseFloat(maxProfitEl.value) || 0, minScore: (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30, qualityFilter: !!qualityChk.checked,
+        model: modelEl ? modelEl.value : 'sonnet',
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(), mt5_id: s.id || ''
       };
@@ -22251,7 +22627,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
         inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
         const thinking = addMsg('Thinking…', 'bot');
-        fetch('/api/aibot/mt5/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1) }) })
+        fetch('/api/aibot/mt5/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') }) })
           .then(r => r.json()).then(res => {
             thinking.remove();
             if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
@@ -22353,7 +22729,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dr=false,sx,sy,ol,ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         dr=true; panel.style.transform='none';
         const r = panel.getBoundingClientRect();
         ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
@@ -22402,6 +22778,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const scoreBufferEl = document.getElementById('deltaBotScoreBuffer');
     const cooldownEl  = document.getElementById('deltaBotCooldown');
     const tickSecEl   = document.getElementById('deltaBotTickSec');
+    const modelEl     = document.getElementById('deltaBotModel');
     const qualityChk  = document.getElementById('deltaBotQualityFilter');
     const movableChk  = document.getElementById('deltaBotMovable');
     let priceLines = null;
@@ -22433,7 +22810,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     (function() {
       let dr=false,sx,sy,ol,ot;
       header.addEventListener('mousedown', function(e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, select, input, label')) return;
         if (panel.classList.contains('maximized')) return;
         dr=true; panel.style.transform='none';
         const r = panel.getBoundingClientRect();
@@ -22549,7 +22926,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     } catch(e) {}
     function _dCollectStrategies() { return dStratChks.filter(c => c.checked).map(c => c.dataset.strat); }
     function _dSaveStrategies() { try { localStorage.setItem(D_STRAT_KEY, JSON.stringify(_dCollectStrategies())); } catch(e) {} }
-    dStratChks.forEach(c => c.addEventListener('change', _dSaveStrategies));
+    // Claude owns SL/TP when its strategy is selected — disable the manual inputs.
+    const _dClaudeChk = dStratChks.find(c => c.dataset.strat === 'claude');
+    function _dSyncClaudeSLTP() {
+      const on = !_dClaudeChk || _dClaudeChk.checked;
+      [slPctEl, tpPctEl].forEach(function(el) {
+        if (!el) return;
+        el.disabled = on;
+        el.title = on ? 'Claude sets SL/TP per trade from market structure (Claude AI strategy is selected).' : 'Stop-Loss / Target % from entry';
+        const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
+      });
+    }
+    dStratChks.forEach(c => c.addEventListener('change', function(){ _dSaveStrategies(); _dSyncClaudeSLTP(); }));
+    _dSyncClaudeSLTP();
 
     // ---- Regime + strategy (same as Zerodha bot) ----
     function detectRegime(candles) {
@@ -22683,7 +23072,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const s = DeltaStore.getSession();
       calcBtn.disabled = true; sizingEl.textContent = 'Asking Claude…';
       fetch('/api/aibot/delta/sizing', { method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ capital: cap, symbol: sym, tf: tfEl.value, api_key: (s.apiKey || '') }) })
+        body: JSON.stringify({ capital: cap, symbol: sym, tf: tfEl.value, api_key: (s.apiKey || ''), model: (modelEl ? modelEl.value : '') }) })
         .then(r => r.json()).then(function(res) {
           if (!res.success) { sizingEl.textContent = 'Sizing failed: ' + (res.error || 'unknown'); return; }
           sizingEl.innerHTML = 'Capital $' + res.capital + ' · Leverage <b>' + res.leverage + 'x</b> · SL <b>' + res.slPct +
@@ -22895,7 +23284,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.scoreBuffer != null) scoreBufferEl.value = c.scoreBuffer;
         if (c.cooldownSec != null) cooldownEl.value = c.cooldownSec;
         if (c.tickSec != null) tickSecEl.value = c.tickSec;
+        if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
+        { const _cEl = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'Capital')); if (_cEl && c.capital != null) _cEl.value = c.capital; }
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
 
@@ -22979,6 +23370,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         minScore:   (isNaN(parseFloat(minScoreEl.value)) ? 0 : parseFloat(minScoreEl.value)),
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
+        model:      modelEl ? modelEl.value : 'sonnet',
         qualityFilter: !!qualityChk.checked,
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
@@ -23084,7 +23476,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const thinking = addMsg('Thinking…', 'bot');
         fetch('/api/aibot/delta/chat', {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ message: msg, history: history.slice(0, -1) })
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') })
         }).then(r => r.json()).then(res => {
           thinking.remove();
           if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
