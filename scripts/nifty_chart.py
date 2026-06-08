@@ -1871,6 +1871,22 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
     ohlcv = [[round(c['open'], 5), round(c['high'], 5), round(c['low'], 5), round(c['close'], 5),
               int(c.get('volume', 0) or 0)] for c in win[-36:]]
 
+    # Support/Resistance from swing pivots (5-bar fractals) so Claude trades around
+    # structure and can reason about where stop-liquidity sits (sweep/stop-hunt zones).
+    sr_highs, sr_lows = [], []
+    for i in range(2, len(win) - 2):
+        h, l = win[i]['high'], win[i]['low']
+        if h >= win[i-1]['high'] and h >= win[i-2]['high'] and h >= win[i+1]['high'] and h >= win[i+2]['high']:
+            sr_highs.append(round(h, 5))
+        if l <= win[i-1]['low'] and l <= win[i-2]['low'] and l <= win[i+1]['low'] and l <= win[i+2]['low']:
+            sr_lows.append(round(l, 5))
+    resistances = sorted({x for x in sr_highs if x >= last})[:4]
+    supports    = sorted({x for x in sr_lows if x <= last}, reverse=True)[:4]
+    nearest_res = min((x for x in sr_highs if x > last), default=None)
+    nearest_sup = max((x for x in sr_lows if x < last), default=None)
+    dist_res    = round((nearest_res - last) / last * 100.0, 2) if (nearest_res and last) else None
+    dist_sup    = round((last - nearest_sup) / last * 100.0, 2) if (nearest_sup and last) else None
+
     pos_ctx = None
     if position:
         ep = position.get('entryPrice') or 0
@@ -1881,28 +1897,37 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
                   for t in (recent_trades or [])[-8:]]
     wins = sum(1 for t in trades_ctx if t['pnl'] > 0)
 
-    min_enter = float(cfg.get('minScore', 4.0)) + float(cfg.get('scoreBuffer', 1.0) or 0)
+    min_enter = float(cfg.get('minScore', 0) or 0) + float(cfg.get('scoreBuffer', 0) or 0)
     if min_enter <= 0:
-        gate = ("There is NO fixed conviction threshold — use your own judgment. Still prefer HOLD unless the edge is real.")
+        gate = ("Score the setup YOURSELF on a 0-10 conviction scale and ONLY take BUY/SELL when your own conviction "
+                "is genuinely HIGH (>=7); otherwise HOLD. A high win rate comes from passing on mediocre setups — "
+                "when in doubt, HOLD.")
     else:
         gate = ("Only choose BUY or SELL when your conviction |score| >= " + str(min_enter) + " (score sign matches signal).")
     system = (
-        "You are an autonomous intraday trading strategy. Decide the next action from recent OHLCV candles and the "
-        "supplied market context. Goal: HIGH WIN RATE with controlled risk and steady profit.\n"
+        "You are an ELITE intraday trader. Your job: make the MAXIMUM profit with a HIGH WIN RATE so the customer is "
+        "happy. Trade like a professional reading order flow and market-maker (smart-money) behaviour — NOT a "
+        "retail breakout-chaser. Be highly selective: a few high-quality trades beat many mediocre ones.\n"
         "METHOD (in order):\n"
-        "1) MARKET DIRECTION: read the overall trend from regime/SMAs/trend%. Trade WITH the higher-timeframe trend. "
-        "In a 'range/choppy' regime, default to HOLD — do NOT trade chop; only act on a clean breakout/breakdown of the "
-        "20-bar range CONFIRMED by rising volume (volRatio > 1.2).\n"
-        "2) LIQUIDITY: weigh volume. Avoid entries on weak/declining volume (thin = whipsaw). Prefer participation.\n"
-        "3) ENTRY: require a clear setup with an obvious invalidation level and reward:risk >= 1.5. Otherwise HOLD.\n"
-        "4) ANTI-WHIPSAW: if you already hold a position (see 'position'), DEFAULT to staying — return HOLD to keep it, "
-        "or a signal in the SAME direction. Only return the OPPOSITE signal when there is a genuine, strong reversal. "
-        "Do NOT flip side on minor noise — repeated flipping loses money to costs.\n"
-        "5) LEARN: review 'recentTrades'. If recent trades (especially exits by 'signal reversal') lost in conditions "
-        "like now, be MORE selective and HOLD more; tighten only when the edge is clear.\n"
-        "RISK: You OWN risk management — ALWAYS set slPct and tpPct (percent from entry) for this trade from market "
-        "structure (SL just beyond the invalidation level, TP at a realistic target with reward:risk >= 1.5). These "
-        "override the panel's SL/TP. Never omit them on a BUY/SELL.\n"
+        "1) MARKET DIRECTION: read the higher-timeframe trend from regime/SMAs/trend%. Trade WITH the trend. In a "
+        "'range/choppy' regime default to HOLD unless price is reacting at a clean support/resistance level.\n"
+        "2) STRUCTURE (support/resistance): use 'supports'/'resistances' and the nearest levels. BUY near SUPPORT in "
+        "an uptrend; SELL near RESISTANCE in a downtrend. NEVER buy straight into resistance or sell straight into "
+        "support — that is where moves stall and reverse. Best entries are AT structure, not mid-range.\n"
+        "3) MARKET-MAKER / SMART MONEY: anticipate liquidity. Market makers run price into obvious stop clusters just "
+        "beyond recent swing highs/lows (liquidity grabs / stop hunts), then reverse. A sweep of a level that "
+        "IMMEDIATELY reclaims is a high-probability reversal entry in the reclaim direction. Do NOT be the liquidity: "
+        "avoid chasing a breakout that just swept a level on a long wick — wait for the reclaim/retest. Favour "
+        "entries where the stops are BEHIND your invalidation (so the next stop-run pushes your trade into profit).\n"
+        "4) CONFIRMATION: require participation — rising volume (volRatio > 1.1) on the move you trade. Weak/declining "
+        "volume = whipsaw; HOLD.\n"
+        "5) ANTI-WHIPSAW: if you already hold a 'position', DEFAULT to staying (HOLD to keep, or same-direction). Only "
+        "flip on a genuine structural reversal (level break + reclaim against you). Do NOT flip on noise — costs add up.\n"
+        "6) LEARN: review 'recentTrades'. If recent trades lost in conditions like now (esp. 'signal reversal' exits), "
+        "be MORE selective and HOLD more.\n"
+        "RISK: You OWN risk management — ALWAYS set slPct and tpPct (percent from entry). Put SL just BEYOND the "
+        "invalidation level (the swing/structure that proves you wrong), and TP at the next opposing S/R level, with "
+        "reward:risk >= 1.5. These override the panel's SL/TP. Never omit them on a BUY/SELL.\n"
         + ("OPTION: This instrument is an OPTION on the underlying in 'underlying'. Weigh 'underlyingTrendPct' — a "
            "CALL (CE) gains when the underlying RISES, a PUT (PE) gains when it FALLS. Trade the leg WITH the "
            "underlying's direction; HOLD a CE in a falling underlying and a PE in a rising one.\n" if (extra_ctx and extra_ctx.get('underlying')) else "")
@@ -1914,6 +1939,9 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         'sma10': round(sma10, 5), 'sma20': round(sma20, 5), 'sma50': round(sma50, 5),
         'trendShortPct': round(trend_short, 2), 'trendMediumPct': round(trend_med, 2),
         'rangePct20': round(range_pct, 2), 'recentHigh20': round(hi20, 5), 'recentLow20': round(lo20, 5),
+        'supports': supports, 'resistances': resistances,
+        'nearestSupport': nearest_sup, 'nearestResistance': nearest_res,
+        'distToSupportPct': dist_sup, 'distToResistancePct': dist_res,
         'volAvg20': round(vol_avg, 1), 'volRecent3': round(vol_recent, 1), 'volRatio': vol_ratio,
         'position': pos_ctx, 'recentTrades': trades_ctx, 'recentWinRate': (round(wins/len(trades_ctx)*100) if trades_ctx else None),
         'ohlcv': ohlcv,
@@ -13669,10 +13697,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #2a2e39 !important; color: #555 !important;
     cursor: not-allowed; opacity: 0.7;
   }
-  .zd-log { background: #131722; border: 1px solid #2a2e39; border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #787b86; max-height: 100px; overflow-y: auto; font-family: monospace; margin-top: 10px; }
+  .zd-log { background: #131722; border: 1px solid #2a2e39; border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #ffffff; max-height: 100px; overflow-y: auto; font-family: monospace; margin-top: 10px; }
   .zd-log .log-buy { color: #26a69a; }
   .zd-log .log-sell { color: #ef5350; }
-  .zd-log .log-info { color: #787b86; }
+  .zd-log .log-info { color: #ffffff; }
 
   /* Instrument Search Modal */
   .zd-inst-overlay {
@@ -14929,14 +14957,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Risk controls -->
       <div class="ai-risk-bar">
-        <label title="Stop-Loss % from entry">SL %: <input type="number" id="aiBotSlPct" value="1.5" min="0.1" step="0.1"></label>
-        <label title="Target % from entry">Target %: <input type="number" id="aiBotTpPct" value="3.0" min="0.1" step="0.1"></label>
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
-        <label title="Min algo score to enter">Min score: <input type="number" id="aiBotMinScore" value="0" min="0" step="0.1"></label>
-        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="aiBotScoreBuffer" value="0" min="0" step="0.1"></label>
-        <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="aiBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="aiBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="aiBotMovable"> Movable TP/SL</label>
+        <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
+        <!-- Claude manages these; kept hidden so it decides entries/SL/TP itself -->
+        <span style="display:none">
+          <input type="number" id="aiBotSlPct" value="1.5"><input type="number" id="aiBotTpPct" value="3.0">
+          <input type="number" id="aiBotMinScore" value="0"><input type="number" id="aiBotScoreBuffer" value="0">
+          <input type="number" id="aiBotCooldown" value="0"><input type="checkbox" id="aiBotQualityFilter" checked>
+        </span>
       </div>
 
       <!-- Control buttons -->
@@ -15117,14 +15146,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-risk-bar">
-        <label title="Stop-Loss % from entry">SL %: <input type="number" id="mtBotSlPct" value="1.0" min="0.05" step="0.05"></label>
-        <label title="Target % from entry">Target %: <input type="number" id="mtBotTpPct" value="2.0" min="0.05" step="0.05"></label>
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="mtBotMaxConsec" value="3" min="1"></label>
-        <label title="Min algo score to enter">Min score: <input type="number" id="mtBotMinScore" value="0" min="0" step="0.1"></label>
-        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="mtBotScoreBuffer" value="0" min="0" step="0.1"></label>
-        <label title="Seconds to wait after an exit before re-entering">Cooldown s: <input type="number" id="mtBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="mtBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
+        <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
+        <span style="display:none">
+          <input type="number" id="mtBotSlPct" value="1.0"><input type="number" id="mtBotTpPct" value="2.0">
+          <input type="number" id="mtBotMinScore" value="0"><input type="number" id="mtBotScoreBuffer" value="0">
+          <input type="number" id="mtBotCooldown" value="0"><input type="checkbox" id="mtBotQualityFilter" checked>
+        </span>
       </div>
 
       <div class="zd-footer">
@@ -15251,14 +15280,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-risk-bar">
-        <label>SL %: <input type="number" id="deltaBotSlPct" value="1.0" min="0.1" step="0.1"></label>
-        <label>Target %: <input type="number" id="deltaBotTpPct" value="2.0" min="0.1" step="0.1"></label>
         <label>Max consec losses: <input type="number" id="deltaBotMaxConsec" value="3" min="1"></label>
-        <label>Min score: <input type="number" id="deltaBotMinScore" value="0" min="0" step="0.1"></label>
-        <label title="Extra edge required above Min score before entering. Full buffer in calm markets, half in volatile. Set 0 to make Min score the literal threshold.">Score buffer: <input type="number" id="deltaBotScoreBuffer" value="0" min="0" step="0.1"></label>
-        <label title="Seconds to wait after an exit before re-entering (reduces whipsaw).">Cooldown s: <input type="number" id="deltaBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Blocks counter-trend and over-extended entries for higher win rate."><input type="checkbox" id="deltaBotQualityFilter" checked> Quality filter</label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
+        <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
+        <span style="display:none">
+          <input type="number" id="deltaBotSlPct" value="1.0"><input type="number" id="deltaBotTpPct" value="2.0">
+          <input type="number" id="deltaBotMinScore" value="0"><input type="number" id="deltaBotScoreBuffer" value="0">
+          <input type="number" id="deltaBotCooldown" value="0"><input type="checkbox" id="deltaBotQualityFilter" checked>
+        </span>
       </div>
 
       <!-- Capital-based sizing preview (optional — autopilot does this automatically on Start) -->
@@ -15428,13 +15457,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-risk-bar">
-        <label title="Stop-Loss % from entry (option premium)">SL %: <input type="number" id="zoBotSlPct" value="10" min="0.1" step="0.5"></label>
-        <label title="Target % from entry (option premium)">Target %: <input type="number" id="zoBotTpPct" value="10" min="0.1" step="0.5"></label>
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="zoBotMaxConsec" value="3" min="1"></label>
-        <label title="Min algo score to enter">Min score: <input type="number" id="zoBotMinScore" value="0" min="0" step="0.1"></label>
-        <label title="Extra edge above Min score before entering. Full in calm markets, half in volatile. 0 = literal.">Score buffer: <input type="number" id="zoBotScoreBuffer" value="0" min="0" step="0.1"></label>
-        <label title="Seconds to wait after an exit before re-entering that leg">Cooldown s: <input type="number" id="zoBotCooldown" value="60" min="0" step="5"></label>
-        <label title="Blocks counter-trend and over-extended entries"><input type="checkbox" id="zoBotQualityFilter" checked> Quality filter</label>
+        <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
+        <span style="display:none">
+          <input type="number" id="zoBotSlPct" value="10"><input type="number" id="zoBotTpPct" value="10">
+          <input type="number" id="zoBotMinScore" value="0"><input type="number" id="zoBotScoreBuffer" value="0">
+          <input type="number" id="zoBotCooldown" value="0"><input type="checkbox" id="zoBotQualityFilter" checked>
+        </span>
       </div>
 
       <div class="zd-footer">
