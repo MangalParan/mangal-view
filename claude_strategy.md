@@ -90,9 +90,16 @@ Each tick ([`_delta_bot_tick`](scripts/nifty_chart.py#L2197) and the Zerodha / M
 ## 7. Options specifics (Zerodha Options bot)
 
 - **Underlying base** (NIFTY / BANKNIFTY / FINNIFTY / SENSEX / any stock) feeds Claude. No chart is drawn for the base — it is only input to the strategy.
-- **Auto strikes ON** → Claude picks the **CE and PE strikes** near ATM at the nearest expiry from the live option chain (NFO / BFO), then trades each leg with the same per-tick logic, informed by the underlying's trend. See [`_zo_resolve_auto_strikes`](scripts/nifty_chart.py).
+- **Auto strikes ON** → Claude picks the **CE and PE strikes** near ATM at the nearest expiry from the live option chain (NFO / BFO), then trades each leg with the same per-tick logic. See [`_zo_resolve_auto_strikes`](scripts/nifty_chart.py).
 - **Auto strikes OFF** → you enter the CE and PE option symbols manually (two legs).
-- A CE (call) leg trades with a **rising** underlying; a PE (put) leg trades with a **falling** underlying.
+
+### Option Buyer vs Option Seller (premium decay / IV crush aware)
+The price Claude analyses for an option leg is the **premium**, not the index. The bot maps the signal to an action: **BUY → go long the option** (Option Buyer), **SELL → go short / sell the option** (Option Seller). Each leg is fed extra context — `optionType` (CE/PE), `strike`, `moneyness`, `underlyingVsStrikePct`, `dte`, the underlying trend, and which modes (`buyerEnabled`/`sellerEnabled`) are on — via [`_zo_option_meta`](scripts/nifty_chart.py).
+
+- **Buyer (BUY / long premium)** — only when the premium will likely **expand**: a fresh directional thrust in the option's favour (CE = underlying breaking up with momentum + volume; PE = breaking down) and IV not collapsing. It will **not** buy a bleeding/mid-range premium into a flat or opposing underlying — that's the classic morning trap where theta + IV crush melt a long.
+- **Seller (SELL / short premium)** — harvests **decay**: it shorts a rich premium that is likely to fall — choppy/range-bound or opposing underlying (both CE and PE bleed when the index goes nowhere), **post-open IV crush**, or OTM strikes the underlying won't reach. Prefers OTM, lower-DTE, elevated premium. These theta trades can score ≥7 even in a flat/choppy regime, so the bot stops *holding through* an obvious decay.
+- **Short-option risk is large/undefined**, so a SELL always carries a **tight premium-% stop** (`slPct` = the premium rise that stops you out, e.g. 25–40%) with `tpPct` = the decay target; it exits immediately if the underlying starts trending in the option's favour.
+- With **both modes on**, the two legs can be shorted together (a theta/short-strangle posture) to profit from a range-bound index, each with its own stop.
 
 ---
 

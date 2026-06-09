@@ -1897,6 +1897,46 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
                   for t in (recent_trades or [])[-8:]]
     wins = sum(1 for t in trades_ctx if t['pnl'] > 0)
 
+    # OPTIONS block — only when this instrument is an option leg. Covers BOTH
+    # buying (long premium) and selling/shorting (harvesting theta + IV crush).
+    option_block = ""
+    if extra_ctx and extra_ctx.get('optionType'):
+        buyer_on  = extra_ctx.get('buyerEnabled', True)
+        seller_on = extra_ctx.get('sellerEnabled', False)
+        if buyer_on and seller_on:
+            allowed = ("BOTH are enabled: BUY (go LONG the option) and SELL (go SHORT / sell the option) are both "
+                       "valid — choose whichever has the genuine edge, else HOLD.")
+        elif seller_on:
+            allowed = ("ONLY SELL (short / sell the option to collect decay) is enabled — return SELL to short or "
+                       "HOLD. Do NOT return BUY.")
+        else:
+            allowed = ("ONLY BUY (go long the option) is enabled — return BUY to go long or HOLD. Do NOT return SELL.")
+        option_block = (
+            "\nOPTIONS — READ CAREFULLY. 'symbol' is an OPTION (optionType: CE=call, PE=put) on the underlying; the "
+            "OHLCV/price shown is the OPTION PREMIUM, not the index. " + allowed + "\n"
+            "SIGNAL MEANING for an option leg: BUY = go LONG the option, you profit if the PREMIUM RISES. "
+            "SELL = go SHORT / SELL the option, you profit if the PREMIUM FALLS (time decay, IV/volatility crush, or "
+            "the underlying moving against the option).\n"
+            "PREMIUM = intrinsic + extrinsic(time + IV). Extrinsic is destroyed by: (a) THETA / TIME DECAY — fastest "
+            "for OTM and low-DTE options, accelerates intraday; (b) IV CRUSH — implied volatility collapses after the "
+            "volatile open and after events, so premiums fall even when the index is flat; (c) DIRECTION — a CE bleeds "
+            "when the underlying falls/stalls, a PE bleeds when it rises/stalls.\n"
+            "BUYER (BUY / long) — take ONLY when the premium will likely EXPAND: a FRESH directional thrust in the "
+            "option's favour (CE = underlying breaking UP with momentum + rising volume; PE = underlying breaking "
+            "DOWN) and IV is NOT collapsing. NEVER buy a bleeding or mid-range premium into a flat/opposing underlying "
+            "— theta + IV crush will melt it (the classic morning-buyer trap). Demand a real underlying move, R:R>=1.5.\n"
+            "SELLER (SELL / short) — collect decay when the premium is RICH and likely to FALL: choppy/range-bound or "
+            "OPPOSING underlying (both CE and PE bleed when the index goes nowhere), post-open IV crush, or OTM strikes "
+            "the underlying is unlikely to reach. Prefer OTM, lower DTE, elevated/just-spiked premium. This is a "
+            "HIGH-PROBABILITY theta trade and CAN score >=7 in a flat/choppy regime — do NOT just HOLD a clearly "
+            "decaying premium when SELL is enabled; that is leaving the edge on the table.\n"
+            "SHORT-OPTION RISK IS LARGE/UNDEFINED: a short loses fast if the underlying trends toward/through the "
+            "strike (CE: index rallies; PE: index drops) or IV spikes. So for a SELL set a TIGHT slPct = the premium % "
+            "RISE that stops you out (e.g. 25-40%), and tpPct = the premium % DROP you target (the decay you expect). "
+            "Exit at once if the underlying starts trending in the option's favour.\n"
+            "Weigh optionType, moneyness, underlyingVsStrikePct, dte and underlyingTrendPct together before deciding.\n"
+        )
+
     min_enter = float(cfg.get('minScore', 0) or 0) + float(cfg.get('scoreBuffer', 0) or 0)
     if min_enter <= 0:
         gate = ("Score the setup YOURSELF on a 0-10 conviction scale and ONLY take BUY/SELL when your own conviction "
@@ -1928,9 +1968,7 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "RISK: You OWN risk management — ALWAYS set slPct and tpPct (percent from entry). Put SL just BEYOND the "
         "invalidation level (the swing/structure that proves you wrong), and TP at the next opposing S/R level, with "
         "reward:risk >= 1.5. These override the panel's SL/TP. Never omit them on a BUY/SELL.\n"
-        + ("OPTION: This instrument is an OPTION on the underlying in 'underlying'. Weigh 'underlyingTrendPct' — a "
-           "CALL (CE) gains when the underlying RISES, a PUT (PE) gains when it FALLS. Trade the leg WITH the "
-           "underlying's direction; HOLD a CE in a falling underlying and a PE in a rising one.\n" if (extra_ctx and extra_ctx.get('underlying')) else "")
+        + option_block
         + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
     )
@@ -3449,6 +3487,39 @@ def _zo_underlying_ctx(cfg):
         ctx['capital'] = cap
     return ctx
 
+def _zo_option_meta(symbol, exchange, spot):
+    """Per-leg option context for Claude: type (CE/PE), strike, moneyness vs the
+    underlying spot, and days-to-expiry (theta proxy). Looked up from the chain."""
+    sym   = (symbol or '').upper()
+    otype = 'CE' if sym.endswith('CE') else ('PE' if sym.endswith('PE') else '')
+    meta  = {'optionType': otype}
+    row = None
+    try:
+        for i in _zo_load_opt_instruments(exchange or 'NFO'):
+            if (i.get('symbol') or '').upper() == sym:
+                row = i; break
+    except Exception:
+        row = None
+    if row:
+        strike = float(row.get('strike') or 0)
+        if strike:
+            meta['strike'] = strike
+            if spot:
+                diff = round((float(spot) - strike) / float(spot) * 100.0, 2)
+                meta['underlyingVsStrikePct'] = diff       # +ve = spot above strike
+                if otype == 'CE':
+                    meta['moneyness'] = 'ITM' if spot > strike else ('ATM' if abs(diff) < 0.2 else 'OTM')
+                elif otype == 'PE':
+                    meta['moneyness'] = 'ITM' if spot < strike else ('ATM' if abs(diff) < 0.2 else 'OTM')
+        exp = row.get('expiry', '')
+        if exp:
+            meta['expiry'] = exp
+            try:
+                meta['dte'] = max(0, (datetime.strptime(exp, '%Y-%m-%d') - datetime.now()).days)
+            except Exception:
+                pass
+    return meta
+
 def _zo_bot_tick():
     cfg = zo_ai_state.get('config') or {}
     if not cfg: return
@@ -3456,7 +3527,8 @@ def _zo_bot_tick():
     interval = cfg.get('tf', '5m')
     buyer    = bool(cfg.get('optionBuyer'))
     seller   = bool(cfg.get('optionSeller'))
-    base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and _bot_is_claude(cfg)) else None
+    is_claude = _bot_is_claude(cfg)
+    base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and is_claude) else {}
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -3470,7 +3542,13 @@ def _zo_bot_tick():
             _zo_log('[Tick] no Kite candles for ' + symbol); continue
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
-        strat  = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=base_ctx) if _bot_is_claude(cfg) else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        leg_ctx = None
+        if is_claude:
+            leg_ctx = dict(base_ctx) if base_ctx else {}
+            leg_ctx.update(_zo_option_meta(symbol, leg.get('exchange'), (base_ctx or {}).get('underlyingSpot')))
+            leg_ctx['buyerEnabled']  = buyer
+            leg_ctx['sellerEnabled'] = seller
+        strat  = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx) if is_claude else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
