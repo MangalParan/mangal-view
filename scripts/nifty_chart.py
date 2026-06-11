@@ -1934,6 +1934,13 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "strike (CE: index rallies; PE: index drops) or IV spikes. So for a SELL set a TIGHT slPct = the premium % "
             "RISE that stops you out (e.g. 25-40%), and tpPct = the premium % DROP you target (the decay you expect). "
             "Exit at once if the underlying starts trending in the option's favour.\n"
+            "SELLER GUARDRAILS (avoid the morning trap that loses big): do NOT short HIGH/rich ATM premium early in the "
+            "session or when gamma is high — a small index move can DOUBLE the premium and blow the stop (a CE shorted "
+            "at ~60 ran to ~103 = a full stop-out). Prefer premium that is ALREADY decaying (price below sma10/sma20), "
+            "OTM or just-OTM strikes, and the back half of the session. Require the underlying to be flat or moving "
+            "AGAINST the option (use underlyingVsStrikePct + underlyingTrendPct), not merely 'theta exists'. SKIP "
+            "micro-premium shorts (premium < ~3): the decay left is pennies but a spike still stops you out — bad "
+            "reward:risk and not worth the tail risk.\n"
             "Weigh optionType, moneyness, underlyingVsStrikePct, dte and underlyingTrendPct together before deciding.\n"
         )
 
@@ -1968,6 +1975,11 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "RISK: You OWN risk management — ALWAYS set slPct and tpPct (percent from entry). Put SL just BEYOND the "
         "invalidation level (the swing/structure that proves you wrong), and TP at the next opposing S/R level, with "
         "reward:risk >= 1.5. These override the panel's SL/TP. Never omit them on a BUY/SELL.\n"
+        "VOLATILITY & SLIPPAGE: the stop is enforced on candle data, so a single violent bar can slip past it. In "
+        "fast/high-volatility conditions (very wide recent bars, range expanding fast, volRatio >> 1.5 on a runaway "
+        "move) do NOT chase — HOLD, or demand a tighter structure-based stop. Keep slPct tight: if the only valid "
+        "invalidation sits far away (a wide stop), the trade risks too much per unit — prefer HOLD. After a recent "
+        "'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
         + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
@@ -2274,7 +2286,8 @@ def _delta_bot_tick():
     interval = cfg.get('tf', '5m')
     # Auto-symbol: while flat, Claude picks the SINGLE best symbol (+ decision).
     _autopick = (_claude_auto_pick('delta', interval, cfg, None, delta_ai_state.get('trades'))
-                 if (_bot_is_claude(cfg) and (cfg.get('autoSymbol') or cfg.get('tokens')) and not delta_ai_state.get('position')) else None)
+                 if (_bot_is_claude(cfg) and (cfg.get('autoSymbol') or cfg.get('tokens')) and not delta_ai_state.get('position')
+                     and delta_ai_state.get('_decide', True)) else None)
     if _autopick is not None:
         cfg['symbol'] = (_autopick.get('symbol') or cfg.get('symbol') or '').upper()
     else:
@@ -2297,8 +2310,10 @@ def _delta_bot_tick():
     regime = _bot_detect_regime(candles)
     if _autopick is not None:
         strat = _autopick
-    elif _bot_is_claude(cfg):
+    elif _bot_is_claude(cfg) and delta_ai_state.get('_decide', True):
         strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'))
+    elif _bot_is_claude(cfg):
+        strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
         strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
@@ -2375,15 +2390,21 @@ def _delta_bot_tick():
                 unreal_now   = _delta_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'], prod_now)
                 if realized_now + unreal_now >= max_profit:
                     reason = 'max daily profit'
+            exit_px = price
             if reason is None:
-                if is_long and price <= pos['sl']:        reason = 'SL hit'
-                elif is_long and price >= pos['tp']:      reason = 'TP hit'
-                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
-                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
-                elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
-                elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+                # Intrabar stop/target on the bar high/low, filled at the level.
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                if is_long:
+                    if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                else:
+                    if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                if reason is None:
+                    if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                    elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
-                _delta_bot_close(price, reason, mode)
+                _delta_bot_close(exit_px, reason, mode)
             else:
                 _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
                     symbol, price, pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
@@ -2413,11 +2434,19 @@ def _delta_bot_loop():
             paused  = delta_ai_state.get('paused', False)
         if not running: break
         if not paused:
+            # Fast loop (priceTickSec, default 10s): refresh price + check stops.
+            # Claude DECISIONS only run every 'tickSec' (the configured bot tick),
+            # gated by _decide so API cost is unchanged while price/stops stay live.
+            _cfg = delta_ai_state.get('config') or {}
+            _now = _zd_time.time()
+            _dsec = max(5, int(_cfg.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC))
+            delta_ai_state['_decide'] = (_now - delta_ai_state.get('_last_decision_ts', 0)) >= _dsec
             try: _delta_bot_tick()
             except Exception as e:
                 _bot_log('[Tick] ERROR: ' + str(e))
+            if delta_ai_state.get('_decide'): delta_ai_state['_last_decision_ts'] = _now
         _bot_gc_tick()
-        _zd_time.sleep(max(5, int((delta_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
+        _zd_time.sleep(max(5, int((delta_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
 # Need timedelta/timezone for IST log timestamps
 import datetime as _tz_module
@@ -2846,8 +2875,15 @@ def _zd_bot_open(side, price, strat, mode):
     _persist_log_line('[ZERODHA] ' + line)
     if mode == 'live':
         _zd_bot_place_live(side, qty, price, cfg)
+        # Resting broker hard stop (SL-M) so the loss is capped intrabar, not at
+        # the next tick. Falls back to the soft stop if placement fails.
+        if cfg.get('hardStop', True):
+            oid = _zd_place_stop_live('SELL' if side == 'BUY' else 'BUY', qty, sl, cfg)
+            if oid:
+                zd_ai_state['position']['sl_order_id'] = oid
+                zd_ai_state['position']['sl_order_trigger'] = round(sl, 2)
 
-def _zd_bot_close(price, reason, mode):
+def _zd_bot_close(price, reason, mode, skip_order=False):
     pos = zd_ai_state.get('position')
     if not pos: return
     pnl = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
@@ -2865,8 +2901,20 @@ def _zd_bot_close(price, reason, mode):
         '+' if pnl >= 0 else '', pnl, reason, pos['strategy'])
     _zd_log(line)
     _persist_log_line('[ZERODHA] ' + line)
-    if mode == 'live':
-        _zd_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg)
+    if mode == 'live' and not skip_order:
+        # If the resting hard stop already squared us off (e.g. a soft 'SL hit' and
+        # the broker SL-M fired the same instant), do NOT send another order — that
+        # would open a reverse position. Otherwise cancel the resting stop, then
+        # square off at market.
+        already_flat = False
+        if pos.get('sl_order_id'):
+            _st, _ = _zd_stop_status_live(pos['sl_order_id'], cfg)
+            if _st == 'COMPLETE':
+                already_flat = True
+            else:
+                _zd_cancel_stop_live(pos['sl_order_id'], cfg)
+        if not already_flat:
+            _zd_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg, order_type='MARKET')
     zd_ai_state['position'] = None
     zd_ai_state['last_exit_time'] = int(_zd_time.time())
     # Circuit breakers (mirror Delta)
@@ -2887,7 +2935,7 @@ def _zd_bot_close(price, reason, mode):
         _persist_log_line('[ZERODHA] [STOP] Max daily profit')
         zd_ai_state['running'] = False
 
-def _zd_bot_place_live(side, qty, price, cfg):
+def _zd_bot_place_live(side, qty, price, cfg, order_type='LIMIT'):
     import urllib.request as _ur, urllib.parse as _up, json as _json
     api_key = cfg.get('api_key') or ''
     if not api_key or api_key not in zerodha_sessions:
@@ -2903,14 +2951,16 @@ def _zd_bot_place_live(side, qty, price, cfg):
     exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
     product  = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
     tick     = _get_instrument_tick(symbol, exchange)
-    lim      = price * (0.998 if side == 'SELL' else 1.002)   # tight LIMIT around LTP
-    lim      = _quantize_to_tick(lim, tick)
-    payload  = _up.urlencode({
+    fields   = {
         'tradingsymbol': symbol, 'exchange': exchange,
         'transaction_type': side, 'quantity': qty,
-        'product': product, 'order_type': 'LIMIT',
-        'price': lim, 'validity': 'DAY',
-    }).encode('utf-8')
+        'product': product, 'order_type': order_type, 'validity': 'DAY',
+    }
+    # Entry uses a tight LIMIT around LTP; an EXIT (stop/target) uses MARKET so a
+    # triggered stop always fills instead of resting unfilled in a fast move.
+    if order_type == 'LIMIT':
+        fields['price'] = _quantize_to_tick(price * (0.998 if side == 'SELL' else 1.002), tick)
+    payload  = _up.urlencode(fields).encode('utf-8')
     req = _ur.Request('https://api.kite.trade/orders/regular', data=payload,
                       headers={'X-Kite-Version': '3',
                                'Authorization': 'token {}:{}'.format(api_key, access_token),
@@ -2934,12 +2984,98 @@ def _zd_bot_place_live(side, qty, price, cfg):
         _zd_log('[LIVE] Kite rejected: ' + str(rd.get('message', rd))[:200])
         _persist_log_line('[ZERODHA] [LIVE] Kite rejected: ' + str(rd.get('message', ''))[:200])
 
+# --- Broker-side HARD STOP (SL-M) ------------------------------------------
+# The soft stop is only evaluated each tick; a violent candle can slip far past
+# it. A resting SL-M at the broker fires INTRABAR at market, so the worst loss is
+# capped near the stop regardless of the bot's tick cadence. We keep it in sync
+# with pos['sl'] (which the user can drag via Movable TP/SL) and cancel it on any
+# bot-driven exit so it can never fire on a flat book and open a reverse trade.
+def _zd_kite_api(cfg, method, url, fields=None):
+    """Authenticated Kite REST call for the bot. Returns (ok, data_dict | err_str)."""
+    import urllib.request as _ur, urllib.parse as _up, json as _json
+    api_key = cfg.get('api_key') or ''
+    if not api_key or api_key not in zerodha_sessions:
+        return False, 'not connected'
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        return False, 'no access_token'
+    data = _up.urlencode(fields).encode('utf-8') if fields else None
+    req = _ur.Request(url, data=data,
+                      headers={'X-Kite-Version': '3',
+                               'Authorization': 'token {}:{}'.format(api_key, access_token),
+                               'Content-Type': 'application/x-www-form-urlencoded',
+                               'User-Agent': 'Mozilla/5.0'}, method=method)
+    try:
+        with _kite_urlopen(req, timeout=12) as resp:
+            return True, _json.loads(resp.read().decode('utf-8') or '{}')
+    except Exception as e:
+        err = ''
+        try: err = e.read().decode('utf-8')   # type: ignore[attr-defined]
+        except Exception: pass
+        return False, (str(err) or str(e))[:200]
+
+def _zd_place_stop_live(exit_side, qty, trigger_price, cfg):
+    """Place a resting SL-M (stop-market) at the broker. `exit_side` is the side
+    that CLOSES the position (opposite the entry). Returns order_id or None."""
+    symbol   = (cfg.get('symbol') or '').upper()
+    exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
+    product  = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
+    trig     = _quantize_to_tick(trigger_price, _get_instrument_tick(symbol, exchange))
+    ok, rd = _zd_kite_api(cfg, 'POST', 'https://api.kite.trade/orders/regular', {
+        'tradingsymbol': symbol, 'exchange': exchange,
+        'transaction_type': exit_side, 'quantity': qty,
+        'product': product, 'order_type': 'SL-M',
+        'trigger_price': trig, 'validity': 'DAY',
+    })
+    if ok and isinstance(rd, dict) and rd.get('status') == 'success':
+        oid = str((rd.get('data') or {}).get('order_id', ''))
+        _zd_log('[LIVE] Hard stop SL-M @ {} placed #{}'.format(trig, oid))
+        _persist_log_line('[ZERODHA] [LIVE] hard stop SL-M @ {} #{}'.format(trig, oid))
+        return oid
+    _zd_log('[LIVE] Hard stop NOT placed (soft stop still active): ' + str(rd)[:160])
+    _persist_log_line('[ZERODHA] [LIVE] hard stop place failed: ' + str(rd)[:160])
+    return None
+
+def _zd_modify_stop_live(order_id, trigger_price, cfg):
+    """Move a resting SL-M to a new trigger (dynamic / dragged SL). Returns bool."""
+    symbol   = (cfg.get('symbol') or '').upper()
+    exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
+    trig     = _quantize_to_tick(trigger_price, _get_instrument_tick(symbol, exchange))
+    ok, rd = _zd_kite_api(cfg, 'PUT', 'https://api.kite.trade/orders/regular/' + str(order_id), {
+        'trigger_price': trig, 'order_type': 'SL-M', 'validity': 'DAY',
+    })
+    if ok and isinstance(rd, dict) and rd.get('status') == 'success':
+        _zd_log('[LIVE] Hard stop moved -> {} #{}'.format(trig, order_id))
+        return True
+    _zd_log('[LIVE] Hard stop modify failed #{}: {}'.format(order_id, str(rd)[:140]))
+    return False
+
+def _zd_cancel_stop_live(order_id, cfg):
+    ok, rd = _zd_kite_api(cfg, 'DELETE', 'https://api.kite.trade/orders/regular/' + str(order_id))
+    if ok and isinstance(rd, dict) and rd.get('status') == 'success':
+        _zd_log('[LIVE] Hard stop cancelled #{}'.format(order_id))
+        return True
+    return False
+
+def _zd_stop_status_live(order_id, cfg):
+    """Return (status, average_price) for the resting stop, else (None, None).
+    status is Kite's: TRIGGER PENDING / OPEN / COMPLETE / CANCELLED / REJECTED."""
+    import urllib.parse as _up
+    ok, rd = _zd_kite_api(cfg, 'GET', 'https://api.kite.trade/orders/' + _up.quote(str(order_id)))
+    if ok and isinstance(rd, dict) and rd.get('status') == 'success':
+        hist = rd.get('data') or []
+        if hist:
+            cur = hist[-1]
+            return cur.get('status'), cur.get('average_price')
+    return None, None
+
 def _zd_bot_tick():
     cfg = zd_ai_state.get('config') or {}
     if not cfg: return
     interval = cfg.get('tf', '5m')
     _autopick = (_claude_auto_pick('kite', interval, cfg, cfg.get('api_key'), zd_ai_state.get('trades'))
-                 if (_bot_is_claude(cfg) and cfg.get('autoSymbol') and not zd_ai_state.get('position')) else None)
+                 if (_bot_is_claude(cfg) and cfg.get('autoSymbol') and not zd_ai_state.get('position')
+                     and zd_ai_state.get('_decide', True)) else None)
     if _autopick is not None:
         cfg['symbol'] = (_autopick.get('symbol') or cfg.get('symbol') or '').upper()
     else:
@@ -2962,8 +3098,10 @@ def _zd_bot_tick():
     regime = _bot_detect_regime(candles)
     if _autopick is not None:
         strat = _autopick
-    elif _bot_is_claude(cfg):
+    elif _bot_is_claude(cfg) and zd_ai_state.get('_decide', True):
         strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'))
+    elif _bot_is_claude(cfg):
+        strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
         strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
@@ -2978,6 +3116,22 @@ def _zd_bot_tick():
                 'trending ' + regime['direction'] if regime['trending'] else 'range'),
         }
         pos = zd_ai_state.get('position')
+        # Broker hard-stop reconcile & sync (live). Do this BEFORE the soft checks:
+        #  - if the resting SL-M already fired intrabar, record that exit (no new
+        #    order) so the bot can't double-fire and flip into a reverse position;
+        #  - if pos['sl'] changed (dynamic / dragged SL), move the SL-M to match.
+        if pos and mode == 'live' and pos.get('sl_order_id'):
+            _st, _avg = _zd_stop_status_live(pos['sl_order_id'], cfg)
+            if _st == 'COMPLETE':
+                _fill = float(_avg) if _avg else pos['sl']
+                pos.pop('sl_order_id', None)
+                _zd_bot_close(_fill, 'SL hit (broker)', mode, skip_order=True)
+            elif _st in ('REJECTED', 'CANCELLED'):
+                pos.pop('sl_order_id', None)   # lost the hard stop; soft stop covers
+            elif round(float(pos['sl']), 2) != round(float(pos.get('sl_order_trigger') or pos['sl']), 2):
+                if _zd_modify_stop_live(pos['sl_order_id'], pos['sl'], cfg):
+                    pos['sl_order_trigger'] = round(float(pos['sl']), 2)
+            pos = zd_ai_state.get('position')   # refresh (may have been closed above)
         if pos:
             is_long = pos['side'] == 'BUY'
             max_profit = float(cfg.get('maxProfit', 0) or 0)
@@ -2987,15 +3141,24 @@ def _zd_bot_tick():
                 unreal_now   = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
                 if realized_now + unreal_now >= max_profit:
                     reason = 'max daily profit'
+            exit_px = price
             if reason is None:
-                if is_long and price <= pos['sl']:        reason = 'SL hit'
-                elif is_long and price >= pos['tp']:      reason = 'TP hit'
-                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
-                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
-                elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
-                elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+                # Intrabar stop/target: trigger on the BAR's high/low (not just the
+                # close) and fill AT the SL/TP level. A close-only soft stop let a
+                # single violent candle blow 80+ pts past the stop (e.g. SELL 8390
+                # SL 8406 filled 8489). SL takes priority over TP (worst case).
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                if is_long:
+                    if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                else:
+                    if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                if reason is None:
+                    if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                    elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
-                _zd_bot_close(price, reason, mode)
+                _zd_bot_close(exit_px, reason, mode)
             else:
                 _zd_log('[Tick] {} price={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
                     symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
@@ -3021,11 +3184,18 @@ def _zd_bot_loop():
             paused  = zd_ai_state.get('paused', False)
         if not running: break
         if not paused:
+            # Fast loop (priceTickSec, default 10s): refresh price + check stops.
+            # Claude DECISIONS only run every 'tickSec' (the configured bot tick).
+            _cfg = zd_ai_state.get('config') or {}
+            _now = _zd_time.time()
+            _dsec = max(5, int(_cfg.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC))
+            zd_ai_state['_decide'] = (_now - zd_ai_state.get('_last_decision_ts', 0)) >= _dsec
             try: _zd_bot_tick()
             except Exception as e:
                 _zd_log('[Tick] ERROR: ' + str(e))
+            if zd_ai_state.get('_decide'): zd_ai_state['_last_decision_ts'] = _now
         _bot_gc_tick()
-        _zd_time.sleep(max(5, int((zd_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
+        _zd_time.sleep(max(5, int((zd_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
 @app.route('/api/aibot/zerodha/start', methods=['POST'])
 @login_required
@@ -3060,6 +3230,7 @@ def zd_aibot_start():
             'api_key':    (data.get('api_key') or '').strip(),
         }
         _c = zd_ai_state['config']
+        _c['hardStop'] = bool(data.get('hardStop', True))   # resting SL-M at the broker (live) — default ON
         if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
             return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
         zd_ai_state['scan_idx']       = 0
@@ -3528,7 +3699,9 @@ def _zo_bot_tick():
     buyer    = bool(cfg.get('optionBuyer'))
     seller   = bool(cfg.get('optionSeller'))
     is_claude = _bot_is_claude(cfg)
-    base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and is_claude) else {}
+    # Claude decisions only on the slow tick; price/stops still refresh every loop.
+    _zo_decide = is_claude and zo_ai_state.get('_decide', True)
+    base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and _zo_decide) else {}
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -3543,12 +3716,17 @@ def _zo_bot_tick():
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
         leg_ctx = None
-        if is_claude:
+        if _zo_decide:
             leg_ctx = dict(base_ctx) if base_ctx else {}
             leg_ctx.update(_zo_option_meta(symbol, leg.get('exchange'), (base_ctx or {}).get('underlyingSpot')))
             leg_ctx['buyerEnabled']  = buyer
             leg_ctx['sellerEnabled'] = seller
-        strat  = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx) if is_claude else {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        if _zo_decide:
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx)
+        elif is_claude:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
+        else:
+            strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
@@ -3563,14 +3741,22 @@ def _zo_bot_tick():
             if pos:
                 is_long = pos['side'] == 'BUY'
                 reason = None
-                if is_long and price <= pos['sl']:        reason = 'SL hit'
-                elif is_long and price >= pos['tp']:      reason = 'TP hit'
-                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
-                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
-                elif is_long and sig == 'SELL':            reason = 'signal reversal'
-                elif (not is_long) and sig == 'BUY':       reason = 'signal reversal'
+                exit_px = price
+                # Intrabar stop/target on the bar high/low, filled at the level — a
+                # close-only soft stop let premium spikes blow far past it (e.g. a CE
+                # short SL 82 filled 103.65). SL takes priority over TP (worst case).
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                if is_long:
+                    if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                else:
+                    if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                if reason is None:
+                    if is_long and sig == 'SELL':            reason = 'signal reversal'
+                    elif (not is_long) and sig == 'BUY':       reason = 'signal reversal'
                 if reason:
-                    _zo_close_leg(leg, price, reason, cfg, mode)
+                    _zo_close_leg(leg, exit_px, reason, cfg, mode)
                 else:
                     _zo_log('[Tick] {} px={} (in {} from {}, strat={} score={:.1f}) — {}'.format(
                         symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
@@ -3604,11 +3790,18 @@ def _zo_bot_loop():
             paused  = zo_ai_state.get('paused', False)
         if not running: break
         if not paused:
+            # Fast loop (priceTickSec, default 10s): refresh price + check stops.
+            # Claude DECISIONS only run every 'tickSec' (the configured bot tick).
+            _cfg = zo_ai_state.get('config') or {}
+            _now = _zd_time.time()
+            _dsec = max(5, int(_cfg.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC))
+            zo_ai_state['_decide'] = (_now - zo_ai_state.get('_last_decision_ts', 0)) >= _dsec
             try: _zo_bot_tick()
             except Exception as e:
                 _zo_log('[Tick] ERROR: ' + str(e))
+            if zo_ai_state.get('_decide'): zo_ai_state['_last_decision_ts'] = _now
         _bot_gc_tick()
-        _zd_time.sleep(max(5, int((zo_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
+        _zd_time.sleep(max(5, int((zo_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
 @app.route('/api/aibot/zoptions/start', methods=['POST'])
 @login_required
@@ -3911,10 +4104,29 @@ def fetch_mt5_data(interval, symbol, session_id=None):
         return out
     return []
 
-def _mt5_place_order(session_id, symbol, side, qty, price):
-    """Market deal on MT5. Returns (ok, msg). NOTE: uses simple BUY/SELL deals —
-    on netting accounts these open/close net; on hedging accounts a close may
-    open an opposite position. Refine per account type when going live."""
+def _mt5_position_qty(symbol):
+    """Net signed volume held on MT5 for `symbol` (>0 long, <0 short, 0 flat).
+    Returns None if it can't be determined (so callers don't wrongly assume flat)."""
+    try:
+        mt5 = _mt5_pkg()
+    except Exception:
+        return None
+    try:
+        ps = mt5.positions_get(symbol=symbol)
+        if ps is None:
+            return None
+        net = 0.0
+        for p in ps:
+            net += p.volume if p.type == mt5.ORDER_TYPE_BUY else -p.volume
+        return net
+    except Exception:
+        return None
+
+def _mt5_place_order(session_id, symbol, side, qty, price, sl=0.0, tp=0.0):
+    """Market deal on MT5. Returns (ok, msg). When sl/tp > 0 they are attached to
+    the deal as SERVER-SIDE stops (MT5 enforces them even if the bot lags). NOTE:
+    uses simple BUY/SELL deals — on netting accounts these open/close net; on
+    hedging accounts a close may open an opposite position."""
     backend = _mt5_backend()
     if backend == 'metatrader5':
         try:
@@ -3932,6 +4144,8 @@ def _mt5_place_order(session_id, symbol, side, qty, price):
                    'type': otype, 'price': px, 'deviation': 20,
                    'type_filling': mt5.ORDER_FILLING_IOC, 'type_time': mt5.ORDER_TIME_GTC,
                    'comment': 'mangalview-mt5-bot'}
+            if sl and sl > 0: req['sl'] = float(sl)
+            if tp and tp > 0: req['tp'] = float(tp)
             res = mt5.order_send(req)
             if res is None:
                 return False, 'order_send None: ' + str(mt5.last_error())
@@ -4003,10 +4217,10 @@ def _mt_log(msg):
         if len(buf) > 500:
             del buf[:len(buf) - 500]
 
-def _mt_bot_place_live(side, qty, price, cfg):
-    ok, msg = _mt5_place_order(cfg.get('mt5_id'), cfg.get('symbol'), side, qty, price)
+def _mt_bot_place_live(side, qty, price, cfg, sl=0.0, tp=0.0):
+    ok, msg = _mt5_place_order(cfg.get('mt5_id'), cfg.get('symbol'), side, qty, price, sl=sl, tp=tp)
     if ok:
-        _mt_log('[LIVE] MT5 order #' + msg)
+        _mt_log('[LIVE] MT5 order #' + msg + (' (SL={} TP={})'.format(sl, tp) if (sl or tp) else ''))
         _persist_log_line('[MT5] [LIVE] MT5 order #' + msg)
     else:
         _mt_log('[LIVE] MT5 order failed: ' + msg)
@@ -4040,7 +4254,11 @@ def _mt_bot_open(side, price, strat, mode):
     _mt_log(line)
     _persist_log_line('[MT5] ' + line)
     if mode == 'live':
-        _mt_bot_place_live(side, qty, price, cfg)
+        # Attach SL/TP to the deal so MT5 enforces them server-side (hard stop),
+        # not just at the bot's next tick — unless disabled via hardStop=false.
+        _hs = cfg.get('hardStop', True)
+        _mt_bot_place_live(side, qty, price, cfg,
+                           sl=(sl if _hs else 0.0), tp=(tp if _hs else 0.0))
 
 def _mt_bot_close(price, reason, mode):
     pos = mt_ai_state.get('position')
@@ -4059,7 +4277,13 @@ def _mt_bot_close(price, reason, mode):
     _mt_log(line)
     _persist_log_line('[MT5] ' + line)
     if mode == 'live':
-        _mt_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg)
+        # If MT5's server-side SL/TP already closed the position, don't send another
+        # deal — on a netting account that would open a reverse position.
+        _net = _mt5_position_qty(cfg.get('symbol'))
+        if _net is not None and abs(_net) < 1e-9:
+            _mt_log('[LIVE] Position already flat on MT5 (server SL/TP filled) — no exit deal sent.')
+        else:
+            _mt_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg)
     mt_ai_state['position'] = None
     mt_ai_state['last_exit_time'] = int(_zd_time.time())
     realized   = sum(t['pnl'] for t in mt_ai_state['trades'])
@@ -4084,7 +4308,8 @@ def _mt_bot_tick():
     if not cfg: return
     interval = cfg.get('tf', '5m')
     _autopick = (_claude_auto_pick('mt5', interval, cfg, cfg.get('mt5_id'), mt_ai_state.get('trades'))
-                 if (_bot_is_claude(cfg) and cfg.get('autoSymbol') and not mt_ai_state.get('position')) else None)
+                 if (_bot_is_claude(cfg) and cfg.get('autoSymbol') and not mt_ai_state.get('position')
+                     and mt_ai_state.get('_decide', True)) else None)
     if _autopick is not None:
         cfg['symbol'] = (_autopick.get('symbol') or cfg.get('symbol') or '').upper()
     else:
@@ -4104,8 +4329,10 @@ def _mt_bot_tick():
     regime = _bot_detect_regime(candles)
     if _autopick is not None:
         strat = _autopick
-    elif _bot_is_claude(cfg):
+    elif _bot_is_claude(cfg) and mt_ai_state.get('_decide', True):
         strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'))
+    elif _bot_is_claude(cfg):
+        strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
         strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
     mode   = cfg.get('mode', 'paper')
@@ -4127,15 +4354,21 @@ def _mt_bot_tick():
                 unreal_now   = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
                 if realized_now + unreal_now >= max_profit:
                     reason = 'max daily profit'
+            exit_px = price
             if reason is None:
-                if is_long and price <= pos['sl']:        reason = 'SL hit'
-                elif is_long and price >= pos['tp']:      reason = 'TP hit'
-                elif (not is_long) and price >= pos['sl']: reason = 'SL hit'
-                elif (not is_long) and price <= pos['tp']: reason = 'TP hit'
-                elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
-                elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
+                # Intrabar stop/target on the bar high/low, filled at the level.
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                if is_long:
+                    if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                else:
+                    if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
+                    elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                if reason is None:
+                    if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                    elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
-                _mt_bot_close(price, reason, mode)
+                _mt_bot_close(exit_px, reason, mode)
             else:
                 _mt_log('[Tick] {} px={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
                     symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
@@ -4161,11 +4394,18 @@ def _mt_bot_loop():
             paused  = mt_ai_state.get('paused', False)
         if not running: break
         if not paused:
+            # Fast loop (priceTickSec, default 10s): refresh price + check stops.
+            # Claude DECISIONS only run every 'tickSec' (the configured bot tick).
+            _cfg = mt_ai_state.get('config') or {}
+            _now = _zd_time.time()
+            _dsec = max(5, int(_cfg.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC))
+            mt_ai_state['_decide'] = (_now - mt_ai_state.get('_last_decision_ts', 0)) >= _dsec
             try: _mt_bot_tick()
             except Exception as e:
                 _mt_log('[Tick] ERROR: ' + str(e))
+            if mt_ai_state.get('_decide'): mt_ai_state['_last_decision_ts'] = _now
         _bot_gc_tick()
-        _zd_time.sleep(max(5, int((mt_ai_state.get('config') or {}).get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)))
+        _zd_time.sleep(max(5, int((mt_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
 @app.route('/api/aibot/mt5/start', methods=['POST'])
 @login_required
