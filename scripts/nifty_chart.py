@@ -4778,11 +4778,22 @@ def aibot_tv_webhook():
     and message body e.g. {"symbol":"NIFTY","signal":"BUY","indicator":"MyPine","note":"..."}"""
     if request.args.get('token', '') != _TV_DEFAULT_TOKEN:
         return jsonify({'success': False, 'error': 'bad token'}), 403
-    data = request.get_json(silent=True) or {}
-    if not data:                                  # accept plain "SYMBOL BUY" text too
-        raw = (request.get_data(as_text=True) or '').strip().split()
-        if len(raw) >= 2:
-            data = {'symbol': raw[0], 'signal': raw[1]}
+    # TradingView sends the alert message as the body with an inconsistent
+    # content-type (often text/plain), so parse JSON regardless; fall back to a
+    # plain "SYMBOL SIGNAL" text alert.
+    data = request.get_json(force=True, silent=True) or {}
+    if not data:
+        raw = (request.get_data(as_text=True) or '').strip()
+        if raw:
+            try:
+                import json as _j
+                data = _j.loads(raw)
+            except Exception:
+                parts = raw.split()
+                if len(parts) >= 2:
+                    data = {'symbol': parts[0], 'signal': parts[1]}
+    if not isinstance(data, dict):
+        data = {}
     sym = (data.get('symbol') or data.get('ticker') or '').upper().strip()
     if not sym:
         return jsonify({'success': False, 'error': 'no symbol'}), 400
