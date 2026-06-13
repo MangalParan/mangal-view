@@ -1596,8 +1596,8 @@ def _zd_log(msg):
     with zd_ai_lock:
         buf = zd_ai_state.setdefault('log_buffer', [])
         buf.append('[' + ts + '] ' + msg)
-        if len(buf) > 500:
-            del buf[:len(buf) - 500]
+        if len(buf) > 200:           # circular buffer: keep newest 200, drop oldest
+            del buf[:len(buf) - 200]
 
 def _bot_log(msg):
     """Append a UI-only log line to the bot's circular buffer."""
@@ -1606,8 +1606,8 @@ def _bot_log(msg):
     with delta_ai_lock:
         buf = delta_ai_state.setdefault('log_buffer', [])
         buf.append('[' + ts + '] ' + msg)
-        if len(buf) > 500:
-            del buf[:len(buf) - 500]
+        if len(buf) > 200:           # circular buffer: keep newest 200, drop oldest
+            del buf[:len(buf) - 200]
 
 def _bot_log_ts():
     from datetime import timezone, timedelta
@@ -2447,7 +2447,7 @@ def _delta_bot_tick():
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
-        strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        strat = _tv_alert_signal(delta_ai_state, cfg, symbol)   # Claude off -> trade TV alerts
     mode   = cfg.get('mode', 'paper')
 
     # --- LIVE mode: pull authoritative position/P&L from Delta ---
@@ -2538,8 +2538,8 @@ def _delta_bot_tick():
             if reason:
                 _delta_bot_close(exit_px, reason, mode)
             else:
-                _bot_log('[Tick] [delta] {} price={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
-                    symbol, price, pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
+                _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {})'.format(
+                    symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 # Re-entry cooldown: avoid whipsaw churn right after an exit
@@ -3239,7 +3239,7 @@ def _zd_bot_tick():
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
-        strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        strat = _tv_alert_signal(zd_ai_state, cfg, symbol)   # Claude off -> trade TV alerts
     mode   = cfg.get('mode', 'paper')
 
     with zd_ai_lock:
@@ -3296,8 +3296,8 @@ def _zd_bot_tick():
             if reason:
                 _zd_bot_close(exit_px, reason, mode)
             else:
-                _zd_log('[Tick] {} price={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
-                    symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
+                _zd_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
+                    symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -3550,8 +3550,8 @@ def _zo_log(msg):
     with zo_ai_lock:
         buf = zo_ai_state.setdefault('log_buffer', [])
         buf.append('[' + ts + '] ' + msg)
-        if len(buf) > 500:
-            del buf[:len(buf) - 500]
+        if len(buf) > 200:           # circular buffer: keep newest 200, drop oldest
+            del buf[:len(buf) - 200]
 
 def _kite_limit_order(api_key, symbol, exchange, side, qty, price):
     """Place a tight LIMIT order (±0.2% around price) on Kite. Returns (ok, msg)."""
@@ -3867,7 +3867,7 @@ def _zo_bot_tick():
         elif is_claude:
             strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
         else:
-            strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+            strat = _tv_alert_leg_signal(leg, cfg)   # Claude off -> trade TV alerts on the underlying
         sig    = strat['signal']
         with zo_ai_lock:
             leg['last_candles'] = candles[-150:]
@@ -3899,8 +3899,8 @@ def _zo_bot_tick():
                 if reason:
                     _zo_close_leg(leg, exit_px, reason, cfg, mode)
                 else:
-                    _zo_log('[Tick] {} px={} (in {} from {}, strat={} score={:.1f}) — {}'.format(
-                        symbol, round(price, 2), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
+                    _zo_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
+                        symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
             else:
                 open_side = None
                 if sig == 'BUY' and buyer:    open_side = 'BUY'    # long the option
@@ -4357,8 +4357,8 @@ def _mt_log(msg):
     with mt_ai_lock:
         buf = mt_ai_state.setdefault('log_buffer', [])
         buf.append('[' + ts + '] ' + msg)
-        if len(buf) > 500:
-            del buf[:len(buf) - 500]
+        if len(buf) > 200:           # circular buffer: keep newest 200, drop oldest
+            del buf[:len(buf) - 200]
 
 def _mt_bot_place_live(side, qty, price, cfg, sl=0.0, tp=0.0):
     ok, msg = _mt5_place_order(cfg.get('mt5_id'), cfg.get('symbol'), side, qty, price, sl=sl, tp=tp)
@@ -4479,7 +4479,7 @@ def _mt_bot_tick():
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
-        strat = {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Tick the Claude AI strategy to trade'}
+        strat = _tv_alert_signal(mt_ai_state, cfg, symbol)   # Claude off -> trade TV alerts
     mode   = cfg.get('mode', 'paper')
     with mt_ai_lock:
         mt_ai_state['last_candles'] = candles[-150:]
@@ -4515,8 +4515,8 @@ def _mt_bot_tick():
             if reason:
                 _mt_bot_close(exit_px, reason, mode)
             else:
-                _mt_log('[Tick] {} px={} (in position {} from {}, strat={} score={:.1f}) — {}'.format(
-                    symbol, round(price, 5), pos['side'], pos['entryPrice'], strat['name'], strat['score'], strat.get('reason', '')))
+                _mt_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
+                    symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
         else:
             if strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -4775,6 +4775,82 @@ def delta_update_levels():
 def mt_update_levels():
     return _update_levels(mt_ai_state, mt_ai_lock, _mt_log, 'MT5', 5)
 
+def _tv_log_alert(sym, signal, price, indicator=''):
+    """Log a received TradingView alert to log.txt and mirror it into any RUNNING
+    bot whose symbol matches, so it shows in that panel's activity log."""
+    pstr = (' price=' + str(price)) if (price not in (None, '')) else ''
+    istr = (' [' + indicator + ']') if indicator else ''
+    line = '[TV-ALERT] {} {}{}{}'.format(sym, signal or '?', pstr, istr)
+    _persist_log_line(line)
+    for state, logfn in ((delta_ai_state, _bot_log), (zd_ai_state, _zd_log),
+                         (mt_ai_state, _mt_log), (zo_ai_state, _zo_log)):
+        try:
+            if not state.get('running'):
+                continue
+            cfg = state.get('config') or {}
+            keys = set()
+            for k in (cfg.get('symbol'), cfg.get('baseSymbol')):
+                if k: keys.add(str(k).upper())
+            tv = (cfg.get('tvSymbol') or '').upper()
+            if tv: keys.add(tv.split(':')[-1])
+            for leg in (state.get('legs') or []):
+                if leg.get('symbol'): keys.add(str(leg['symbol']).upper())
+            if sym in keys:
+                logfn(line)
+        except Exception:
+            pass
+
+def _tv_alert_for(cfg, symbol, base=''):
+    """Latest TradingView webhook alert dict for a bot's symbol (tries the bot
+    symbol, the tvSymbol's last segment, and the options base). None if none."""
+    sym_u = (symbol or '').upper().strip()
+    tv = (cfg.get('tvSymbol') or '').upper()
+    return (_TV_WEBHOOK.get(sym_u)
+            or (_TV_WEBHOOK.get(tv.split(':')[-1]) if tv else None)
+            or (_TV_WEBHOOK.get((base or '').upper()) if base else None))
+
+def _tv_alert_signal(state, cfg, symbol):
+    """TV-ONLY mode (Claude AI not selected): trade directly off the latest UNACTED
+    TradingView alert. BUY/LONG -> BUY, SELL/SHORT -> SELL. Acts once per alert."""
+    if not cfg.get('tvEnabled'):
+        return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
+    wh = _tv_alert_for(cfg, symbol)
+    if not wh:
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for an alert'}
+    raw = (wh.get('signal') or '').upper()
+    sig = 'BUY' if raw in ('BUY', 'LONG') else ('SELL' if raw in ('SELL', 'SHORT') else 'HOLD')
+    acted = state.get('_tv_acted_ts', 0)
+    if sig == 'HOLD' or int(wh.get('ts', 0)) <= acted:
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: last alert ' + (raw or '?') + ' (already acted)'}
+    state['_tv_acted_ts'] = int(wh.get('ts', 0))
+    ind = (' [' + wh.get('indicator', '') + ']') if wh.get('indicator') else ''
+    return {'name': 'tv', 'signal': sig, 'score': 10.0, 'reason': 'TV alert ' + sig + ind}
+
+def _tv_alert_leg_signal(leg, cfg):
+    """TV-ONLY mode for an options leg: map the UNDERLYING alert to the leg.
+    Bullish (BUY) -> long CE / short PE; bearish (SELL) -> long PE / short CE.
+    Acts once per alert per leg."""
+    if not cfg.get('tvEnabled'):
+        return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
+    wh = _tv_alert_for(cfg, leg.get('symbol', ''), base=cfg.get('baseSymbol'))
+    if not wh:
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for an alert'}
+    raw = (wh.get('signal') or '').upper()
+    bull = raw in ('BUY', 'LONG'); bear = raw in ('SELL', 'SHORT')
+    if not (bull or bear):
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: ' + (raw or '?')}
+    su = (leg.get('symbol') or '').upper()
+    otype = 'CE' if su.endswith('CE') else ('PE' if su.endswith('PE') else '')
+    if otype == 'PE':
+        leg_sig = 'BUY' if bear else 'SELL'
+    else:   # CE or unknown -> treat as directional
+        leg_sig = 'BUY' if bull else 'SELL'
+    acted = leg.get('_tv_acted_ts', 0)
+    if int(wh.get('ts', 0)) <= acted:
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: ' + raw + ' (already acted)'}
+    leg['_tv_acted_ts'] = int(wh.get('ts', 0))
+    return {'name': 'tv', 'signal': leg_sig, 'score': 10.0, 'reason': 'TV alert ' + raw + ' -> ' + (otype or 'leg') + ' ' + leg_sig}
+
 @app.route('/api/aibot/tv/webhook', methods=['POST'])
 def aibot_tv_webhook():
     """Receives TradingView alert JSON for the user's CUSTOM indicators and stores
@@ -4813,6 +4889,8 @@ def aibot_tv_webhook():
     if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
         for k, _v in sorted(_TV_WEBHOOK.items(), key=lambda kv: kv[1]['ts'])[:50]:
             _TV_WEBHOOK.pop(k, None)
+    e = _TV_WEBHOOK[sym]
+    _tv_log_alert(sym, e['signal'], e['price'], e['indicator'])
     return jsonify({'success': True})
 
 @app.route('/api/aibot/tv/peek')
@@ -15479,7 +15557,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
       <div class="ai-strat-bar" data-tv="aiBot" data-tv-broker="kite">
         <span class="lbl">&#128202; TradingView:</span>
-        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="aiBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="aiBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="aiBotTVSym" placeholder="auto e.g. NSE:RELIANCE" style="min-width:150px"></label>
         <button class="zd-add-btn" id="aiBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="aiBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -15680,7 +15758,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
       <div class="ai-strat-bar" data-tv="mtBot" data-tv-broker="mt5">
         <span class="lbl">&#128202; TradingView:</span>
-        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="mtBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="mtBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="mtBotTVSym" placeholder="auto e.g. FX:EURUSD" style="min-width:150px"></label>
         <button class="zd-add-btn" id="mtBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="mtBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -15825,7 +15903,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
       <div class="ai-strat-bar" data-tv="deltaBot" data-tv-broker="delta">
         <span class="lbl">&#128202; TradingView:</span>
-        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="deltaBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="deltaBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="deltaBotTVSym" placeholder="auto e.g. BINANCE:BTCUSDT" style="min-width:160px"></label>
         <button class="zd-add-btn" id="deltaBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="deltaBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -16013,7 +16091,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- TradingView (TA + custom-indicator webhook) on the UNDERLYING — context for Claude -->
       <div class="ai-strat-bar" data-tv="zoBot" data-tv-broker="kite">
         <span class="lbl">&#128202; TradingView:</span>
-        <label title="Feed TradingView's technical analysis of the UNDERLYING + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="zoBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="Feed TradingView's technical analysis of the UNDERLYING + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="zoBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="zoBotTVSym" placeholder="auto e.g. NSE:NIFTY" style="min-width:150px"></label>
         <button class="zd-add-btn" id="zoBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="zoBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -22136,14 +22214,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
-      if (log.length > lastRenderedLogLen) {
-        log.slice(lastRenderedLogLen).forEach(line => {
-          logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>';
-        });
-        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
-        lastRenderedLogLen = log.length;
-      }
-      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      { const _sig = log.join('\n');                  // re-render whole buffer on change
+        if (logEl.__logsig !== _sig) {                // (circular 200-line buffer never freezes the view)
+          logEl.innerHTML = log.map(line => '<span class="log-info">' + line.replace(/</g,'&lt;') + '</span>').join('<br>');
+          logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = _sig;
+        } }
       const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
       const _auto = !!(s.config && (s.config.autoSymbol || s.config.tokens));
       if (_auto && _botSym) symEl.value = _botSym;   // reflect Claude's auto-picked symbol
@@ -22698,11 +22773,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // config — those are user choices and must not be auto-ticked.
       }
       const log = s.log || [];
-      if (log.length > lastRenderedLogLen) {
-        log.slice(lastRenderedLogLen).forEach(line => { logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>'; });
-        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200); lastRenderedLogLen = log.length;
-      }
-      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      { const _sig = log.join('\n');                  // re-render whole buffer on change
+        if (logEl.__logsig !== _sig) {                // (circular 200-line buffer never freezes the view)
+          logEl.innerHTML = log.map(line => '<span class="log-info">' + line.replace(/</g,'&lt;') + '</span>').join('<br>');
+          logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = _sig;
+        } }
       const legs = s.legs || [];
       for (let i = 0; i < 2; i++) {
         const leg = legs[i];
@@ -23118,11 +23193,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
-      if (log.length > lastRenderedLogLen) {
-        log.slice(lastRenderedLogLen).forEach(line => { logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>'; });
-        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200); lastRenderedLogLen = log.length;
-      }
-      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      { const _sig = log.join('\n');                  // re-render whole buffer on change
+        if (logEl.__logsig !== _sig) {                // (circular 200-line buffer never freezes the view)
+          logEl.innerHTML = log.map(line => '<span class="log-info">' + line.replace(/</g,'&lt;') + '</span>').join('<br>');
+          logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = _sig;
+        } }
       const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
       const _auto = !!(s.config && (s.config.autoSymbol || s.config.tokens));
       if (_auto && _botSym) symEl.value = _botSym;   // reflect Claude's auto-picked symbol
@@ -23894,18 +23969,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
 
-      // New log lines (server's log_buffer is a rolling tail)
+      // Re-render the whole rolling buffer whenever it changes — the server keeps
+      // a circular 200-line tail, so length-diff appending would freeze the view
+      // once it fills. Content signature avoids that.
       const log = s.log || [];
-      if (log.length > lastRenderedLogLen) {
-        const fresh = log.slice(lastRenderedLogLen);
-        fresh.forEach(line => {
-          logEl.innerHTML += '<br><span class="log-info">' + line.replace(/</g,'&lt;') + '</span>';
-        });
-        logEl.scrollTop = logEl.scrollHeight; _capLog(logEl, 200);
-        lastRenderedLogLen = log.length;
-      }
-      // If the server cleared its buffer (e.g., new start), reset our cursor
-      if (log.length < lastRenderedLogLen) lastRenderedLogLen = log.length;
+      { const _sig = log.join('\n');
+        if (logEl.__logsig !== _sig) {
+          logEl.innerHTML = log.map(line => '<span class="log-info">' + line.replace(/</g,'&lt;') + '</span>').join('<br>');
+          logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = _sig;
+        } }
 
       // Chart from server's last candles
       const _botSym = (s.config && s.config.symbol) ? String(s.config.symbol).toUpperCase() : '';
@@ -24575,7 +24647,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           webhookUrl = res.webhookUrl;
           hook.style.display = '';
           hook.innerHTML = 'Custom indicators → in TradingView create an Alert with Webhook URL <b>' + esc(res.webhookUrl) +
-            '</b> and message <code>{"symbol":"' + esc((symGetter() || 'NIFTY')) + '","signal":"BUY","indicator":"MyPine"}</code>';
+            '</b> and message <code>{"symbol":"' + esc((symGetter() || 'NIFTY')) + '","signal":"BUY","price":{{close}},"indicator":"MyPine"}</code>';
         }
       }).catch(() => { box.textContent = 'TV error'; });
     }
