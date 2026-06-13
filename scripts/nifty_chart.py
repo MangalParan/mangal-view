@@ -15476,6 +15476,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="aiBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="aiBotTVSym" placeholder="auto e.g. NSE:RELIANCE" style="min-width:150px"></label>
         <button class="zd-add-btn" id="aiBotTVBtn" type="button">&#128268; Connect</button>
+        <button class="zd-add-btn" id="aiBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
         <span id="aiBotTVBox" style="font-size:11px;color:#787b86">off</span>
         <div id="aiBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
@@ -15676,6 +15677,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="mtBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="mtBotTVSym" placeholder="auto e.g. FX:EURUSD" style="min-width:150px"></label>
         <button class="zd-add-btn" id="mtBotTVBtn" type="button">&#128268; Connect</button>
+        <button class="zd-add-btn" id="mtBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
         <span id="mtBotTVBox" style="font-size:11px;color:#787b86">off</span>
         <div id="mtBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
@@ -15820,6 +15822,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="deltaBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="deltaBotTVSym" placeholder="auto e.g. BINANCE:BTCUSDT" style="min-width:160px"></label>
         <button class="zd-add-btn" id="deltaBotTVBtn" type="button">&#128268; Connect</button>
+        <button class="zd-add-btn" id="deltaBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
         <span id="deltaBotTVBox" style="font-size:11px;color:#787b86">off</span>
         <div id="deltaBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
@@ -16007,6 +16010,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Feed TradingView's technical analysis of the UNDERLYING + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="zoBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="zoBotTVSym" placeholder="auto e.g. NSE:NIFTY" style="min-width:150px"></label>
         <button class="zd-add-btn" id="zoBotTVBtn" type="button">&#128268; Connect</button>
+        <button class="zd-add-btn" id="zoBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
         <span id="zoBotTVBox" style="font-size:11px;color:#787b86">off</span>
         <div id="zoBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
@@ -24530,10 +24534,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const chk = document.getElementById(prefix + 'TV');
     const symIn = document.getElementById(prefix + 'TVSym');
     const btn = document.getElementById(prefix + 'TVBtn');
+    const testBtn = document.getElementById(prefix + 'TVTest');
     const box = document.getElementById(prefix + 'TVBox');
     const hook = document.getElementById(prefix + 'TVHook');
     if (!chk || !btn || !box) return;
-    let timer = null;
+    let timer = null, webhookUrl = '';
     const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     function refresh() {
       const sym = symGetter() || '';
@@ -24561,6 +24566,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           box.innerHTML = '<span style="color:#787b86">' + esc(tv.note || ('no TradingView data' + (tv.tvSymbol ? ' for ' + tv.tvSymbol : ''))) + '</span>';
         }
         if (hook && res.webhookUrl) {
+          webhookUrl = res.webhookUrl;
           hook.style.display = '';
           hook.innerHTML = 'Custom indicators → in TradingView create an Alert with Webhook URL <b>' + esc(res.webhookUrl) +
             '</b> and message <code>{"symbol":"' + esc((symGetter() || 'NIFTY')) + '","signal":"BUY","indicator":"MyPine"}</code>';
@@ -24569,8 +24575,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function start() { refresh(); if (timer) clearInterval(timer); timer = setInterval(refresh, 20000); }
     function stop() { if (timer) { clearInterval(timer); timer = null; } box.textContent = 'off'; if (hook) hook.style.display = 'none'; }
+    function sendTest() {
+      const sym = (symGetter() || '').toUpperCase();
+      if (!sym) { box.textContent = 'enter a symbol first'; return; }
+      box.textContent = 'sending test ' + sym + '…';
+      const getUrl = webhookUrl ? Promise.resolve(webhookUrl)
+        : fetch('/api/aibot/tv/peek?broker=' + encodeURIComponent(broker)).then(r => r.json()).then(j => j.webhookUrl);
+      getUrl.then(url => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: sym, signal: 'BUY', indicator: 'TEST', note: 'manual test from panel' }) })
+        .then(r => r.json())).then(res => {
+          if (res && res.success) { chk.checked = true; start(); }   // poll so the box shows 'alert BUY 0s'
+          else { box.innerHTML = '<span style="color:#ef5350">test failed: ' + esc((res && res.error) || '?') + '</span>'; }
+        }).catch(() => { box.innerHTML = '<span style="color:#ef5350">test failed (network)</span>'; });
+    }
     btn.addEventListener('click', () => { chk.checked = true; start(); });
     chk.addEventListener('change', () => { chk.checked ? start() : stop(); });
+    if (testBtn) testBtn.addEventListener('click', sendTest);
   }
   const val = id => { const e = document.getElementById(id); return e ? (e.value || '').trim().toUpperCase() : ''; };
   function zoBase() { const sel = document.getElementById('zoBotBaseSel'); let v = sel ? sel.value : ''; if (v === '__custom') v = val('zoBotBaseCustom'); return v; }
