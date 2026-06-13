@@ -1842,6 +1842,116 @@ def _bot_build_algos(cfg):
     if cfg.get('includeMMA'): algos.append('mma')
     return [a for a in algos if a not in ('mpredict', 'claude')]
 
+# ============================================================================
+# TradingView integration. There is NO official API for a user's private chart
+# indicators, so this provides the realistic equivalents the bots feed to Claude
+# (context only) when the panel's TradingView toggle is on:
+#   (1) Technical Analysis readout via TradingView's public scanner endpoint
+#       (RSI/MACD/Stoch/ADX + an overall STRONG BUY..STRONG SELL rating), and
+#   (2) custom-indicator signals the user PUSHES in via TradingView alert webhooks.
+# ============================================================================
+_TV_TA_CACHE = {}        # {(tv_symbol, interval): {'ts': float, 'data': dict|None}}
+_TV_TA_TTL   = 20
+_TV_WEBHOOK  = {}        # {SYMBOL: {'signal','price','indicator','note','ts'}}
+_TV_WEBHOOK_MAX = 300
+_TV_DEFAULT_TOKEN = os.environ.get('TV_WEBHOOK_TOKEN', '').strip() or 'mangalview'
+_TV_INTERVAL = {'1m': '1', '3m': '5', '5m': '5', '15m': '15', '30m': '30',
+                '1h': '60', '2h': '120', '4h': '240', '1d': '1D', '1w': '1W'}
+_TV_COLS = ['Recommend.All', 'Recommend.MA', 'Recommend.Other', 'RSI', 'Mom',
+            'MACD.macd', 'MACD.signal', 'Stoch.K', 'ADX', 'close']
+
+def _tv_rating_label(v):
+    try: v = float(v)
+    except (TypeError, ValueError): return 'n/a'
+    if v >= 0.5:  return 'STRONG BUY'
+    if v >= 0.1:  return 'BUY'
+    if v > -0.1:  return 'NEUTRAL'
+    if v > -0.5:  return 'SELL'
+    return 'STRONG SELL'
+
+def _tv_screener_for(tv_symbol):
+    pre = (tv_symbol.split(':', 1)[0] if ':' in tv_symbol else '').upper()
+    if pre in ('NSE', 'BSE', 'MCX'):                                   return 'india'
+    if pre in ('BINANCE', 'COINBASE', 'BYBIT', 'OKX', 'KUCOIN', 'BITSTAMP'): return 'crypto'
+    if pre in ('FX', 'FX_IDC', 'OANDA', 'FOREXCOM', 'SAXO', 'PEPPERSTONE'):  return 'forex'
+    if pre in ('NASDAQ', 'NYSE', 'AMEX', 'CBOE'):                      return 'america'
+    return 'global'
+
+def _tv_default_symbol(broker, symbol, exchange):
+    s = (symbol or '').upper().strip()
+    if not s: return ''
+    if broker == 'kite':
+        ex = (exchange or 'NSE').upper()
+        return (ex if ex in ('NSE', 'BSE') else 'NSE') + ':' + s
+    if broker == 'delta':
+        base = s.replace('USDT', '').replace('USD', '')
+        return 'BINANCE:' + base + 'USDT'
+    if broker == 'mt5':
+        return 'FX:' + s
+    return s
+
+def _tv_fetch_ta(tv_symbol, interval):
+    """TradingView Technical Analysis for a symbol+interval via the public scanner.
+    Returns a dict (rating + indicators) or None on any failure. Cached _TV_TA_TTL s."""
+    if not tv_symbol: return None
+    key = (tv_symbol, interval)
+    now = _zd_time.time()
+    ent = _TV_TA_CACHE.get(key)
+    if ent and now - ent['ts'] < _TV_TA_TTL:
+        return ent['data']
+    suffix = '' if interval in ('', '1D') else '|' + interval
+    cols = [c + suffix for c in _TV_COLS]
+    body = __import__('json').dumps({'symbols': {'tickers': [tv_symbol], 'query': {'types': []}},
+                                     'columns': cols}).encode('utf-8')
+    url = 'https://scanner.tradingview.com/' + _tv_screener_for(tv_symbol) + '/scan'
+    try:
+        import urllib.request as _ur, json as _j
+        req = _ur.Request(url, data=body, method='POST',
+                          headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+        with _ur.urlopen(req, timeout=10) as resp:
+            data = _j.loads(resp.read().decode('utf-8'))
+        rows = data.get('data') or []
+        if not rows:
+            _TV_TA_CACHE[key] = {'ts': now, 'data': None}; return None
+        m = dict(zip(_TV_COLS, rows[0].get('d') or []))
+        def _f(k, nd=2):
+            try: return round(float(m.get(k)), nd)
+            except (TypeError, ValueError): return None
+        out = {
+            'tvSymbol': tv_symbol, 'interval': interval,
+            'rating': _tv_rating_label(m.get('Recommend.All')), 'ratingScore': _f('Recommend.All'),
+            'maRating': _tv_rating_label(m.get('Recommend.MA')),
+            'oscRating': _tv_rating_label(m.get('Recommend.Other')),
+            'rsi': _f('RSI', 1), 'macdHist': (round((m.get('MACD.macd') or 0) - (m.get('MACD.signal') or 0), 4)
+                                              if m.get('MACD.macd') is not None else None),
+            'stochK': _f('Stoch.K', 1), 'adx': _f('ADX', 1), 'close': _f('close', 4),
+        }
+        _TV_TA_CACHE[key] = {'ts': now, 'data': out}
+        return out
+    except Exception:
+        _TV_TA_CACHE[key] = {'ts': now, 'data': (ent['data'] if ent else None)}
+        return ent['data'] if ent else None
+
+def _tv_context(cfg, broker, symbol, exchange):
+    """TradingView context for Claude (TA + latest custom-indicator webhook), or
+    None when the panel's TradingView toggle is off. Keyed under 'tradingview'."""
+    if not cfg.get('tvEnabled'):
+        return None
+    tv_symbol = (cfg.get('tvSymbol') or '').strip().upper() or _tv_default_symbol(broker, symbol, exchange)
+    interval  = _TV_INTERVAL.get(cfg.get('tf', '5m'), '5')
+    ta = _tv_fetch_ta(tv_symbol, interval)
+    sym_u = (symbol or '').upper().strip()
+    wh = _TV_WEBHOOK.get(sym_u) or (_TV_WEBHOOK.get(tv_symbol.split(':')[-1]) if tv_symbol else None)
+    out = {'tvSymbol': tv_symbol}
+    if ta:
+        out.update({k: v for k, v in ta.items() if k not in ('tvSymbol', 'interval') and v is not None})
+    if wh:
+        out['webhook'] = {'signal': wh.get('signal'), 'indicator': wh.get('indicator'),
+                          'note': wh.get('note'), 'ageSec': int(_zd_time.time()) - int(wh.get('ts', 0))}
+    if len(out) == 1 and not wh:   # only tvSymbol, no data
+        out['note'] = 'no TradingView data for ' + tv_symbol
+    return out
+
 def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None, extra_ctx=None):
     """Autonomous Claude strategy. Sends recent OHLCV plus market context (multi-
     window trend, volume/liquidity, volatility), the CURRENT position (so it
@@ -1944,6 +2054,19 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "Weigh optionType, moneyness, underlyingVsStrikePct, dte and underlyingTrendPct together before deciding.\n"
         )
 
+    # TradingView block — external confirmation (context only) when the panel's
+    # TradingView toggle is on. Claude still decides; TV nudges conviction.
+    tv_block = ""
+    if extra_ctx and extra_ctx.get('tradingview'):
+        tv_block = (
+            "\nTRADINGVIEW (external confirmation in 'tradingview'): 'rating' is TradingView's overall technical "
+            "signal (STRONG BUY..STRONG SELL) from its standard indicators, with rsi / macdHist / stochK / adx and "
+            "the moving-average (maRating) and oscillator (oscRating) ratings. 'webhook' (if present) is the user's "
+            "OWN custom-indicator alert — signal + indicator + ageSec. WEIGH these as confirmation: lift conviction "
+            "when they ALIGN with your read, and lower it / raise your bar when they OPPOSE it. A fresh webhook "
+            "(small ageSec) is a strong hint; a stale one (large ageSec) is weak. This is confirmation ONLY — you "
+            "still make the final call; never trade against your own structure read just because TV disagrees.\n")
+
     min_enter = float(cfg.get('minScore', 0) or 0) + float(cfg.get('scoreBuffer', 0) or 0)
     if min_enter <= 0:
         gate = ("Score the setup YOURSELF on a 0-10 conviction scale and ONLY take BUY/SELL when your own conviction "
@@ -1981,6 +2104,7 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "invalidation sits far away (a wide stop), the trade risks too much per unit — prefer HOLD. After a recent "
         "'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
+        + tv_block
         + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
     )
@@ -2311,7 +2435,9 @@ def _delta_bot_tick():
     if _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and delta_ai_state.get('_decide', True):
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'))
+        _tv = _tv_context(cfg, 'delta', symbol, '')
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
+                                     extra_ctx=({'tradingview': _tv} if _tv else None))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -2481,6 +2607,8 @@ def delta_aibot_start():
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
+            'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'api_key':    (data.get('api_key') or '').strip(),
         }
         _c = delta_ai_state['config']
@@ -3099,7 +3227,9 @@ def _zd_bot_tick():
     if _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and zd_ai_state.get('_decide', True):
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'))
+        _tv = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
+                                     extra_ctx=({'tradingview': _tv} if _tv else None))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -3227,6 +3357,8 @@ def zd_aibot_start():
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
+            'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'api_key':    (data.get('api_key') or '').strip(),
         }
         _c = zd_ai_state['config']
@@ -3702,6 +3834,8 @@ def _zo_bot_tick():
     # Claude decisions only on the slow tick; price/stops still refresh every loop.
     _zo_decide = is_claude and zo_ai_state.get('_decide', True)
     base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and _zo_decide) else {}
+    # TradingView readout for the UNDERLYING (option contracts aren't on TV TA).
+    tv_ctx = _tv_context(cfg, 'kite', cfg.get('baseSymbol') or '', '') if _zo_decide else None
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -3721,6 +3855,7 @@ def _zo_bot_tick():
             leg_ctx.update(_zo_option_meta(symbol, leg.get('exchange'), (base_ctx or {}).get('underlyingSpot')))
             leg_ctx['buyerEnabled']  = buyer
             leg_ctx['sellerEnabled'] = seller
+            if tv_ctx: leg_ctx['tradingview'] = tv_ctx
         if _zo_decide:
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx)
         elif is_claude:
@@ -3867,6 +4002,8 @@ def zo_aibot_start():
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
+            'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'api_key':    (data.get('api_key') or '').strip(),
         }
         zo_ai_state['legs']          = legs
@@ -4330,7 +4467,9 @@ def _mt_bot_tick():
     if _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and mt_ai_state.get('_decide', True):
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'))
+        _tv = _tv_context(cfg, 'mt5', symbol, '')
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
+                                     extra_ctx=({'tradingview': _tv} if _tv else None))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -4435,6 +4574,8 @@ def mt_aibot_start():
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
+            'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'capital':    float(data.get('capital') or 0),   # Auto-symbol: Claude sizes lots & leverage from this
             'mt5_id':     (data.get('mt5_id') or '').strip(),
         }
@@ -4627,6 +4768,51 @@ def delta_update_levels():
 @login_required
 def mt_update_levels():
     return _update_levels(mt_ai_state, mt_ai_lock, _mt_log, 'MT5', 5)
+
+@app.route('/api/aibot/tv/webhook', methods=['POST'])
+def aibot_tv_webhook():
+    """Receives TradingView alert JSON for the user's CUSTOM indicators and stores
+    the latest signal per symbol. No login (TradingView can't authenticate) — a
+    ?token= guards it. Configure a TradingView alert with webhook URL:
+        <origin>/api/aibot/tv/webhook?token=<token>
+    and message body e.g. {"symbol":"NIFTY","signal":"BUY","indicator":"MyPine","note":"..."}"""
+    if request.args.get('token', '') != _TV_DEFAULT_TOKEN:
+        return jsonify({'success': False, 'error': 'bad token'}), 403
+    data = request.get_json(silent=True) or {}
+    if not data:                                  # accept plain "SYMBOL BUY" text too
+        raw = (request.get_data(as_text=True) or '').strip().split()
+        if len(raw) >= 2:
+            data = {'symbol': raw[0], 'signal': raw[1]}
+    sym = (data.get('symbol') or data.get('ticker') or '').upper().strip()
+    if not sym:
+        return jsonify({'success': False, 'error': 'no symbol'}), 400
+    _TV_WEBHOOK[sym] = {
+        'signal':    (data.get('signal') or data.get('action') or '').upper().strip(),
+        'price':     data.get('price'),
+        'indicator': str(data.get('indicator') or data.get('strategy') or '')[:60],
+        'note':      str(data.get('note') or data.get('comment') or data.get('message') or '')[:160],
+        'ts':        int(_zd_time.time()),
+    }
+    if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
+        for k, _v in sorted(_TV_WEBHOOK.items(), key=lambda kv: kv[1]['ts'])[:50]:
+            _TV_WEBHOOK.pop(k, None)
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/tv/peek')
+@login_required
+def aibot_tv_peek():
+    """Live TradingView readout for a panel's small display: TA rating + indicators
+    for the symbol/timeframe, plus the latest custom-indicator webhook signal and
+    the webhook URL the user pastes into TradingView alerts."""
+    broker   = (request.args.get('broker') or 'kite').lower()
+    symbol   = request.args.get('symbol', '')
+    exchange = request.args.get('exchange', '')
+    tf       = request.args.get('tf', '5m')
+    tvsym    = request.args.get('tvsymbol', '')
+    ctx = _tv_context({'tvEnabled': True, 'tvSymbol': tvsym, 'tf': tf}, broker, symbol, exchange) or {}
+    origin = request.host_url.rstrip('/')
+    return jsonify({'success': True, 'tv': ctx,
+                    'webhookUrl': origin + '/api/aibot/tv/webhook?token=' + _TV_DEFAULT_TOKEN})
 
 @app.route('/api/aibot/suggest_symbols', methods=['POST'])
 @login_required
@@ -15273,6 +15459,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span style="display:none"><input type="checkbox" id="aiBotIncludeMM"><input type="checkbox" id="aiBotIncludeMMA"></span>
       </div>
 
+      <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
+      <div class="ai-strat-bar" data-tv="aiBot" data-tv-broker="kite">
+        <span class="lbl">&#128202; TradingView:</span>
+        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="aiBotTV"> Use TradingView (Claude weighs it)</label>
+        <label>Symbol <input type="text" id="aiBotTVSym" placeholder="auto e.g. NSE:RELIANCE" style="min-width:150px"></label>
+        <button class="zd-add-btn" id="aiBotTVBtn" type="button">&#128268; Connect</button>
+        <span id="aiBotTVBox" style="font-size:11px;color:#787b86">off</span>
+        <div id="aiBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
+      </div>
+
       <!-- Risk controls -->
       <div class="ai-risk-bar">
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
@@ -15463,6 +15659,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span style="display:none"><input type="checkbox" id="mtBotIncludeMM"><input type="checkbox" id="mtBotIncludeMMA"></span>
       </div>
 
+      <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
+      <div class="ai-strat-bar" data-tv="mtBot" data-tv-broker="mt5">
+        <span class="lbl">&#128202; TradingView:</span>
+        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="mtBotTV"> Use TradingView (Claude weighs it)</label>
+        <label>Symbol <input type="text" id="mtBotTVSym" placeholder="auto e.g. FX:EURUSD" style="min-width:150px"></label>
+        <button class="zd-add-btn" id="mtBotTVBtn" type="button">&#128268; Connect</button>
+        <span id="mtBotTVBox" style="font-size:11px;color:#787b86">off</span>
+        <div id="mtBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
+      </div>
+
       <div class="ai-risk-bar">
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="mtBotMaxConsec" value="3" min="1"></label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
@@ -15595,6 +15801,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="deltaBotIncludeMM"><input type="checkbox" id="deltaBotIncludeMMA"></span>
+      </div>
+
+      <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
+      <div class="ai-strat-bar" data-tv="deltaBot" data-tv-broker="delta">
+        <span class="lbl">&#128202; TradingView:</span>
+        <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="deltaBotTV"> Use TradingView (Claude weighs it)</label>
+        <label>Symbol <input type="text" id="deltaBotTVSym" placeholder="auto e.g. BINANCE:BTCUSDT" style="min-width:160px"></label>
+        <button class="zd-add-btn" id="deltaBotTVBtn" type="button">&#128268; Connect</button>
+        <span id="deltaBotTVBox" style="font-size:11px;color:#787b86">off</span>
+        <div id="deltaBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
 
       <div class="ai-risk-bar">
@@ -15772,6 +15988,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="zoBotIncludeMM"><input type="checkbox" id="zoBotIncludeMMA"></span>
+      </div>
+
+      <!-- TradingView (TA + custom-indicator webhook) on the UNDERLYING — context for Claude -->
+      <div class="ai-strat-bar" data-tv="zoBot" data-tv-broker="kite">
+        <span class="lbl">&#128202; TradingView:</span>
+        <label title="Feed TradingView's technical analysis of the UNDERLYING + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides."><input type="checkbox" id="zoBotTV"> Use TradingView (Claude weighs it)</label>
+        <label>Symbol <input type="text" id="zoBotTVSym" placeholder="auto e.g. NSE:NIFTY" style="min-width:150px"></label>
+        <button class="zd-add-btn" id="zoBotTVBtn" type="button">&#128268; Connect</button>
+        <span id="zoBotTVBox" style="font-size:11px;color:#787b86">off</span>
+        <div id="zoBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
 
       <div class="ai-risk-bar">
@@ -21885,6 +22111,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         { const _cEl = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'Capital')); if (_cEl && c.capital != null) _cEl.value = c.capital; }
+        { const _tvE = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'TV')); const _tvS = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'TVSym')); if (_tvS && c.tvSymbol) _tvS.value = c.tvSymbol; if (_tvE && c.tvEnabled != null) { _tvE.checked = !!c.tvEnabled; _tvE.dispatchEvent(new Event('change')); } }
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
@@ -21962,6 +22189,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
         model:       modelEl ? modelEl.value : 'sonnet',
+        tvEnabled:   !!(document.getElementById('aiBotTV') || {}).checked,
+        tvSymbol:    ((document.getElementById('aiBotTVSym') || {}).value || '').trim().toUpperCase(),
         qualityFilter: !!qualityChk.checked,
         includeMM:   !!incMMChk.checked,
         includeMMA:  !!incMMAChk.checked,
@@ -22437,6 +22666,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         { const cap = document.getElementById('zoBotCapital'); if (cap && c.capital != null) cap.value = c.capital; }
+        { const _tvS = document.getElementById('zoBotTVSym'); if (_tvS && c.tvSymbol) _tvS.value = c.tvSymbol; const _tvE = document.getElementById('zoBotTV'); if (_tvE && c.tvEnabled != null) { _tvE.checked = !!c.tvEnabled; _tvE.dispatchEvent(new Event('change')); } }
         { const ac = document.getElementById('zoBotAutoStrikes'); if (ac && c.autoStrikes != null) ac.checked = !!c.autoStrikes; }
         { const bs = document.getElementById('zoBotBaseSel'); if (bs && c.baseSymbol) {
             const opt = Array.from(bs.options).some(o => o.value === c.baseSymbol);
@@ -22512,6 +22742,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
         model: modelEl ? modelEl.value : 'sonnet',
+        tvEnabled: !!(document.getElementById('zoBotTV') || {}).checked,
+        tvSymbol: ((document.getElementById('zoBotTVSym') || {}).value || '').trim().toUpperCase(),
         qualityFilter: !!qualityChk.checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(),
@@ -22861,6 +23093,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         { const _cEl = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'Capital')); if (_cEl && c.capital != null) _cEl.value = c.capital; }
+        { const _tvE = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'TV')); const _tvS = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'TVSym')); if (_tvS && c.tvSymbol) _tvS.value = c.tvSymbol; if (_tvE && c.tvEnabled != null) { _tvE.checked = !!c.tvEnabled; _tvE.dispatchEvent(new Event('change')); } }
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
       const log = s.log || [];
@@ -22907,6 +23140,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30, qualityFilter: !!qualityChk.checked,
         model: modelEl ? modelEl.value : 'sonnet',
+        tvEnabled: !!(document.getElementById('mtBotTV') || {}).checked,
+        tvSymbol: ((document.getElementById('mtBotTVSym') || {}).value || '').trim().toUpperCase(),
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(), mt5_id: s.id || ''
       };
@@ -23634,6 +23869,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (c.model && modelEl) modelEl.value = c.model;
         if (c.qualityFilter != null) qualityChk.checked = !!c.qualityFilter;
         { const _cEl = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'Capital')); if (_cEl && c.capital != null) _cEl.value = c.capital; }
+        { const _tvE = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'TV')); const _tvS = document.getElementById((maxLossEl.id || '').replace('MaxLoss', 'TVSym')); if (_tvS && c.tvSymbol) _tvS.value = c.tvSymbol; if (_tvE && c.tvEnabled != null) { _tvE.checked = !!c.tvEnabled; _tvE.dispatchEvent(new Event('change')); } }
         // NOTE: strategy checkboxes are user choices — never auto-tick from config.
       }
 
@@ -23718,6 +23954,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         scoreBuffer: isNaN(parseFloat(scoreBufferEl.value)) ? 1.0 : parseFloat(scoreBufferEl.value),
         cooldownSec: parseInt(cooldownEl.value) || 0, tickSec: parseInt(tickSecEl.value) || 30,
         model:      modelEl ? modelEl.value : 'sonnet',
+        tvEnabled:  !!(document.getElementById('deltaBotTV') || {}).checked,
+        tvSymbol:   ((document.getElementById('deltaBotTVSym') || {}).value || '').trim().toUpperCase(),
         qualityFilter: !!qualityChk.checked,
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
@@ -24273,6 +24511,62 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     })
     .catch(() => {});
+})();
+
+// ---- TradingView panels (TA readout + custom-indicator webhook) ----
+(function() {
+  function tvSetup(prefix, broker, symGetter, exchId, tfId) {
+    const chk = document.getElementById(prefix + 'TV');
+    const symIn = document.getElementById(prefix + 'TVSym');
+    const btn = document.getElementById(prefix + 'TVBtn');
+    const box = document.getElementById(prefix + 'TVBox');
+    const hook = document.getElementById(prefix + 'TVHook');
+    if (!chk || !btn || !box) return;
+    let timer = null;
+    const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    function refresh() {
+      const sym = symGetter() || '';
+      const ex = exchId ? ((document.getElementById(exchId) || {}).value || '') : '';
+      const tf = tfId ? ((document.getElementById(tfId) || {}).value || '5m') : '5m';
+      const tvsym = ((symIn || {}).value || '').trim();
+      const qs = '?broker=' + encodeURIComponent(broker) + '&symbol=' + encodeURIComponent(sym) +
+                 '&exchange=' + encodeURIComponent(ex) + '&tf=' + encodeURIComponent(tf) +
+                 '&tvsymbol=' + encodeURIComponent(tvsym);
+      box.textContent = 'loading…';
+      fetch('/api/aibot/tv/peek' + qs).then(r => r.json()).then(res => {
+        if (!res || !res.success) { box.textContent = 'TV error'; return; }
+        const tv = res.tv || {};
+        if (tv.rating) {
+          const col = tv.rating.indexOf('BUY') >= 0 ? '#26a69a' : (tv.rating.indexOf('SELL') >= 0 ? '#ef5350' : '#9aa0ac');
+          let s = '<b style="color:' + col + '">' + esc(tv.rating) + '</b>';
+          if (tv.tvSymbol) s += ' <span style="color:#787b86">' + esc(tv.tvSymbol) + '</span>';
+          if (tv.rsi != null) s += ' · RSI ' + tv.rsi;
+          if (tv.macdHist != null) s += ' · MACD ' + (tv.macdHist >= 0 ? '+' : '') + tv.macdHist;
+          if (tv.adx != null) s += ' · ADX ' + tv.adx;
+          if (tv.webhook) s += ' · <span style="color:#b388ff">alert ' + esc(tv.webhook.signal || '?') +
+                               (tv.webhook.ageSec != null ? ' ' + tv.webhook.ageSec + 's' : '') + '</span>';
+          box.innerHTML = s;
+        } else {
+          box.innerHTML = '<span style="color:#787b86">' + esc(tv.note || ('no TradingView data' + (tv.tvSymbol ? ' for ' + tv.tvSymbol : ''))) + '</span>';
+        }
+        if (hook && res.webhookUrl) {
+          hook.style.display = '';
+          hook.innerHTML = 'Custom indicators → in TradingView create an Alert with Webhook URL <b>' + esc(res.webhookUrl) +
+            '</b> and message <code>{"symbol":"' + esc((symGetter() || 'NIFTY')) + '","signal":"BUY","indicator":"MyPine"}</code>';
+        }
+      }).catch(() => { box.textContent = 'TV error'; });
+    }
+    function start() { refresh(); if (timer) clearInterval(timer); timer = setInterval(refresh, 20000); }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } box.textContent = 'off'; if (hook) hook.style.display = 'none'; }
+    btn.addEventListener('click', () => { chk.checked = true; start(); });
+    chk.addEventListener('change', () => { chk.checked ? start() : stop(); });
+  }
+  const val = id => { const e = document.getElementById(id); return e ? (e.value || '').trim().toUpperCase() : ''; };
+  function zoBase() { const sel = document.getElementById('zoBotBaseSel'); let v = sel ? sel.value : ''; if (v === '__custom') v = val('zoBotBaseCustom'); return v; }
+  tvSetup('aiBot', 'kite', () => val('aiBotSymbol'), 'aiBotExchange', 'aiBotTF');
+  tvSetup('mtBot', 'mt5', () => val('mtBotSymbol'), null, 'mtBotTF');
+  tvSetup('deltaBot', 'delta', () => val('deltaBotSymbol'), null, 'deltaBotTF');
+  tvSetup('zoBot', 'kite', () => zoBase(), null, 'zoBotTF');
 })();
 </script>
 </body>

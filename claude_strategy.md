@@ -103,14 +103,23 @@ The price Claude analyses for an option leg is the **premium**, not the index. T
 
 ---
 
-## 8. Model & cadence
+## 8. TradingView confirmation (optional)
+
+Each panel has a **📊 TradingView** toggle. There's no official API for a user's private chart indicators, so it provides the realistic equivalents, fed to Claude as **context only** (Claude still decides):
+
+- **Technical Analysis (auto)** — pulled from TradingView's public scanner for the symbol + timeframe: overall **STRONG BUY → STRONG SELL** rating plus RSI, MACD histogram, Stochastic, ADX, and the moving-average / oscillator sub-ratings. Shown in the small panel display and refreshed ~20s. See [`_tv_fetch_ta`](scripts/nifty_chart.py).
+- **Custom indicators (webhook)** — create a TradingView **Alert** on your own Pine indicator with a Webhook URL `<origin>/api/aibot/tv/webhook?token=<token>` and a JSON body like `{"symbol":"NIFTY","signal":"BUY","indicator":"MyPine"}`. The latest signal per symbol is stored and passed to Claude with its age. See [`aibot_tv_webhook`](scripts/nifty_chart.py).
+- For the **Options** bot, TradingView is read on the **underlying** (e.g. NSE:NIFTY), since option contracts aren't on TradingView TA.
+- Influence is **context only**: Claude lifts conviction when TV aligns with its own read and raises its bar when TV opposes — it never trades against its own structure read just because TV disagrees. A stale webhook (large `ageSec`) is weighted weakly.
+
+## 9. Model & cadence
 
 - The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
 - **Tick** sets how often the bot checks the market and calls Claude (15s … 10m). Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost.
 
 ---
 
-## 9. Honest caveats
+## 10. Honest caveats
 
 - This is a **discretionary, LLM-judgment** strategy, **not** a backtested quant edge. The prompt steers Claude toward selective, structure-based trades to favour win rate, but **no strategy guarantees profit** — markets gap and reverse.
 - The **circuit breakers** (max consecutive losses, max daily loss/profit) and **SL on every trade** are what cap the downside.
