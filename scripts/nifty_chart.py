@@ -4800,6 +4800,29 @@ def _tv_log_alert(sym, signal, price, indicator=''):
         except Exception:
             pass
 
+def _tv_norm_signal(raw):
+    """Normalise a TradingView signal value to 'BUY'/'SELL'/'' (unknown).
+    Unresolved placeholders like {{strategy.order.action}} -> '' (not a signal)."""
+    s = (raw or '').strip().upper()
+    if not s or '{{' in s or '}}' in s:
+        return ''
+    if s in ('BUY', 'LONG', 'B', 'BULL', 'BULLISH', 'ENTRYLONG', 'LONGENTRY'):
+        return 'BUY'
+    if s in ('SELL', 'SHORT', 'S', 'BEAR', 'BEARISH', 'ENTRYSHORT', 'SHORTENTRY'):
+        return 'SELL'
+    return ''
+
+def _tv_recover_signal(text):
+    """Last-resort: scan free text for a buy/sell word (e.g. a strategy comment)."""
+    t = (text or '').upper()
+    if '{{' in t:                        # still an unresolved placeholder
+        return ''
+    has_buy  = any(w in t for w in (' BUY', 'LONG', 'BULL'))
+    has_sell = any(w in t for w in ('SELL', 'SHORT', 'BEAR'))
+    if has_buy and not has_sell:  return 'BUY'
+    if has_sell and not has_buy:  return 'SELL'
+    return ''
+
 def _tv_alert_for(cfg, symbol, base=''):
     """Latest TradingView webhook alert dict for a bot's symbol (tries the bot
     symbol, the tvSymbol's last segment, and the options base). None if none."""
@@ -4877,13 +4900,19 @@ def aibot_tv_webhook():
     if not isinstance(data, dict):
         data = {}
     sym = (data.get('symbol') or data.get('ticker') or '').upper().strip()
+    if ':' in sym:                       # strip exchange prefix: BITSTAMP:BTCUSD -> BTCUSD
+        sym = sym.split(':')[-1].strip()
     if not sym:
         return jsonify({'success': False, 'error': 'no symbol'}), 400
+    note = str(data.get('note') or data.get('comment') or data.get('message') or '')[:160]
+    sig  = _tv_norm_signal(data.get('signal') or data.get('action'))
+    if not sig:                          # signal unresolved/blank — try to recover from text
+        sig = _tv_norm_signal(note) or _tv_recover_signal(note) or _tv_recover_signal(str(data.get('signal') or ''))
     _TV_WEBHOOK[sym] = {
-        'signal':    (data.get('signal') or data.get('action') or '').upper().strip(),
+        'signal':    sig,
         'price':     data.get('price'),
         'indicator': str(data.get('indicator') or data.get('strategy') or '')[:60],
-        'note':      str(data.get('note') or data.get('comment') or data.get('message') or '')[:160],
+        'note':      note,
         'ts':        int(_zd_time.time()),
     }
     if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
