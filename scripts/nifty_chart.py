@@ -1937,7 +1937,12 @@ def _tv_context(cfg, broker, symbol, exchange):
     None when the panel's TradingView toggle is off. Keyed under 'tradingview'."""
     if not cfg.get('tvEnabled'):
         return None
-    tv_symbol = (cfg.get('tvSymbol') or '').strip().upper() or _tv_default_symbol(broker, symbol, exchange)
+    raw_tv = (cfg.get('tvSymbol') or '').strip().upper()
+    if raw_tv and ':' not in raw_tv:
+        # User typed a bare symbol (e.g. BTCUSD) — TradingView needs an exchange
+        # prefix, so map it through the broker default (BTCUSD -> BINANCE:BTCUSDT).
+        raw_tv = _tv_default_symbol(broker, raw_tv, exchange)
+    tv_symbol = raw_tv or _tv_default_symbol(broker, symbol, exchange)
     interval  = _TV_INTERVAL.get(cfg.get('tf', '5m'), '5')
     ta = _tv_fetch_ta(tv_symbol, interval)
     sym_u = (symbol or '').upper().strip()
@@ -1948,8 +1953,9 @@ def _tv_context(cfg, broker, symbol, exchange):
     if wh:
         out['webhook'] = {'signal': wh.get('signal'), 'indicator': wh.get('indicator'),
                           'note': wh.get('note'), 'ageSec': int(_zd_time.time()) - int(wh.get('ts', 0))}
-    if len(out) == 1 and not wh:   # only tvSymbol, no data
-        out['note'] = 'no TradingView data for ' + tv_symbol
+    if len(out) == 1 and not wh:   # only tvSymbol, no TA and no webhook
+        out['note'] = ('no TradingView data for ' + tv_symbol +
+                       ' — use an EXCHANGE:SYMBOL ticker (e.g. BINANCE:BTCUSDT, NSE:RELIANCE) or leave blank for auto')
     return out
 
 def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None, extra_ctx=None):
