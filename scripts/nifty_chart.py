@@ -4778,12 +4778,17 @@ def delta_update_levels():
 def mt_update_levels():
     return _update_levels(mt_ai_state, mt_ai_lock, _mt_log, 'MT5', 5)
 
-def _tv_log_alert(sym, signal, price, indicator=''):
-    """Log a received TradingView alert to log.txt and mirror it into any RUNNING
-    bot whose symbol matches, so it shows in that panel's activity log."""
+def _tv_log_alert(sym, entry):
+    """Log a received TradingView alert (the WHOLE payload) to log.txt and mirror it
+    into any RUNNING bot whose symbol matches, so it shows in that panel's log."""
+    price = entry.get('price')
     pstr = (' price=' + str(price)) if (price not in (None, '')) else ''
+    fstr = ''.join(' {}={}'.format(k, v) for k, v in (entry.get('fields') or {}).items())
+    note = entry.get('note') or ''
+    nstr = (' note="' + note + '"') if note else ''
+    indicator = entry.get('indicator') or ''
     istr = (' [' + indicator + ']') if indicator else ''
-    line = '[TV-ALERT] {} {}{}{}'.format(sym, signal or '?', pstr, istr)
+    line = '[TV-ALERT] {} {}{}{}{}{}'.format(sym, entry.get('signal') or '?', pstr, fstr, nstr, istr)
     _persist_log_line(line)
     for state, logfn in ((delta_ai_state, _bot_log), (zd_ai_state, _zd_log),
                          (mt_ai_state, _mt_log), (zo_ai_state, _zo_log)):
@@ -4935,8 +4940,7 @@ def aibot_tv_webhook():
     if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
         for k, _v in sorted(_TV_WEBHOOK.items(), key=lambda kv: kv[1]['ts'])[:50]:
             _TV_WEBHOOK.pop(k, None)
-    e = _TV_WEBHOOK[sym]
-    _tv_log_alert(sym, e['signal'], e['price'], e['indicator'])
+    _tv_log_alert(sym, _TV_WEBHOOK[sym])
     return jsonify({'success': True})
 
 @app.route('/api/aibot/tv/peek')
@@ -24676,6 +24680,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fetch('/api/aibot/tv/peek' + qs).then(r => r.json()).then(res => {
         if (!res || !res.success) { box.textContent = 'TV error'; return; }
         const tv = res.tv || {};
+        // Webhook (custom-indicator) details — the FULL payload the alert sent
+        let ws = '';
+        if (tv.webhook) {
+          const w = tv.webhook;
+          ws = ' · <span style="color:#b388ff">alert ' + esc(w.signal || '?') + (w.ageSec != null ? ' ' + w.ageSec + 's' : '');
+          if (w.fields) { const p = Object.keys(w.fields).map(k => k + '=' + w.fields[k]); if (p.length) ws += ' {' + esc(p.join(' ')) + '}'; }
+          if (w.note) ws += ' ' + esc(w.note);
+          ws += '</span>';
+        }
         if (tv.rating) {
           const col = tv.rating.indexOf('BUY') >= 0 ? '#26a69a' : (tv.rating.indexOf('SELL') >= 0 ? '#ef5350' : '#9aa0ac');
           let s = '<b style="color:' + col + '">' + esc(tv.rating) + '</b>';
@@ -24683,9 +24696,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
           if (tv.rsi != null) s += ' · RSI ' + tv.rsi;
           if (tv.macdHist != null) s += ' · MACD ' + (tv.macdHist >= 0 ? '+' : '') + tv.macdHist;
           if (tv.adx != null) s += ' · ADX ' + tv.adx;
-          if (tv.webhook) s += ' · <span style="color:#b388ff">alert ' + esc(tv.webhook.signal || '?') +
-                               (tv.webhook.ageSec != null ? ' ' + tv.webhook.ageSec + 's' : '') + '</span>';
-          box.innerHTML = s;
+          box.innerHTML = s + ws;
+        } else if (ws) {
+          box.innerHTML = '<span style="color:#787b86">' + esc(tv.tvSymbol || '') + '</span>' + ws;
         } else {
           box.innerHTML = '<span style="color:#787b86">' + esc(tv.note || ('no TradingView data' + (tv.tvSymbol ? ' for ' + tv.tvSymbol : ''))) + '</span>';
         }
