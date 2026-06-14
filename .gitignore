@@ -14,3 +14,5 @@ bench_results.txt
 log.txt
 # Local dev server output
 server.log
+# Third-party TradingView Pine scripts kept locally for reference (not app code)
+*.pine
