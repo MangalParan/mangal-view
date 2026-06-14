@@ -4850,18 +4850,38 @@ def _tv_num(v):
     except (TypeError, ValueError):
         return None
 
-def _tv_apply_sltp(out, wh):
-    """If the alert carried SL/TP — as slPct/tpPct (percent) or sl/tp (absolute
-    price) — put slPct/tpPct on the strat so the trade uses the alert's levels."""
+def _tv_apply_sltp(out, wh, levels=True):
+    """Derive the trade's SL/TP from the alert. Priority:
+      1) slPct/tpPct (percent) — used directly;
+      2) sl/tp (absolute price) — converted to % from the alert price;
+      3) STRUCTURE: support/resistance levels (psar, rangeTop, rangeBottom, or
+         generic support/resistance) — for a BUY, SL = nearest support BELOW price
+         and TP = nearest resistance ABOVE; mirrored for a SELL.
+    `levels=False` (option legs) skips 2/3 since those are underlying prices, not
+    premium. Falls back to panel defaults when nothing usable is present."""
     f = {str(k).lower(): v for k, v in (wh.get('fields') or {}).items()}
     slp = _tv_num(f.get('slpct')); tpp = _tv_num(f.get('tppct'))
     if slp and slp > 0: out['slPct'] = min(90.0, slp)
     if tpp and tpp > 0: out['tpPct'] = min(90.0, tpp)
+    if not levels:
+        return out
     price = _tv_num(wh.get('price'))
+    if not price or price <= 0:
+        return out
     sl_abs = _tv_num(f.get('sl')); tp_abs = _tv_num(f.get('tp'))
-    if price and price > 0:
-        if 'slPct' not in out and sl_abs: out['slPct'] = min(90.0, abs(price - sl_abs) / price * 100.0)
-        if 'tpPct' not in out and tp_abs: out['tpPct'] = min(90.0, abs(price - tp_abs) / price * 100.0)
+    side = out.get('signal')
+    if side in ('BUY', 'SELL') and (sl_abs is None or tp_abs is None):
+        pool = [_tv_num(f.get(k)) for k in ('psar', 'rangetop', 'rangebottom', 'support', 'resistance')]
+        supports    = [x for x in pool if x and x < price]
+        resistances = [x for x in pool if x and x > price]
+        if side == 'BUY':
+            if sl_abs is None and supports:    sl_abs = max(supports)     # nearest support below
+            if tp_abs is None and resistances: tp_abs = min(resistances)  # nearest resistance above
+        else:
+            if sl_abs is None and resistances: sl_abs = min(resistances)  # nearest resistance above
+            if tp_abs is None and supports:    tp_abs = max(supports)      # nearest support below
+    if 'slPct' not in out and sl_abs: out['slPct'] = min(90.0, abs(price - sl_abs) / price * 100.0)
+    if 'tpPct' not in out and tp_abs: out['tpPct'] = min(90.0, abs(price - tp_abs) / price * 100.0)
     return out
 
 def _tv_alert_signal(state, cfg, symbol):
@@ -4905,7 +4925,7 @@ def _tv_alert_leg_signal(leg, cfg):
     if int(wh.get('ts', 0)) <= acted:
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: ' + raw + ' (already acted)'}
     leg['_tv_acted_ts'] = int(wh.get('ts', 0))
-    return _tv_apply_sltp({'name': 'tv', 'signal': leg_sig, 'score': 10.0, 'reason': 'TV alert ' + raw + ' -> ' + (otype or 'leg') + ' ' + leg_sig}, wh)
+    return _tv_apply_sltp({'name': 'tv', 'signal': leg_sig, 'score': 10.0, 'reason': 'TV alert ' + raw + ' -> ' + (otype or 'leg') + ' ' + leg_sig}, wh, levels=False)
 
 @app.route('/api/aibot/tv/webhook', methods=['POST'])
 def aibot_tv_webhook():
