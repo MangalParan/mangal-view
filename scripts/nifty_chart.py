@@ -24675,8 +24675,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (hook && res.webhookUrl) {
           webhookUrl = res.webhookUrl;
           hook.style.display = '';
-          hook.innerHTML = 'Custom indicators → in TradingView create an Alert with Webhook URL <b>' + esc(res.webhookUrl) +
-            '</b> and message <code>{"symbol":"' + esc((symGetter() || 'NIFTY')) + '","signal":"BUY","price":{{close}},"indicator":"MyPine"}</code>';
+          hook.innerHTML = 'Custom indicators → Webhook URL <b>' + esc(res.webhookUrl) +
+            '</b>. Create TWO alerts (any symbol via {{ticker}}): on the BUY/Long condition use ' +
+            '<code>{"symbol":"{{ticker}}","signal":"BUY","price":{{close}},"indicator":"MyPine"}</code> ' +
+            'and on the SELL/Short condition use <code>"signal":"SELL"</code>. ' +
+            '(Only a real Pine strategy alert resolves <code>{{strategy.order.action}}</code> — an indicator does not.)';
         }
       }).catch(() => { box.textContent = 'TV error'; });
     }
