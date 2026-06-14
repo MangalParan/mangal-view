@@ -4840,9 +4840,34 @@ def _tv_alert_for(cfg, symbol, base=''):
             or (_TV_WEBHOOK.get(tv.split(':')[-1]) if tv else None)
             or (_TV_WEBHOOK.get((base or '').upper()) if base else None))
 
+def _tv_num(v):
+    """Parse a numeric alert field; None for blank/null/NaN/non-number."""
+    if v in (None, '', 'null', 'NULL', 'NaN', 'nan'):
+        return None
+    try:
+        f = float(v)
+        return None if f != f else f
+    except (TypeError, ValueError):
+        return None
+
+def _tv_apply_sltp(out, wh):
+    """If the alert carried SL/TP — as slPct/tpPct (percent) or sl/tp (absolute
+    price) — put slPct/tpPct on the strat so the trade uses the alert's levels."""
+    f = {str(k).lower(): v for k, v in (wh.get('fields') or {}).items()}
+    slp = _tv_num(f.get('slpct')); tpp = _tv_num(f.get('tppct'))
+    if slp and slp > 0: out['slPct'] = min(90.0, slp)
+    if tpp and tpp > 0: out['tpPct'] = min(90.0, tpp)
+    price = _tv_num(wh.get('price'))
+    sl_abs = _tv_num(f.get('sl')); tp_abs = _tv_num(f.get('tp'))
+    if price and price > 0:
+        if 'slPct' not in out and sl_abs: out['slPct'] = min(90.0, abs(price - sl_abs) / price * 100.0)
+        if 'tpPct' not in out and tp_abs: out['tpPct'] = min(90.0, abs(price - tp_abs) / price * 100.0)
+    return out
+
 def _tv_alert_signal(state, cfg, symbol):
     """TV-ONLY mode (Claude AI not selected): trade directly off the latest UNACTED
-    TradingView alert. BUY/LONG -> BUY, SELL/SHORT -> SELL. Acts once per alert."""
+    TradingView alert. BUY/LONG -> BUY, SELL/SHORT -> SELL. Acts once per alert.
+    Uses sl/tp/slPct/tpPct from the alert when present (else panel defaults)."""
     if not cfg.get('tvEnabled'):
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
     wh = _tv_alert_for(cfg, symbol)
@@ -4855,7 +4880,7 @@ def _tv_alert_signal(state, cfg, symbol):
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: last alert ' + (raw or '?') + ' (already acted)'}
     state['_tv_acted_ts'] = int(wh.get('ts', 0))
     ind = (' [' + wh.get('indicator', '') + ']') if wh.get('indicator') else ''
-    return {'name': 'tv', 'signal': sig, 'score': 10.0, 'reason': 'TV alert ' + sig + ind}
+    return _tv_apply_sltp({'name': 'tv', 'signal': sig, 'score': 10.0, 'reason': 'TV alert ' + sig + ind}, wh)
 
 def _tv_alert_leg_signal(leg, cfg):
     """TV-ONLY mode for an options leg: map the UNDERLYING alert to the leg.
@@ -4880,7 +4905,7 @@ def _tv_alert_leg_signal(leg, cfg):
     if int(wh.get('ts', 0)) <= acted:
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: ' + raw + ' (already acted)'}
     leg['_tv_acted_ts'] = int(wh.get('ts', 0))
-    return {'name': 'tv', 'signal': leg_sig, 'score': 10.0, 'reason': 'TV alert ' + raw + ' -> ' + (otype or 'leg') + ' ' + leg_sig}
+    return _tv_apply_sltp({'name': 'tv', 'signal': leg_sig, 'score': 10.0, 'reason': 'TV alert ' + raw + ' -> ' + (otype or 'leg') + ' ' + leg_sig}, wh)
 
 @app.route('/api/aibot/tv/webhook', methods=['POST'])
 def aibot_tv_webhook():
@@ -4925,7 +4950,7 @@ def aibot_tv_webhook():
             continue
         if isinstance(v, bool) or isinstance(v, (int, float)):
             fields[str(k)[:32]] = v
-        elif isinstance(v, str) and v and '{{' not in v and len(v) <= 80:
+        elif isinstance(v, str) and v and '{{' not in v and v.strip().lower() not in ('null', 'nan', 'na', 'none', '') and len(v) <= 80:
             fields[str(k)[:32]] = v
         if len(fields) >= 24:
             break
