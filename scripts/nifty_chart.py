@@ -1953,6 +1953,8 @@ def _tv_context(cfg, broker, symbol, exchange):
     if wh:
         out['webhook'] = {'signal': wh.get('signal'), 'indicator': wh.get('indicator'),
                           'note': wh.get('note'), 'ageSec': int(_zd_time.time()) - int(wh.get('ts', 0))}
+        if wh.get('fields'):
+            out['webhook']['fields'] = wh['fields']
     if len(out) == 1 and not wh:   # only tvSymbol, no TA and no webhook
         out['note'] = ('no TradingView data for ' + tv_symbol +
                        ' — use an EXCHANGE:SYMBOL ticker (e.g. BINANCE:BTCUSDT, NSE:RELIANCE) or leave blank for auto')
@@ -2068,7 +2070,8 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "\nTRADINGVIEW (external confirmation in 'tradingview'): 'rating' is TradingView's overall technical "
             "signal (STRONG BUY..STRONG SELL) from its standard indicators, with rsi / macdHist / stochK / adx and "
             "the moving-average (maRating) and oscillator (oscRating) ratings. 'webhook' (if present) is the user's "
-            "OWN custom-indicator alert — signal + indicator + ageSec. WEIGH these as confirmation: lift conviction "
+            "OWN custom-indicator alert — signal + indicator + ageSec, plus any extra values the indicator sent in "
+            "webhook.fields (e.g. its RSI/plots/SL/TP). WEIGH all of these as confirmation: lift conviction "
             "when they ALIGN with your read, and lower it / raise your bar when they OPPOSE it. A fresh webhook "
             "(small ageSec) is a strong hint; a stale one (large ageSec) is weak. This is confirmation ONLY — you "
             "still make the final call; never trade against your own structure read just because TV disagrees.\n")
@@ -4908,11 +4911,25 @@ def aibot_tv_webhook():
     sig  = _tv_norm_signal(data.get('signal') or data.get('action'))
     if not sig:                          # signal unresolved/blank — try to recover from text
         sig = _tv_norm_signal(note) or _tv_recover_signal(note) or _tv_recover_signal(str(data.get('signal') or ''))
+    # Capture every OTHER scalar field the alert sent (RSI, plots, SL, TP, tf …) so
+    # Claude can use the full indicator readout, and unresolved {{placeholders}} are skipped.
+    _skip = {'symbol', 'ticker', 'signal', 'action', 'price', 'indicator', 'strategy', 'note', 'comment', 'message'}
+    fields = {}
+    for k, v in data.items():
+        if str(k).lower() in _skip:
+            continue
+        if isinstance(v, bool) or isinstance(v, (int, float)):
+            fields[str(k)[:32]] = v
+        elif isinstance(v, str) and v and '{{' not in v and len(v) <= 80:
+            fields[str(k)[:32]] = v
+        if len(fields) >= 24:
+            break
     _TV_WEBHOOK[sym] = {
         'signal':    sig,
         'price':     data.get('price'),
         'indicator': str(data.get('indicator') or data.get('strategy') or '')[:60],
         'note':      note,
+        'fields':    fields,
         'ts':        int(_zd_time.time()),
     }
     if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
