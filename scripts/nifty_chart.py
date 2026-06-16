@@ -1955,6 +1955,8 @@ def _tv_context(cfg, broker, symbol, exchange):
                           'note': wh.get('note'), 'ageSec': int(_zd_time.time()) - int(wh.get('ts', 0))}
         if wh.get('fields'):
             out['webhook']['fields'] = wh['fields']
+        if wh.get('test'):
+            out['webhook']['test'] = True   # manual Test-button alert — Claude must ignore for trading
     if len(out) == 1 and not wh:   # only tvSymbol, no TA and no webhook
         out['note'] = ('no TradingView data for ' + tv_symbol +
                        ' — use an EXCHANGE:SYMBOL ticker (e.g. BINANCE:BTCUSDT, NSE:RELIANCE) or leave blank for auto')
@@ -2074,7 +2076,8 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "webhook.fields (e.g. its RSI/plots/SL/TP). WEIGH all of these as confirmation: lift conviction "
             "when they ALIGN with your read, and lower it / raise your bar when they OPPOSE it. A fresh webhook "
             "(small ageSec) is a strong hint; a stale one (large ageSec) is weak. This is confirmation ONLY — you "
-            "still make the final call; never trade against your own structure read just because TV disagrees.\n")
+            "still make the final call; never trade against your own structure read just because TV disagrees. "
+            "If webhook.test is true it is a MANUAL TEST alert — IGNORE it completely, do not let it influence the trade.\n")
 
     min_enter = float(cfg.get('minScore', 0) or 0) + float(cfg.get('scoreBuffer', 0) or 0)
     if min_enter <= 0:
@@ -4788,7 +4791,8 @@ def _tv_log_alert(sym, entry):
     nstr = (' note="' + note + '"') if note else ''
     indicator = entry.get('indicator') or ''
     istr = (' [' + indicator + ']') if indicator else ''
-    line = '[TV-ALERT] {} {}{}{}{}{}'.format(sym, entry.get('signal') or '?', pstr, fstr, nstr, istr)
+    tstr = ' (TEST — not traded)' if entry.get('test') else ''
+    line = '[TV-ALERT] {} {}{}{}{}{}{}'.format(sym, entry.get('signal') or '?', pstr, fstr, nstr, istr, tstr)
     _persist_log_line(line)
     for state, logfn in ((delta_ai_state, _bot_log), (zd_ai_state, _zd_log),
                          (mt_ai_state, _mt_log), (zo_ai_state, _zo_log)):
@@ -4893,6 +4897,8 @@ def _tv_alert_signal(state, cfg, symbol):
     wh = _tv_alert_for(cfg, symbol)
     if not wh:
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for an alert'}
+    if wh.get('test'):           # Test/Connect button alert — never trade it
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: test alert (ignored — not traded)'}
     raw = (wh.get('signal') or '').upper()
     sig = 'BUY' if raw in ('BUY', 'LONG') else ('SELL' if raw in ('SELL', 'SHORT') else 'HOLD')
     acted = state.get('_tv_acted_ts', 0)
@@ -4911,6 +4917,8 @@ def _tv_alert_leg_signal(leg, cfg):
     wh = _tv_alert_for(cfg, leg.get('symbol', ''), base=cfg.get('baseSymbol'))
     if not wh:
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for an alert'}
+    if wh.get('test'):           # Test/Connect button alert — never trade it
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: test alert (ignored — not traded)'}
     raw = (wh.get('signal') or '').upper()
     bull = raw in ('BUY', 'LONG'); bear = raw in ('SELL', 'SHORT')
     if not (bull or bear):
@@ -4974,12 +4982,14 @@ def aibot_tv_webhook():
             fields[str(k)[:32]] = v
         if len(fields) >= 24:
             break
+    is_test = bool(data.get('test')) or str(data.get('indicator') or '').strip().upper() == 'TEST'
     _TV_WEBHOOK[sym] = {
         'signal':    sig,
         'price':     data.get('price'),
         'indicator': str(data.get('indicator') or data.get('strategy') or '')[:60],
         'note':      note,
         'fields':    fields,
+        'test':      is_test,    # Test/Connect button alert — shown & logged, but NEVER traded
         'ts':        int(_zd_time.time()),
     }
     if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
@@ -24767,7 +24777,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const getUrl = webhookUrl ? Promise.resolve(webhookUrl)
         : fetch('/api/aibot/tv/peek?broker=' + encodeURIComponent(broker)).then(r => r.json()).then(j => j.webhookUrl);
       getUrl.then(url => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbol: sym, signal: 'BUY', indicator: 'TEST', note: 'manual test from panel' }) })
+          body: JSON.stringify({ symbol: sym, signal: 'BUY', indicator: 'TEST', test: true, note: 'manual test from panel' }) })
         .then(r => r.json())).then(res => {
           if (res && res.success) { chk.checked = true; start(); }   // poll so the box shows 'alert BUY 0s'
           else { box.innerHTML = '<span style="color:#ef5350">test failed: ' + esc((res && res.error) || '?') + '</span>'; }
