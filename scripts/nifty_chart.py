@@ -4807,7 +4807,8 @@ def _tv_log_alert(sym, entry):
             if tv: keys.add(tv.split(':')[-1])
             for leg in (state.get('legs') or []):
                 if leg.get('symbol'): keys.add(str(leg['symbol']).upper())
-            if sym in keys:
+            roots = {_tv_root(k) for k in keys}
+            if sym in keys or _tv_root(sym) in roots:
                 logfn(line)
         except Exception:
             pass
@@ -4835,14 +4836,41 @@ def _tv_recover_signal(text):
     if has_sell and not has_buy:  return 'SELL'
     return ''
 
-def _tv_alert_for(cfg, symbol, base=''):
-    """Latest TradingView webhook alert dict for a bot's symbol (tries the bot
-    symbol, the tvSymbol's last segment, and the options base). None if none."""
-    sym_u = (symbol or '').upper().strip()
-    tv = (cfg.get('tvSymbol') or '').upper()
-    return (_TV_WEBHOOK.get(sym_u)
-            or (_TV_WEBHOOK.get(tv.split(':')[-1]) if tv else None)
-            or (_TV_WEBHOOK.get((base or '').upper()) if base else None))
+def _tv_root(sym):
+    """Normalise a symbol to its instrument ROOT so a TradingView alert symbol
+    matches the bot's tradingsymbol even when they differ by exchange/contract:
+      BITSTAMP:BTCUSD -> BTCUSD ;  PAXGUSD.P -> PAXGUSD ;  GOLDTEN1! -> GOLDTEN ;
+      GOLDTEN26JUNFUT -> GOLDTEN ;  NIFTY26JUN24000CE -> NIFTY..(left as-is mostly)."""
+    import re as _re2
+    s = (sym or '').upper().strip()
+    if ':' in s:
+        s = s.split(':')[-1]
+    s = _re2.sub(r'\.PERP$', '', s)
+    s = _re2.sub(r'\.P$', '', s)
+    s = _re2.sub(r'\d+!$', '', s)                 # continuous futures  GOLDTEN1! -> GOLDTEN
+    s = _re2.sub(r'\d{2}[A-Z]{3}FUT$', '', s)     # Kite futures        GOLDTEN26JUNFUT -> GOLDTEN
+    return s
+
+def _tv_alert_for(cfg, symbol, base='', skip_test=False):
+    """Newest TradingView webhook alert dict that matches a bot's symbol. Matches
+    on the exact key OR the normalised instrument root (so PAXGUSD.P matches a
+    PAXGUSD bot and GOLDTEN1! matches GOLDTEN26JUNFUT). `skip_test` drops manual
+    Test-button alerts so they never trade (only real TradingView alerts do).
+    None if nothing matches."""
+    keys = set()
+    for k in (symbol, (cfg.get('tvSymbol') or '').split(':')[-1], base):
+        if k: keys.add(str(k).upper().strip())
+    roots = {_tv_root(k) for k in keys}
+    roots.discard('')
+    best = None
+    for k, v in _TV_WEBHOOK.items():
+        if skip_test and v.get('test'):
+            continue
+        ku = str(k).upper()
+        if ku in keys or _tv_root(ku) in roots:
+            if best is None or int(v.get('ts', 0)) >= int(best.get('ts', 0)):
+                best = v
+    return best
 
 def _tv_num(v):
     """Parse a numeric alert field; None for blank/null/NaN/non-number."""
@@ -4894,11 +4922,9 @@ def _tv_alert_signal(state, cfg, symbol):
     Uses sl/tp/slPct/tpPct from the alert when present (else panel defaults)."""
     if not cfg.get('tvEnabled'):
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
-    wh = _tv_alert_for(cfg, symbol)
+    wh = _tv_alert_for(cfg, symbol, skip_test=True)   # only real alerts ever trade
     if not wh:
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for an alert'}
-    if wh.get('test'):           # Test/Connect button alert — never trade it
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: test alert (ignored — not traded)'}
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for a real alert'}
     raw = (wh.get('signal') or '').upper()
     sig = 'BUY' if raw in ('BUY', 'LONG') else ('SELL' if raw in ('SELL', 'SHORT') else 'HOLD')
     acted = state.get('_tv_acted_ts', 0)
@@ -4914,11 +4940,9 @@ def _tv_alert_leg_signal(leg, cfg):
     Acts once per alert per leg."""
     if not cfg.get('tvEnabled'):
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
-    wh = _tv_alert_for(cfg, leg.get('symbol', ''), base=cfg.get('baseSymbol'))
+    wh = _tv_alert_for(cfg, leg.get('symbol', ''), base=cfg.get('baseSymbol'), skip_test=True)
     if not wh:
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for an alert'}
-    if wh.get('test'):           # Test/Connect button alert — never trade it
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: test alert (ignored — not traded)'}
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for a real alert'}
     raw = (wh.get('signal') or '').upper()
     bull = raw in ('BUY', 'LONG'); bear = raw in ('SELL', 'SHORT')
     if not (bull or bear):
