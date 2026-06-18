@@ -2543,6 +2543,10 @@ def _delta_bot_tick():
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _delta_bot_close(exit_px, reason, mode)
+                # Stop & reverse: opposite signal closes then opens the other side.
+                if reason == 'signal reversal' and delta_ai_state.get('running') and not delta_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
+                    _bot_log('[Tick] [delta] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], price))
+                    _delta_bot_open(strat['signal'], price, strat, mode)
             else:
                 _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -3311,6 +3315,11 @@ def _zd_bot_tick():
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _zd_bot_close(exit_px, reason, mode)
+                # Stop & reverse: an opposite signal CLOSES the trade and immediately
+                # OPENS the other side (bypasses cooldown/quality — the flip is the signal).
+                if reason == 'signal reversal' and zd_ai_state.get('running') and not zd_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
+                    _zd_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 2)))
+                    _zd_bot_open(strat['signal'], price, strat, mode)
             else:
                 _zd_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -4530,6 +4539,10 @@ def _mt_bot_tick():
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _mt_bot_close(exit_px, reason, mode)
+                # Stop & reverse: opposite signal closes then opens the other side.
+                if reason == 'signal reversal' and mt_ai_state.get('running') and not mt_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
+                    _mt_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 5)))
+                    _mt_bot_open(strat['signal'], price, strat, mode)
             else:
                 _mt_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
