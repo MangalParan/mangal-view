@@ -3054,7 +3054,10 @@ def _zd_bot_close(price, reason, mode, skip_order=False):
             else:
                 _zd_cancel_stop_live(pos['sl_order_id'], cfg)
         if not already_flat:
-            _zd_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg, order_type='MARKET')
+            # LIMIT (aggressive band that crosses the spread) — MCX/Kite reject plain
+            # MARKET orders via API ("market protection"). The band guarantees a fill
+            # like a market order while staying a LIMIT.
+            _zd_bot_place_live('SELL' if pos['side'] == 'BUY' else 'BUY', pos['qty'], price, cfg, order_type='LIMIT')
     zd_ai_state['position'] = None
     zd_ai_state['last_exit_time'] = int(_zd_time.time())
     # Circuit breakers (mirror Delta)
@@ -3160,12 +3163,17 @@ def _zd_place_stop_live(exit_side, qty, trigger_price, cfg):
     symbol   = (cfg.get('symbol') or '').upper()
     exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
     product  = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
-    trig     = _quantize_to_tick(trigger_price, _get_instrument_tick(symbol, exchange))
+    tick     = _get_instrument_tick(symbol, exchange)
+    trig     = _quantize_to_tick(trigger_price, tick)
+    # SL (stop-LIMIT) not SL-M (stop-market): MCX/Kite reject market-type orders via
+    # API. Limit is set ~0.3% beyond the trigger in the fill direction so it still
+    # executes when triggered.
+    lim      = _quantize_to_tick(trig * (0.997 if exit_side == 'SELL' else 1.003), tick)
     ok, rd = _zd_kite_api(cfg, 'POST', 'https://api.kite.trade/orders/regular', {
         'tradingsymbol': symbol, 'exchange': exchange,
         'transaction_type': exit_side, 'quantity': qty,
-        'product': product, 'order_type': 'SL-M',
-        'trigger_price': trig, 'validity': 'DAY',
+        'product': product, 'order_type': 'SL',
+        'trigger_price': trig, 'price': lim, 'validity': 'DAY',
     })
     if ok and isinstance(rd, dict) and rd.get('status') == 'success':
         oid = str((rd.get('data') or {}).get('order_id', ''))
@@ -3176,13 +3184,15 @@ def _zd_place_stop_live(exit_side, qty, trigger_price, cfg):
     _persist_log_line('[ZERODHA] [LIVE] hard stop place failed: ' + str(rd)[:160])
     return None
 
-def _zd_modify_stop_live(order_id, trigger_price, cfg):
-    """Move a resting SL-M to a new trigger (dynamic / dragged SL). Returns bool."""
+def _zd_modify_stop_live(order_id, trigger_price, cfg, exit_side='SELL'):
+    """Move a resting SL (stop-limit) to a new trigger (dynamic / dragged SL). Bool."""
     symbol   = (cfg.get('symbol') or '').upper()
     exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
-    trig     = _quantize_to_tick(trigger_price, _get_instrument_tick(symbol, exchange))
+    tick     = _get_instrument_tick(symbol, exchange)
+    trig     = _quantize_to_tick(trigger_price, tick)
+    lim      = _quantize_to_tick(trig * (0.997 if exit_side == 'SELL' else 1.003), tick)
     ok, rd = _zd_kite_api(cfg, 'PUT', 'https://api.kite.trade/orders/regular/' + str(order_id), {
-        'trigger_price': trig, 'order_type': 'SL-M', 'validity': 'DAY',
+        'trigger_price': trig, 'price': lim, 'order_type': 'SL', 'validity': 'DAY',
     })
     if ok and isinstance(rd, dict) and rd.get('status') == 'success':
         _zd_log('[LIVE] Hard stop moved -> {} #{}'.format(trig, order_id))
@@ -3271,7 +3281,7 @@ def _zd_bot_tick():
             elif _st in ('REJECTED', 'CANCELLED'):
                 pos.pop('sl_order_id', None)   # lost the hard stop; soft stop covers
             elif round(float(pos['sl']), 2) != round(float(pos.get('sl_order_trigger') or pos['sl']), 2):
-                if _zd_modify_stop_live(pos['sl_order_id'], pos['sl'], cfg):
+                if _zd_modify_stop_live(pos['sl_order_id'], pos['sl'], cfg, 'SELL' if pos['side'] == 'BUY' else 'BUY'):
                     pos['sl_order_trigger'] = round(float(pos['sl']), 2)
             pos = zd_ai_state.get('position')   # refresh (may have been closed above)
         if pos:
