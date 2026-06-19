@@ -4924,11 +4924,15 @@ def _tv_alert_for(cfg, symbol, base='', skip_test=False):
     return best
 
 def _tv_num(v):
-    """Parse a numeric alert field; None for blank/null/NaN/non-number."""
-    if v in (None, '', 'null', 'NULL', 'NaN', 'nan'):
+    """Parse a numeric alert field; None for blank/null/NaN/non-number. Tolerant of
+    stray wrappers users add — braces and a % sign — so "{0.25}" / "0.25%" -> 0.25."""
+    if v is None:
+        return None
+    s = str(v).strip().strip('{}').strip().rstrip('%').strip()
+    if s in ('', 'null', 'NULL', 'NaN', 'nan', 'none', 'None'):
         return None
     try:
-        f = float(v)
+        f = float(s)
         return None if f != f else f
     except (TypeError, ValueError):
         return None
