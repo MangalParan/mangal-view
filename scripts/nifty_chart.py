@@ -3181,8 +3181,8 @@ def _zd_place_stop_live(exit_side, qty, trigger_price, cfg):
     })
     if ok and isinstance(rd, dict) and rd.get('status') == 'success':
         oid = str((rd.get('data') or {}).get('order_id', ''))
-        _zd_log('[LIVE] Hard stop SL-M @ {} placed #{}'.format(trig, oid))
-        _persist_log_line('[ZERODHA] [LIVE] hard stop SL-M @ {} #{}'.format(trig, oid))
+        _zd_log('[LIVE] Hard stop SL @ {} (limit {}) placed #{}'.format(trig, lim, oid))
+        _persist_log_line('[ZERODHA] [LIVE] hard stop SL @ {} (limit {}) #{}'.format(trig, lim, oid))
         return oid
     _zd_log('[LIVE] Hard stop NOT placed (soft stop still active): ' + str(rd)[:160])
     _persist_log_line('[ZERODHA] [LIVE] hard stop place failed: ' + str(rd)[:160])
@@ -3222,6 +3222,24 @@ def _zd_stop_status_live(order_id, cfg):
             cur = hist[-1]
             return cur.get('status'), cur.get('average_price')
     return None, None
+
+def _within_market_hours(exchange):
+    """True if the exchange's regular session is open now (IST). Used to BLOCK live
+    orders outside hours — placing them after close fails ('could not be converted
+    to AMO') and can leave a position unprotected. Conservative per exchange."""
+    from datetime import datetime as _dt, timezone as _tzc, timedelta as _tdc
+    now = _dt.now(_tzc(_tdc(seconds=IST_OFFSET)))
+    if now.weekday() >= 5:          # Sat / Sun
+        return False
+    mins = now.hour * 60 + now.minute
+    ex = (exchange or '').upper()
+    if ex == 'MCX':
+        return 9 * 60 <= mins <= 23 * 60 + 30           # 09:00–23:30
+    if ex in ('CDS', 'BCD', 'NCO'):
+        return 9 * 60 <= mins <= 17 * 60                # 09:00–17:00
+    if ex in ('NSE', 'BSE', 'NFO', 'BFO'):
+        return 9 * 60 + 15 <= mins <= 15 * 60 + 30      # 09:15–15:30
+    return 9 * 60 + 15 <= mins <= 15 * 60 + 30          # default = equity hours
 
 def _zd_bot_tick():
     cfg = zd_ai_state.get('config') or {}
@@ -3271,6 +3289,16 @@ def _zd_bot_tick():
             'regime': '{} vol, {}'.format(regime['volatility'],
                 'trending ' + regime['direction'] if regime['trending'] else 'range'),
         }
+        # Outside market hours, place NO live orders (entry/exit/stop) — they fail
+        # ('could not be converted to AMO') and leave the book inconsistent. Hold
+        # and resume next session. (Paper mode is unaffected.)
+        _exch = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
+        if mode == 'live' and not _within_market_hours(_exch):
+            if not zd_ai_state.get('_mkt_closed_logged'):
+                _zd_log('[Tick] {} — {} session closed; holding, no live orders until next session.'.format(symbol, _exch))
+                zd_ai_state['_mkt_closed_logged'] = True
+            return
+        zd_ai_state['_mkt_closed_logged'] = False
         pos = zd_ai_state.get('position')
         # Broker hard-stop reconcile & sync (live). Do this BEFORE the soft checks:
         #  - if the resting SL-M already fired intrabar, record that exit (no new
