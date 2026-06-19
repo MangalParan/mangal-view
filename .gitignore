@@ -14,5 +14,7 @@ bench_results.txt
 log.txt
 # Local dev server output
 server.log
+# Persisted Zerodha/Kite session (access token — secret, never commit)
+zerodha_session.json
 # Third-party TradingView Pine scripts kept locally for reference (not app code)
 *.pine

@@ -676,6 +676,36 @@ def delta_status():
 zerodha_sessions = {}   # api_key -> {connected, token}
 zerodha_orders   = []   # order log
 
+# Persist the Kite session (api_secret + access_token) to disk so a server restart
+# within the same trading day keeps you logged in. Kite tokens expire ~6am IST, so
+# we reload only if saved within the last ~day; a dead token is caught by /verify.
+_ZD_SESSION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'zerodha_session.json')
+_ZD_SESSION_TTL  = 86400
+
+def _zd_save_sessions():
+    try:
+        import json as _j, time as _t
+        with open(_ZD_SESSION_FILE, 'w', encoding='utf-8') as f:
+            _j.dump({'ts': int(_t.time()), 'sessions': zerodha_sessions}, f)
+    except Exception:
+        pass
+
+def _zd_load_sessions():
+    try:
+        import json as _j, time as _t
+        if not os.path.exists(_ZD_SESSION_FILE):
+            return
+        with open(_ZD_SESSION_FILE, encoding='utf-8') as f:
+            data = _j.load(f)
+        if int(_t.time()) - int(data.get('ts', 0)) < _ZD_SESSION_TTL:
+            for k, v in (data.get('sessions') or {}).items():
+                if isinstance(v, dict) and v.get('access_token'):
+                    zerodha_sessions[k] = v
+    except Exception:
+        pass
+
+_zd_load_sessions()
+
 @app.route('/api/zerodha/connect', methods=['POST'])
 @login_required
 def zerodha_connect():
@@ -691,6 +721,7 @@ def zerodha_connect():
         'access_token': access_token,
         'connected': True
     }
+    _zd_save_sessions()   # persist so a restart within the day keeps the session
     return jsonify({'success': True, 'message': 'Connected to Zerodha'})
 
 @app.route('/api/zerodha/verify', methods=['GET'])
@@ -5092,6 +5123,48 @@ def aibot_tv_peek():
     origin = request.host_url.rstrip('/')
     return jsonify({'success': True, 'tv': ctx,
                     'webhookUrl': origin + '/api/aibot/tv/webhook?token=' + _TV_DEFAULT_TOKEN})
+
+def _reset_bot_state(state, lock):
+    """Stop the bot and wipe it back to the initial state (position, trades, log,
+    config, counters). The running loop exits on the next iteration."""
+    with lock:
+        state['running'] = False
+        state['paused']  = False
+        state['position'] = None
+        state['legs']     = []
+        state['trades']   = []
+        state['consec_losses'] = 0
+        state['log_buffer']    = []
+        state['last_tick']     = {}
+        state['last_candles']  = []
+        state['config']        = None
+        for k in ('_tv_acted_ts', '_decide', '_last_decision_ts', '_mkt_closed_logged',
+                  'scan_idx', 'last_exit_time', 'thread'):
+            state.pop(k, None)
+
+@app.route('/api/aibot/delta/reset', methods=['POST'])
+@login_required
+def delta_aibot_reset():
+    _reset_bot_state(delta_ai_state, delta_ai_lock); _bot_log('Bot reset to initial state.')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/zerodha/reset', methods=['POST'])
+@login_required
+def zd_aibot_reset():
+    _reset_bot_state(zd_ai_state, zd_ai_lock); _zd_log('Bot reset to initial state.')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/mt5/reset', methods=['POST'])
+@login_required
+def mt_aibot_reset():
+    _reset_bot_state(mt_ai_state, mt_ai_lock); _mt_log('Bot reset to initial state.')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/zoptions/reset', methods=['POST'])
+@login_required
+def zo_aibot_reset():
+    _reset_bot_state(zo_ai_state, zo_ai_lock); _zo_log('Bot reset to initial state.')
+    return jsonify({'success': True})
 
 @app.route('/api/aibot/suggest_symbols', methods=['POST'])
 @login_required
@@ -15624,6 +15697,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-header" id="aiBotHeader">
       <h3><span style="color:#9c27b0">&#129504;</span> Zerodha AI Bot</h3>
       <div class="zd-header-actions">
+        <button class="zd-header-btn" id="aiBotResetBtn" title="Reset bot to initial state (stop &amp; clear)">&#8634;</button>
         <button class="zd-header-btn" id="aiBotMaximizeBtn" title="Maximize">&#9633;</button>
         <button class="zd-header-btn" id="aiBotPopoutBtn"   title="Open in new window">&#8599;</button>
         <button class="zd-close" id="aiBotClose" title="Close">&times;</button>
@@ -15637,7 +15711,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="aiBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
       </div>
       <!-- Connection status -->
       <div class="zd-status-bar" id="aiBotStatusBar" style="margin-bottom:10px">
@@ -15862,6 +15936,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-header" id="mtBotHeader">
       <h3><span style="color:#00897b">&#129504;</span> MT5 AI Bot</h3>
       <div class="zd-header-actions">
+        <button class="zd-header-btn" id="mtBotResetBtn" title="Reset bot to initial state (stop &amp; clear)">&#8634;</button>
         <button class="zd-header-btn" id="mtBotMaximizeBtn" title="Maximize">&#9633;</button>
         <button class="zd-header-btn" id="mtBotPopoutBtn"   title="Open in new window">&#8599;</button>
         <button class="zd-close" id="mtBotClose" title="Close">&times;</button>
@@ -15870,12 +15945,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-body">
       <!-- Top control line: Capital, Daily loss/profit limits, Model, Tick -->
       <div class="bot-top-line">
-        <label title="Your trading capital. When Auto symbol is on, Claude sizes volume (lots) &amp; leverage from this.">Capital<input type="number" id="mtBotCapital" value="1000" min="0" step="100"></label>
+        <label title="Your trading capital. When Auto symbol is on, Claude sizes volume (lots) &amp; leverage from this.">Capital<input type="number" id="mtBotCapital" value="100000" min="0" step="100"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Daily loss<input type="number" id="mtBotMaxLoss" value="2000" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="mtBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
       </div>
       <div class="zd-status-bar" id="mtBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="mtBotStatusDot"></span>
@@ -15990,6 +16065,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-header" id="deltaBotHeader">
       <h3><span style="color:#9c27b0">&#129504;</span> Delta Exchange AI Bot</h3>
       <div class="zd-header-actions">
+        <button class="zd-header-btn" id="deltaBotResetBtn" title="Reset bot to initial state (stop &amp; clear)">&#8634;</button>
         <button class="zd-header-btn" id="deltaBotMaximizeBtn" title="Maximize">&#9633;</button>
         <button class="zd-header-btn" id="deltaBotPopoutBtn"   title="Open in new window">&#8599;</button>
         <button class="zd-close" id="deltaBotClose" title="Close">&times;</button>
@@ -15998,12 +16074,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-body">
       <!-- Top control line: Capital, Daily loss/profit limits, Model, Tick -->
       <div class="bot-top-line">
-        <label title="Your trading capital (USD). When Auto symbol is on, Claude sizes leverage &amp; quantity from this.">Capital $<input type="number" id="deltaBotCapital" value="10" min="1" step="1"></label>
+        <label title="Your trading capital (USD). When Auto symbol is on, Claude sizes leverage &amp; quantity from this.">Capital $<input type="number" id="deltaBotCapital" value="100000" min="1" step="1"></label>
         <label title="Bot auto-stops when realised P/L drops below this">Daily loss<input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="deltaBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
       </div>
       <div class="zd-status-bar" id="deltaBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="deltaBotStatusDot"></span>
@@ -16142,6 +16218,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-header" id="zoBotHeader">
       <h3><span style="color:#26a69a">&#127919;</span> Zerodha Options AI Bot</h3>
       <div class="zd-header-actions">
+        <button class="zd-header-btn" id="zoBotResetBtn" title="Reset bot to initial state (stop &amp; clear)">&#8634;</button>
         <button class="zd-header-btn" id="zoBotMaximizeBtn" title="Maximize">&#9633;</button>
         <button class="zd-header-btn" id="zoBotPopoutBtn"   title="Open in new window">&#8599;</button>
         <button class="zd-close" id="zoBotClose" title="Close">&times;</button>
@@ -16155,7 +16232,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="zoBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
       </div>
       <div class="zd-status-bar" id="zoBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="zoBotStatusDot"></span>
@@ -24872,6 +24949,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
   tvSetup('mtBot', 'mt5', () => val('mtBotSymbol'), null, 'mtBotTF');
   tvSetup('deltaBot', 'delta', () => val('deltaBotSymbol'), null, 'deltaBotTF');
   tvSetup('zoBot', 'kite', () => zoBase(), null, 'zoBotTF');
+})();
+
+// ---- Reset button: stop bot + clear server state + restore panel defaults ----
+(function() {
+  function aibotReset(prefix, broker) {
+    if (!confirm('Reset this bot to its initial state?\n\nThis STOPS the bot and clears its position, trades and log.')) return;
+    fetch('/api/aibot/' + broker + '/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(r => r.json()).catch(() => ({}))
+      .then(() => {
+        const set = (id, val) => { const e = document.getElementById(id); if (e) { if (e.type === 'checkbox') e.checked = !!val; else e.value = val; } };
+        // restore default settings
+        set(prefix + 'Capital', 100000); set(prefix + 'MaxLoss', 2000); set(prefix + 'MaxProfit', 10000);
+        set(prefix + 'Model', 'sonnet'); set(prefix + 'TickSec', '120'); set(prefix + 'MaxConsec', 3);
+        // reset Start/Pause/Stop
+        const sb = document.getElementById(prefix + 'StartBtn'), pb = document.getElementById(prefix + 'PauseBtn'), tb = document.getElementById(prefix + 'StopBtn');
+        if (sb) sb.disabled = false; if (pb) pb.disabled = true; if (tb) tb.disabled = true;
+        // clear the activity log
+        const lg = document.getElementById(prefix + 'Log');
+        if (lg) { lg.innerHTML = '<span class="log-info">Bot reset to initial state.</span>'; lg.__logsig = ''; }
+        // reset the info grid
+        const pos = document.getElementById(prefix + 'Position'); if (pos) { pos.textContent = 'FLAT'; pos.className = 'val'; }
+        const tc = document.getElementById(prefix + 'TradeCount'); if (tc) tc.textContent = '0';
+        ['Strategy', 'Regime', 'EntryPx', 'WinRate'].forEach(s => { const e = document.getElementById(prefix + s); if (e) e.textContent = '—'; });
+      });
+  }
+  [['aiBot', 'zerodha'], ['mtBot', 'mt5'], ['deltaBot', 'delta'], ['zoBot', 'zoptions']].forEach(function(pb) {
+    const btn = document.getElementById(pb[0] + 'ResetBtn');
+    if (btn) btn.addEventListener('click', function() { aibotReset(pb[0], pb[1]); });
+  });
 })();
 </script>
 </body>
