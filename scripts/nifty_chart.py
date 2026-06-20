@@ -3201,10 +3201,10 @@ def _zd_place_stop_live(exit_side, qty, trigger_price, cfg):
     tick     = _get_instrument_tick(symbol, exchange)
     trig     = _quantize_to_tick(trigger_price, tick)
     # SL (stop-LIMIT) not SL-M (stop-market): MCX/Kite reject market-type orders via
-    # API. Limit is set a small 0.1% beyond the trigger in the fill direction so it
+    # API. Limit is set a tiny 0.02% beyond the trigger in the fill direction so it
     # still fills when triggered without allowing big slippage (the bot's soft stop
     # is the backstop if a violent move skips this limit).
-    lim      = _quantize_to_tick(trig * (0.999 if exit_side == 'SELL' else 1.001), tick)
+    lim      = _quantize_to_tick(trig * (0.9998 if exit_side == 'SELL' else 1.0002), tick)
     ok, rd = _zd_kite_api(cfg, 'POST', 'https://api.kite.trade/orders/regular', {
         'tradingsymbol': symbol, 'exchange': exchange,
         'transaction_type': exit_side, 'quantity': qty,
@@ -3226,7 +3226,7 @@ def _zd_modify_stop_live(order_id, trigger_price, cfg, exit_side='SELL'):
     exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
     tick     = _get_instrument_tick(symbol, exchange)
     trig     = _quantize_to_tick(trigger_price, tick)
-    lim      = _quantize_to_tick(trig * (0.999 if exit_side == 'SELL' else 1.001), tick)
+    lim      = _quantize_to_tick(trig * (0.9998 if exit_side == 'SELL' else 1.0002), tick)
     ok, rd = _zd_kite_api(cfg, 'PUT', 'https://api.kite.trade/orders/regular/' + str(order_id), {
         'trigger_price': trig, 'price': lim, 'order_type': 'SL', 'validity': 'DAY',
     })
