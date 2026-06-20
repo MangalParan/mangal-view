@@ -2325,9 +2325,10 @@ def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
 def _delta_bot_open(side, price, strat, mode):
     cfg    = delta_ai_state['config']
     # Capital-based auto sizing: qty = capital × leverage ÷ (price × contract_value).
-    # Leverage = Claude's pick (capped 1-20x); falls back to the Qty field if no capital.
+    # Leverage = the panel's manual value or Claude's pick (1-125x); falls back to the
+    # Qty field if no capital. Matches the Leverage button's preview.
     capital = float(cfg.get('capital') or 0)
-    lev     = min(20.0, max(1.0, float(strat.get('leverage') or cfg.get('leverage') or 5)))
+    lev     = min(125.0, max(1.0, float(strat.get('leverage') or cfg.get('leverage') or 5)))
     if capital > 0 and price > 0:
         prod = _load_delta_products().get((cfg.get('symbol') or '').upper())
         cv   = float((prod or {}).get('contract_value', 1.0) or 1.0)
@@ -2644,6 +2645,7 @@ def delta_aibot_start():
             'maxLoss':    float(data.get('maxLoss', 200) or 200),
             'tokens':     bool(data.get('tokens', False)),   # Delta only: trade top-gainer tokens in auto mode
             'capital':    float(data.get('capital') or 0),   # Delta only: auto-size leverage & qty from this
+            'leverage':   float(data.get('leverage') or 0),  # Delta only: manual leverage from the panel (0 = default 5)
             'maxProfit':  float(data.get('maxProfit', 0) or 0),
             'minScore':   float(data.get('minScore') if data.get('minScore') is not None else 4.0),
             'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 1.0),
@@ -2866,6 +2868,31 @@ def delta_aibot_sizing():
     _persist_log_line('[DELTA] [Sizing] cap=${} lev={}x qty={} SL={}% TP={}%'.format(capital, lev, qty, slp, tpp))
     return jsonify({'success': True, 'capital': capital, 'leverage': lev, 'slPct': slp, 'tpPct': tpp,
                     'qty': qty, 'price': round(price, 5), 'reason': reason})
+
+@app.route('/api/aibot/delta/leverage', methods=['POST'])
+@login_required
+def delta_aibot_leverage():
+    """Deterministic sizing for the Delta panel's Leverage button: given Capital,
+    Symbol and a chosen leverage, return the live price and the quantity to trade
+    (qty = capital × leverage ÷ (price × contract_value)) plus notional & margin."""
+    data    = request.json or {}
+    capital = float(data.get('capital') or 0)
+    symbol  = (data.get('symbol') or '').upper().strip()
+    lev     = min(125.0, max(1.0, float(data.get('leverage') or 5)))
+    tf      = data.get('tf', '5m')
+    if capital <= 0 or not symbol:
+        return jsonify({'success': False, 'error': 'Enter Capital and a Delta symbol first'}), 400
+    candles = fetch_delta_data(tf, symbol)
+    if not candles:
+        return jsonify({'success': False, 'error': 'No Delta market data for ' + symbol + ' — check the symbol'}), 502
+    price = float(candles[-1]['close'])
+    prod  = _load_delta_products().get(symbol)
+    cv    = float((prod or {}).get('contract_value', 1.0) or 1.0)
+    qty   = max(1, int((capital * lev) / (price * cv))) if price > 0 else 0
+    notional = qty * price * cv
+    return jsonify({'success': True, 'symbol': symbol, 'price': round(price, 5),
+                    'leverage': lev, 'qty': qty, 'contractValue': cv,
+                    'notional': round(notional, 2), 'margin': round(notional / lev, 2)})
 
 @app.route('/api/aibot/delta/apply_config', methods=['POST'])
 @login_required
@@ -16185,6 +16212,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Capital-based sizing preview (optional — autopilot does this automatically on Start) -->
       <div class="ai-risk-bar">
+        <label title="Leverage used to size the position from your Capital. Click 'Leverage &amp; Qty' to see the quantity to trade.">Leverage <input type="number" id="deltaBotLeverage" value="5" min="1" max="125" step="1" style="width:60px"></label>
+        <button class="zd-add-btn" id="deltaBotLevBtn" type="button" title="With Capital + Symbol set, show the leverage and quantity to trade (qty = capital × leverage ÷ price). Auto-fills Qty.">&#128176; Leverage &amp; Qty</button>
+        <span id="deltaBotLevOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+        <span style="width:1px;align-self:stretch;background:#2a2e39;margin:0 6px"></span>
         <button class="zd-add-btn" id="deltaBotCalcBtn" type="button" title="Preview: ask Claude for leverage, SL%, TP% &amp; quantity for your Capital and the current market (autopilot does this automatically when you Start)">&#129302; Preview sizing</button>
         <span id="deltaBotSizing" style="color:#787b86;font-size:11px">Capital &mdash; · Leverage &mdash; · SL &mdash; · TP &mdash; · Qty &mdash;</span>
       </div>
@@ -24024,6 +24055,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { calcBtn.disabled = false; });
     });
 
+    // ---- Leverage button: capital + symbol + leverage -> quantity (deterministic) ----
+    const levBtn = document.getElementById('deltaBotLevBtn');
+    const levEl  = document.getElementById('deltaBotLeverage');
+    const levOut = document.getElementById('deltaBotLevOut');
+    if (levBtn) levBtn.addEventListener('click', function() {
+      const sym = symEl.value.trim().toUpperCase();
+      const cap = parseFloat(capEl.value) || 0;
+      const lev = parseFloat(levEl.value) || 5;
+      if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
+      if (cap <= 0) { logLine('Enter Capital ($) first.', 'info'); return; }
+      levBtn.disabled = true; levOut.textContent = 'calculating…';
+      fetch('/api/aibot/delta/leverage', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ capital: cap, symbol: sym, leverage: lev, tf: tfEl.value }) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { levOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; return; }
+          levOut.innerHTML = 'Leverage <b>' + res.leverage + 'x</b> · Qty <b>' + res.qty + '</b> · @ ' + res.price +
+            ' · notional $' + res.notional + ' · margin $' + res.margin;
+          qtyEl.value = res.qty;   // auto-fill so the bot trades this quantity
+          logLine('[Leverage] ' + sym + ' ' + res.leverage + 'x → qty ' + res.qty + ' (margin $' + res.margin + ')', 'info');
+        }).catch(e => { levOut.innerHTML = '<span style="color:#ef5350">error: ' + e.message + '</span>'; })
+        .finally(() => { levBtn.disabled = false; });
+    });
+
     function openPosition(side, price, strategy, mode) {
       const qty   = Math.max(1, parseInt(qtyEl.value) || 1);
       const slPct = Math.max(0.1, parseFloat(slPctEl.value) || 1.0);
@@ -24297,6 +24351,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         autoSymbol: !!document.getElementById('deltaBotAutoSym').checked,
         tokens:     !!document.getElementById('deltaBotTokens').checked,
         capital:    parseFloat(document.getElementById('deltaBotCapital').value) || 0,
+        leverage:   parseFloat((document.getElementById('deltaBotLeverage') || {}).value) || 0,
         qty:        parseInt(qtyEl.value) || 1,
         tf:         tfEl.value,
         mode:       currentMode(),
