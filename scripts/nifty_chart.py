@@ -2343,6 +2343,7 @@ def _delta_bot_open(side, price, strat, mode):
     delta_ai_state['position'] = {
         'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 4), 'tp': round(tp, 4),
+        'slPct': sl_pct, 'tpPct': tp_pct,   # kept for TP-continuation re-entry
         'strategy': strat['name'], 'mode': mode,
     }
     tag  = '[DELTA-' + mode.upper() + ']'
@@ -2562,8 +2563,13 @@ def _delta_bot_tick():
                     reason = 'max daily profit'
             exit_px = price
             if reason is None:
-                # Intrabar stop/target on the bar high/low, filled at the level.
-                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                # Intrabar stop/target — but on the ENTRY bar use close only (high/low
+                # may predate the fill), to avoid false SL/TP and TP-re-entry loops.
+                bar = candles[-1]
+                if bar.get('time') == pos.get('entryBarTime'):
+                    hi = lo = price
+                else:
+                    hi = bar.get('high', price); lo = bar.get('low', price)
                 if is_long:
                     if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
@@ -2574,11 +2580,21 @@ def _delta_bot_tick():
                     if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
+                _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
                 _delta_bot_close(exit_px, reason, mode)
+                _bartime = candles[-1].get('time')
                 # Stop & reverse: opposite signal closes then opens the other side.
                 if reason == 'signal reversal' and delta_ai_state.get('running') and not delta_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
                     _bot_log('[Tick] [delta] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], price))
                     _delta_bot_open(strat['signal'], price, strat, mode)
+                    if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = _bartime
+                # TP-continuation (TV mode only): re-enter SAME side, SAME SL%/TP%.
+                elif reason == 'TP hit' and not _bot_is_claude(cfg) and delta_ai_state.get('running') and not delta_ai_state.get('position'):
+                    _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
+                           'slPct': _re_slp, 'tpPct': _re_tpp}
+                    _bot_log('[Tick] [delta] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, price, _re_slp, _re_tpp))
+                    _delta_bot_open(_re_side, price, _re, mode)
+                    if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = _bartime
             else:
                 _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -2595,6 +2611,7 @@ def _delta_bot_tick():
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _delta_bot_open(strat['signal'], price, strat, mode)
+                        if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = candles[-1].get('time')
                     else:
                         _bot_log('[Tick] [delta] {} {} skipped — entry quality: {}'.format(
                             symbol, strat['signal'], qreason))
@@ -3066,6 +3083,7 @@ def _zd_bot_open(side, price, strat, mode):
     zd_ai_state['position'] = {
         'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 2), 'tp': round(tp, 2),
+        'slPct': sl_pct, 'tpPct': tp_pct,   # kept for TP-continuation re-entry
         'strategy': strat['name'], 'mode': mode,
     }
     tag  = '[' + mode.upper() + ']'
@@ -3390,7 +3408,14 @@ def _zd_bot_tick():
                 # close) and fill AT the SL/TP level. A close-only soft stop let a
                 # single violent candle blow 80+ pts past the stop (e.g. SELL 8390
                 # SL 8406 filled 8489). SL takes priority over TP (worst case).
-                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                bar = candles[-1]
+                # On the position's ENTRY bar the high/low may PREDATE the fill, so
+                # use the close only (prevents a stale high/low from false-triggering
+                # SL/TP and a TP-continuation re-entry loop); intrabar from next bar on.
+                if bar.get('time') == pos.get('entryBarTime'):
+                    hi = lo = price
+                else:
+                    hi = bar.get('high', price); lo = bar.get('low', price)
                 if is_long:
                     if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
@@ -3401,12 +3426,23 @@ def _zd_bot_tick():
                     if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
+                _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
                 _zd_bot_close(exit_px, reason, mode)
+                _bartime = candles[-1].get('time')
                 # Stop & reverse: an opposite signal CLOSES the trade and immediately
                 # OPENS the other side (bypasses cooldown/quality — the flip is the signal).
                 if reason == 'signal reversal' and zd_ai_state.get('running') and not zd_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
                     _zd_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 2)))
                     _zd_bot_open(strat['signal'], price, strat, mode)
+                    if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = _bartime
+                # TP-continuation (TV mode only): re-enter the SAME side at the current
+                # price with the SAME SL%/TP% so it keeps riding the trend.
+                elif reason == 'TP hit' and not _bot_is_claude(cfg) and zd_ai_state.get('running') and not zd_ai_state.get('position'):
+                    _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
+                           'slPct': _re_slp, 'tpPct': _re_tpp}
+                    _zd_log('[Tick] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, round(price, 2), _re_slp, _re_tpp))
+                    _zd_bot_open(_re_side, price, _re, mode)
+                    if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = _bartime
             else:
                 _zd_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -3420,6 +3456,7 @@ def _zd_bot_tick():
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _zd_bot_open(strat['signal'], price, strat, mode)
+                        if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = candles[-1].get('time')
                     else:
                         _zd_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
             else:
@@ -4500,6 +4537,7 @@ def _mt_bot_open(side, price, strat, mode):
     mt_ai_state['position'] = {
         'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 5), 'tp': round(tp, 5),
+        'slPct': sl_pct, 'tpPct': tp_pct,   # kept for TP-continuation re-entry
         'strategy': strat['name'], 'mode': mode,
     }
     _cap_note = (' [cap ' + str(capital) + ' ×' + str(lev) + 'x]') if (capital > 0 and cfg.get('autoSymbol')) else ''
@@ -4613,8 +4651,13 @@ def _mt_bot_tick():
                     reason = 'max daily profit'
             exit_px = price
             if reason is None:
-                # Intrabar stop/target on the bar high/low, filled at the level.
-                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                # Intrabar stop/target — but on the ENTRY bar use close only (high/low
+                # may predate the fill), to avoid false SL/TP and TP-re-entry loops.
+                bar = candles[-1]
+                if bar.get('time') == pos.get('entryBarTime'):
+                    hi = lo = price
+                else:
+                    hi = bar.get('high', price); lo = bar.get('low', price)
                 if is_long:
                     if lo <= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif hi >= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
@@ -4625,11 +4668,21 @@ def _mt_bot_tick():
                     if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
+                _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
                 _mt_bot_close(exit_px, reason, mode)
+                _bartime = candles[-1].get('time')
                 # Stop & reverse: opposite signal closes then opens the other side.
                 if reason == 'signal reversal' and mt_ai_state.get('running') and not mt_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
                     _mt_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 5)))
                     _mt_bot_open(strat['signal'], price, strat, mode)
+                    if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = _bartime
+                # TP-continuation (TV mode only): re-enter SAME side, SAME SL%/TP%.
+                elif reason == 'TP hit' and not _bot_is_claude(cfg) and mt_ai_state.get('running') and not mt_ai_state.get('position'):
+                    _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
+                           'slPct': _re_slp, 'tpPct': _re_tpp}
+                    _mt_log('[Tick] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, round(price, 5), _re_slp, _re_tpp))
+                    _mt_bot_open(_re_side, price, _re, mode)
+                    if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = _bartime
             else:
                 _mt_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -4643,6 +4696,7 @@ def _mt_bot_tick():
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _mt_bot_open(strat['signal'], price, strat, mode)
+                        if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = candles[-1].get('time')
                     else:
                         _mt_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
             else:
