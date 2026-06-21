@@ -1885,6 +1885,9 @@ _TV_TA_CACHE = {}        # {(tv_symbol, interval): {'ts': float, 'data': dict|No
 _TV_TA_TTL   = 20
 _TV_WEBHOOK  = {}        # {SYMBOL: {'signal','price','indicator','note','ts'}}
 _TV_WEBHOOK_MAX = 300
+# Dual-indicator state machine: latest SuperTrend (bias) + EMA (trigger) alert per
+# instrument ROOT. {ROOT: {'SUPERTREND': {...}, 'EMA': {...}}}. Drives _tv_dual_signal.
+_TV_IND = {}
 _TV_DEFAULT_TOKEN = os.environ.get('TV_WEBHOOK_TOKEN', '').strip() or 'mangalview'
 _TV_INTERVAL = {'1m': '1', '3m': '5', '5m': '5', '15m': '15', '30m': '30',
                 '1h': '60', '2h': '120', '4h': '240', '1d': '1D', '1w': '1W'}
@@ -2577,7 +2580,8 @@ def _delta_bot_tick():
                     if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
                 if reason is None:
-                    if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                    if strat['signal'] == 'CLOSE':             reason = 'EMA exit'   # dual: EMA opposes SuperTrend
+                    elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
@@ -2589,7 +2593,8 @@ def _delta_bot_tick():
                     _delta_bot_open(strat['signal'], price, strat, mode)
                     if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = _bartime
                 # TP-continuation (TV mode only): re-enter SAME side, SAME SL%/TP%.
-                elif reason == 'TP hit' and not _bot_is_claude(cfg) and delta_ai_state.get('running') and not delta_ai_state.get('position'):
+                # In dual mode, only continue while SuperTrend AND EMA still agree.
+                elif reason == 'TP hit' and not _bot_is_claude(cfg) and _tv_dual_aligned(cfg, symbol, _re_side) and delta_ai_state.get('running') and not delta_ai_state.get('position'):
                     _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
                            'slPct': _re_slp, 'tpPct': _re_tpp}
                     _bot_log('[Tick] [delta] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, price, _re_slp, _re_tpp))
@@ -3423,7 +3428,8 @@ def _zd_bot_tick():
                     if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
                 if reason is None:
-                    if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                    if strat['signal'] == 'CLOSE':             reason = 'EMA exit'   # dual: EMA opposes SuperTrend
+                    elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
@@ -3436,8 +3442,9 @@ def _zd_bot_tick():
                     _zd_bot_open(strat['signal'], price, strat, mode)
                     if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = _bartime
                 # TP-continuation (TV mode only): re-enter the SAME side at the current
-                # price with the SAME SL%/TP% so it keeps riding the trend.
-                elif reason == 'TP hit' and not _bot_is_claude(cfg) and zd_ai_state.get('running') and not zd_ai_state.get('position'):
+                # price with the SAME SL%/TP% so it keeps riding the trend. In dual mode,
+                # only continue while SuperTrend AND EMA still agree with the side.
+                elif reason == 'TP hit' and not _bot_is_claude(cfg) and _tv_dual_aligned(cfg, symbol, _re_side) and zd_ai_state.get('running') and not zd_ai_state.get('position'):
                     _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
                            'slPct': _re_slp, 'tpPct': _re_tpp}
                     _zd_log('[Tick] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, round(price, 2), _re_slp, _re_tpp))
@@ -4665,7 +4672,8 @@ def _mt_bot_tick():
                     if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
                 if reason is None:
-                    if is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
+                    if strat['signal'] == 'CLOSE':             reason = 'EMA exit'   # dual: EMA opposes SuperTrend
+                    elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
                 _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
@@ -4677,7 +4685,8 @@ def _mt_bot_tick():
                     _mt_bot_open(strat['signal'], price, strat, mode)
                     if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = _bartime
                 # TP-continuation (TV mode only): re-enter SAME side, SAME SL%/TP%.
-                elif reason == 'TP hit' and not _bot_is_claude(cfg) and mt_ai_state.get('running') and not mt_ai_state.get('position'):
+                # In dual mode, only continue while SuperTrend AND EMA still agree.
+                elif reason == 'TP hit' and not _bot_is_claude(cfg) and _tv_dual_aligned(cfg, symbol, _re_side) and mt_ai_state.get('running') and not mt_ai_state.get('position'):
                     _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
                            'slPct': _re_slp, 'tpPct': _re_tpp}
                     _mt_log('[Tick] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, round(price, 5), _re_slp, _re_tpp))
@@ -5084,12 +5093,100 @@ def _tv_apply_sltp(out, wh, levels=True):
     if 'tpPct' not in out and tp_abs: out['tpPct'] = min(90.0, abs(price - tp_abs) / price * 100.0)
     return out
 
+def _tv_ind_for(cfg, symbol, base=''):
+    """Latest SuperTrend + EMA alerts for a bot's instrument ROOT, for the dual
+    state machine. Returns {'SUPERTREND': {...}, 'EMA': {...}} (either may be absent)."""
+    roots = set()
+    for k in (symbol, (cfg.get('tvSymbol') or '').split(':')[-1], base):
+        if k:
+            roots.add(_tv_root(str(k)))
+    roots.discard('')
+    out = {}
+    best_ts = {}
+    for root, inds in _TV_IND.items():
+        if root not in roots:
+            continue
+        for ind, entry in inds.items():
+            if entry.get('ts', 0) >= best_ts.get(ind, -1):
+                best_ts[ind] = entry.get('ts', 0); out[ind] = entry
+    return out
+
+def _tv_dual_active(cfg, symbol, base=''):
+    """True when BOTH a SuperTrend and an EMA alert exist for this bot's symbol —
+    i.e. the dual SuperTrend(bias)+EMA(trigger) state machine should drive trading."""
+    inds = _tv_ind_for(cfg, symbol, base)
+    return ('SUPERTREND' in inds) and ('EMA' in inds)
+
+def _tv_dual_aligned(cfg, symbol, side, base=''):
+    """True when SuperTrend and EMA both point the SAME way as `side` ('BUY'/'SELL').
+    Used to gate TP-continuation re-entry: only continue while both still agree."""
+    inds = _tv_ind_for(cfg, symbol, base)
+    st = inds.get('SUPERTREND'); ema = inds.get('EMA')
+    if not st or not ema:
+        return True   # not in dual mode -> don't block continuation
+    return st.get('signal') == side and ema.get('signal') == side
+
+def _tv_dual_signal(state, cfg, symbol, inds):
+    """Dual-indicator logic: SuperTrend = bias (master direction), EMA 5/13 = trigger.
+    Hold a position ONLY while both agree; go flat when they disagree; direction is
+    whichever they agree on. Edge-triggered: reconciles once per new ST/EMA alert.
+      both agree LONG  -> BUY  (open, or reverse a short)
+      both agree SHORT -> SELL (open, or reverse a long)
+      disagree         -> CLOSE (flatten; never reverse) when in a position, else HOLD
+    SL/TP for opens comes from the SuperTrend alert (slPct/tpPct/structure)."""
+    st = inds.get('SUPERTREND'); ema = inds.get('EMA')
+    if not st or not ema:        # dispatcher guarantees both; guard anyway
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: waiting for both SuperTrend & EMA'}
+    st_dir  = st.get('signal')
+    ema_dir = ema.get('signal')
+    latest_ts = max(int(st.get('ts', 0)), int(ema.get('ts', 0)))
+    acted = state.get('_tv_acted_ts', 0)
+
+    # current exposure from the open position
+    pos = state.get('position')
+    cur = 'BUY' if (pos and pos.get('side') == 'BUY') else ('SELL' if (pos and pos.get('side') == 'SELL') else None)
+
+    # desired exposure: only when both indicators are known and agree
+    if st_dir in ('BUY', 'SELL') and st_dir == ema_dir:
+        desired = st_dir
+    elif st_dir in ('BUY', 'SELL') and ema_dir in ('BUY', 'SELL'):
+        desired = None              # disagree -> flat
+    else:
+        # one side unknown/unparseable -> do nothing (don't force-flatten)
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
+                'reason': 'TV dual: waiting (ST {} / EMA {})'.format(st_dir or '?', ema_dir or '?')}
+
+    align = 'ST {} + EMA {}'.format(st_dir, ema_dir)
+    # Already reconciled to the latest alerts and position matches -> nothing to do.
+    if latest_ts <= acted and (desired == cur or (desired is None and cur is None)):
+        _st = ('holding ' + cur) if cur else 'flat'
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: {} ({})'.format(_st, align)}
+    state['_tv_acted_ts'] = latest_ts
+
+    if desired is None:
+        if cur is not None:
+            return {'name': 'tv', 'signal': 'CLOSE', 'score': 10.0,
+                    'reason': 'TV dual: EMA opposes SuperTrend -> flat ({})'.format(align)}
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: flat, waiting ({})'.format(align)}
+    if desired == cur:
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: holding {} ({})'.format(desired, align)}
+    # open (cur None) or reverse (cur opposite) into the agreed direction; SL/TP from the SuperTrend alert
+    verb = 'reverse' if cur else 'open'
+    out = {'name': 'tv', 'signal': desired, 'score': 10.0,
+           'reason': 'TV dual: {} {} ({})'.format(verb, desired, align)}
+    return _tv_apply_sltp(out, {'price': (st or {}).get('price'), 'fields': (st or {}).get('fields') or {}})
+
 def _tv_alert_signal(state, cfg, symbol):
     """TV-ONLY mode (Claude AI not selected): trade directly off the latest UNACTED
     TradingView alert. BUY/LONG -> BUY, SELL/SHORT -> SELL. Acts once per alert.
-    Uses sl/tp/slPct/tpPct from the alert when present (else panel defaults)."""
+    Uses sl/tp/slPct/tpPct from the alert when present (else panel defaults).
+    When BOTH a SuperTrend and EMA alert exist for the symbol, the dual state
+    machine (SuperTrend bias + EMA trigger) takes over instead."""
     if not cfg.get('tvEnabled'):
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
+    inds = _tv_ind_for(cfg, symbol)
+    if ('SUPERTREND' in inds) and ('EMA' in inds):
+        return _tv_dual_signal(state, cfg, symbol, inds)
     wh = _tv_alert_for(cfg, symbol, skip_test=True)   # only real alerts ever trade
     if not wh:
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV: waiting for a real alert'}
@@ -5187,6 +5284,14 @@ def aibot_tv_webhook():
     if len(_TV_WEBHOOK) > _TV_WEBHOOK_MAX:
         for k, _v in sorted(_TV_WEBHOOK.items(), key=lambda kv: kv[1]['ts'])[:50]:
             _TV_WEBHOOK.pop(k, None)
+    # Dual-indicator state machine: keep the latest SuperTrend / EMA alert per ROOT
+    # so the bot can require BOTH to agree (SuperTrend = bias, EMA = entry/exit trigger).
+    _ind = str(data.get('indicator') or data.get('strategy') or '').strip().upper()
+    if sig and not is_test and _ind in ('SUPERTREND', 'EMA'):
+        _TV_IND.setdefault(_tv_root(sym), {})[_ind] = {
+            'symbol': sym, 'signal': sig, 'price': data.get('price'),
+            'fields': fields, 'ts': _TV_WEBHOOK[sym]['ts'],
+        }
     _tv_log_alert(sym, _TV_WEBHOOK[sym])
     return jsonify({'success': True})
 
