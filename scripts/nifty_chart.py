@@ -16103,6 +16103,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </span>
       </div>
 
+      <!-- Option D: manual SuperTrend bias seed — open in this direction at Start (TV mode) -->
+      <div class="ai-risk-bar" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend. (TV mode only.)">
+        <span style="color:#9aa0ac;font-size:12px">&#129517; Start bias:</span>
+        <button class="zd-add-btn" id="aiBotBiasLong"   type="button" title="Seed a LONG (BUY) — bot opens long at Start">&#9650; Long</button>
+        <button class="zd-add-btn" id="aiBotBiasShort"  type="button" title="Seed a SHORT (SELL) — bot opens short at Start">&#9660; Short</button>
+        <button class="zd-add-btn" id="aiBotBiasDetect" type="button" title="Read the live SuperTrend for this symbol and set the bias from it">&#128269; Detect current</button>
+        <button class="zd-add-btn" id="aiBotBiasClear"  type="button" title="Clear the bias — bot waits for a SuperTrend alert as usual">&#10006; None</button>
+        <span id="aiBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
+      </div>
+
       <!-- Control buttons -->
       <div class="zd-footer">
         <button class="zd-start-btn start"  id="aiBotStartBtn">&#9654; Start Bot</button>
@@ -16301,6 +16311,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <input type="number" id="mtBotMinScore" value="0"><input type="number" id="mtBotScoreBuffer" value="0">
           <input type="number" id="mtBotCooldown" value="0"><input type="checkbox" id="mtBotQualityFilter" checked>
         </span>
+      </div>
+
+      <!-- Option D: manual SuperTrend bias seed — open in this direction at Start (TV mode) -->
+      <div class="ai-risk-bar" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend. (TV mode only.)">
+        <span style="color:#9aa0ac;font-size:12px">&#129517; Start bias:</span>
+        <button class="zd-add-btn" id="mtBotBiasLong"   type="button" title="Seed a LONG (BUY) — bot opens long at Start">&#9650; Long</button>
+        <button class="zd-add-btn" id="mtBotBiasShort"  type="button" title="Seed a SHORT (SELL) — bot opens short at Start">&#9660; Short</button>
+        <button class="zd-add-btn" id="mtBotBiasDetect" type="button" title="Read the live SuperTrend for this symbol and set the bias from it">&#128269; Detect current</button>
+        <button class="zd-add-btn" id="mtBotBiasClear"  type="button" title="Clear the bias — bot waits for a SuperTrend alert as usual">&#10006; None</button>
+        <span id="mtBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
       </div>
 
       <div class="zd-footer">
@@ -22802,6 +22822,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
       wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
     }
 
+    // ---- Option D: manual SuperTrend start bias (seed the first entry at Start) ----
+    let zdSeedBias = '';
+    const zBiasLong = document.getElementById('aiBotBiasLong');
+    const zBiasShort = document.getElementById('aiBotBiasShort');
+    const zBiasDetect = document.getElementById('aiBotBiasDetect');
+    const zBiasClear = document.getElementById('aiBotBiasClear');
+    const zBiasOut = document.getElementById('aiBotBiasOut');
+    function zRenderBias(note) {
+      if (zBiasLong)  zBiasLong.style.outline  = (zdSeedBias === 'BUY')  ? '2px solid #26a69a' : '';
+      if (zBiasShort) zBiasShort.style.outline = (zdSeedBias === 'SELL') ? '2px solid #ef5350' : '';
+      if (!zBiasOut) return;
+      if (zdSeedBias === 'BUY')       zBiasOut.innerHTML = '<b style="color:#26a69a">LONG</b> at Start' + (note ? ' — ' + note : '');
+      else if (zdSeedBias === 'SELL') zBiasOut.innerHTML = '<b style="color:#ef5350">SHORT</b> at Start' + (note ? ' — ' + note : '');
+      else zBiasOut.innerHTML = 'No start bias &mdash; waits for SuperTrend' + (note ? ' (' + note + ')' : '');
+    }
+    function zdGetSeedBias() { return zdSeedBias; }
+    function zdClearSeedBias(note) { zdSeedBias = ''; zRenderBias(note || ''); }
+    if (zBiasLong)  zBiasLong.addEventListener('click',  function() { zdSeedBias = 'BUY';  zRenderBias('manual'); });
+    if (zBiasShort) zBiasShort.addEventListener('click', function() { zdSeedBias = 'SELL'; zRenderBias('manual'); });
+    if (zBiasClear) zBiasClear.addEventListener('click', function() { zdSeedBias = '';     zRenderBias(''); });
+    if (zBiasDetect) zBiasDetect.addEventListener('click', function() {
+      const bsym = symEl.value.trim().toUpperCase();
+      if (!bsym) { logLine('Enter a symbol first.', 'info'); return; }
+      zBiasDetect.disabled = true; zRenderBias('detecting…');
+      fetch('/api/aibot/tv/bias?symbol=' + encodeURIComponent(bsym))
+        .then(r => r.json()).then(function(res) {
+          if (!res.success || !res.bias) { zRenderBias('no SuperTrend alert yet'); logLine('[Bias] No SuperTrend alert stored for ' + bsym + ' yet.', 'info'); return; }
+          zdSeedBias = res.bias;
+          const stx = res.superTrend || {}; const age = (stx.ageSec != null) ? ' (' + stx.ageSec + 's ago)' : '';
+          zRenderBias('live ST ' + res.bias + age);
+          logLine('[Bias] Detected SuperTrend ' + res.bias + ' for ' + bsym + age, 'info');
+        }).catch(e => { zRenderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
+        .finally(() => { zBiasDetect.disabled = false; });
+    });
+
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
@@ -22833,6 +22888,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         includeMM:   !!incMMChk.checked,
         includeMMA:  !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(),
+        seedBias:    zdGetSeedBias(),   // Option D: open in this SuperTrend bias at Start
         api_key:     s.apiKey || ''
       };
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -22842,6 +22898,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }).then(r => r.json()).then(res => {
         if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
         _serverStarted();
+        if (zdGetSeedBias()) { logLine('[Bias] Seeded ' + zdGetSeedBias() + ' — bot will open at start.', 'info'); zdClearSeedBias('applied'); }
         logLine('Bot is now running on the server. Safe to close this tab — bot keeps ticking.', 'info');
       }).catch(e => logLine('Start request error: ' + e.message, 'info'));
     });
@@ -23766,6 +23823,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
       wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
     }
 
+    // ---- Option D: manual SuperTrend start bias (seed the first entry at Start) ----
+    let mtSeedBias = '';
+    const mBiasLong = document.getElementById('mtBotBiasLong');
+    const mBiasShort = document.getElementById('mtBotBiasShort');
+    const mBiasDetect = document.getElementById('mtBotBiasDetect');
+    const mBiasClear = document.getElementById('mtBotBiasClear');
+    const mBiasOut = document.getElementById('mtBotBiasOut');
+    function mRenderBias(note) {
+      if (mBiasLong)  mBiasLong.style.outline  = (mtSeedBias === 'BUY')  ? '2px solid #26a69a' : '';
+      if (mBiasShort) mBiasShort.style.outline = (mtSeedBias === 'SELL') ? '2px solid #ef5350' : '';
+      if (!mBiasOut) return;
+      if (mtSeedBias === 'BUY')       mBiasOut.innerHTML = '<b style="color:#26a69a">LONG</b> at Start' + (note ? ' — ' + note : '');
+      else if (mtSeedBias === 'SELL') mBiasOut.innerHTML = '<b style="color:#ef5350">SHORT</b> at Start' + (note ? ' — ' + note : '');
+      else mBiasOut.innerHTML = 'No start bias &mdash; waits for SuperTrend' + (note ? ' (' + note + ')' : '');
+    }
+    function mtGetSeedBias() { return mtSeedBias; }
+    function mtClearSeedBias(note) { mtSeedBias = ''; mRenderBias(note || ''); }
+    if (mBiasLong)  mBiasLong.addEventListener('click',  function() { mtSeedBias = 'BUY';  mRenderBias('manual'); });
+    if (mBiasShort) mBiasShort.addEventListener('click', function() { mtSeedBias = 'SELL'; mRenderBias('manual'); });
+    if (mBiasClear) mBiasClear.addEventListener('click', function() { mtSeedBias = '';     mRenderBias(''); });
+    if (mBiasDetect) mBiasDetect.addEventListener('click', function() {
+      const bsym = symEl.value.trim().toUpperCase();
+      if (!bsym) { logLine('Enter a symbol first.', 'info'); return; }
+      mBiasDetect.disabled = true; mRenderBias('detecting…');
+      fetch('/api/aibot/tv/bias?symbol=' + encodeURIComponent(bsym))
+        .then(r => r.json()).then(function(res) {
+          if (!res.success || !res.bias) { mRenderBias('no SuperTrend alert yet'); logLine('[Bias] No SuperTrend alert stored for ' + bsym + ' yet.', 'info'); return; }
+          mtSeedBias = res.bias;
+          const stx = res.superTrend || {}; const age = (stx.ageSec != null) ? ' (' + stx.ageSec + 's ago)' : '';
+          mRenderBias('live ST ' + res.bias + age);
+          logLine('[Bias] Detected SuperTrend ' + res.bias + ' for ' + bsym + age, 'info');
+        }).catch(e => { mRenderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
+        .finally(() => { mBiasDetect.disabled = false; });
+    });
+
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase(); if (!sym && !document.getElementById('mtBotAutoSym').checked && !(document.getElementById('mtBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
@@ -23781,7 +23873,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         tvEnabled: !!(document.getElementById('mtBotTV') || {}).checked,
         tvSymbol: ((document.getElementById('mtBotTVSym') || {}).value || '').trim().toUpperCase(),
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
-        allowedStrategies: _collectStrategies(), mt5_id: s.id || ''
+        allowedStrategies: _collectStrategies(), seedBias: mtGetSeedBias(), mt5_id: s.id || ''
       };
       if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
       logLine('Starting MT5 Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / vol=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -23789,7 +23881,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fetch('/api/aibot/mt5/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) })
         .then(r => r.json()).then(res => {
           if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
-          _serverStarted(); logLine('Bot running on the server. Safe to close this tab — it keeps ticking.', 'info');
+          _serverStarted();
+          if (mtGetSeedBias()) { logLine('[Bias] Seeded ' + mtGetSeedBias() + ' — bot will open at start.', 'info'); mtClearSeedBias('applied'); }
+          logLine('Bot running on the server. Safe to close this tab — it keeps ticking.', 'info');
         }).catch(e => logLine('Start request error: ' + e.message, 'info'));
     });
     pauseBtn.addEventListener('click', function() {
