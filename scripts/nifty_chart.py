@@ -5112,80 +5112,102 @@ def _tv_ind_for(cfg, symbol, base=''):
     return out
 
 def _tv_dual_active(cfg, symbol, base=''):
-    """True when BOTH a SuperTrend and an EMA alert exist for this bot's symbol —
-    i.e. the dual SuperTrend(bias)+EMA(trigger) state machine should drive trading."""
+    """True when a SuperTrend and/or EMA alert exists for this bot's symbol — i.e.
+    the dual SuperTrend(primary, entry) + EMA(secondary, exit) machine drives trading."""
     inds = _tv_ind_for(cfg, symbol, base)
-    return ('SUPERTREND' in inds) and ('EMA' in inds)
+    return ('SUPERTREND' in inds) or ('EMA' in inds)
 
 def _tv_dual_aligned(cfg, symbol, side, base=''):
-    """True when SuperTrend and EMA both point the SAME way as `side` ('BUY'/'SELL').
-    Used to gate TP-continuation re-entry: only continue while both still agree."""
+    """True when the PRIMARY (SuperTrend) bias still backs `side` ('BUY'/'SELL').
+    Gates TP-continuation: keep re-entering only while SuperTrend still agrees.
+    EMA is exit-only and does NOT gate continuation (an opposing EMA would already
+    have closed the position via its own exit)."""
     inds = _tv_ind_for(cfg, symbol, base)
-    st = inds.get('SUPERTREND'); ema = inds.get('EMA')
-    if not st or not ema:
+    st = inds.get('SUPERTREND')
+    if not st:
         return True   # not in dual mode -> don't block continuation
-    return st.get('signal') == side and ema.get('signal') == side
+    return st.get('signal') == side
 
 def _tv_dual_signal(state, cfg, symbol, inds):
-    """Dual-indicator logic: SuperTrend = bias (master direction), EMA 5/13 = trigger.
-    Hold a position ONLY while both agree; go flat when they disagree; direction is
-    whichever they agree on. Edge-triggered: reconciles once per new ST/EMA alert.
-      both agree LONG  -> BUY  (open, or reverse a short)
-      both agree SHORT -> SELL (open, or reverse a long)
-      disagree         -> CLOSE (flatten; never reverse) when in a position, else HOLD
-    SL/TP for opens comes from the SuperTrend alert (slPct/tpPct/structure)."""
+    """Dual-indicator logic — SuperTrend is PRIMARY (the only thing that OPENS a
+    position); EMA 5/13 is SECONDARY (exit only, never opens):
+
+      * SuperTrend alert  -> ENTRY. Open in its direction when flat; reaffirm when
+        already on that side. (No position is ever opened without SuperTrend.)
+      * EMA alert         -> EXIT. When holding and EMA prints the OPPOSITE side,
+        CLOSE to flat. EMA never opens and never reverses.
+      * SuperTrend flip while holding the opposite side does NOT force an exit while
+        an EMA exists (exits are EMA's job); for a SuperTrend-only symbol it reverses
+        so there is still a way out.
+      * TP-continuation (handled in the tick) re-enters the SAME side on TP while
+        SuperTrend still backs it.
+
+    Edge-triggered: acts once on the newest unacted ST/EMA alert. SL/TP for opens
+    come from the SuperTrend alert (slPct/tpPct/structure)."""
     st = inds.get('SUPERTREND'); ema = inds.get('EMA')
-    if not st or not ema:        # dispatcher guarantees both; guard anyway
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: waiting for both SuperTrend & EMA'}
-    st_dir  = st.get('signal')
-    ema_dir = ema.get('signal')
-    latest_ts = max(int(st.get('ts', 0)), int(ema.get('ts', 0)))
+    pos = state.get('position')
+    cur = pos.get('side') if pos else None
+
+    # PRIMARY required: without a SuperTrend signal, nothing opens (EMA can't open).
+    if not st or st.get('signal') not in ('BUY', 'SELL'):
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
+                'reason': 'TV dual: waiting for SuperTrend (primary) before any entry'}
+
+    st_dir = st.get('signal'); st_ts = int(st.get('ts', 0))
+    ema_dir = ema.get('signal') if ema else None
+    ema_ts  = int(ema.get('ts', 0)) if ema else 0
     acted = state.get('_tv_acted_ts', 0)
 
-    # current exposure from the open position
-    pos = state.get('position')
-    cur = 'BUY' if (pos and pos.get('side') == 'BUY') else ('SELL' if (pos and pos.get('side') == 'SELL') else None)
+    # Newest UNACTED alert wins (entry vs exit reflects the latest market state).
+    best = None
+    if st_ts > acted:
+        best = (st_ts, 'ST', st_dir)
+    if ema_dir in ('BUY', 'SELL') and ema_ts > acted and (best is None or ema_ts > best[0]):
+        best = (ema_ts, 'EMA', ema_dir)
 
-    # desired exposure: only when both indicators are known and agree
-    if st_dir in ('BUY', 'SELL') and st_dir == ema_dir:
-        desired = st_dir
-    elif st_dir in ('BUY', 'SELL') and ema_dir in ('BUY', 'SELL'):
-        desired = None              # disagree -> flat
-    else:
-        # one side unknown/unparseable -> do nothing (don't force-flatten)
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
-                'reason': 'TV dual: waiting (ST {} / EMA {})'.format(st_dir or '?', ema_dir or '?')}
-
-    align = 'ST {} + EMA {}'.format(st_dir, ema_dir)
-    # Already reconciled to the latest alerts and position matches -> nothing to do.
-    if latest_ts <= acted and (desired == cur or (desired is None and cur is None)):
+    align = 'ST {}{}'.format(st_dir, (' / EMA ' + ema_dir) if ema_dir else '')
+    if best is None:
         _st = ('holding ' + cur) if cur else 'flat'
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: {} ({})'.format(_st, align)}
-    state['_tv_acted_ts'] = latest_ts
 
-    if desired is None:
-        if cur is not None:
-            return {'name': 'tv', 'signal': 'CLOSE', 'score': 10.0,
-                    'reason': 'TV dual: EMA opposes SuperTrend -> flat ({})'.format(align)}
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: flat, waiting ({})'.format(align)}
-    if desired == cur:
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: holding {} ({})'.format(desired, align)}
-    # open (cur None) or reverse (cur opposite) into the agreed direction; SL/TP from the SuperTrend alert
-    verb = 'reverse' if cur else 'open'
-    out = {'name': 'tv', 'signal': desired, 'score': 10.0,
-           'reason': 'TV dual: {} {} ({})'.format(verb, desired, align)}
-    return _tv_apply_sltp(out, {'price': (st or {}).get('price'), 'fields': (st or {}).get('fields') or {}})
+    ts, src, sdir = best
+    state['_tv_acted_ts'] = ts
+
+    if src == 'ST':
+        # PRIMARY = entry only. Open from flat; reaffirm when already on-side.
+        if cur is None:
+            out = {'name': 'tv', 'signal': st_dir, 'score': 10.0,
+                   'reason': 'TV dual: open {} (SuperTrend)'.format(st_dir)}
+            return _tv_apply_sltp(out, {'price': st.get('price'), 'fields': st.get('fields') or {}})
+        if cur == st_dir:
+            return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: holding {} (SuperTrend reaffirm)'.format(cur)}
+        # holding opposite to a flipped SuperTrend
+        if ema is None:
+            # SuperTrend-only symbol — no EMA to exit, so the flip reverses.
+            out = {'name': 'tv', 'signal': st_dir, 'score': 10.0,
+                   'reason': 'TV dual: reverse {} (SuperTrend, no EMA)'.format(st_dir)}
+            return _tv_apply_sltp(out, {'price': st.get('price'), 'fields': st.get('fields') or {}})
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
+                'reason': 'TV dual: SuperTrend flipped {} — exit is EMA-only, holding {}'.format(st_dir, cur)}
+
+    # SECONDARY = EMA, EXIT ONLY. Never opens, never reverses.
+    if cur and cur != ema_dir:
+        return {'name': 'tv', 'signal': 'CLOSE', 'score': 10.0,
+                'reason': 'TV dual: EMA {} opposes {} -> exit ({})'.format(ema_dir, cur, align)}
+    _st = ('holding ' + cur) if cur else 'flat'
+    return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: {} (EMA {} — exit-only)'.format(_st, ema_dir)}
 
 def _tv_alert_signal(state, cfg, symbol):
     """TV-ONLY mode (Claude AI not selected): trade directly off the latest UNACTED
     TradingView alert. BUY/LONG -> BUY, SELL/SHORT -> SELL. Acts once per alert.
     Uses sl/tp/slPct/tpPct from the alert when present (else panel defaults).
-    When BOTH a SuperTrend and EMA alert exist for the symbol, the dual state
-    machine (SuperTrend bias + EMA trigger) takes over instead."""
+    When a SuperTrend and/or EMA alert exists for the symbol, the dual state machine
+    (SuperTrend = primary/entry, EMA = secondary/exit-only) takes over instead — an
+    EMA alert alone never opens a position (it waits for SuperTrend)."""
     if not cfg.get('tvEnabled'):
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
     inds = _tv_ind_for(cfg, symbol)
-    if ('SUPERTREND' in inds) and ('EMA' in inds):
+    if ('SUPERTREND' in inds) or ('EMA' in inds):
         return _tv_dual_signal(state, cfg, symbol, inds)
     wh = _tv_alert_for(cfg, symbol, skip_test=True)   # only real alerts ever trade
     if not wh:
