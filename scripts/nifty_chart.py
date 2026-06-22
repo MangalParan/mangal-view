@@ -2552,6 +2552,31 @@ def _delta_bot_tick():
                 else:            delta_ai_state['consec_losses'] = 0
                 delta_ai_state['position'] = None
         pos = delta_ai_state.get('position')
+        # --- Manual override (Open/Close buttons): runs before the signal logic ---
+        mcmd = delta_ai_state.pop('manualCmd', None)
+        if mcmd:
+            _maction = (mcmd.get('action') or '').lower(); _mside = mcmd.get('side')
+            if _maction == 'close':
+                if pos:
+                    _bot_log('[Manual] [delta] close {} @ {}'.format(symbol, price))
+                    _delta_bot_close(price, 'manual close', mode)
+                else:
+                    _bot_log('[Manual] [delta] close ignored — no open position')
+            elif _maction == 'open' and _mside in ('BUY', 'SELL'):
+                if pos and pos['side'] == _mside:
+                    _bot_log('[Manual] [delta] open {} ignored — already {}'.format(_mside, pos['side']))
+                else:
+                    if pos:
+                        _bot_log('[Manual] [delta] reverse — close {} then open {}'.format(pos['side'], _mside))
+                        _delta_bot_close(price, 'manual reverse', mode)
+                    _ms = _tv_apply_sltp({'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
+                                          'reason': 'manual open ' + _mside},
+                                         {'price': None, 'fields': ((_tv_ind_for(cfg, symbol).get('SUPERTREND') or {}).get('fields') or {})})
+                    _bot_log('[Manual] [delta] open {} {} @ {}'.format(_mside, symbol, price))
+                    _delta_bot_open(_mside, price, _ms, mode)
+                    if delta_ai_state.get('position'):
+                        delta_ai_state['position']['entryBarTime'] = candles[-1].get('time')
+            return   # manual action stands for this tick; normal logic resumes next tick
         if pos:
             is_long = pos['side'] == 'BUY'
             # Profit-lock: if total P/L (realised + this position's unrealised)
@@ -2711,6 +2736,25 @@ def delta_aibot_start():
     _persist_log_line('[DELTA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
     return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/delta/manual', methods=['POST'])
+@login_required
+def delta_aibot_manual():
+    """Manual Open/Close override: queue a command the running bot executes on its
+    next tick (open BUY/SELL at market with the configured SL%/TP%, or close)."""
+    data = request.json or {}
+    action = (data.get('action') or '').lower()
+    side = _seed_bias_norm(data.get('side'))
+    if action not in ('open', 'close'):
+        return jsonify({'success': False, 'error': 'action must be open or close'}), 400
+    if action == 'open' and side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'pick Long or Short first'}), 400
+    with delta_ai_lock:
+        if not delta_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Start the bot first'}), 400
+        delta_ai_state['manualCmd'] = {'action': action, 'side': side}
+    _bot_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
+    return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
 @app.route('/api/aibot/delta/pause', methods=['POST'])
 @login_required
@@ -3405,6 +3449,31 @@ def _zd_bot_tick():
                 if _zd_modify_stop_live(pos['sl_order_id'], pos['sl'], cfg, 'SELL' if pos['side'] == 'BUY' else 'BUY'):
                     pos['sl_order_trigger'] = round(float(pos['sl']), 2)
             pos = zd_ai_state.get('position')   # refresh (may have been closed above)
+        # --- Manual override (Open/Close buttons): runs before the signal logic ---
+        mcmd = zd_ai_state.pop('manualCmd', None)
+        if mcmd:
+            _maction = (mcmd.get('action') or '').lower(); _mside = mcmd.get('side')
+            if _maction == 'close':
+                if pos:
+                    _zd_log('[Manual] close {} @ {}'.format(symbol, round(price, 2)))
+                    _zd_bot_close(price, 'manual close', mode)
+                else:
+                    _zd_log('[Manual] close ignored — no open position')
+            elif _maction == 'open' and _mside in ('BUY', 'SELL'):
+                if pos and pos['side'] == _mside:
+                    _zd_log('[Manual] open {} ignored — already {}'.format(_mside, pos['side']))
+                else:
+                    if pos:
+                        _zd_log('[Manual] reverse — close {} then open {}'.format(pos['side'], _mside))
+                        _zd_bot_close(price, 'manual reverse', mode)
+                    _ms = _tv_apply_sltp({'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
+                                          'reason': 'manual open ' + _mside},
+                                         {'price': None, 'fields': ((_tv_ind_for(cfg, symbol).get('SUPERTREND') or {}).get('fields') or {})})
+                    _zd_log('[Manual] open {} {} @ {}'.format(_mside, symbol, round(price, 2)))
+                    _zd_bot_open(_mside, price, _ms, mode)
+                    if zd_ai_state.get('position'):
+                        zd_ai_state['position']['entryBarTime'] = candles[-1].get('time')
+            return   # manual action stands for this tick; normal logic resumes next tick
         if pos:
             is_long = pos['side'] == 'BUY'
             max_profit = float(cfg.get('maxProfit', 0) or 0)
@@ -3559,6 +3628,24 @@ def zd_aibot_start():
     _persist_log_line('[ZERODHA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
     return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/zerodha/manual', methods=['POST'])
+@login_required
+def zd_aibot_manual():
+    """Manual Open/Close override for the Zerodha bot (executes on next tick)."""
+    data = request.json or {}
+    action = (data.get('action') or '').lower()
+    side = _seed_bias_norm(data.get('side'))
+    if action not in ('open', 'close'):
+        return jsonify({'success': False, 'error': 'action must be open or close'}), 400
+    if action == 'open' and side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'pick Long or Short first'}), 400
+    with zd_ai_lock:
+        if not zd_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Start the bot first'}), 400
+        zd_ai_state['manualCmd'] = {'action': action, 'side': side}
+    _zd_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
+    return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
 @app.route('/api/aibot/zerodha/pause', methods=['POST'])
 @login_required
@@ -4660,6 +4747,31 @@ def _mt_bot_tick():
                 'trending ' + regime['direction'] if regime['trending'] else 'range'),
         }
         pos = mt_ai_state.get('position')
+        # --- Manual override (Open/Close buttons): runs before the signal logic ---
+        mcmd = mt_ai_state.pop('manualCmd', None)
+        if mcmd:
+            _maction = (mcmd.get('action') or '').lower(); _mside = mcmd.get('side')
+            if _maction == 'close':
+                if pos:
+                    _mt_log('[Manual] close {} @ {}'.format(symbol, round(price, 5)))
+                    _mt_bot_close(price, 'manual close', mode)
+                else:
+                    _mt_log('[Manual] close ignored — no open position')
+            elif _maction == 'open' and _mside in ('BUY', 'SELL'):
+                if pos and pos['side'] == _mside:
+                    _mt_log('[Manual] open {} ignored — already {}'.format(_mside, pos['side']))
+                else:
+                    if pos:
+                        _mt_log('[Manual] reverse — close {} then open {}'.format(pos['side'], _mside))
+                        _mt_bot_close(price, 'manual reverse', mode)
+                    _ms = _tv_apply_sltp({'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
+                                          'reason': 'manual open ' + _mside},
+                                         {'price': None, 'fields': ((_tv_ind_for(cfg, symbol).get('SUPERTREND') or {}).get('fields') or {})})
+                    _mt_log('[Manual] open {} {} @ {}'.format(_mside, symbol, round(price, 5)))
+                    _mt_bot_open(_mside, price, _ms, mode)
+                    if mt_ai_state.get('position'):
+                        mt_ai_state['position']['entryBarTime'] = candles[-1].get('time')
+            return   # manual action stands for this tick; normal logic resumes next tick
         if pos:
             is_long = pos['side'] == 'BUY'
             max_profit = float(cfg.get('maxProfit', 0) or 0)
@@ -4807,6 +4919,24 @@ def mt_aibot_start():
     if not _mt5_backend():
         _mt_log('[Note] MT5_BACKEND not set — running but no live data/orders. Set MT5_BACKEND=metatrader5 and reconnect.')
     return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/mt5/manual', methods=['POST'])
+@login_required
+def mt_aibot_manual():
+    """Manual Open/Close override for the MT5 bot (executes on next tick)."""
+    data = request.json or {}
+    action = (data.get('action') or '').lower()
+    side = _seed_bias_norm(data.get('side'))
+    if action not in ('open', 'close'):
+        return jsonify({'success': False, 'error': 'action must be open or close'}), 400
+    if action == 'open' and side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'pick Long or Short first'}), 400
+    with mt_ai_lock:
+        if not mt_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Start the bot first'}), 400
+        mt_ai_state['manualCmd'] = {'action': action, 'side': side}
+    _mt_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
+    return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
 @app.route('/api/aibot/mt5/pause', methods=['POST'])
 @login_required
@@ -16113,6 +16243,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="aiBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
       </div>
 
+      <!-- Manual override: open/close a position by hand while the bot runs (uses configured SL%/TP%) -->
+      <div class="ai-risk-bar" title="Manually open or close a position while the bot is running. Pick Long/Short and press Open to enter at market with the configured SL%/TP%; Close flattens the current position. Runs on the next bot tick.">
+        <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
+        <label><input type="radio" name="aiBotManualSide" value="BUY" checked> &#9650; Long</label>
+        <label><input type="radio" name="aiBotManualSide" value="SELL"> &#9660; Short</label>
+        <button class="zd-add-btn" id="aiBotManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
+        <button class="zd-add-btn" id="aiBotManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
+        <span id="aiBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+      </div>
+
       <!-- Control buttons -->
       <div class="zd-footer">
         <button class="zd-start-btn start"  id="aiBotStartBtn">&#9654; Start Bot</button>
@@ -16323,6 +16463,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="mtBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
       </div>
 
+      <!-- Manual override: open/close a position by hand while the bot runs (uses configured SL%/TP%) -->
+      <div class="ai-risk-bar" title="Manually open or close a position while the bot is running. Pick Long/Short and press Open to enter at market with the configured SL%/TP%; Close flattens the current position. Runs on the next bot tick.">
+        <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
+        <label><input type="radio" name="mtBotManualSide" value="BUY" checked> &#9650; Long</label>
+        <label><input type="radio" name="mtBotManualSide" value="SELL"> &#9660; Short</label>
+        <button class="zd-add-btn" id="mtBotManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
+        <button class="zd-add-btn" id="mtBotManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
+        <span id="mtBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+      </div>
+
       <div class="zd-footer">
         <button class="zd-start-btn start"  id="mtBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="mtBotPauseBtn" disabled>&#9208; Pause</button>
@@ -16487,6 +16637,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="deltaBotBiasDetect" type="button" title="Read the live SuperTrend for this symbol and set the bias from it">&#128269; Detect current</button>
         <button class="zd-add-btn" id="deltaBotBiasClear" type="button" title="Clear the bias — bot waits for a SuperTrend alert as usual">&#10006; None</button>
         <span id="deltaBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
+      </div>
+
+      <!-- Manual override: open/close a position by hand while the bot runs (uses configured SL%/TP%) -->
+      <div class="ai-risk-bar" title="Manually open or close a position while the bot is running. Pick Long/Short and press Open to enter at market with the configured SL%/TP%; Close flattens the current position. Runs on the next bot tick.">
+        <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
+        <label><input type="radio" name="deltaManualSide" value="BUY" checked> &#9650; Long</label>
+        <label><input type="radio" name="deltaManualSide" value="SELL"> &#9660; Short</label>
+        <button class="zd-add-btn" id="deltaManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
+        <button class="zd-add-btn" id="deltaManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
+        <span id="deltaManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
 
       <div class="zd-footer">
@@ -22857,6 +23017,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { zBiasDetect.disabled = false; });
     });
 
+    // ---- Manual override: Open / Close a position by hand while the bot runs ----
+    const zmOpenBtn = document.getElementById('aiBotManualOpen');
+    const zmCloseBtn = document.getElementById('aiBotManualClose');
+    const zmOut = document.getElementById('aiBotManualOut');
+    function zManualSide() { const r = document.querySelector('input[name="aiBotManualSide"]:checked'); return r ? r.value : 'BUY'; }
+    function zSendManual(action) {
+      const body = { action: action, side: (action === 'open') ? zManualSide() : '' };
+      if (zmOut) zmOut.textContent = (action === 'open' ? 'opening ' + zManualSide() : 'closing') + '…';
+      fetch('/api/aibot/zerodha/manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { if (zmOut) zmOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
+          if (zmOut) zmOut.textContent = res.message || 'queued';
+          logLine('[Manual] ' + (res.message || (action + ' queued')), 'info');
+        }).catch(e => { if (zmOut) zmOut.innerHTML = '<span style="color:#ef5350">error</span>'; logLine('[Manual] error: ' + e.message, 'info'); });
+    }
+    if (zmOpenBtn)  zmOpenBtn.addEventListener('click',  function() { zSendManual('open'); });
+    if (zmCloseBtn) zmCloseBtn.addEventListener('click', function() { zSendManual('close'); });
+
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase();
@@ -23858,6 +24036,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { mBiasDetect.disabled = false; });
     });
 
+    // ---- Manual override: Open / Close a position by hand while the bot runs ----
+    const mmOpenBtn = document.getElementById('mtBotManualOpen');
+    const mmCloseBtn = document.getElementById('mtBotManualClose');
+    const mmOut = document.getElementById('mtBotManualOut');
+    function mManualSide() { const r = document.querySelector('input[name="mtBotManualSide"]:checked'); return r ? r.value : 'BUY'; }
+    function mSendManual(action) {
+      const body = { action: action, side: (action === 'open') ? mManualSide() : '' };
+      if (mmOut) mmOut.textContent = (action === 'open' ? 'opening ' + mManualSide() : 'closing') + '…';
+      fetch('/api/aibot/mt5/manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { if (mmOut) mmOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
+          if (mmOut) mmOut.textContent = res.message || 'queued';
+          logLine('[Manual] ' + (res.message || (action + ' queued')), 'info');
+        }).catch(e => { if (mmOut) mmOut.innerHTML = '<span style="color:#ef5350">error</span>'; logLine('[Manual] error: ' + e.message, 'info'); });
+    }
+    if (mmOpenBtn)  mmOpenBtn.addEventListener('click',  function() { mSendManual('open'); });
+    if (mmCloseBtn) mmCloseBtn.addEventListener('click', function() { mSendManual('close'); });
+
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
       const sym = symEl.value.trim().toUpperCase(); if (!sym && !document.getElementById('mtBotAutoSym').checked && !(document.getElementById('mtBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
@@ -24456,6 +24652,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }).catch(e => { renderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
         .finally(() => { biasDetectBtn.disabled = false; });
     });
+
+    // ---- Manual override: Open / Close a position by hand while the bot runs ----
+    const mOpenBtn = document.getElementById('deltaManualOpen');
+    const mCloseBtn = document.getElementById('deltaManualClose');
+    const mOut = document.getElementById('deltaManualOut');
+    function manualSide() { const r = document.querySelector('input[name="deltaManualSide"]:checked'); return r ? r.value : 'BUY'; }
+    function sendManual(action) {
+      const body = { action: action, side: (action === 'open') ? manualSide() : '' };
+      if (mOut) mOut.textContent = (action === 'open' ? 'opening ' + manualSide() : 'closing') + '…';
+      fetch('/api/aibot/delta/manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { if (mOut) mOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
+          if (mOut) mOut.textContent = res.message || 'queued';
+          logLine('[Manual] ' + (res.message || (action + ' queued')), 'info');
+        }).catch(e => { if (mOut) mOut.innerHTML = '<span style="color:#ef5350">error</span>'; logLine('[Manual] error: ' + e.message, 'info'); });
+    }
+    if (mOpenBtn)  mOpenBtn.addEventListener('click',  function() { sendManual('open'); });
+    if (mCloseBtn) mCloseBtn.addEventListener('click', function() { sendManual('close'); });
 
     function openPosition(side, price, strategy, mode) {
       const qty   = Math.max(1, parseInt(qtyEl.value) || 1);
