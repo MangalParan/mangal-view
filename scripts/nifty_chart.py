@@ -2604,7 +2604,13 @@ def _delta_bot_tick():
                 _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
         else:
-            if strat['signal'] in ('BUY', 'SELL'):
+            if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
+                # Manual SuperTrend bias seed (Option D): open immediately at start,
+                # bypassing cooldown/quality (the user explicitly chose this entry).
+                _bot_log('[Tick] [delta] {} manual bias seed -> open {} @ {}'.format(symbol, strat['signal'], price))
+                _delta_bot_open(strat['signal'], price, strat, mode)
+                if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = candles[-1].get('time')
+            elif strat['signal'] in ('BUY', 'SELL'):
                 # Re-entry cooldown: avoid whipsaw churn right after an exit
                 # (the PAXGUSD signal-reversal losses in log.txt).
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
@@ -2693,6 +2699,7 @@ def delta_aibot_start():
         delta_ai_state['log_buffer']    = []
         delta_ai_state['last_tick']     = {}
         delta_ai_state['last_candles']  = []
+        delta_ai_state['seedBias']      = _seed_bias_norm(data.get('seedBias'))   # Option D: open in this bias at start
         delta_ai_state['running']       = True
         delta_ai_state['paused']        = False
         t = _threading.Thread(target=_delta_bot_loop, daemon=True, name='delta-aibot')
@@ -3454,7 +3461,12 @@ def _zd_bot_tick():
                 _zd_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
         else:
-            if strat['signal'] in ('BUY', 'SELL'):
+            if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
+                # Manual SuperTrend bias seed (Option D): open immediately, bypass cooldown/quality.
+                _zd_log('[Tick] {} manual bias seed -> open {} @ {}'.format(symbol, strat['signal'], round(price, 2)))
+                _zd_bot_open(strat['signal'], price, strat, mode)
+                if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = candles[-1].get('time')
+            elif strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
                 last_exit = zd_ai_state.get('last_exit_time') or 0
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
@@ -3535,6 +3547,7 @@ def zd_aibot_start():
         zd_ai_state['log_buffer']     = []
         zd_ai_state['last_tick']      = {}
         zd_ai_state['last_candles']   = []
+        zd_ai_state['seedBias']       = _seed_bias_norm(data.get('seedBias'))   # Option D: open in this bias at start
         zd_ai_state['running']        = True
         zd_ai_state['paused']         = False
         t = _threading.Thread(target=_zd_bot_loop, daemon=True, name='zerodha-aibot')
@@ -4696,7 +4709,12 @@ def _mt_bot_tick():
                 _mt_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
         else:
-            if strat['signal'] in ('BUY', 'SELL'):
+            if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
+                # Manual SuperTrend bias seed (Option D): open immediately, bypass cooldown/quality.
+                _mt_log('[Tick] {} manual bias seed -> open {} @ {}'.format(symbol, strat['signal'], round(price, 5)))
+                _mt_bot_open(strat['signal'], price, strat, mode)
+                if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = candles[-1].get('time')
+            elif strat['signal'] in ('BUY', 'SELL'):
                 cooldown = int(cfg.get('cooldownSec', 60) or 0)
                 last_exit = mt_ai_state.get('last_exit_time') or 0
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
@@ -4775,6 +4793,7 @@ def mt_aibot_start():
         mt_ai_state['log_buffer']     = []
         mt_ai_state['last_tick']      = {}
         mt_ai_state['last_candles']   = []
+        mt_ai_state['seedBias']       = _seed_bias_norm(data.get('seedBias'))   # Option D: open in this bias at start
         mt_ai_state['running']        = True
         mt_ai_state['paused']         = False
         t = _threading.Thread(target=_mt_bot_loop, daemon=True, name='mt5-aibot')
@@ -4998,6 +5017,14 @@ def _tv_norm_signal(raw):
         return 'SELL'
     return ''
 
+def _seed_bias_norm(v):
+    """Normalise a manual SuperTrend bias choice -> 'BUY'/'SELL'/'' (Option D).
+    Accepts long/buy/bull -> BUY, short/sell/bear -> SELL; anything else clears it."""
+    s = (str(v or '')).strip().upper()
+    if s in ('BUY', 'LONG', 'BULL', 'UP'):   return 'BUY'
+    if s in ('SELL', 'SHORT', 'BEAR', 'DOWN'): return 'SELL'
+    return ''
+
 def _tv_recover_signal(text):
     """Last-resort: scan free text for a buy/sell word (e.g. a strategy comment)."""
     t = (text or '').upper()
@@ -5206,6 +5233,17 @@ def _tv_alert_signal(state, cfg, symbol):
     EMA alert alone never opens a position (it waits for SuperTrend)."""
     if not cfg.get('tvEnabled'):
         return {'name': 'wait', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Select Claude AI or enable TradingView to trade'}
+    # Option D — manual SuperTrend bias seed: open ONCE at bot start in the chosen
+    # direction, so the first entry fires immediately instead of waiting for a flip.
+    seed = state.get('seedBias')
+    if seed in ('BUY', 'SELL'):
+        state.pop('seedBias', None)                  # consume once, whatever happens
+        if not state.get('position'):
+            st0 = _tv_ind_for(cfg, symbol).get('SUPERTREND')
+            fields0 = (st0.get('fields') if st0 else None) or {}   # reuse last ST slPct/tpPct/structure if any
+            out = {'name': 'tv', 'signal': seed, 'score': 10.0, 'seed': True,
+                   'reason': 'Manual SuperTrend bias seed: open ' + seed}
+            return _tv_apply_sltp(out, {'price': None, 'fields': fields0})
     inds = _tv_ind_for(cfg, symbol)
     if ('SUPERTREND' in inds) or ('EMA' in inds):
         return _tv_dual_signal(state, cfg, symbol, inds)
@@ -5317,6 +5355,26 @@ def aibot_tv_webhook():
     _tv_log_alert(sym, _TV_WEBHOOK[sym])
     return jsonify({'success': True})
 
+@app.route('/api/aibot/tv/bias')
+@login_required
+def aibot_tv_bias():
+    """Current SuperTrend (primary) + EMA (secondary) state for a symbol, read from
+    the latest stored webhook alerts. Powers the panel's 'Detect current bias' button
+    (Option D) so the user can seed the first entry at bot start."""
+    symbol = (request.args.get('symbol') or '').strip()
+    root = _tv_root(symbol)
+    inds = _TV_IND.get(root, {})
+    st = inds.get('SUPERTREND'); ema = inds.get('EMA')
+    now = int(_zd_time.time())
+    def info(e):
+        if not e:
+            return None
+        return {'signal': e.get('signal'), 'price': e.get('price'),
+                'ageSec': max(0, now - int(e.get('ts', 0)))}
+    return jsonify({'success': True, 'root': root,
+                    'bias': (st or {}).get('signal') or '',
+                    'superTrend': info(st), 'ema': info(ema)})
+
 @app.route('/api/aibot/tv/peek')
 @login_required
 def aibot_tv_peek():
@@ -5348,7 +5406,7 @@ def _reset_bot_state(state, lock):
         state['last_candles']  = []
         state['config']        = None
         for k in ('_tv_acted_ts', '_decide', '_last_decision_ts', '_mkt_closed_logged',
-                  'scan_idx', 'last_exit_time', 'thread'):
+                  'scan_idx', 'last_exit_time', 'thread', 'seedBias'):
             state.pop(k, None)
 
 @app.route('/api/aibot/delta/reset', methods=['POST'])
@@ -16401,6 +16459,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="deltaBotSizing" style="color:#787b86;font-size:11px">Capital &mdash; · Leverage &mdash; · SL &mdash; · TP &mdash; · Qty &mdash;</span>
       </div>
 
+      <!-- Option D: manual SuperTrend bias seed — open in this direction at Start (no waiting for a flip) -->
+      <div class="ai-risk-bar" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend.">
+        <span style="color:#9aa0ac;font-size:12px">&#129517; Start bias:</span>
+        <button class="zd-add-btn" id="deltaBotBiasLong"  type="button" title="Seed a LONG (BUY) — bot opens long at Start">&#9650; Long</button>
+        <button class="zd-add-btn" id="deltaBotBiasShort" type="button" title="Seed a SHORT (SELL) — bot opens short at Start">&#9660; Short</button>
+        <button class="zd-add-btn" id="deltaBotBiasDetect" type="button" title="Read the live SuperTrend for this symbol and set the bias from it">&#128269; Detect current</button>
+        <button class="zd-add-btn" id="deltaBotBiasClear" type="button" title="Clear the bias — bot waits for a SuperTrend alert as usual">&#10006; None</button>
+        <span id="deltaBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
+      </div>
+
       <div class="zd-footer">
         <button class="zd-start-btn start"  id="deltaBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="deltaBotPauseBtn" disabled>&#9208; Pause</button>
@@ -24259,6 +24327,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { levBtn.disabled = false; });
     });
 
+    // ---- Option D: manual SuperTrend start bias (seed the first entry at Start) ----
+    let deltaSeedBias = '';
+    const biasLongBtn   = document.getElementById('deltaBotBiasLong');
+    const biasShortBtn  = document.getElementById('deltaBotBiasShort');
+    const biasDetectBtn = document.getElementById('deltaBotBiasDetect');
+    const biasClearBtn  = document.getElementById('deltaBotBiasClear');
+    const biasOut       = document.getElementById('deltaBotBiasOut');
+    function renderBias(note) {
+      if (biasLongBtn)  biasLongBtn.style.outline  = (deltaSeedBias === 'BUY')  ? '2px solid #26a69a' : '';
+      if (biasShortBtn) biasShortBtn.style.outline = (deltaSeedBias === 'SELL') ? '2px solid #ef5350' : '';
+      if (!biasOut) return;
+      if (deltaSeedBias === 'BUY')       biasOut.innerHTML = '<b style="color:#26a69a">LONG</b> at Start' + (note ? ' — ' + note : '');
+      else if (deltaSeedBias === 'SELL') biasOut.innerHTML = '<b style="color:#ef5350">SHORT</b> at Start' + (note ? ' — ' + note : '');
+      else biasOut.innerHTML = 'No start bias &mdash; waits for SuperTrend' + (note ? ' (' + note + ')' : '');
+    }
+    function deltaGetSeedBias() { return deltaSeedBias; }
+    function deltaClearSeedBias(note) { deltaSeedBias = ''; renderBias(note || ''); }
+    if (biasLongBtn)  biasLongBtn.addEventListener('click',  function() { deltaSeedBias = 'BUY';  renderBias('manual'); });
+    if (biasShortBtn) biasShortBtn.addEventListener('click', function() { deltaSeedBias = 'SELL'; renderBias('manual'); });
+    if (biasClearBtn) biasClearBtn.addEventListener('click', function() { deltaSeedBias = '';     renderBias(''); });
+    if (biasDetectBtn) biasDetectBtn.addEventListener('click', function() {
+      const sym = symEl.value.trim().toUpperCase();
+      if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
+      biasDetectBtn.disabled = true; renderBias('detecting…');
+      fetch('/api/aibot/tv/bias?symbol=' + encodeURIComponent(sym))
+        .then(r => r.json()).then(function(res) {
+          if (!res.success || !res.bias) { renderBias('no SuperTrend alert yet'); logLine('[Bias] No SuperTrend alert stored for ' + sym + ' yet.', 'info'); return; }
+          deltaSeedBias = res.bias;
+          const st = res.superTrend || {};
+          const age = (st.ageSec != null) ? ' (' + st.ageSec + 's ago)' : '';
+          renderBias('live ST ' + res.bias + age);
+          logLine('[Bias] Detected SuperTrend ' + res.bias + ' for ' + sym + age, 'info');
+        }).catch(e => { renderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
+        .finally(() => { biasDetectBtn.disabled = false; });
+    });
+
     function openPosition(side, price, strategy, mode) {
       const qty   = Math.max(1, parseInt(qtyEl.value) || 1);
       const slPct = Math.max(0.1, parseFloat(slPctEl.value) || 1.0);
@@ -24551,6 +24655,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
         allowedStrategies: _dCollectStrategies(),
+        seedBias:   deltaGetSeedBias(),   // Option D: open in this SuperTrend bias at Start
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -24561,6 +24666,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }).then(r => r.json()).then(res => {
         if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown'), 'info'); return; }
         _serverStarted(res);
+        if (deltaGetSeedBias()) { logLine('[Bias] Seeded ' + deltaGetSeedBias() + ' — bot will open at start.', 'info'); deltaClearSeedBias('applied'); }
         logLine('Bot is now running on the server. Safe to close this tab — bot keeps ticking.', 'info');
       }).catch(e => logLine('Start request error: ' + e.message, 'info'));
     });
