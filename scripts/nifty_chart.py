@@ -16326,6 +16326,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="aiBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
 
+      <!-- Win-protect: chop filter + TP-continuation guards (maximise wins) -->
+      <div class="ai-risk-bar" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
+        <span style="color:#9aa0ac;font-size:12px">&#128737; Win-protect:</span>
+        <label title="Skip TV entries when the market is choppy (Kaufman efficiency ratio below Min ER)"><input type="checkbox" id="aiBotAvoidRange" checked> Avoid chop</label>
+        <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="aiBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
+        <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="aiBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
+        <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="aiBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
+      </div>
+
       <!-- Control buttons -->
       <div class="zd-footer">
         <button class="zd-start-btn start"  id="aiBotStartBtn">&#9654; Start Bot</button>
@@ -16546,6 +16555,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="mtBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
 
+      <!-- Win-protect: chop filter + TP-continuation guards (maximise wins) -->
+      <div class="ai-risk-bar" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
+        <span style="color:#9aa0ac;font-size:12px">&#128737; Win-protect:</span>
+        <label title="Skip TV entries when the market is choppy (Kaufman efficiency ratio below Min ER)"><input type="checkbox" id="mtBotAvoidRange" checked> Avoid chop</label>
+        <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="mtBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
+        <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="mtBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
+        <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="mtBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
+      </div>
+
       <div class="zd-footer">
         <button class="zd-start-btn start"  id="mtBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="mtBotPauseBtn" disabled>&#9208; Pause</button>
@@ -16720,6 +16738,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="deltaManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
         <button class="zd-add-btn" id="deltaManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
         <span id="deltaManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+      </div>
+
+      <!-- Win-protect: chop filter + TP-continuation guards (maximise wins) -->
+      <div class="ai-risk-bar" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
+        <span style="color:#9aa0ac;font-size:12px">&#128737; Win-protect:</span>
+        <label title="Skip TV entries when the market is choppy (Kaufman efficiency ratio below Min ER)"><input type="checkbox" id="deltaBotAvoidRange" checked> Avoid chop</label>
+        <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="deltaBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
+        <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="deltaBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
+        <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="deltaBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
       </div>
 
       <div class="zd-footer">
@@ -23140,6 +23167,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         includeMMA:  !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(),
         seedBias:    zdGetSeedBias(),   // Option D: open in this SuperTrend bias at Start
+        avoidRange:  !!(document.getElementById('aiBotAvoidRange')||{}).checked,
+        minER:       parseFloat((document.getElementById('aiBotMinER')||{}).value) || 0.28,
+        maxCont:     parseInt((document.getElementById('aiBotMaxCont')||{}).value) || 4,
+        contSlPct:   parseFloat((document.getElementById('aiBotContSl')||{}).value) || 0,
         api_key:     s.apiKey || ''
       };
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -24142,7 +24173,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         tvEnabled: !!(document.getElementById('mtBotTV') || {}).checked,
         tvSymbol: ((document.getElementById('mtBotTVSym') || {}).value || '').trim().toUpperCase(),
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
-        allowedStrategies: _collectStrategies(), seedBias: mtGetSeedBias(), mt5_id: s.id || ''
+        allowedStrategies: _collectStrategies(), seedBias: mtGetSeedBias(),
+        avoidRange: !!(document.getElementById('mtBotAvoidRange')||{}).checked,
+        minER:      parseFloat((document.getElementById('mtBotMinER')||{}).value) || 0.28,
+        maxCont:    parseInt((document.getElementById('mtBotMaxCont')||{}).value) || 4,
+        contSlPct:  parseFloat((document.getElementById('mtBotContSl')||{}).value) || 0,
+        mt5_id: s.id || ''
       };
       if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
       logLine('Starting MT5 Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / vol=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -25037,6 +25073,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         includeMMA: !!dIncMMAChk.checked,
         allowedStrategies: _dCollectStrategies(),
         seedBias:   deltaGetSeedBias(),   // Option D: open in this SuperTrend bias at Start
+        avoidRange: !!(document.getElementById('deltaBotAvoidRange')||{}).checked,
+        minER:      parseFloat((document.getElementById('deltaBotMinER')||{}).value) || 0.28,
+        maxCont:    parseInt((document.getElementById('deltaBotMaxCont')||{}).value) || 4,
+        contSlPct:  parseFloat((document.getElementById('deltaBotContSl')||{}).value) || 0,
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
