@@ -1816,6 +1816,24 @@ def _bot_entry_quality(side, candles, regime, cfg):
             return False, 'overextended below mean ({:.1f}x range)'.format(-ext)
     return True, ''
 
+def _bot_is_ranging(candles, cfg):
+    """Chop filter via Kaufman efficiency ratio: ER = |net move| / |path travelled|
+    over the lookback. ER→1 = clean trend, ER→0 = back-and-forth chop. It is
+    instrument-agnostic (works for crypto % moves AND small GOLDTEN ticks), unlike a
+    fixed-% trend test. Used to SKIP TV entries in ranges (the GOLDTEN/SOL losing
+    clusters all had ER near 0). Turn off with avoidRange=False."""
+    if not cfg.get('avoidRange', True):
+        return False
+    n = min(int(cfg.get('rangeLook', 20) or 20), len(candles))
+    if n < 10:
+        return False                      # not enough data — don't block
+    closes = [c['close'] for c in candles[-n:]]
+    net  = abs(closes[-1] - closes[0])
+    path = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+    if path <= 0:
+        return True
+    return (net / path) < float(cfg.get('minER', 0.28) or 0.28)
+
 # Always-on reliable strategies (the "core") + the user-configurable opt-ins
 # exposed as checkboxes in both AI bot panels.
 _BOT_CORE_ALGOS         = ['trend', 'momentum', 'breakout', 'smartmoney', 'orderflow']
@@ -2609,7 +2627,7 @@ def _delta_bot_tick():
                     elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
-                _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
+                _re_side, _re_slp, _re_tpp, _re_cont = pos['side'], pos.get('slPct'), pos.get('tpPct'), (pos.get('contCount') or 0)
                 _delta_bot_close(exit_px, reason, mode)
                 _bartime = candles[-1].get('time')
                 # Stop & reverse: opposite signal closes then opens the other side.
@@ -2617,14 +2635,26 @@ def _delta_bot_tick():
                     _bot_log('[Tick] [delta] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], price))
                     _delta_bot_open(strat['signal'], price, strat, mode)
                     if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = _bartime
-                # TP-continuation (TV mode only): re-enter SAME side, SAME SL%/TP%.
-                # In dual mode, only continue while SuperTrend AND EMA still agree.
+                # TP-continuation (TV mode): re-enter SAME side while SuperTrend still
+                # backs it. Win-protect: tighter SL (= TP%, 1:1) so banked TPs aren't
+                # given back; cap chain depth; skip if the market has gone choppy.
                 elif reason == 'TP hit' and not _bot_is_claude(cfg) and _tv_dual_aligned(cfg, symbol, _re_side) and delta_ai_state.get('running') and not delta_ai_state.get('position'):
-                    _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
-                           'slPct': _re_slp, 'tpPct': _re_tpp}
-                    _bot_log('[Tick] [delta] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, price, _re_slp, _re_tpp))
-                    _delta_bot_open(_re_side, price, _re, mode)
-                    if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = _bartime
+                    _cont_n = _re_cont + 1
+                    _maxc = int(cfg.get('maxCont', 4) or 4)
+                    if _cont_n > _maxc:
+                        _bot_log('[Tick] [delta] {} TP — continuation cap {} reached, staying flat'.format(symbol, _maxc))
+                    elif _bot_is_ranging(candles, cfg):
+                        _bot_log('[Tick] [delta] {} TP — skip continuation (ranging)'.format(symbol))
+                    else:
+                        _cont_sl = float(cfg.get('contSlPct') or _re_tpp or _re_slp or 1.0)
+                        _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0,
+                               'reason': 'TP re-entry (continuation #{})'.format(_cont_n),
+                               'slPct': _cont_sl, 'tpPct': _re_tpp}
+                        _bot_log('[Tick] [delta] {} TP re-entry #{} -> {} @ {} (SL {}% TP {}%)'.format(symbol, _cont_n, _re_side, price, _cont_sl, _re_tpp))
+                        _delta_bot_open(_re_side, price, _re, mode)
+                        if delta_ai_state.get('position'):
+                            delta_ai_state['position']['entryBarTime'] = _bartime
+                            delta_ai_state['position']['contCount'] = _cont_n
             else:
                 _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -2643,6 +2673,9 @@ def _delta_bot_tick():
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _bot_log('[Tick] [delta] {} {} skipped — cooldown {}s after last exit'.format(
                         symbol, strat['signal'], cooldown))
+                elif (not _bot_is_claude(cfg)) and _bot_is_ranging(candles, cfg):
+                    _bot_log('[Tick] [delta] {} {} skipped — ranging (chop filter, ER<{})'.format(
+                        symbol, strat['signal'], cfg.get('minER', 0.28)))
                 else:
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
@@ -2705,6 +2738,10 @@ def delta_aibot_start():
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
+            'avoidRange': bool(data.get('avoidRange', True)),         # skip TV entries in chop (efficiency-ratio filter)
+            'minER':      float(data.get('minER', 0.28) or 0.28),     # ranging if efficiency ratio < this
+            'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
+            'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -3508,7 +3545,7 @@ def _zd_bot_tick():
                     elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
-                _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
+                _re_side, _re_slp, _re_tpp, _re_cont = pos['side'], pos.get('slPct'), pos.get('tpPct'), (pos.get('contCount') or 0)
                 _zd_bot_close(exit_px, reason, mode)
                 _bartime = candles[-1].get('time')
                 # Stop & reverse: an opposite signal CLOSES the trade and immediately
@@ -3517,15 +3554,25 @@ def _zd_bot_tick():
                     _zd_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 2)))
                     _zd_bot_open(strat['signal'], price, strat, mode)
                     if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = _bartime
-                # TP-continuation (TV mode only): re-enter the SAME side at the current
-                # price with the SAME SL%/TP% so it keeps riding the trend. In dual mode,
-                # only continue while SuperTrend AND EMA still agree with the side.
+                # TP-continuation (TV mode): re-enter SAME side while SuperTrend still
+                # backs it. Win-protect: tighter SL (= TP%, 1:1), cap chain depth, skip chop.
                 elif reason == 'TP hit' and not _bot_is_claude(cfg) and _tv_dual_aligned(cfg, symbol, _re_side) and zd_ai_state.get('running') and not zd_ai_state.get('position'):
-                    _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
-                           'slPct': _re_slp, 'tpPct': _re_tpp}
-                    _zd_log('[Tick] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, round(price, 2), _re_slp, _re_tpp))
-                    _zd_bot_open(_re_side, price, _re, mode)
-                    if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = _bartime
+                    _cont_n = _re_cont + 1
+                    _maxc = int(cfg.get('maxCont', 4) or 4)
+                    if _cont_n > _maxc:
+                        _zd_log('[Tick] {} TP — continuation cap {} reached, staying flat'.format(symbol, _maxc))
+                    elif _bot_is_ranging(candles, cfg):
+                        _zd_log('[Tick] {} TP — skip continuation (ranging)'.format(symbol))
+                    else:
+                        _cont_sl = float(cfg.get('contSlPct') or _re_tpp or _re_slp or 1.0)
+                        _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0,
+                               'reason': 'TP re-entry (continuation #{})'.format(_cont_n),
+                               'slPct': _cont_sl, 'tpPct': _re_tpp}
+                        _zd_log('[Tick] {} TP re-entry #{} -> {} @ {} (SL {}% TP {}%)'.format(symbol, _cont_n, _re_side, round(price, 2), _cont_sl, _re_tpp))
+                        _zd_bot_open(_re_side, price, _re, mode)
+                        if zd_ai_state.get('position'):
+                            zd_ai_state['position']['entryBarTime'] = _bartime
+                            zd_ai_state['position']['contCount'] = _cont_n
             else:
                 _zd_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -3540,6 +3587,8 @@ def _zd_bot_tick():
                 last_exit = zd_ai_state.get('last_exit_time') or 0
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _zd_log('[Tick] {} {} skipped — cooldown {}s after last exit'.format(symbol, strat['signal'], cooldown))
+                elif (not _bot_is_claude(cfg)) and _bot_is_ranging(candles, cfg):
+                    _zd_log('[Tick] {} {} skipped — ranging (chop filter, ER<{})'.format(symbol, strat['signal'], cfg.get('minER', 0.28)))
                 else:
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
@@ -3596,6 +3645,10 @@ def zd_aibot_start():
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
+            'avoidRange': bool(data.get('avoidRange', True)),         # skip TV entries in chop (efficiency-ratio filter)
+            'minER':      float(data.get('minER', 0.28) or 0.28),     # ranging if efficiency ratio < this
+            'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
+            'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -4801,7 +4854,7 @@ def _mt_bot_tick():
                     elif is_long and strat['signal'] == 'SELL':  reason = 'signal reversal'
                     elif (not is_long) and strat['signal'] == 'BUY': reason = 'signal reversal'
             if reason:
-                _re_side, _re_slp, _re_tpp = pos['side'], pos.get('slPct'), pos.get('tpPct')
+                _re_side, _re_slp, _re_tpp, _re_cont = pos['side'], pos.get('slPct'), pos.get('tpPct'), (pos.get('contCount') or 0)
                 _mt_bot_close(exit_px, reason, mode)
                 _bartime = candles[-1].get('time')
                 # Stop & reverse: opposite signal closes then opens the other side.
@@ -4809,14 +4862,25 @@ def _mt_bot_tick():
                     _mt_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 5)))
                     _mt_bot_open(strat['signal'], price, strat, mode)
                     if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = _bartime
-                # TP-continuation (TV mode only): re-enter SAME side, SAME SL%/TP%.
-                # In dual mode, only continue while SuperTrend AND EMA still agree.
+                # TP-continuation (TV mode): re-enter SAME side while SuperTrend still
+                # backs it. Win-protect: tighter SL (= TP%, 1:1), cap chain depth, skip chop.
                 elif reason == 'TP hit' and not _bot_is_claude(cfg) and _tv_dual_aligned(cfg, symbol, _re_side) and mt_ai_state.get('running') and not mt_ai_state.get('position'):
-                    _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0, 'reason': 'TP re-entry (continuation)',
-                           'slPct': _re_slp, 'tpPct': _re_tpp}
-                    _mt_log('[Tick] {} TP re-entry -> {} @ {} (SL {}% TP {}%)'.format(symbol, _re_side, round(price, 5), _re_slp, _re_tpp))
-                    _mt_bot_open(_re_side, price, _re, mode)
-                    if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = _bartime
+                    _cont_n = _re_cont + 1
+                    _maxc = int(cfg.get('maxCont', 4) or 4)
+                    if _cont_n > _maxc:
+                        _mt_log('[Tick] {} TP — continuation cap {} reached, staying flat'.format(symbol, _maxc))
+                    elif _bot_is_ranging(candles, cfg):
+                        _mt_log('[Tick] {} TP — skip continuation (ranging)'.format(symbol))
+                    else:
+                        _cont_sl = float(cfg.get('contSlPct') or _re_tpp or _re_slp or 1.0)
+                        _re = {'name': 'tv', 'signal': _re_side, 'score': 10.0,
+                               'reason': 'TP re-entry (continuation #{})'.format(_cont_n),
+                               'slPct': _cont_sl, 'tpPct': _re_tpp}
+                        _mt_log('[Tick] {} TP re-entry #{} -> {} @ {} (SL {}% TP {}%)'.format(symbol, _cont_n, _re_side, round(price, 5), _cont_sl, _re_tpp))
+                        _mt_bot_open(_re_side, price, _re, mode)
+                        if mt_ai_state.get('position'):
+                            mt_ai_state['position']['entryBarTime'] = _bartime
+                            mt_ai_state['position']['contCount'] = _cont_n
             else:
                 _mt_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                     symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -4831,6 +4895,8 @@ def _mt_bot_tick():
                 last_exit = mt_ai_state.get('last_exit_time') or 0
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _mt_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, strat['signal'], cooldown))
+                elif (not _bot_is_claude(cfg)) and _bot_is_ranging(candles, cfg):
+                    _mt_log('[Tick] {} {} skipped — ranging (chop filter, ER<{})'.format(symbol, strat['signal'], cfg.get('minER', 0.28)))
                 else:
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
@@ -4885,6 +4951,10 @@ def mt_aibot_start():
             'cooldownSec': int(data.get('cooldownSec', 60) or 0),
             'tickSec':    max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'qualityFilter': bool(data.get('qualityFilter', True)),
+            'avoidRange': bool(data.get('avoidRange', True)),         # skip TV entries in chop (efficiency-ratio filter)
+            'minER':      float(data.get('minER', 0.28) or 0.28),     # ranging if efficiency ratio < this
+            'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
+            'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -5305,30 +5375,37 @@ def _tv_dual_signal(state, cfg, symbol, inds):
     pos = state.get('position')
     cur = pos.get('side') if pos else None
 
-    # PRIMARY required: without a SuperTrend signal, nothing opens (EMA can't open).
-    if not st or st.get('signal') not in ('BUY', 'SELL'):
-        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
-                'reason': 'TV dual: waiting for SuperTrend (primary) before any entry'}
-
-    st_dir = st.get('signal'); st_ts = int(st.get('ts', 0))
+    st_dir = st.get('signal') if st else None
+    st_ts  = int(st.get('ts', 0)) if st else 0
     ema_dir = ema.get('signal') if ema else None
     ema_ts  = int(ema.get('ts', 0)) if ema else 0
     acted = state.get('_tv_acted_ts', 0)
 
-    # Newest UNACTED alert wins (entry vs exit reflects the latest market state).
+    # Newest UNACTED alert wins. EMA may act on its own as an EXIT (even with no
+    # SuperTrend stored, so manual/seed/continuation positions are always protected);
+    # only an ENTRY requires SuperTrend.
     best = None
-    if st_ts > acted:
+    if st_dir in ('BUY', 'SELL') and st_ts > acted:
         best = (st_ts, 'ST', st_dir)
     if ema_dir in ('BUY', 'SELL') and ema_ts > acted and (best is None or ema_ts > best[0]):
         best = (ema_ts, 'EMA', ema_dir)
 
-    align = 'ST {}{}'.format(st_dir, (' / EMA ' + ema_dir) if ema_dir else '')
+    align = 'ST {}{}'.format(st_dir or '—', (' / EMA ' + ema_dir) if ema_dir else '')
     if best is None:
         _st = ('holding ' + cur) if cur else 'flat'
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: {} ({})'.format(_st, align)}
 
     ts, src, sdir = best
     state['_tv_acted_ts'] = ts
+
+    if src == 'EMA':
+        # SECONDARY = EMA, EXIT ONLY — works with or without a SuperTrend stored,
+        # so a manual/seed/continuation position still gets the fast EMA exit.
+        if cur and cur != ema_dir:
+            return {'name': 'tv', 'signal': 'CLOSE', 'score': 10.0,
+                    'reason': 'TV dual: EMA {} opposes {} -> exit ({})'.format(ema_dir, cur, align)}
+        _st = ('holding ' + cur) if cur else 'flat'
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: {} (EMA {} — exit-only)'.format(_st, ema_dir)}
 
     if src == 'ST':
         # PRIMARY = entry only. Open from flat; reaffirm when already on-side.
@@ -5347,12 +5424,8 @@ def _tv_dual_signal(state, cfg, symbol, inds):
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
                 'reason': 'TV dual: SuperTrend flipped {} — exit is EMA-only, holding {}'.format(st_dir, cur)}
 
-    # SECONDARY = EMA, EXIT ONLY. Never opens, never reverses.
-    if cur and cur != ema_dir:
-        return {'name': 'tv', 'signal': 'CLOSE', 'score': 10.0,
-                'reason': 'TV dual: EMA {} opposes {} -> exit ({})'.format(ema_dir, cur, align)}
-    _st = ('holding ' + cur) if cur else 'flat'
-    return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: {} (EMA {} — exit-only)'.format(_st, ema_dir)}
+    # unreachable (src is always EMA or ST)
+    return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: hold'}
 
 def _tv_alert_signal(state, cfg, symbol):
     """TV-ONLY mode (Claude AI not selected): trade directly off the latest UNACTED
