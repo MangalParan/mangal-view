@@ -1816,23 +1816,37 @@ def _bot_entry_quality(side, candles, regime, cfg):
             return False, 'overextended below mean ({:.1f}x range)'.format(-ext)
     return True, ''
 
-def _bot_is_ranging(candles, cfg):
-    """Chop filter via Kaufman efficiency ratio: ER = |net move| / |path travelled|
-    over the lookback. ER→1 = clean trend, ER→0 = back-and-forth chop. It is
-    instrument-agnostic (works for crypto % moves AND small GOLDTEN ticks), unlike a
-    fixed-% trend test. Used to SKIP TV entries in ranges (the GOLDTEN/SOL losing
-    clusters all had ER near 0). Turn off with avoidRange=False."""
-    if not cfg.get('avoidRange', True):
-        return False
-    n = min(int(cfg.get('rangeLook', 20) or 20), len(candles))
+def _bot_efficiency_ratio(candles, cfg=None):
+    """Kaufman efficiency ratio: ER = |net move| / |path travelled| over the lookback
+    (rangeLook, default 20). ER→1 = clean trend, ER→0 = back-and-forth chop. Returns
+    a float in [0,1], or None when there isn't enough data. Instrument-agnostic."""
+    n = min(int((cfg or {}).get('rangeLook', 20) or 20), len(candles))
     if n < 10:
-        return False                      # not enough data — don't block
+        return None
     closes = [c['close'] for c in candles[-n:]]
     net  = abs(closes[-1] - closes[0])
     path = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
     if path <= 0:
-        return True
-    return (net / path) < float(cfg.get('minER', 0.28) or 0.28)
+        return 0.0
+    return net / path
+
+def _bot_is_ranging(candles, cfg):
+    """Chop filter: True when the efficiency ratio is below minER (default 0.28).
+    Used to SKIP TV entries/continuation in ranges (the GOLDTEN/SOL losing clusters
+    all had ER near 0). Turn off with avoidRange=False."""
+    if not cfg.get('avoidRange', True):
+        return False
+    er = _bot_efficiency_ratio(candles, cfg)
+    if er is None:
+        return False                      # not enough data — don't block
+    return er < float(cfg.get('minER', 0.28) or 0.28)
+
+def _bot_er_tag(candles, cfg):
+    """Short market-state tag for tick logs/display, e.g. 'ER 0.42 trend' / 'ER 0.11 chop'."""
+    er = _bot_efficiency_ratio(candles, cfg)
+    if er is None:
+        return 'ER —'
+    return 'ER {:.2f} {}'.format(er, 'chop' if er < float((cfg or {}).get('minER', 0.28) or 0.28) else 'trend')
 
 # Always-on reliable strategies (the "core") + the user-configurable opt-ins
 # exposed as checkboxes in both AI bot panels.
@@ -2542,14 +2556,17 @@ def _delta_bot_tick():
             except Exception:
                 pass
 
+    er      = _bot_efficiency_ratio(candles, cfg)
+    er_tag  = _bot_er_tag(candles, cfg)
     with delta_ai_lock:
         delta_ai_state['last_candles'] = candles[-150:]
         delta_ai_state['last_tick'] = {
             'time': int(_zd_time.time()), 'price': price,
             'strategy': strat['name'], 'signal': strat['signal'],
             'score': strat['score'], 'reason': strat['reason'],
-            'regime': '{} vol, {}'.format(regime['volatility'],
-                'trending ' + regime['direction'] if regime['trending'] else 'range'),
+            'regime': '{} vol, {} · {}'.format(regime['volatility'],
+                'trending ' + regime['direction'] if regime['trending'] else 'range', er_tag),
+            'er': er, 'ranging': _bot_is_ranging(candles, cfg),
             # Live values from Delta (when available) — used by /status for display
             'delta_live': delta_live_pos,
         }
@@ -2656,8 +2673,8 @@ def _delta_bot_tick():
                             delta_ai_state['position']['entryBarTime'] = _bartime
                             delta_ai_state['position']['contCount'] = _cont_n
             else:
-                _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {})'.format(
-                    symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
+                _bot_log('[Tick] [delta] {} px={} SL={} TP={} ({} from {}) [{}]'.format(
+                    symbol, price, pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice'], er_tag))
         else:
             if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
                 # Manual SuperTrend bias seed (Option D): open immediately at start,
@@ -2685,7 +2702,7 @@ def _delta_bot_tick():
                         _bot_log('[Tick] [delta] {} {} skipped — entry quality: {}'.format(
                             symbol, strat['signal'], qreason))
             else:
-                _bot_log('[Tick] [delta] {} price={} HOLD — {} (score {:.1f})'.format(symbol, price, strat['reason'], strat['score']))
+                _bot_log('[Tick] [delta] {} price={} HOLD — {} (score {:.1f}) [{}]'.format(symbol, price, strat['reason'], strat['score'], er_tag))
 
 def _delta_bot_loop():
     while True:
@@ -3449,6 +3466,8 @@ def _zd_bot_tick():
     else:
         strat = _tv_alert_signal(zd_ai_state, cfg, symbol)   # Claude off -> trade TV alerts
     mode   = cfg.get('mode', 'paper')
+    er      = _bot_efficiency_ratio(candles, cfg)
+    er_tag  = _bot_er_tag(candles, cfg)
 
     with zd_ai_lock:
         zd_ai_state['last_candles'] = candles[-150:]
@@ -3456,8 +3475,9 @@ def _zd_bot_tick():
             'time': int(_zd_time.time()), 'price': price,
             'strategy': strat['name'], 'signal': strat['signal'],
             'score': strat['score'], 'reason': strat['reason'],
-            'regime': '{} vol, {}'.format(regime['volatility'],
-                'trending ' + regime['direction'] if regime['trending'] else 'range'),
+            'regime': '{} vol, {} · {}'.format(regime['volatility'],
+                'trending ' + regime['direction'] if regime['trending'] else 'range', er_tag),
+            'er': er, 'ranging': _bot_is_ranging(candles, cfg),
         }
         # Outside market hours, place NO live orders (entry/exit/stop) — they fail
         # ('could not be converted to AMO') and leave the book inconsistent. Hold
@@ -3574,8 +3594,8 @@ def _zd_bot_tick():
                             zd_ai_state['position']['entryBarTime'] = _bartime
                             zd_ai_state['position']['contCount'] = _cont_n
             else:
-                _zd_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
-                    symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
+                _zd_log('[Tick] {} px={} SL={} TP={} ({} from {}) [{}]'.format(
+                    symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice'], er_tag))
         else:
             if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
                 # Manual SuperTrend bias seed (Option D): open immediately, bypass cooldown/quality.
@@ -3597,7 +3617,7 @@ def _zd_bot_tick():
                     else:
                         _zd_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
             else:
-                _zd_log('[Tick] {} price={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 2), strat['reason'], strat['score']))
+                _zd_log('[Tick] {} price={} HOLD — {} (score {:.1f}) [{}]'.format(symbol, round(price, 2), strat['reason'], strat['score'], er_tag))
 
 def _zd_bot_loop():
     while True:
@@ -4791,13 +4811,16 @@ def _mt_bot_tick():
     else:
         strat = _tv_alert_signal(mt_ai_state, cfg, symbol)   # Claude off -> trade TV alerts
     mode   = cfg.get('mode', 'paper')
+    er      = _bot_efficiency_ratio(candles, cfg)
+    er_tag  = _bot_er_tag(candles, cfg)
     with mt_ai_lock:
         mt_ai_state['last_candles'] = candles[-150:]
         mt_ai_state['last_tick'] = {
             'time': int(_zd_time.time()), 'price': price, 'strategy': strat['name'],
             'signal': strat['signal'], 'score': strat['score'], 'reason': strat['reason'],
-            'regime': '{} vol, {}'.format(regime['volatility'],
-                'trending ' + regime['direction'] if regime['trending'] else 'range'),
+            'regime': '{} vol, {} · {}'.format(regime['volatility'],
+                'trending ' + regime['direction'] if regime['trending'] else 'range', er_tag),
+            'er': er, 'ranging': _bot_is_ranging(candles, cfg),
         }
         pos = mt_ai_state.get('position')
         # --- Manual override (Open/Close buttons): runs before the signal logic ---
@@ -4882,8 +4905,8 @@ def _mt_bot_tick():
                             mt_ai_state['position']['entryBarTime'] = _bartime
                             mt_ai_state['position']['contCount'] = _cont_n
             else:
-                _mt_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
-                    symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
+                _mt_log('[Tick] {} px={} SL={} TP={} ({} from {}) [{}]'.format(
+                    symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice'], er_tag))
         else:
             if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
                 # Manual SuperTrend bias seed (Option D): open immediately, bypass cooldown/quality.
@@ -4905,7 +4928,7 @@ def _mt_bot_tick():
                     else:
                         _mt_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
             else:
-                _mt_log('[Tick] {} px={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 5), strat['reason'], strat['score']))
+                _mt_log('[Tick] {} px={} HOLD — {} (score {:.1f}) [{}]'.format(symbol, round(price, 5), strat['reason'], strat['score'], er_tag))
 
 def _mt_bot_loop():
     while True:
