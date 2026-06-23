@@ -1,19 +1,18 @@
 # TradingView Strategy & Integration
 
-How the AI bots use TradingView — channels, the webhook alert format, **entry/exit
-criteria**, symbol matching, SL/TP rules, the full plot map, and ready-to-paste alerts.
+How the AI bots trade from TradingView — the **dual SuperTrend + EMA** state machine,
+**entry/exit criteria**, TP-continuation, the **win-protect** filters, manual controls,
+the webhook alert format, symbol matching, SL/TP rules, and the full plot map.
 
-Core code lives in [`scripts/nifty_chart.py`](scripts/nifty_chart.py) (functions prefixed `_tv_`).
+Core code lives in [`scripts/nifty_chart.py`](scripts/nifty_chart.py) (functions prefixed `_tv_` / `_bot_`).
 
 ---
 
 ## 1. Two channels
-There is **no official API** for a user's private TradingView chart indicators, so the bot uses two realistic equivalents, surfaced per panel by the **📊 TradingView** toggle:
+There is **no official API** for a user's private TradingView indicators, so the bot uses two equivalents, toggled per panel by **📊 TradingView**:
 
-1. **Technical Analysis (auto)** — TradingView's public scanner per symbol+timeframe (`_tv_fetch_ta`): overall **STRONG BUY…STRONG SELL** rating + RSI, MACD histogram, Stochastic, ADX, MA/oscillator ratings. Cached ~20s.
-2. **Custom-indicator webhook** — your TradingView **alerts** (e.g. `Mangal_Zp.pine` / `Claude_AI.pine`) POST a JSON signal. This drives **TV-only trading**.
-
-Both merge in `_tv_context()` and show in the panel's TV box / `/api/aibot/tv/peek`.
+1. **Technical Analysis (auto)** — TradingView's public scanner per symbol+timeframe (`_tv_fetch_ta`): overall **STRONG BUY…STRONG SELL** rating + RSI, MACD, Stochastic, ADX, MA ratings. Cached ~20s. Used only as *context* for Claude.
+2. **Custom-indicator webhook** — your TradingView **alerts** POST JSON. This drives **TV-only trading** (Claude unticked).
 
 ---
 
@@ -21,84 +20,145 @@ Both merge in `_tv_context()` and show in the panel's TV box / `/api/aibot/tv/pe
 ```
 POST  https://mangal-view.onrender.com/api/aibot/tv/webhook?token=mangalview
 ```
-- No login (TradingView can't authenticate) — `?token=` guards it (`TV_WEBHOOK_TOKEN` env, default `mangalview`).
-- Parses the body as JSON **regardless of content-type** (TradingView often sends `text/plain`); falls back to plain `SYMBOL SIGNAL` text.
-- Stores the latest alert **per symbol**, logs it to `log.txt` as `[TV-ALERT] …`, and mirrors it into any running bot whose symbol matches.
+- No login (`?token=` guards it — `TV_WEBHOOK_TOKEN` env, default `mangalview`).
+- Parses the body as JSON **regardless of content-type** (TradingView often sends `text/plain`); falls back to plain `SYMBOL SIGNAL`.
+- Stores the latest alert **per symbol** (`_TV_WEBHOOK`) for display/log, **and** — when `indicator` is `SuperTrend` or `EMA` — the latest of each **per instrument root** (`_TV_IND`) to drive the dual state machine.
 
 ---
 
-## 3. Alert payload — accepted fields
+## 3. The trading model — SuperTrend (primary) + EMA (secondary) ⭐
 
-### Fields the bot ACTS on
-| Field | Meaning |
-|---|---|
-| `symbol` (or `ticker`) | **Required.** Root-matched to the bot (exchange prefix, `.P`, `1!`, `…JUNFUT` stripped). |
-| `signal` (or `action`) | **Required to trade.** `BUY`/`LONG` → long, `SELL`/`SHORT` → short. |
-| `price` | Entry/context price; used to convert absolute `sl`/`tp` → %. |
-| `slPct` / `tpPct` | Stop / target **percent** from entry (used directly). |
-| `sl` / `tp` | Stop / target **absolute price** → converted to % from `price`. |
-| `support`, `resistance`, `psar`, `rangeTop`, `rangeBottom` | Structural levels — bot sets SL = nearest support below price, TP = nearest resistance above (mirrored for SELL). |
-| `test` | `true` → **never traded** (the 🧪 Test button) — only shown/logged. |
+When Claude is **off** and a `SuperTrend` and/or `EMA` alert exists for the symbol, the bot runs a **dual state machine** (`_tv_dual_signal`):
 
-**SL/TP precedence** (`_tv_apply_sltp`): `slPct`/`tpPct` → else `sl`/`tp` (absolute) → else structural levels → else **panel default %** (from `Default.csv`).
-Numeric fields are tolerant of stray wrappers: `"{0.25}"` and `"0.25%"` both parse to `0.25`. `null`/`NaN`/unresolved `{{…}}` are dropped.
+> **SuperTrend = PRIMARY** → the only thing that **opens** a position.
+> **EMA 5/13 = SECONDARY** → **exit only**; it never opens and never reverses.
 
-### Fields shown / logged / fed to Claude (not traded directly)
-| Field | Meaning |
-|---|---|
-| `indicator` (or `strategy`) | Label in log/display, e.g. `[DIY zp v1]`. |
-| `note` (or `comment`, `message`) | Free text. |
-| Any other scalar (`tf`, `vwap`, MAs, BB, Ichimoku, `longSignal`, …) | Captured (**max 24**), shown in the box + log, passed to Claude as context. |
+| SuperTrend | EMA | Action |
+|---|---|---|
+| BUY/SELL alert, **flat** | — | **OPEN** in the SuperTrend direction |
+| same side already held | — | hold (reaffirm) |
+| flip while holding (EMA exists) | — | **hold** — exit is EMA's job (faster, less laggy) |
+| flip while holding (**no EMA** for symbol) | — | **reverse** (close + open) so there's still a way out |
+| — | EMA prints **opposite** to the open side | **CLOSE** (flat) — `EMA exit` |
+| — (no SuperTrend yet) | EMA only, flat | **nothing** — entries require SuperTrend |
 
-### TradingView placeholders (global — these are indicators, not strategies)
-`{{ticker}}`, `{{exchange}}`, `{{close}}`, `{{open}}`, `{{high}}`, `{{low}}`, `{{volume}}`, `{{time}}`, `{{timenow}}`, `{{interval}}`, and `{{plot_0}}…{{plot_N}}`.
-`{{strategy.order.action}}` does **not** work (indicator, not a `strategy()`).
+It is **edge-triggered**: it acts once on the **newest unacted** alert (`_tv_acted_ts`).
 
-### JSON rules
-- Only `price` may be unquoted (`{{close}}` always resolves to a number). Quote everything else: `"sl":"{{plot_17}}"`.
-- Never use `{{plot("Title")}}` — inner quotes break JSON. Use `{{plot_N}}`.
+**EMA exit is always reachable.** The exit branch runs even when **no SuperTrend alert is stored**, so a **manual / seed / continuation** position still gets the fast EMA exit. (Earlier this was gated behind SuperTrend, which left such positions unprotected — fixed.)
+
+### Why this shape
+SuperTrend is a confirmed-but-laggy trend signal — great for *direction*, poor for *exit timing*. EMA 5/13 flips faster, so it cuts losers early instead of waiting for the slow opposite SuperTrend. Entries stay disciplined (SuperTrend only); exits stay fast (EMA).
 
 ---
 
-## 4. Entry / Exit criteria  ⭐
+## 4. Entry / Exit criteria
 
-### TV-only mode (Claude AI unticked, TradingView on)
-The bot trades the alert **literally** (`_tv_alert_signal` / `_tv_alert_leg_signal`):
+### ENTRY (open a position)
+| Source | Opens when | Direction | SL / TP | Skips cooldown+quality? |
+|---|---|---|---|---|
+| **SuperTrend** (primary) | SuperTrend alert while **flat** and **not ranging** (chop filter) | alert BUY/SELL | from the SuperTrend alert (`slPct`/`tpPct` → `sl`/`tp` → structure → panel default) | No |
+| **EMA** | never | — | — | — |
+| **TP-continuation** | a `TP hit`, SuperTrend still backs the side, **not ranging**, depth < cap | same side | same TP%, **tighter SL** (= TP%, 1:1) | Yes |
+| **Manual seed** (Start bias) | you set Long/Short before Start | chosen | configured SL/TP (reuses last SuperTrend's if present) | Yes |
+| **Manual Open** (button) | you click Open while running | selected radio | configured SL/TP | Yes |
 
-**ENTRY**
-- A **real** (not `test`) `BUY`/`SELL` alert whose symbol root-matches the bot → enter that side.
-- **Acts once per alert** (`_tv_acted_ts`) — repeated identical alerts don't re-enter.
-- Entry SL/TP set from the alert per the precedence above; the fill price (not the alert's `price`) is the reference:
-  - Long: `SL = entry × (1 − slPct/100)`, `TP = entry × (1 + tpPct/100)`
-  - Short: mirrored (SL above, TP below).
+### EXIT (close a position) — checked every tick, intrabar on the bar's high/low; **SL has priority over TP**
+| Trigger | Reason label | Then |
+|---|---|---|
+| **EMA opposite cross** (any position, even with no SuperTrend) | `EMA exit` | flat — **no reverse** |
+| **TP hit** | `TP hit` | → TP-continuation (if eligible) |
+| **SL hit** | `SL hit` | flat |
+| **SuperTrend flip, no EMA** (ST-only symbol) | `signal reversal` | close + reverse |
+| **SuperTrend flip, EMA exists** | *(none)* | hold — EMA exits |
+| **Manual Close** button | `manual close` | flat |
+| **Manual Open opposite** | `manual reverse` | close + open chosen side |
+| **Max daily profit** | `max daily profit` | flat (profit-lock) |
+| **Max consec losses / daily loss** | — | flat **and bot stops** |
+| **Broker hard stop** (Zerodha live) | `SL hit (broker)` | flat |
 
-**EXIT** (checked every ~10s, intrabar on the bar's high/low; SL has priority over TP)
-1. **SL hit** — price reaches the stop → close (filled at the SL level).
-2. **TP hit** — price reaches the target → close.
-3. **Signal reversal** — the **opposite** alert arrives → close **and** open the other side (**stop-and-reverse**, see §8).
-4. **Daily profit lock** — realised + open P/L ≥ Max daily profit → bank and stop.
-5. **Circuit breakers** — Max consecutive losses or Max daily loss → stop the bot.
+**Entry-bar guard:** on the bar a position opens, SL/TP use **close only** (not the bar's high/low, which may predate the fill), so a stale wick can't instantly false-trigger an exit or a re-entry loop. Intrabar high/low applies from the next bar.
 
-**Market hours** — the live Zerodha bot places **no orders outside the exchange session** (MCX 09:00–23:30, NSE/BSE/NFO/BFO 09:15–15:30, CDS 09:00–17:00, weekends off). It holds and resumes next session. (Avoids the "could not be converted to AMO" error.)
+**SL/TP from the fill** (not the alert price): Long `SL = entry×(1−slPct/100)`, `TP = entry×(1+tpPct/100)`; Short mirrored.
 
-### Claude AI + TradingView mode
-Claude makes the entry/exit decision (trend → S/R → liquidity sweep → volume → R:R, see [claude_strategy.md](claude_strategy.md)); the TV **rating + alert fields** are *context* that lift/lower its conviction. Test alerts are ignored.
+**Market hours** — the live Zerodha bot places **no orders outside the session** (MCX 09:00–23:30, NSE/BSE/NFO/BFO 09:15–15:30, CDS 09:00–17:00, weekends off).
 
 ---
 
-## 5. Ready-to-paste alerts (Mangal_Zp.pine)
+## 5. TP-continuation (trend scalping)
+When a position closes on **TP** and SuperTrend still backs the side, the bot **re-enters the same side** at the current price to keep riding the trend. Win-protected:
 
-Create **two** alerts — Condition → `DIY Custom Strategy Builder [ZP]` → **Buy Alert** and **Sell Alert** (not "Buy or Sell Alert" — no direction). "Once Per Bar Close", webhook URL above.
+- **Tighter SL on continuation legs** = `contSlPct` (default **0 → use TP%**, i.e. **1:1**). After the first banked TP the chain can't be given back ("breakeven after first TP").
+- **Depth cap** = `maxCont` (default **4**) — after that it stays flat and waits for a fresh SuperTrend (avoids chasing exhaustion). Tracked on `position['contCount']`.
+- **Chop guard** — continuation is **skipped if the market is ranging** (see §6).
+- Re-entry log: `TP re-entry (continuation #N)`.
 
-### BUY  (fixed 0.4% SL/TP + structural levels as context)
+---
+
+## 6. Win-protect: the chop filter & how `minER` works ⭐
+
+Every loss cluster in the live logs happened in **ranging / choppy** markets. The bot **skips TV entries (and continuation) in chop** using the **Kaufman Efficiency Ratio (ER)** — `_bot_is_ranging()`.
+
+### How ER is calculated
+Over the last **N** candles (`rangeLook`, default **20**), on closes:
+
+```
+       | close[last] − close[first] |          (net directional move)
+ER  =  ─────────────────────────────────
+        Σ | close[i] − close[i−1] |            (total path travelled)
+```
+
+- **Numerator** = how far price moved **net** (start → end).
+- **Denominator** = the **whole zig-zag path** (sum of every bar-to-bar move).
+- **ER ∈ [0, 1]**: **1.0** = a perfectly straight trend (net = path); **→0** = lots of back-and-forth that goes nowhere (chop).
+
+### What `minER` is
+`minER` is **not calculated** — it's the **threshold you set**. The market is treated as **ranging when `ER < minER`** (default **0.28**):
+
+| ER vs minER | Meaning | Bot |
+|---|---|---|
+| `ER ≥ minER` | clean enough trend | **allows** entries / continuation |
+| `ER < minER` | choppy, going nowhere | **skips** entries (`skipped — ranging`) |
+
+It's **instrument-agnostic** (a ratio, not a %), so it works for crypto % swings *and* small GOLDTEN ticks — unlike a fixed-% trend test. Lower `minER` to allow choppier entries; raise it to demand cleaner trends. Turn the whole filter off with **avoidRange = false**.
+
+### Win-protect config knobs (panel "🛡 Win-protect" row, all directional bots)
+| Knob | Default | Meaning |
+|---|---|---|
+| `avoidRange` | **on** | enable the chop filter |
+| `minER` | **0.28** | ranging when ER < this |
+| `rangeLook` | 20 | ER lookback (candles) |
+| `maxCont` | **4** | TP-continuation chain-depth cap |
+| `contSlPct` | **0** | continuation SL% (0 = use TP%, 1:1) |
+
+---
+
+## 7. Manual controls (all directional bots: Delta, Zerodha, MT5)
+
+### Start bias — Option D (`🧭 Start bias` row)
+Open the **first** entry at Start instead of waiting for a SuperTrend flip. Buttons **▲ Long / ▼ Short / 🔍 Detect current / ✖ None**; Detect reads the live SuperTrend (`GET /api/aibot/tv/bias`). The chosen bias rides the start payload (`seedBias`) and is consumed **once** on the first flat tick (`_tv_alert_signal`), reusing the last SuperTrend's SL/TP if present (else panel defaults). Bypasses cooldown/quality.
+
+### Open / Close override (`✋ Manual` row)
+Hand-trade while the bot runs: **Long/Short radios + Open + Close**. `POST /api/aibot/<broker>/manual {action, side}` queues a command the tick executes (before the signal logic):
+- **Open** → enter at market in the selected direction with the configured SL/TP; if holding the opposite side it **reverses**; same side is a no-op.
+- **Close** → flatten at market (`manual close`).
+
+Manual and seed positions are still **EMA-exited** and obey SL/TP — the §3 fix makes that work even with no SuperTrend.
+
+---
+
+## 8. Ready-to-paste alerts
+
+Send **both** indicators to the same webhook (same `{{ticker}}`; matched by root). `indicator` **must** be exactly `SuperTrend` or `EMA` (case-insensitive) for the dual machine to engage.
+
+### SuperTrend (primary — opens, carries SL/TP + context)
 ```json
 {
   "symbol": "{{ticker}}",
   "exchange": "{{exchange}}",
   "signal": "BUY",
   "price": {{close}},
-  "slPct": 0.4,
-  "tpPct": 0.4,
+  "slPct": 2.0,
+  "tpPct": 0.3,
   "support": "{{plot_17}}",
   "resistance": "{{plot_16}}",
   "psar": "{{plot_14}}",
@@ -112,41 +172,66 @@ Create **two** alerts — Condition → `DIY Custom Strategy Builder [ZP]` → *
   "bbLower": "{{plot_20}}",
   "ma1": "{{plot_0}}",
   "ma2": "{{plot_1}}",
-  "ma4": "{{plot_3}}",
-  "ma5": "{{plot_4}}",
-  "longSignal": "{{plot_21}}",
-  "shortSignal": "{{plot_22}}",
   "tf": "{{interval}}",
-  "indicator": "DIY zp v1"
+  "indicator": "SuperTrend"
 }
 ```
-**SELL** = same body with `"signal": "SELL"`.
+**SELL** = same with `"signal": "SELL"`. Create **two** alerts (Buy / Sell), "Once Per Bar Close".
 
-- With `slPct`/`tpPct` present, **SL/TP = 0.4% fixed**; `support`/`resistance`/etc. are context only.
-- To make **structure** drive SL/TP instead, **remove `slPct`/`tpPct`** → SL = nearest support, TP = nearest resistance.
-- Keep ≤ **24** non-core fields (the cap).
+### EMA 5/13 (secondary — exit only, no SL/TP needed)
+```json
+{
+  "symbol": "{{ticker}}",
+  "exchange": "{{exchange}}",
+  "signal": "BUY",
+  "price": {{close}},
+  "tf": "{{interval}}",
+  "indicator": "EMA"
+}
+```
+**SELL** = same with `"signal": "SELL"`. Fire on the EMA 5/13 cross (Buy = 5 crosses above 13, Sell = below).
 
 ---
 
-## 6. Mangal_Zp.pine — full plot map
-`{{plot_N}}` counts `plot()` calls in declaration order (`plotshape`/`plotcandle` excluded). Each carries a value **only when its Switch Board toggle is ON** — otherwise it sends `na` and the bot drops it.
+## 9. Alert payload — accepted fields
+
+### Acted on
+| Field | Meaning |
+|---|---|
+| `symbol`/`ticker` | **Required.** Root-matched (exchange prefix, `.P`, `1!`, `…JUNFUT` stripped). |
+| `signal`/`action` | **Required.** `BUY`/`LONG` → long, `SELL`/`SHORT` → short. |
+| `indicator` | `SuperTrend` / `EMA` engage the dual machine; anything else = a legacy single-alert symbol. |
+| `price` | Fill/context price; converts absolute `sl`/`tp` → %. |
+| `slPct`/`tpPct` | Stop/target **percent** (used directly). |
+| `sl`/`tp` | Stop/target **absolute** → converted to % from `price`. |
+| `support`,`resistance`,`psar`,`rangeTop`,`rangeBottom` | Structure — SL = nearest support below, TP = nearest resistance above (mirrored for SELL). |
+| `test` | `true` → **never traded** (🧪 Test). |
+
+**SL/TP precedence** (`_tv_apply_sltp`): `slPct`/`tpPct` → `sl`/`tp` → structure → **panel default**. Numeric fields tolerate `"{0.25}"` / `"0.25%"` → `0.25`; `null`/`NaN`/`{{…}}` dropped.
+
+### Context only (shown/logged/fed to Claude)
+`note`/`comment`/`message`, and any other scalar (`tf`, `vwap`, MAs, BB, Ichimoku, `longSignal`…), **max 24** fields.
+
+### Placeholders
+`{{ticker}}`, `{{exchange}}`, `{{close}}`, `{{open}}`, `{{high}}`, `{{low}}`, `{{volume}}`, `{{interval}}`, `{{plot_0}}…{{plot_N}}`. Only `price` may be unquoted; quote everything else. Never `{{plot("Title")}}` (inner quotes break JSON) — use `{{plot_N}}`.
+
+---
+
+## 10. Mangal_Zp.pine — full plot map
+`{{plot_N}}` counts `plot()` calls in declaration order. Each carries a value **only when its Switch Board toggle is ON** (else `na`, dropped).
 
 | Plot | Title | Switch | Use as |
 |---|---|---|---|
-| `plot_0` | MA 1 | EMA | EMA 5 — fast trend / dynamic S/R |
+| `plot_0` | MA 1 | EMA | EMA 5 — fast trend |
 | `plot_1` | MA 2 | EMA | EMA 13 — fast trend |
 | `plot_2` | MA 3 | EMA | EMA 20 (off by default) |
 | `plot_3` | MA 4 | EMA | EMA 50 — medium trend |
-| `plot_4` | MA 5 | EMA | EMA 200 — major trend / strong S/R |
+| `plot_4` | MA 5 | EMA | EMA 200 — major trend |
 | `plot_5` | Range Filter | Range Filter | trend filter line |
 | `plot_6` | Up Trend | Supertrend | trailing **support** (uptrend) |
 | `plot_7` | Down Trend | Supertrend | trailing **resistance** (downtrend) |
 | `plot_8` | HalfTrend | Half Trend | trend direction line |
-| `plot_9` | Conversion Line | Ichimoku | Tenkan |
-| `plot_10` | Base Line | Ichimoku | Kijun |
-| `plot_11` | Lagging Span | Ichimoku | Chikou |
-| `plot_12` | Leading Span A | Ichimoku | cloud edge (S/R) |
-| `plot_13` | Leading Span B | Ichimoku | cloud edge (S/R) |
+| `plot_9`–`plot_13` | Ichimoku | Ichimoku | Tenkan / Kijun / Chikou / cloud A / cloud B |
 | `plot_14` | ParabolicSAR | PSAR | trailing stop / dynamic S/R |
 | `plot_15` | VWAP | VWAP | volume-weighted mean |
 | `plot_16` | Range Top | Range Detector | **resistance** |
@@ -154,62 +239,51 @@ Create **two** alerts — Condition → `DIY Custom Strategy Builder [ZP]` → *
 | `plot_18` | Basis | Bollinger | BB middle (20-SMA) |
 | `plot_19` | Upper | Bollinger | BB upper → **resistance** |
 | `plot_20` | Lower | Bollinger | BB lower → **support** |
-| `plot_21` | long Signal | always | `100` when a BUY fires, else `na` |
-| `plot_22` | Short Signal | always | `-100` when a SELL fires, else `na` |
+| `plot_21` | long Signal | always | `100` on a BUY, else `na` |
+| `plot_22` | Short Signal | always | `-100` on a SELL, else `na` |
 
-Indices are tied to **this script version** — if you add/remove any `plot()`, they shift; re-check with a probe alert (`"p0":"{{plot_0}}", …`) and read the values in `log.txt`.
-
-The indicator emits 3 `alertcondition`s: **Buy Alert** (`BUY`), **Sell Alert** (`SELL`), **Buy or Sell Alert** (combined — avoid). No exit alerts; exits are the bot's job.
+Indices are tied to **this script version** — if you add/remove any `plot()` they shift; re-check with a probe alert (`"p0":"{{plot_0}}", …`) and read `log.txt`.
 
 ---
 
-## 7. Symbol matching (`_tv_root`)
-Alert symbol and bot tradingsymbol are normalised to a **root**:
-- strip `EXCHANGE:` → `BITSTAMP:BTCUSD` → `BTCUSD`
-- strip `.P` / `.PERP` → `PAXGUSD.P` → `PAXGUSD`
-- strip continuous `1!` → `GOLDTEN1!` → `GOLDTEN`
-- strip Kite expiry/FUT → `GOLDTEN26JUNFUT` / `GOLDTEN26JULFUT` → `GOLDTEN`
-
-So `GOLDTEN1!` drives a bot on `GOLDTEN26JUNFUT` (any month). `_tv_alert_for()` returns the **newest** matching alert; `skip_test=True` (trading) means a Test alert never blocks or fires a trade.
+## 11. Symbol matching (`_tv_root`)
+Alert symbol and bot tradingsymbol normalise to a **root**: strip `EXCHANGE:`, `.P`/`.PERP`, continuous `1!`, Kite `…26JUNFUT`. So `GOLDTEN1!` drives a bot on `GOLDTEN26JUNFUT` (any month). `_tv_alert_for()` returns the **newest** match; trading uses `skip_test=True` so a Test alert never fires a trade.
 
 ---
 
-## 8. Stop-and-reverse (directional bots: Zerodha, Delta, MT5)
-On a **signal reversal** (opposite alert / Claude flip) while in a position, the bot **closes and immediately opens the opposite side** in the same tick (bypassing cooldown/quality — the flip *is* the signal), using the new alert's SL/TP. Example: long + `SELL` → close long → open short.
-- **SL-hit / TP-hit** exits go **flat** (no reverse) — wait for the next alert.
-- The Options (two-leg) bot is not included.
+## 12. Live order placement (Zerodha/Kite)
+MCX/Kite reject plain MARKET orders ("market protection"), so:
+- **Entries & exits** use **LIMIT** with a spread-crossing band (fills like market).
+- **Broker hard stop** = **SL (stop-limit)**, limit only **0.02%** beyond the trigger; the bot's soft tick-stop backstops a violent skip (`_zd_place_stop_live` / `_zd_modify_stop_live`).
+- Hard stops are **DAY** orders → cancelled at session close (no overnight carry).
 
 ---
 
-## 9. Live order placement (Zerodha/Kite)
-MCX/Kite reject plain MARKET orders via API ("market protection"), so:
-- **Entries & exits** use **LIMIT** with an aggressive spread-crossing band (fills like market, accepted).
-- **Broker hard stop** uses **SL (stop-limit)** with a limit only **0.02%** beyond the trigger (≈29 pts on GOLDTEN) so it fills near the trigger; the bot's soft tick-stop backstops a violent skip. Kept in sync with the position SL (`_zd_place_stop_live` / `_zd_modify_stop_live`).
-- Hard stops are **DAY** orders → the exchange cancels them at session close; they don't carry overnight.
+## 13. Panel features
+- **🧭 Start bias** (§7), **✋ Manual** open/close (§7), **🛡 Win-protect** knobs (§6) — on Delta, Zerodha, MT5.
+- **💰 Leverage & Qty** (Delta) — capital × leverage → quantity.
+- **↺ Reset** → `POST /api/aibot/<broker>/reset` stops the bot and wipes state.
+- **Defaults** (`Default.csv`): Capital 100000, Daily loss 2000, Daily profit 10000, Model Sonnet.
+- **Zerodha session persistence**: `zerodha_session.json` (gitignored) keeps you logged in across restarts (token expires ~6am IST).
 
 ---
 
-## 10. Panel features
-- **↺ Reset** (header) → `POST /api/aibot/<broker>/reset` stops the bot and wipes state (position, trades, log, config, counters); the panel restores defaults.
-- **Defaults** (`Default.csv` + HTML): Capital **100000**, Daily loss **2000**, Daily profit **10000**, Model **Sonnet**, Tick **2m**.
-- **Zerodha session persistence**: `api_secret` + `access_token` saved to `zerodha_session.json` (gitignored) and reloaded on startup within ~a day, so a restart keeps you logged in (token expires ~6am IST; a dead one is caught by `/verify`).
-
----
-
-## 11. Test / verify
-- **🧪 Test** button: POSTs a sample `test:true` alert → shows as `(TEST — not traded)`, **never trades**. Confirms the webhook + display path.
-- **Terminal self-test:**
+## 14. Test / verify
+- **🧪 Test** button → sample `test:true` alert → `(TEST — not traded)`.
+- **Terminal:**
   ```
   curl -X POST "https://mangal-view.onrender.com/api/aibot/tv/webhook?token=mangalview" \
        -H "Content-Type: application/json" \
-       -d '{"symbol":"BTCUSD","signal":"BUY","price":64000,"indicator":"test"}'
+       -d '{"symbol":"BTCUSD","signal":"BUY","price":64000,"indicator":"SuperTrend","slPct":2,"tpPct":0.3}'
   ```
-  Expect `{"success":true}`, then the panel TV box shows the alert.
+  Expect `{"success":true}`.
+- **Bias readout:** `GET /api/aibot/tv/bias?symbol=SOLUSD` → current SuperTrend/EMA direction + age.
 
 ---
 
-## 12. Caveats
-- Webhook alerts require a **paid TradingView plan**; use the deployed (Render) URL — TradingView can't reach `localhost`; Render free sleeps, so the first alert after idle may cold-start.
-- TV-only mode follows the alert literally — your indicator's quality is the whole edge. Supertrend-type signals whipsaw in chop; the **Max consecutive losses / Max daily loss** breakers are the safety net.
-- Open MCX positions are **unprotected overnight** (hard stop is a DAY order; the bot places no orders after close).
+## 15. Caveats
+- Webhook alerts need a **paid TradingView plan**; use the Render URL (TradingView can't reach `localhost`; Render free sleeps → first alert may cold-start).
+- The dual machine only engages when `indicator` is exactly `SuperTrend`/`EMA`. An **EMA-only** symbol (no SuperTrend yet) **never opens** — by design.
+- The chop filter (`avoidRange`) trades **fewer but cleaner** entries; if a bot looks idle the log shows `skipped — ranging (ER<…)` — lower `minER` or untick Avoid chop to loosen.
+- Open MCX positions are **unprotected overnight** (hard stop is a DAY order).
 - Always paper-trade first.
