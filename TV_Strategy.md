@@ -56,7 +56,7 @@ SuperTrend is a confirmed-but-laggy trend signal — great for *direction*, poor
 ### ENTRY (open a position)
 | Source | Opens when | Direction | SL / TP | Skips cooldown+quality? |
 |---|---|---|---|---|
-| **SuperTrend** (primary) | SuperTrend alert while **flat** and **not ranging** (chop filter) | alert BUY/SELL | from the SuperTrend alert (`slPct`/`tpPct` → `sl`/`tp` → structure → panel default) | No |
+| **SuperTrend** (primary) | SuperTrend alert while **flat**, **not ranging** (chop filter), **and trend-aligned** (EMA50/200 gate) | alert BUY/SELL | from the SuperTrend alert (`slPct`/`tpPct` → `sl`/`tp` → structure → panel default) | No |
 | **EMA** | never | — | — | — |
 | **TP-continuation** | a `TP hit`, SuperTrend still backs the side, **not ranging**, depth < cap | same side | same TP%, **tighter SL** (= TP%, 1:1) | Yes |
 | **Manual seed** (Start bias) | you set Long/Short before Start | chosen | configured SL/TP (reuses last SuperTrend's if present) | Yes |
@@ -121,6 +121,19 @@ ER  =  ────────────────────────�
 
 It's **instrument-agnostic** (a ratio, not a %), so it works for crypto % swings *and* small GOLDTEN ticks — unlike a fixed-% trend test. Lower `minER` to allow choppier entries; raise it to demand cleaner trends. Turn the whole filter off with **avoidRange = false**.
 
+### EMA 50 / 200 trend gate ⭐ (`_tv_trend_gate_ok`)
+A direction filter on top of the chop filter: **only enter WITH the higher trend**, so the bot won't short a market grinding up (the SOL −5.36) or buy one grinding down. It reads **`ma4` (EMA 50)** and **`ma5` (EMA 200)** from the **SuperTrend alert**:
+
+```
+BUY  allowed only if  price > EMA200 (ma5)  AND  EMA50 (ma4) > EMA200
+SELL allowed only if  price < EMA200         AND  EMA50 < EMA200
+else → skip the entry, logged "skip <side> — counter-trend (…EMA200)"
+```
+
+- Applied at the **SuperTrend flat-open** only (seed / manual / continuation / EMA-exit are untouched).
+- **Fails open:** if `ma4`/`ma5` aren't in the alert (Switch Board toggles off / not sent), it **can't judge → passes** — nothing breaks if you omit them.
+- On the live SOL data it blocks every counter-trend SuperTrend SELL (price was above a rising EMA200) — only longs into the up-drift would have fired.
+
 ### Win-protect config knobs (panel "🛡 Win-protect" row, all directional bots)
 | Knob | Default | Meaning |
 |---|---|---|
@@ -129,6 +142,9 @@ It's **instrument-agnostic** (a ratio, not a %), so it works for crypto % swings
 | `rangeLook` | 20 | ER lookback (candles) |
 | `maxCont` | **4** | TP-continuation chain-depth cap |
 | `contSlPct` | **0** | continuation SL% (0 = use TP%, 1:1) |
+| `trendGate` | **on** | EMA50/200 trend gate (needs `ma4`/`ma5` in the SuperTrend alert) |
+
+**Stacked entry filters (max win):** trend gate (direction) → chop filter (only in a trend, not chop) → EMA 5/13 (fast exit) → 1:1 continuation (protect banked profit).
 
 ---
 
@@ -157,8 +173,8 @@ Send **both** indicators to the same webhook (same `{{ticker}}`; matched by root
   "exchange": "{{exchange}}",
   "signal": "BUY",
   "price": {{close}},
-  "slPct": 2.0,
-  "tpPct": 0.3,
+  "slPct": 1.0,
+  "tpPct": 0.4,
   "support": "{{plot_17}}",
   "resistance": "{{plot_16}}",
   "psar": "{{plot_14}}",
@@ -172,11 +188,17 @@ Send **both** indicators to the same webhook (same `{{ticker}}`; matched by root
   "bbLower": "{{plot_20}}",
   "ma1": "{{plot_0}}",
   "ma2": "{{plot_1}}",
+  "ma3": "{{plot_2}}",
+  "ma4": "{{plot_3}}",
+  "ma5": "{{plot_4}}",
   "tf": "{{interval}}",
   "indicator": "SuperTrend"
 }
 ```
 **SELL** = same with `"signal": "SELL"`. Create **two** alerts (Buy / Sell), "Once Per Bar Close".
+
+- **`ma4` = EMA 50 (`plot_3`)** and **`ma5` = EMA 200 (`plot_4`)** drive the **trend gate** (§6) — turn their Switch Board toggles **ON** or they send `na` and the gate can't judge (passes through).
+- `slPct`/`tpPct` shown are the SOL recommendation (`1.0` / `0.4`). Rule of thumb: **TP ≥ 3× round-trip fee** and **SL ≈ 2–2.5× TP**; e.g. GOLDTEN `slPct 0.6 / tpPct 0.25`. Continuation legs ignore this SL and use `contSlPct` (0 → TP%, 1:1).
 
 ### EMA 5/13 (secondary — exit only, no SL/TP needed)
 ```json
@@ -205,6 +227,7 @@ Send **both** indicators to the same webhook (same `{{ticker}}`; matched by root
 | `slPct`/`tpPct` | Stop/target **percent** (used directly). |
 | `sl`/`tp` | Stop/target **absolute** → converted to % from `price`. |
 | `support`,`resistance`,`psar`,`rangeTop`,`rangeBottom` | Structure — SL = nearest support below, TP = nearest resistance above (mirrored for SELL). |
+| `ma4` (EMA 50), `ma5` (EMA 200) | **Trend gate** (§6) — entry allowed only with the EMA50/200 trend. Omit them and the gate passes through. |
 | `test` | `true` → **never traded** (🧪 Test). |
 
 **SL/TP precedence** (`_tv_apply_sltp`): `slPct`/`tpPct` → `sl`/`tp` → structure → **panel default**. Numeric fields tolerate `"{0.25}"` / `"0.25%"` → `0.25`; `null`/`NaN`/`{{…}}` dropped.
