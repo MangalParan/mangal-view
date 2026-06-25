@@ -2759,6 +2759,7 @@ def delta_aibot_start():
             'minER':      float(data.get('minER', 0.28) or 0.28),     # ranging if efficiency ratio < this
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
+            'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -3669,6 +3670,7 @@ def zd_aibot_start():
             'minER':      float(data.get('minER', 0.28) or 0.28),     # ranging if efficiency ratio < this
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
+            'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -4978,6 +4980,7 @@ def mt_aibot_start():
             'minER':      float(data.get('minER', 0.28) or 0.28),     # ranging if efficiency ratio < this
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
+            'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -5378,6 +5381,26 @@ def _tv_dual_aligned(cfg, symbol, side, base=''):
         return True   # not in dual mode -> don't block continuation
     return st.get('signal') == side
 
+def _tv_trend_gate_ok(st, side, cfg=None):
+    """Higher-trend filter (EMA50/200): only enter WITH the slow trend, so the bot
+    won't short a market grinding up (the SOL -5.36) or buy one grinding down. Reads
+    ma4 (EMA50) and ma5 (EMA200) from the SuperTrend alert:
+      BUY  needs price > EMA200 and EMA50 > EMA200
+      SELL needs price < EMA200 and EMA50 < EMA200
+    Returns (ok, reason). If the EMAs aren't present (toggles off / not sent) it
+    passes — can't judge, don't block. Disabled with trendGate=False."""
+    if cfg is not None and not cfg.get('trendGate', True):
+        return True, ''
+    f = {str(k).lower(): v for k, v in ((st or {}).get('fields') or {}).items()}
+    ema50  = _tv_num(f.get('ma4'))
+    ema200 = _tv_num(f.get('ma5'))
+    price  = _tv_num((st or {}).get('price'))
+    if not ema50 or not ema200 or not price:
+        return True, ''                      # no EMA50/200 in the alert -> can't judge
+    if side == 'BUY':
+        return (price > ema200 and ema50 > ema200), 'counter-trend (below EMA200)'
+    return (price < ema200 and ema50 < ema200), 'counter-trend (above EMA200)'
+
 def _tv_dual_signal(state, cfg, symbol, inds):
     """Dual-indicator logic — SuperTrend is PRIMARY (the only thing that OPENS a
     position); EMA 5/13 is SECONDARY (exit only, never opens):
@@ -5433,8 +5456,12 @@ def _tv_dual_signal(state, cfg, symbol, inds):
     if src == 'ST':
         # PRIMARY = entry only. Open from flat; reaffirm when already on-side.
         if cur is None:
+            ok, why = _tv_trend_gate_ok(st, st_dir, cfg)
+            if not ok:
+                return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
+                        'reason': 'TV dual: skip {} — {}'.format(st_dir, why)}
             out = {'name': 'tv', 'signal': st_dir, 'score': 10.0,
-                   'reason': 'TV dual: open {} (SuperTrend)'.format(st_dir)}
+                   'reason': 'TV dual: open {} (SuperTrend, trend-aligned)'.format(st_dir)}
             return _tv_apply_sltp(out, {'price': st.get('price'), 'fields': st.get('fields') or {}})
         if cur == st_dir:
             return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: holding {} (SuperTrend reaffirm)'.format(cur)}
@@ -16356,6 +16383,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="aiBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="aiBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="aiBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
+        <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="aiBotTrendGate" checked> Trend gate (EMA50/200)</label>
       </div>
 
       <!-- Control buttons -->
@@ -16585,6 +16613,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="mtBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="mtBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="mtBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
+        <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="mtBotTrendGate" checked> Trend gate (EMA50/200)</label>
       </div>
 
       <div class="zd-footer">
@@ -16770,6 +16799,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="deltaBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="deltaBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="deltaBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
+        <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="deltaBotTrendGate" checked> Trend gate (EMA50/200)</label>
       </div>
 
       <div class="zd-footer">
@@ -23194,6 +23224,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         minER:       parseFloat((document.getElementById('aiBotMinER')||{}).value) || 0.28,
         maxCont:     parseInt((document.getElementById('aiBotMaxCont')||{}).value) || 4,
         contSlPct:   parseFloat((document.getElementById('aiBotContSl')||{}).value) || 0,
+        trendGate:   !!(document.getElementById('aiBotTrendGate')||{}).checked,
         api_key:     s.apiKey || ''
       };
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -24201,6 +24232,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         minER:      parseFloat((document.getElementById('mtBotMinER')||{}).value) || 0.28,
         maxCont:    parseInt((document.getElementById('mtBotMaxCont')||{}).value) || 4,
         contSlPct:  parseFloat((document.getElementById('mtBotContSl')||{}).value) || 0,
+        trendGate:  !!(document.getElementById('mtBotTrendGate')||{}).checked,
         mt5_id: s.id || ''
       };
       if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
@@ -25100,6 +25132,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         minER:      parseFloat((document.getElementById('deltaBotMinER')||{}).value) || 0.28,
         maxCont:    parseInt((document.getElementById('deltaBotMaxCont')||{}).value) || 4,
         contSlPct:  parseFloat((document.getElementById('deltaBotContSl')||{}).value) || 0,
+        trendGate:  !!(document.getElementById('deltaBotTrendGate')||{}).checked,
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
