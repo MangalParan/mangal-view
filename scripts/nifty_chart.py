@@ -2648,7 +2648,7 @@ def _delta_bot_tick():
                 _delta_bot_close(exit_px, reason, mode)
                 _bartime = candles[-1].get('time')
                 # Stop & reverse: opposite signal closes then opens the other side.
-                if reason == 'signal reversal' and delta_ai_state.get('running') and not delta_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
+                if reason == 'signal reversal' and delta_ai_state.get('running') and not delta_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL') and not (cfg.get('emaMode') and _bot_is_ranging(candles, cfg)):
                     _bot_log('[Tick] [delta] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], price))
                     _delta_bot_open(strat['signal'], price, strat, mode)
                     if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = _bartime
@@ -2761,6 +2761,7 @@ def delta_aibot_start():
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
+            'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -3572,7 +3573,7 @@ def _zd_bot_tick():
                 _bartime = candles[-1].get('time')
                 # Stop & reverse: an opposite signal CLOSES the trade and immediately
                 # OPENS the other side (bypasses cooldown/quality — the flip is the signal).
-                if reason == 'signal reversal' and zd_ai_state.get('running') and not zd_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
+                if reason == 'signal reversal' and zd_ai_state.get('running') and not zd_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL') and not (cfg.get('emaMode') and _bot_is_ranging(candles, cfg)):
                     _zd_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 2)))
                     _zd_bot_open(strat['signal'], price, strat, mode)
                     if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = _bartime
@@ -3673,6 +3674,7 @@ def zd_aibot_start():
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
+            'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -4885,7 +4887,7 @@ def _mt_bot_tick():
                 _mt_bot_close(exit_px, reason, mode)
                 _bartime = candles[-1].get('time')
                 # Stop & reverse: opposite signal closes then opens the other side.
-                if reason == 'signal reversal' and mt_ai_state.get('running') and not mt_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL'):
+                if reason == 'signal reversal' and mt_ai_state.get('running') and not mt_ai_state.get('position') and strat['signal'] in ('BUY', 'SELL') and not (cfg.get('emaMode') and _bot_is_ranging(candles, cfg)):
                     _mt_log('[Tick] {} stop & reverse -> {} @ {}'.format(symbol, strat['signal'], round(price, 5)))
                     _mt_bot_open(strat['signal'], price, strat, mode)
                     if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = _bartime
@@ -4984,6 +4986,7 @@ def mt_aibot_start():
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
+            'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -5378,6 +5381,8 @@ def _tv_dual_aligned(cfg, symbol, side, base=''):
     Gates TP-continuation: keep re-entering only while SuperTrend still agrees.
     EMA is exit-only and does NOT gate continuation (an opposing EMA would already
     have closed the position via its own exit)."""
+    if cfg.get('emaMode'):
+        return True   # EMA-only mode: SuperTrend is ignored, never blocks continuation
     inds = _tv_ind_for(cfg, symbol, base)
     st = inds.get('SUPERTREND')
     if not st:
@@ -5409,9 +5414,10 @@ def _seed_sltp(cfg, symbol):
     slPct/tpPct so the first trade is sized like a real entry; else the panel's — but
     CAP the SL at maxSeedSlPct (default 2%) so a stale panel default (Delta defaults to
     5%) can't open an oversized stop. Fixes the SOL seed that opened with SL=5% because
-    no SuperTrend alert existed yet."""
-    st = _tv_ind_for(cfg, symbol).get('SUPERTREND')
-    f = {str(k).lower(): v for k, v in ((st or {}).get('fields') or {}).items()}
+    no SuperTrend alert existed yet. In EMA-only mode the seed reads the EMA alert."""
+    inds = _tv_ind_for(cfg, symbol)
+    src = inds.get('EMA') if cfg.get('emaMode') else inds.get('SUPERTREND')
+    f = {str(k).lower(): v for k, v in ((src or {}).get('fields') or {}).items()}
     slp = _tv_num(f.get('slpct'))
     tpp = _tv_num(f.get('tppct'))
     slp = slp if (slp and slp > 0) else float(cfg.get('slPct') or 1.0)
@@ -5495,6 +5501,38 @@ def _tv_dual_signal(state, cfg, symbol, inds):
     # unreachable (src is always EMA or ST)
     return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'TV dual: hold'}
 
+def _tv_ema_signal(state, cfg, symbol):
+    """EMA-ONLY mode (emaMode / the 'EMA 5/13' checkbox): the EMA 5/13 alert is BOTH
+    entry and exit; SuperTrend and the trend gate are ignored. Edge-triggered on the
+    newest EMA alert:
+      flat + BUY/SELL  -> OPEN that side
+      holding opposite -> REVERSE (close + open the other side)
+      holding same     -> hold (reaffirm)
+    Exits are: TP hit (-> continuation, capped by maxCont), the opposite EMA (reverse),
+    and the panel SL as a backstop. SL/TP come from the EMA alert (slPct/tpPct) when
+    present, else the panel — SL capped at maxSeedSlPct so it can't be the 5% default."""
+    ema = _tv_ind_for(cfg, symbol).get('EMA')
+    pos = state.get('position')
+    cur = pos.get('side') if pos else None
+    if not ema or ema.get('signal') not in ('BUY', 'SELL'):
+        _st = ('holding ' + cur) if cur else 'flat'
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'EMA mode: {} (waiting for EMA alert)'.format(_st)}
+    ema_dir = ema.get('signal'); ema_ts = int(ema.get('ts', 0))
+    acted = state.get('_tv_acted_ts', 0)
+    if ema_ts <= acted or cur == ema_dir:
+        _st = ('holding ' + cur) if cur else 'flat'
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'EMA mode: {} (EMA {})'.format(_st, ema_dir)}
+    state['_tv_acted_ts'] = ema_ts
+    out = {'name': 'tv', 'signal': ema_dir, 'score': 10.0,
+           'reason': 'EMA mode: {} {} (EMA 5/13)'.format('reverse' if cur else 'open', ema_dir)}
+    f = {str(k).lower(): v for k, v in (ema.get('fields') or {}).items()}
+    slp = _tv_num(f.get('slpct')); tpp = _tv_num(f.get('tppct'))
+    slp = slp if (slp and slp > 0) else float(cfg.get('slPct') or 1.0)
+    tpp = tpp if (tpp and tpp > 0) else float(cfg.get('tpPct') or 0.4)
+    cap = float(cfg.get('maxSeedSlPct', 2.0) or 2.0)
+    out['slPct'] = min(max(slp, 0.05), cap); out['tpPct'] = max(tpp, 0.05)
+    return out
+
 def _tv_alert_signal(state, cfg, symbol):
     """TV-ONLY mode (Claude AI not selected): trade directly off the latest UNACTED
     TradingView alert. BUY/LONG -> BUY, SELL/SHORT -> SELL. Acts once per alert.
@@ -5514,6 +5552,8 @@ def _tv_alert_signal(state, cfg, symbol):
                    'reason': 'Manual SuperTrend bias seed: open ' + seed}
             out.update(_seed_sltp(cfg, symbol))   # SuperTrend's SL/TP if any, else panel — SL capped (no 5%)
             return out
+    if cfg.get('emaMode'):                          # 'EMA 5/13' checkbox -> EMA is entry+exit, SuperTrend ignored
+        return _tv_ema_signal(state, cfg, symbol)
     inds = _tv_ind_for(cfg, symbol)
     if ('SUPERTREND' in inds) or ('EMA' in inds):
         return _tv_dual_signal(state, cfg, symbol, inds)
@@ -16353,6 +16393,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar" data-tv="aiBot" data-tv-broker="kite">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="aiBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="EMA-only mode: trade the EMA 5/13 alert directly (BUY→long, SELL→short); SuperTrend &amp; trend gate are ignored. Exits on TP%/opposite-EMA + SL backstop; TP-continuation up to 'Max cont.' then waits for the next EMA alert."><input type="checkbox" id="aiBotEmaMode" checked> EMA 5/13 mode</label>
         <label>Symbol <input type="text" id="aiBotTVSym" placeholder="auto e.g. NSE:RELIANCE" style="min-width:150px"></label>
         <button class="zd-add-btn" id="aiBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="aiBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -16585,6 +16626,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar" data-tv="mtBot" data-tv-broker="mt5">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="mtBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="EMA-only mode: trade the EMA 5/13 alert directly (BUY→long, SELL→short); SuperTrend &amp; trend gate are ignored. Exits on TP%/opposite-EMA + SL backstop; TP-continuation up to 'Max cont.' then waits for the next EMA alert."><input type="checkbox" id="mtBotEmaMode" checked> EMA 5/13 mode</label>
         <label>Symbol <input type="text" id="mtBotTVSym" placeholder="auto e.g. FX:EURUSD" style="min-width:150px"></label>
         <button class="zd-add-btn" id="mtBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="mtBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -16761,6 +16803,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar" data-tv="deltaBot" data-tv-broker="delta">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="deltaBotTV"> Use TradingView (Claude weighs it)</label>
+        <label title="EMA-only mode: trade the EMA 5/13 alert directly (BUY→long, SELL→short); SuperTrend &amp; trend gate are ignored. Exits on TP%/opposite-EMA + SL backstop; TP-continuation up to 'Max cont.' then waits for the next EMA alert."><input type="checkbox" id="deltaBotEmaMode" checked> EMA 5/13 mode</label>
         <label>Symbol <input type="text" id="deltaBotTVSym" placeholder="auto e.g. BINANCE:BTCUSDT" style="min-width:160px"></label>
         <button class="zd-add-btn" id="deltaBotTVBtn" type="button">&#128268; Connect</button>
         <button class="zd-add-btn" id="deltaBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
@@ -23176,13 +23219,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const bsym = symEl.value.trim().toUpperCase();
       if (!bsym) { logLine('Enter a symbol first.', 'info'); return; }
       zBiasDetect.disabled = true; zRenderBias('detecting…');
+      const useEma = !!(document.getElementById('aiBotEmaMode')||{}).checked;
       fetch('/api/aibot/tv/bias?symbol=' + encodeURIComponent(bsym))
         .then(r => r.json()).then(function(res) {
-          if (!res.success || !res.bias) { zRenderBias('no SuperTrend alert yet'); logLine('[Bias] No SuperTrend alert stored for ' + bsym + ' yet.', 'info'); return; }
-          zdSeedBias = res.bias;
-          const stx = res.superTrend || {}; const age = (stx.ageSec != null) ? ' (' + stx.ageSec + 's ago)' : '';
-          zRenderBias('live ST ' + res.bias + age);
-          logLine('[Bias] Detected SuperTrend ' + res.bias + ' for ' + bsym + age, 'info');
+          const srcObj = useEma ? (res.ema || {}) : (res.superTrend || {});
+          const dir = srcObj.signal || (useEma ? '' : res.bias);
+          if (!res.success || !dir) { zRenderBias('no ' + (useEma ? 'EMA' : 'SuperTrend') + ' alert yet'); logLine('[Bias] No ' + (useEma ? 'EMA' : 'SuperTrend') + ' alert stored for ' + bsym + ' yet.', 'info'); return; }
+          zdSeedBias = dir;
+          const age = (srcObj.ageSec != null) ? ' (' + srcObj.ageSec + 's ago)' : '';
+          zRenderBias('live ' + (useEma ? 'EMA' : 'ST') + ' ' + dir + age);
+          logLine('[Bias] Detected ' + (useEma ? 'EMA' : 'SuperTrend') + ' ' + dir + ' for ' + bsym + age, 'info');
         }).catch(e => { zRenderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
         .finally(() => { zBiasDetect.disabled = false; });
     });
@@ -23242,6 +23288,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxCont:     parseInt((document.getElementById('aiBotMaxCont')||{}).value) || 4,
         contSlPct:   parseFloat((document.getElementById('aiBotContSl')||{}).value) || 0,
         trendGate:   !!(document.getElementById('aiBotTrendGate')||{}).checked,
+        emaMode:     !!(document.getElementById('aiBotEmaMode')||{}).checked,
         api_key:     s.apiKey || ''
       };
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -24200,13 +24247,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const bsym = symEl.value.trim().toUpperCase();
       if (!bsym) { logLine('Enter a symbol first.', 'info'); return; }
       mBiasDetect.disabled = true; mRenderBias('detecting…');
+      const useEma = !!(document.getElementById('mtBotEmaMode')||{}).checked;
       fetch('/api/aibot/tv/bias?symbol=' + encodeURIComponent(bsym))
         .then(r => r.json()).then(function(res) {
-          if (!res.success || !res.bias) { mRenderBias('no SuperTrend alert yet'); logLine('[Bias] No SuperTrend alert stored for ' + bsym + ' yet.', 'info'); return; }
-          mtSeedBias = res.bias;
-          const stx = res.superTrend || {}; const age = (stx.ageSec != null) ? ' (' + stx.ageSec + 's ago)' : '';
-          mRenderBias('live ST ' + res.bias + age);
-          logLine('[Bias] Detected SuperTrend ' + res.bias + ' for ' + bsym + age, 'info');
+          const srcObj = useEma ? (res.ema || {}) : (res.superTrend || {});
+          const dir = srcObj.signal || (useEma ? '' : res.bias);
+          if (!res.success || !dir) { mRenderBias('no ' + (useEma ? 'EMA' : 'SuperTrend') + ' alert yet'); logLine('[Bias] No ' + (useEma ? 'EMA' : 'SuperTrend') + ' alert stored for ' + bsym + ' yet.', 'info'); return; }
+          mtSeedBias = dir;
+          const age = (srcObj.ageSec != null) ? ' (' + srcObj.ageSec + 's ago)' : '';
+          mRenderBias('live ' + (useEma ? 'EMA' : 'ST') + ' ' + dir + age);
+          logLine('[Bias] Detected ' + (useEma ? 'EMA' : 'SuperTrend') + ' ' + dir + ' for ' + bsym + age, 'info');
         }).catch(e => { mRenderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
         .finally(() => { mBiasDetect.disabled = false; });
     });
@@ -24250,6 +24300,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxCont:    parseInt((document.getElementById('mtBotMaxCont')||{}).value) || 4,
         contSlPct:  parseFloat((document.getElementById('mtBotContSl')||{}).value) || 0,
         trendGate:  !!(document.getElementById('mtBotTrendGate')||{}).checked,
+        emaMode:    !!(document.getElementById('mtBotEmaMode')||{}).checked,
         mt5_id: s.id || ''
       };
       if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
@@ -24822,14 +24873,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const sym = symEl.value.trim().toUpperCase();
       if (!sym) { logLine('Enter a Delta symbol first.', 'info'); return; }
       biasDetectBtn.disabled = true; renderBias('detecting…');
+      const useEma = !!(document.getElementById('deltaBotEmaMode')||{}).checked;
       fetch('/api/aibot/tv/bias?symbol=' + encodeURIComponent(sym))
         .then(r => r.json()).then(function(res) {
-          if (!res.success || !res.bias) { renderBias('no SuperTrend alert yet'); logLine('[Bias] No SuperTrend alert stored for ' + sym + ' yet.', 'info'); return; }
-          deltaSeedBias = res.bias;
-          const st = res.superTrend || {};
-          const age = (st.ageSec != null) ? ' (' + st.ageSec + 's ago)' : '';
-          renderBias('live ST ' + res.bias + age);
-          logLine('[Bias] Detected SuperTrend ' + res.bias + ' for ' + sym + age, 'info');
+          const srcObj = useEma ? (res.ema || {}) : (res.superTrend || {});
+          const dir = srcObj.signal || (useEma ? '' : res.bias);
+          if (!res.success || !dir) { renderBias('no ' + (useEma ? 'EMA' : 'SuperTrend') + ' alert yet'); logLine('[Bias] No ' + (useEma ? 'EMA' : 'SuperTrend') + ' alert stored for ' + sym + ' yet.', 'info'); return; }
+          deltaSeedBias = dir;
+          const age = (srcObj.ageSec != null) ? ' (' + srcObj.ageSec + 's ago)' : '';
+          renderBias('live ' + (useEma ? 'EMA' : 'ST') + ' ' + dir + age);
+          logLine('[Bias] Detected ' + (useEma ? 'EMA' : 'SuperTrend') + ' ' + dir + ' for ' + sym + age, 'info');
         }).catch(e => { renderBias('detect error'); logLine('[Bias] detect error: ' + e.message, 'info'); })
         .finally(() => { biasDetectBtn.disabled = false; });
     });
@@ -25150,6 +25203,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxCont:    parseInt((document.getElementById('deltaBotMaxCont')||{}).value) || 4,
         contSlPct:  parseFloat((document.getElementById('deltaBotContSl')||{}).value) || 0,
         trendGate:  !!(document.getElementById('deltaBotTrendGate')||{}).checked,
+        emaMode:    !!(document.getElementById('deltaBotEmaMode')||{}).checked,
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
