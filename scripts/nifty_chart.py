@@ -2604,9 +2604,9 @@ def _delta_bot_tick():
                     if pos:
                         _bot_log('[Manual] [delta] reverse — close {} then open {}'.format(pos['side'], _mside))
                         _delta_bot_close(price, 'manual reverse', mode)
-                    _ms = _tv_apply_sltp({'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
-                                          'reason': 'manual open ' + _mside},
-                                         {'price': None, 'fields': ((_tv_ind_for(cfg, symbol).get('SUPERTREND') or {}).get('fields') or {})})
+                    _ms = {'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
+                           'reason': 'manual open ' + _mside}
+                    _ms.update(_seed_sltp(cfg, symbol))   # SL capped — never the 5% panel default
                     _bot_log('[Manual] [delta] open {} {} @ {}'.format(_mside, symbol, price))
                     _delta_bot_open(_mside, price, _ms, mode)
                     if delta_ai_state.get('position'):
@@ -2760,6 +2760,7 @@ def delta_aibot_start():
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
+            'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -3524,9 +3525,9 @@ def _zd_bot_tick():
                     if pos:
                         _zd_log('[Manual] reverse — close {} then open {}'.format(pos['side'], _mside))
                         _zd_bot_close(price, 'manual reverse', mode)
-                    _ms = _tv_apply_sltp({'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
-                                          'reason': 'manual open ' + _mside},
-                                         {'price': None, 'fields': ((_tv_ind_for(cfg, symbol).get('SUPERTREND') or {}).get('fields') or {})})
+                    _ms = {'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
+                           'reason': 'manual open ' + _mside}
+                    _ms.update(_seed_sltp(cfg, symbol))   # SL capped — never the 5% panel default
                     _zd_log('[Manual] open {} {} @ {}'.format(_mside, symbol, round(price, 2)))
                     _zd_bot_open(_mside, price, _ms, mode)
                     if zd_ai_state.get('position'):
@@ -3671,6 +3672,7 @@ def zd_aibot_start():
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
+            'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -4842,9 +4844,9 @@ def _mt_bot_tick():
                     if pos:
                         _mt_log('[Manual] reverse — close {} then open {}'.format(pos['side'], _mside))
                         _mt_bot_close(price, 'manual reverse', mode)
-                    _ms = _tv_apply_sltp({'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
-                                          'reason': 'manual open ' + _mside},
-                                         {'price': None, 'fields': ((_tv_ind_for(cfg, symbol).get('SUPERTREND') or {}).get('fields') or {})})
+                    _ms = {'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
+                           'reason': 'manual open ' + _mside}
+                    _ms.update(_seed_sltp(cfg, symbol))   # SL capped — never the 5% panel default
                     _mt_log('[Manual] open {} {} @ {}'.format(_mside, symbol, round(price, 5)))
                     _mt_bot_open(_mside, price, _ms, mode)
                     if mt_ai_state.get('position'):
@@ -4981,6 +4983,7 @@ def mt_aibot_start():
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
+            'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -5401,6 +5404,21 @@ def _tv_trend_gate_ok(st, side, cfg=None):
         return (price > ema200 and ema50 > ema200), 'counter-trend (below EMA200)'
     return (price < ema200 and ema50 < ema200), 'counter-trend (above EMA200)'
 
+def _seed_sltp(cfg, symbol):
+    """SL/TP% for a manual seed / manual Open. Prefer the latest SuperTrend alert's
+    slPct/tpPct so the first trade is sized like a real entry; else the panel's — but
+    CAP the SL at maxSeedSlPct (default 2%) so a stale panel default (Delta defaults to
+    5%) can't open an oversized stop. Fixes the SOL seed that opened with SL=5% because
+    no SuperTrend alert existed yet."""
+    st = _tv_ind_for(cfg, symbol).get('SUPERTREND')
+    f = {str(k).lower(): v for k, v in ((st or {}).get('fields') or {}).items()}
+    slp = _tv_num(f.get('slpct'))
+    tpp = _tv_num(f.get('tppct'))
+    slp = slp if (slp and slp > 0) else float(cfg.get('slPct') or 1.0)
+    tpp = tpp if (tpp and tpp > 0) else float(cfg.get('tpPct') or 0.4)
+    cap = float(cfg.get('maxSeedSlPct', 2.0) or 2.0)
+    return {'slPct': min(max(slp, 0.05), cap), 'tpPct': max(tpp, 0.05)}
+
 def _tv_dual_signal(state, cfg, symbol, inds):
     """Dual-indicator logic — SuperTrend is PRIMARY (the only thing that OPENS a
     position); EMA 5/13 is SECONDARY (exit only, never opens):
@@ -5492,11 +5510,10 @@ def _tv_alert_signal(state, cfg, symbol):
     if seed in ('BUY', 'SELL'):
         state.pop('seedBias', None)                  # consume once, whatever happens
         if not state.get('position'):
-            st0 = _tv_ind_for(cfg, symbol).get('SUPERTREND')
-            fields0 = (st0.get('fields') if st0 else None) or {}   # reuse last ST slPct/tpPct/structure if any
             out = {'name': 'tv', 'signal': seed, 'score': 10.0, 'seed': True,
                    'reason': 'Manual SuperTrend bias seed: open ' + seed}
-            return _tv_apply_sltp(out, {'price': None, 'fields': fields0})
+            out.update(_seed_sltp(cfg, symbol))   # SuperTrend's SL/TP if any, else panel — SL capped (no 5%)
+            return out
     inds = _tv_ind_for(cfg, symbol)
     if ('SUPERTREND' in inds) or ('EMA' in inds):
         return _tv_dual_signal(state, cfg, symbol, inds)
