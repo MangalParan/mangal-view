@@ -162,8 +162,12 @@ else → skip the entry, logged "skip <side> — counter-trend (…EMA200)"
 | `trendGate` | **on** | EMA50/200 trend gate (needs `ma4`/`ma5` in the SuperTrend alert) |
 | `emaMode` | **on** | EMA-only mode — EMA alert is entry+exit, SuperTrend ignored (§3) |
 | `maxSeedSlPct` | **2.0** | cap on the SL% a seed / manual Open / EMA-mode entry can use (blocks the 5% panel default) |
+| `pendingSec` | **60** | "Defer ER (s)" — hold a chop-skipped signal this long and take it if ER recovers (0 = off) |
 
 **Stacked entry filters (max win):** trend gate (direction) → chop filter (only in a trend, not chop) → EMA 5/13 (fast exit) → 1:1 continuation (protect banked profit).
+
+### Deferred entry on ER recovery (`pendingSec`, `_bot_take_deferred`)
+A signal skipped because the market was **ranging** is not discarded — it's **held** and **taken the moment ER climbs back ≥ `minER`**, as long as it's still fresh (within `pendingSec`, default **60s**; the **"Defer ER (s)"** field, 0 = off). The recovered entry opens with the original side + SL/TP and then rides the normal TP-continuation. A fresh signal / seed / manual Open supersedes a pending one; an expired one is dropped. Tick logs: `skipped — ranging … deferred until ER recovers` then `deferred entry taken — ER recovered [ER 0.31 trend]`.
 
 ---
 
@@ -308,8 +312,16 @@ MCX/Kite reject plain MARKET orders ("market protection"), so:
 - **🧭 Start bias** (§7), **✋ Manual** open/close (§7), **🛡 Win-protect** knobs (§6) — on Delta, Zerodha, MT5.
 - **💰 Leverage & Qty** (Delta) — capital × leverage → quantity.
 - **↺ Reset** → `POST /api/aibot/<broker>/reset` stops the bot and wipes state.
+- **Config logged on Start:** clicking **Start Bot** writes a `[CONFIG]` line to the panel log and `log.txt` with **every parameter** for the run (capital, qty, SL/TP, leverage, maxConsec/Loss/Profit, cooldown, tick, avoidRange/minER/rangeLook, maxCont, contSlPct, trendGate, emaMode, pendingSec, maxSeedSlPct, seedBias, strategies, claude flag…) so a session can be reproduced/audited.
 - **Defaults** (`Default.csv`): Capital 100000, Daily loss 2000, Daily profit 10000, Model Sonnet.
 - **Zerodha session persistence**: `zerodha_session.json` (gitignored) keeps you logged in across restarts (token expires ~6am IST).
+
+### Journal — `scripts/log_to_journal.py`
+Parses the bot logs into **`Journal.xlsx`** (gitignored, contains live order data): sheets **Trades** (paired entry/exit + PnL/R), **Alerts** (webhook fields), **Config** (one row per Start, every parameter from the `[CONFIG]` line), **Events** (raw lines), **Summary** (per-symbol win%/PnL).
+```
+python scripts/log_to_journal.py                 # logs/*.txt + log.txt
+python scripts/log_to_journal.py a.txt -o J.xlsx
+```
 
 ---
 

@@ -7,6 +7,8 @@ the pasted session logs) and writes a structured, reusable trading journal:
   Sheet "Trades"  — one row per ENTRY..EXIT pair (entry/exit px, PnL, R, reason,
                     SL/TP, order ids, whether it was a TP-continuation re-entry).
   Sheet "Alerts"  — every TV-ALERT webhook with its indicator fields broken out.
+  Sheet "Config"  — one row per BOT START: every parameter logged ([CONFIG] line)
+                    so each run's settings can be reproduced/audited.
   Sheet "Events"  — every parsed log line (timestamp, bot, category, message).
   Sheet "Summary" — per-symbol and overall stats (trades, win%, gross/net PnL).
 
@@ -222,6 +224,33 @@ def build_workbook(events, alerts, trades, out_path):
     for a in alerts:
         wa.append([a.get(c, '') for c in acols])
     _style_header(wa, len(acols)); _autofit(wa, maxw=24)
+
+    # ---- Config (one row per BOT START — every parameter logged for that run) ----
+    cfg_keys = ['claude', 'mode', 'symbol', 'symbols', 'autoSymbol', 'exchange', 'qty', 'tf',
+                'capital', 'leverage', 'slPct', 'tpPct', 'maxConsec', 'maxLoss', 'maxProfit',
+                'minScore', 'scoreBuffer', 'cooldownSec', 'tickSec', 'qualityFilter', 'avoidRange',
+                'minER', 'rangeLook', 'maxCont', 'contSlPct', 'trendGate', 'emaMode', 'pendingSec',
+                'maxSeedSlPct', 'hardStop', 'tvEnabled', 'tvSymbol', 'model', 'strategies', 'seedBias']
+    cfg_rows = []
+    for e in events:
+        if e.get('category') == 'CONFIG':
+            kv = {}
+            for tok in e['msg'].split():
+                if '=' in tok:
+                    k, v = tok.split('=', 1); kv[k] = v
+            cfg_rows.append((e['time'], e['bot'], kv))
+    if cfg_rows:
+        extra = []
+        for _, _, kv in cfg_rows:
+            for k in kv:
+                if k not in cfg_keys and k not in extra:
+                    extra.append(k)
+        wc = wb.create_sheet('Config')
+        cols = ['Time', 'Bot'] + cfg_keys + extra
+        wc.append([c.title() if c in ('time', 'bot') else c for c in cols])
+        for ts, bot, kv in cfg_rows:
+            wc.append([ts, bot] + [kv.get(k, '') for k in cfg_keys + extra])
+        _style_header(wc, len(cols)); _autofit(wc, maxw=24)
 
     # ---- Events (raw) ----
     we = wb.create_sheet('Events')
