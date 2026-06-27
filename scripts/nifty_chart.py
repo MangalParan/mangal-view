@@ -1848,6 +1848,35 @@ def _bot_er_tag(candles, cfg):
         return 'ER —'
     return 'ER {:.2f} {}'.format(er, 'chop' if er < float((cfg or {}).get('minER', 0.28) or 0.28) else 'trend')
 
+def _bot_defer_entry(state, cfg, strat):
+    """Remember a chop-skipped entry so it can be taken once ER recovers (within a
+    freshness window pendingSec, default 600s). Stores the side + the alert's SL/TP."""
+    state['_pending'] = {
+        'side': strat['signal'], 'slPct': strat.get('slPct'), 'tpPct': strat.get('tpPct'),
+        'expires': int(_zd_time.time()) + int(cfg.get('pendingSec', 600) or 600),
+    }
+
+def _bot_take_deferred(state, cfg, candles, price, open_fn, mode):
+    """If a chop-skipped entry is pending and ER has now RECOVERED (and it's still
+    fresh), open it. Returns True if it opened. Implements 'deferred entry on ER
+    recovery'; the position then rides the normal TP-continuation logic."""
+    pend = state.get('_pending')
+    if not pend:
+        return False
+    if int(_zd_time.time()) > int(pend.get('expires', 0)):
+        state.pop('_pending', None); return False   # expired before ER recovered
+    if _bot_is_ranging(candles, cfg):
+        return False                                  # still choppy — keep waiting
+    side = pend.get('side')
+    state.pop('_pending', None)
+    strat = {'name': 'tv', 'signal': side, 'score': 10.0, 'seed': True,
+             'reason': 'deferred entry (ER recovered)',
+             'slPct': pend.get('slPct'), 'tpPct': pend.get('tpPct')}
+    open_fn(side, price, strat, mode)
+    if state.get('position'):
+        state['position']['entryBarTime'] = candles[-1].get('time')
+    return True
+
 # Always-on reliable strategies (the "core") + the user-configurable opt-ins
 # exposed as checkboxes in both AI bot panels.
 _BOT_CORE_ALGOS         = ['trend', 'momentum', 'breakout', 'smartmoney', 'orderflow']
@@ -2679,6 +2708,7 @@ def _delta_bot_tick():
             if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
                 # Manual SuperTrend bias seed (Option D): open immediately at start,
                 # bypassing cooldown/quality (the user explicitly chose this entry).
+                delta_ai_state.pop('_pending', None)
                 _bot_log('[Tick] [delta] {} manual bias seed -> open {} @ {}'.format(symbol, strat['signal'], price))
                 _delta_bot_open(strat['signal'], price, strat, mode)
                 if delta_ai_state.get('position'): delta_ai_state['position']['entryBarTime'] = candles[-1].get('time')
@@ -2691,9 +2721,11 @@ def _delta_bot_tick():
                     _bot_log('[Tick] [delta] {} {} skipped — cooldown {}s after last exit'.format(
                         symbol, strat['signal'], cooldown))
                 elif (not _bot_is_claude(cfg)) and _bot_is_ranging(candles, cfg):
-                    _bot_log('[Tick] [delta] {} {} skipped — ranging (chop filter, ER<{})'.format(
+                    _bot_defer_entry(delta_ai_state, cfg, strat)   # take it when ER recovers
+                    _bot_log('[Tick] [delta] {} {} skipped — ranging (chop filter, ER<{}); deferred until ER recovers'.format(
                         symbol, strat['signal'], cfg.get('minER', 0.28)))
                 else:
+                    delta_ai_state.pop('_pending', None)
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _delta_bot_open(strat['signal'], price, strat, mode)
@@ -2701,6 +2733,8 @@ def _delta_bot_tick():
                     else:
                         _bot_log('[Tick] [delta] {} {} skipped — entry quality: {}'.format(
                             symbol, strat['signal'], qreason))
+            elif _bot_take_deferred(delta_ai_state, cfg, candles, price, _delta_bot_open, mode):
+                _bot_log('[Tick] [delta] {} deferred entry taken — ER recovered ({})'.format(symbol, er_tag))
             else:
                 _bot_log('[Tick] [delta] {} price={} HOLD — {} (score {:.1f}) [{}]'.format(symbol, price, strat['reason'], strat['score'], er_tag))
 
@@ -2762,6 +2796,7 @@ def delta_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
+            'pendingSec': int(data.get('pendingSec', 600) or 600),   # how long a chop-skipped entry waits for ER to recover
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -3602,6 +3637,7 @@ def _zd_bot_tick():
         else:
             if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
                 # Manual SuperTrend bias seed (Option D): open immediately, bypass cooldown/quality.
+                zd_ai_state.pop('_pending', None)
                 _zd_log('[Tick] {} manual bias seed -> open {} @ {}'.format(symbol, strat['signal'], round(price, 2)))
                 _zd_bot_open(strat['signal'], price, strat, mode)
                 if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = candles[-1].get('time')
@@ -3611,14 +3647,18 @@ def _zd_bot_tick():
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _zd_log('[Tick] {} {} skipped — cooldown {}s after last exit'.format(symbol, strat['signal'], cooldown))
                 elif (not _bot_is_claude(cfg)) and _bot_is_ranging(candles, cfg):
-                    _zd_log('[Tick] {} {} skipped — ranging (chop filter, ER<{})'.format(symbol, strat['signal'], cfg.get('minER', 0.28)))
+                    _bot_defer_entry(zd_ai_state, cfg, strat)   # take it when ER recovers
+                    _zd_log('[Tick] {} {} skipped — ranging (chop filter, ER<{}); deferred until ER recovers'.format(symbol, strat['signal'], cfg.get('minER', 0.28)))
                 else:
+                    zd_ai_state.pop('_pending', None)
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _zd_bot_open(strat['signal'], price, strat, mode)
                         if zd_ai_state.get('position'): zd_ai_state['position']['entryBarTime'] = candles[-1].get('time')
                     else:
                         _zd_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
+            elif _bot_take_deferred(zd_ai_state, cfg, candles, price, _zd_bot_open, mode):
+                _zd_log('[Tick] {} deferred entry taken — ER recovered ({})'.format(symbol, er_tag))
             else:
                 _zd_log('[Tick] {} price={} HOLD — {} (score {:.1f}) [{}]'.format(symbol, round(price, 2), strat['reason'], strat['score'], er_tag))
 
@@ -3675,6 +3715,7 @@ def zd_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
+            'pendingSec': int(data.get('pendingSec', 600) or 600),   # how long a chop-skipped entry waits for ER to recover
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -4916,6 +4957,7 @@ def _mt_bot_tick():
         else:
             if strat['signal'] in ('BUY', 'SELL') and strat.get('seed'):
                 # Manual SuperTrend bias seed (Option D): open immediately, bypass cooldown/quality.
+                mt_ai_state.pop('_pending', None)
                 _mt_log('[Tick] {} manual bias seed -> open {} @ {}'.format(symbol, strat['signal'], round(price, 5)))
                 _mt_bot_open(strat['signal'], price, strat, mode)
                 if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = candles[-1].get('time')
@@ -4925,14 +4967,18 @@ def _mt_bot_tick():
                 if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
                     _mt_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, strat['signal'], cooldown))
                 elif (not _bot_is_claude(cfg)) and _bot_is_ranging(candles, cfg):
-                    _mt_log('[Tick] {} {} skipped — ranging (chop filter, ER<{})'.format(symbol, strat['signal'], cfg.get('minER', 0.28)))
+                    _bot_defer_entry(mt_ai_state, cfg, strat)   # take it when ER recovers
+                    _mt_log('[Tick] {} {} skipped — ranging (chop filter, ER<{}); deferred until ER recovers'.format(symbol, strat['signal'], cfg.get('minER', 0.28)))
                 else:
+                    mt_ai_state.pop('_pending', None)
                     ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(strat['signal'], candles, regime, cfg)
                     if ok:
                         _mt_bot_open(strat['signal'], price, strat, mode)
                         if mt_ai_state.get('position'): mt_ai_state['position']['entryBarTime'] = candles[-1].get('time')
                     else:
                         _mt_log('[Tick] {} {} skipped — entry quality: {}'.format(symbol, strat['signal'], qreason))
+            elif _bot_take_deferred(mt_ai_state, cfg, candles, price, _mt_bot_open, mode):
+                _mt_log('[Tick] {} deferred entry taken — ER recovered ({})'.format(symbol, er_tag))
             else:
                 _mt_log('[Tick] {} px={} HOLD — {} (score {:.1f}) [{}]'.format(symbol, round(price, 5), strat['reason'], strat['score'], er_tag))
 
@@ -4987,6 +5033,7 @@ def mt_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
+            'pendingSec': int(data.get('pendingSec', 600) or 600),   # how long a chop-skipped entry waits for ER to recover
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
