@@ -49,6 +49,23 @@ It is **edge-triggered**: it acts once on the **newest unacted** alert (`_tv_act
 ### Why this shape
 SuperTrend is a confirmed-but-laggy trend signal — great for *direction*, poor for *exit timing*. EMA 5/13 flips faster, so it cuts losers early instead of waiting for the slow opposite SuperTrend. Entries stay disciplined (SuperTrend only); exits stay fast (EMA).
 
+### EMA-only mode — the "EMA 5/13" checkbox ⭐ (`emaMode`, `_tv_ema_signal`)
+A second TV sub-mode (checkbox **default ON**). When on, the **EMA 5/13 alert is BOTH entry and exit** and **SuperTrend + the trend gate are ignored**:
+
+| EMA alert | Action |
+|---|---|
+| BUY/SELL while **flat** | **OPEN** that side |
+| **opposite** to the open side | **REVERSE** (close + open the other side) |
+| same side already held | hold (reaffirm) |
+
+- **Exits:** `TP hit` (→ continuation), the **opposite EMA** (reverse), and the **panel SL as a backstop** (capped at `maxSeedSlPct`, default 2% — never the 5% default).
+- **Reversals are chop-gated:** a reverse is **skipped while ranging** (`avoidRange`), so EMA 5/13 doesn't whipsaw in chop. Initial entries are chop-gated too.
+- **TP-continuation:** re-enter the same side up to **`maxCont`** (set it to **3** for "3 TPs then stop"), then it stays flat and **waits for the next EMA alert**.
+- **Seed / Detect** read the **EMA** direction (not SuperTrend) in this mode.
+- SL/TP come from the EMA alert's `slPct`/`tpPct` when present, else the panel (SL capped).
+
+**Highest-churn mode** — it trades every 5/13 cross. The **chop filter is what keeps it profitable**; don't disable `avoidRange` or drop `minER` below ~0.28, or the EMA whipsaw losses return. Uncheck the box to return to the SuperTrend-primary dual model above.
+
 ---
 
 ## 4. Entry / Exit criteria
@@ -143,6 +160,8 @@ else → skip the entry, logged "skip <side> — counter-trend (…EMA200)"
 | `maxCont` | **4** | TP-continuation chain-depth cap |
 | `contSlPct` | **0** | continuation SL% (0 = use TP%, 1:1) |
 | `trendGate` | **on** | EMA50/200 trend gate (needs `ma4`/`ma5` in the SuperTrend alert) |
+| `emaMode` | **on** | EMA-only mode — EMA alert is entry+exit, SuperTrend ignored (§3) |
+| `maxSeedSlPct` | **2.0** | cap on the SL% a seed / manual Open / EMA-mode entry can use (blocks the 5% panel default) |
 
 **Stacked entry filters (max win):** trend gate (direction) → chop filter (only in a trend, not chop) → EMA 5/13 (fast exit) → 1:1 continuation (protect banked profit).
 
@@ -200,18 +219,21 @@ Send **both** indicators to the same webhook (same `{{ticker}}`; matched by root
 - **`ma4` = EMA 50 (`plot_3`)** and **`ma5` = EMA 200 (`plot_4`)** drive the **trend gate** (§6) — turn their Switch Board toggles **ON** or they send `na` and the gate can't judge (passes through).
 - `slPct`/`tpPct` shown are the SOL recommendation (`1.0` / `0.4`). Rule of thumb: **TP ≥ 3× round-trip fee** and **SL ≈ 2–2.5× TP**; e.g. GOLDTEN `slPct 0.6 / tpPct 0.25`. Continuation legs ignore this SL and use `contSlPct` (0 → TP%, 1:1).
 
-### EMA 5/13 (secondary — exit only, no SL/TP needed)
+### EMA 5/13 (exit in dual mode; **entry+exit in EMA-only mode** — add `slPct`/`tpPct` for EMA mode)
 ```json
 {
   "symbol": "{{ticker}}",
   "exchange": "{{exchange}}",
   "signal": "BUY",
   "price": {{close}},
+  "slPct": 1.0,
+  "tpPct": 0.4,
   "tf": "{{interval}}",
   "indicator": "EMA"
 }
 ```
 **SELL** = same with `"signal": "SELL"`. Fire on the EMA 5/13 cross (Buy = 5 crosses above 13, Sell = below).
+- In the **dual** model this alert only **exits** (SL/TP optional). In **EMA-only mode** (§3, the "EMA 5/13" checkbox) it also **opens** — so include `slPct`/`tpPct` (else the panel default applies, SL capped at `maxSeedSlPct`).
 
 ---
 
