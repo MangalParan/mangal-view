@@ -1851,9 +1851,13 @@ def _bot_er_tag(candles, cfg):
 def _bot_defer_entry(state, cfg, strat):
     """Remember a chop-skipped entry so it can be taken once ER recovers (within a
     freshness window pendingSec, default 600s). Stores the side + the alert's SL/TP."""
+    _sec = cfg.get('pendingSec', 60)
+    _sec = int(_sec) if _sec is not None else 60
+    if _sec <= 0:
+        return   # deferral disabled (Defer ER = 0)
     state['_pending'] = {
         'side': strat['signal'], 'slPct': strat.get('slPct'), 'tpPct': strat.get('tpPct'),
-        'expires': int(_zd_time.time()) + int(cfg.get('pendingSec', 600) or 600),
+        'expires': int(_zd_time.time()) + _sec,
     }
 
 def _bot_take_deferred(state, cfg, candles, price, open_fn, mode):
@@ -1890,6 +1894,24 @@ def _bot_is_claude(cfg):
     """True when the 'Claude AI' strategy is selected — Claude decides trades on
     its own and NONE of the core/algo strategies are used."""
     return 'claude' in (cfg.get('allowedStrategies') or [])
+
+def _bot_cfg_summary(cfg, extra=None):
+    """One-line dump of every configurable parameter, logged to log.txt on Start so a
+    session can be reproduced/audited from the log alone."""
+    keys = ['mode', 'symbol', 'symbols', 'autoSymbol', 'exchange', 'qty', 'tf',
+            'capital', 'leverage', 'slPct', 'tpPct', 'maxConsec', 'maxLoss', 'maxProfit',
+            'minScore', 'scoreBuffer', 'cooldownSec', 'tickSec', 'qualityFilter',
+            'avoidRange', 'minER', 'rangeLook', 'maxCont', 'contSlPct', 'trendGate',
+            'emaMode', 'pendingSec', 'maxSeedSlPct', 'hardStop', 'tvEnabled', 'tvSymbol', 'model']
+    parts = ['claude=' + str(_bot_is_claude(cfg))]
+    for k in keys:
+        if k in cfg and cfg.get(k) not in (None, '', []):   # keep 0 / False (meaningful)
+            parts.append('{}={}'.format(k, cfg.get(k)))
+    if cfg.get('allowedStrategies'):
+        parts.append('strategies=' + ','.join(cfg.get('allowedStrategies')))
+    for k, v in (extra or {}).items():
+        parts.append('{}={}'.format(k, v))
+    return ' '.join(parts)
 
 def _bot_fetch_candles(symbol, interval, source, api_key=None):
     """Lightweight candle fetch for the bots. Claude-only mode needs raw candles,
@@ -2796,7 +2818,7 @@ def delta_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
-            'pendingSec': int(data.get('pendingSec', 600) or 600),   # how long a chop-skipped entry waits for ER to recover
+            'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -2827,6 +2849,9 @@ def delta_aibot_start():
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[DELTA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _cfg_line = _bot_cfg_summary(cfg, {'seedBias': delta_ai_state.get('seedBias') or '-'})
+    _bot_log('[Config] ' + _cfg_line)
+    _persist_log_line('[DELTA] [CONFIG] ' + _cfg_line)
     return jsonify({'success': True, 'message': 'Bot started server-side'})
 
 @app.route('/api/aibot/delta/manual', methods=['POST'])
@@ -3715,7 +3740,7 @@ def zd_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
-            'pendingSec': int(data.get('pendingSec', 600) or 600),   # how long a chop-skipped entry waits for ER to recover
+            'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -3747,6 +3772,9 @@ def zd_aibot_start():
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[ZERODHA] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _cfg_line = _bot_cfg_summary(cfg, {'seedBias': zd_ai_state.get('seedBias') or '-'})
+    _zd_log('[Config] ' + _cfg_line)
+    _persist_log_line('[ZERODHA] [CONFIG] ' + _cfg_line)
     return jsonify({'success': True, 'message': 'Bot started server-side'})
 
 @app.route('/api/aibot/zerodha/manual', methods=['POST'])
@@ -5033,7 +5061,7 @@ def mt_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
-            'pendingSec': int(data.get('pendingSec', 600) or 600),   # how long a chop-skipped entry waits for ER to recover
+            'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
             'includeMM':  bool(data.get('includeMM', False)),
             'includeMMA': bool(data.get('includeMMA', False)),
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
@@ -5065,6 +5093,9 @@ def mt_aibot_start():
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[MT5] [{}] BOT START {} qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), cfg['symbol'], cfg['qty'], cfg['tf']))
+    _cfg_line = _bot_cfg_summary(cfg, {'seedBias': mt_ai_state.get('seedBias') or '-'})
+    _mt_log('[Config] ' + _cfg_line)
+    _persist_log_line('[MT5] [CONFIG] ' + _cfg_line)
     if not _mt5_backend():
         _mt_log('[Note] MT5_BACKEND not set — running but no live data/orders. Set MT5_BACKEND=metatrader5 and reconnect.')
     return jsonify({'success': True, 'message': 'Bot started server-side'})
@@ -16489,6 +16520,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="aiBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="aiBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
         <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="aiBotTrendGate" checked> Trend gate (EMA50/200)</label>
+        <label title="A signal skipped in chop is held this many seconds and taken if ER recovers (deferred entry). 0 = off.">Defer ER (s) <input type="number" id="aiBotPendingSec" value="60" min="0" max="3600" step="10" style="width:60px"></label>
       </div>
 
       <!-- Control buttons -->
@@ -16720,6 +16752,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="mtBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="mtBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
         <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="mtBotTrendGate" checked> Trend gate (EMA50/200)</label>
+        <label title="A signal skipped in chop is held this many seconds and taken if ER recovers (deferred entry). 0 = off.">Defer ER (s) <input type="number" id="mtBotPendingSec" value="60" min="0" max="3600" step="10" style="width:60px"></label>
       </div>
 
       <div class="zd-footer">
@@ -16907,6 +16940,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="deltaBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="deltaBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
         <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="deltaBotTrendGate" checked> Trend gate (EMA50/200)</label>
+        <label title="A signal skipped in chop is held this many seconds and taken if ER recovers (deferred entry). 0 = off.">Defer ER (s) <input type="number" id="deltaBotPendingSec" value="60" min="0" max="3600" step="10" style="width:60px"></label>
       </div>
 
       <div class="zd-footer">
@@ -23336,6 +23370,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         contSlPct:   parseFloat((document.getElementById('aiBotContSl')||{}).value) || 0,
         trendGate:   !!(document.getElementById('aiBotTrendGate')||{}).checked,
         emaMode:     !!(document.getElementById('aiBotEmaMode')||{}).checked,
+        pendingSec:  parseInt((document.getElementById('aiBotPendingSec')||{}).value) || 0,
         api_key:     s.apiKey || ''
       };
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
@@ -24348,6 +24383,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         contSlPct:  parseFloat((document.getElementById('mtBotContSl')||{}).value) || 0,
         trendGate:  !!(document.getElementById('mtBotTrendGate')||{}).checked,
         emaMode:    !!(document.getElementById('mtBotEmaMode')||{}).checked,
+        pendingSec: parseInt((document.getElementById('mtBotPendingSec')||{}).value) || 0,
         mt5_id: s.id || ''
       };
       if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
@@ -25251,6 +25287,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         contSlPct:  parseFloat((document.getElementById('deltaBotContSl')||{}).value) || 0,
         trendGate:  !!(document.getElementById('deltaBotTrendGate')||{}).checked,
         emaMode:    !!(document.getElementById('deltaBotEmaMode')||{}).checked,
+        pendingSec: parseInt((document.getElementById('deltaBotPendingSec')||{}).value) || 0,
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
