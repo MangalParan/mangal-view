@@ -3266,11 +3266,14 @@ def _tg_picks_text(kind, universe):
         return title + ' — ' + _now_ist_str() + '\n\n(AI unavailable: ' + err + ')\n\n' + snap
     return title + ' — ' + _now_ist_str() + '\n\n' + (text or '').strip()
 
-# alert kind -> text builder
+# alert kind -> text builder. Scheduled alerts get the "- MangalView" sign-off;
+# log.txt event forwarding goes through _tg_flush_loop and is NOT signed.
 def _tg_alert_text(kind, universe='NIFTY500'):
     if kind == 'brief':
-        return _tg_morning_text()
-    return _tg_picks_text(kind, 'FNO' if kind == 'fno' else (universe or 'NIFTY500'))
+        txt = _tg_morning_text()
+    else:
+        txt = _tg_picks_text(kind, 'FNO' if kind == 'fno' else (universe or 'NIFTY500'))
+    return (txt or '').rstrip() + '\n\n- MangalView'
 
 def _tg_enqueue(line):
     if not (_TG_STATE.get('events') and _TG_STATE.get('masterOn')):
