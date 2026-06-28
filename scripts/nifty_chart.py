@@ -2820,6 +2820,7 @@ def delta_aibot_start():
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
+            'trendGateLoose': bool(data.get('trendGateLoose', False)),  # loose = price vs EMA200 only (skip the EMA50>EMA200 condition)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
@@ -3915,6 +3916,7 @@ def zd_aibot_start():
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
+            'trendGateLoose': bool(data.get('trendGateLoose', False)),  # loose = price vs EMA200 only (skip the EMA50>EMA200 condition)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
@@ -5236,6 +5238,7 @@ def mt_aibot_start():
             'maxCont':    int(data.get('maxCont', 4) or 4),           # cap TP-continuation chain depth
             'contSlPct':  float(data.get('contSlPct') or 0),         # tighter SL on continuation legs (0 = use TP%, 1:1)
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
+            'trendGateLoose': bool(data.get('trendGateLoose', False)),  # loose = price vs EMA200 only (skip the EMA50>EMA200 condition)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
@@ -5644,25 +5647,30 @@ def _tv_dual_aligned(cfg, symbol, side, base=''):
         return True   # not in dual mode -> don't block continuation
     return st.get('signal') == side
 
-def _tv_trend_gate_ok(st, side, cfg=None):
-    """Higher-trend filter (EMA50/200): only enter WITH the slow trend, so the bot
-    won't short a market grinding up (the SOL -5.36) or buy one grinding down. Reads
-    ma4 (EMA50) and ma5 (EMA200) from the SuperTrend alert:
-      BUY  needs price > EMA200 and EMA50 > EMA200
-      SELL needs price < EMA200 and EMA50 < EMA200
-    Returns (ok, reason). If the EMAs aren't present (toggles off / not sent) it
-    passes — can't judge, don't block. Disabled with trendGate=False."""
-    if cfg is not None and not cfg.get('trendGate', True):
+def _tv_trend_gate_ok(st, side, cfg=None, price=None):
+    """Higher-trend filter (EMA50/200): only enter WITH the slow trend. Reads ma4
+    (EMA50) and ma5 (EMA200) from the SuperTrend alert `st`; `price` overrides the
+    compare price (EMA mode passes the EMA-alert price, since EMA50/200 come from the
+    SuperTrend alert). Two modes via trendGateLoose:
+      strict: BUY needs price > EMA200 AND EMA50 > EMA200 (mirror for SELL)
+      loose : BUY needs price > EMA200 only               (mirror for SELL)
+    Returns (ok, reason). Passes when EMA200/price are missing (can't judge) or
+    trendGate=False."""
+    cfg = cfg or {}
+    if not cfg.get('trendGate', True):
         return True, ''
     f = {str(k).lower(): v for k, v in ((st or {}).get('fields') or {}).items()}
     ema50  = _tv_num(f.get('ma4'))
     ema200 = _tv_num(f.get('ma5'))
-    price  = _tv_num((st or {}).get('price'))
-    if not ema50 or not ema200 or not price:
-        return True, ''                      # no EMA50/200 in the alert -> can't judge
+    px = _tv_num(price) if price is not None else _tv_num((st or {}).get('price'))
+    if not ema200 or not px:
+        return True, ''                      # need EMA200 + a price to judge
+    loose = bool(cfg.get('trendGateLoose'))
     if side == 'BUY':
-        return (price > ema200 and ema50 > ema200), 'counter-trend (below EMA200)'
-    return (price < ema200 and ema50 < ema200), 'counter-trend (above EMA200)'
+        ok = (px > ema200) and (loose or not ema50 or ema50 > ema200)
+        return ok, 'counter-trend (below EMA200)'
+    ok = (px < ema200) and (loose or not ema50 or ema50 < ema200)
+    return ok, 'counter-trend (above EMA200)'
 
 def _seed_sltp(cfg, symbol):
     """SL/TP% for a manual seed / manual Open. Prefer the latest SuperTrend alert's
@@ -5758,15 +5766,17 @@ def _tv_dual_signal(state, cfg, symbol, inds):
 
 def _tv_ema_signal(state, cfg, symbol):
     """EMA-ONLY mode (emaMode / the 'EMA 5/13' checkbox): the EMA 5/13 alert is BOTH
-    entry and exit; SuperTrend and the trend gate are ignored. Edge-triggered on the
-    newest EMA alert:
+    entry and exit. Edge-triggered on the newest EMA alert:
       flat + BUY/SELL  -> OPEN that side
       holding opposite -> REVERSE (close + open the other side)
       holding same     -> hold (reaffirm)
-    Exits are: TP hit (-> continuation, capped by maxCont), the opposite EMA (reverse),
-    and the panel SL as a backstop. SL/TP come from the EMA alert (slPct/tpPct) when
-    present, else the panel — SL capped at maxSeedSlPct so it can't be the 5% default."""
-    ema = _tv_ind_for(cfg, symbol).get('EMA')
+    Trend gate (when on): the entry direction must agree with EMA50/200 read from the
+    SuperTrend alert (ma4/ma5); a counter-trend OPEN is skipped, a counter-trend
+    REVERSE just EXITS (no new counter-trend position). strict vs loose via
+    trendGateLoose. Exits: TP hit (-> continuation, capped by maxCont), opposite EMA,
+    panel SL backstop. SL/TP from the EMA alert (else panel), SL capped at maxSeedSlPct."""
+    inds = _tv_ind_for(cfg, symbol)
+    ema = inds.get('EMA')
     pos = state.get('position')
     cur = pos.get('side') if pos else None
     if not ema or ema.get('signal') not in ('BUY', 'SELL'):
@@ -5778,8 +5788,15 @@ def _tv_ema_signal(state, cfg, symbol):
         _st = ('holding ' + cur) if cur else 'flat'
         return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'EMA mode: {} (EMA {})'.format(_st, ema_dir)}
     state['_tv_acted_ts'] = ema_ts
+    # Trend gate: EMA50/200 from the SuperTrend alert, price from this EMA alert.
+    ok, why = _tv_trend_gate_ok(inds.get('SUPERTREND'), ema_dir, cfg, price=ema.get('price'))
+    if not ok:
+        if cur:   # holding -> exit, but don't open the counter-trend side
+            return {'name': 'tv', 'signal': 'CLOSE', 'score': 10.0,
+                    'reason': 'EMA mode: exit {} — new {} is {}'.format(cur, ema_dir, why)}
+        return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0, 'reason': 'EMA mode: skip {} — {}'.format(ema_dir, why)}
     out = {'name': 'tv', 'signal': ema_dir, 'score': 10.0,
-           'reason': 'EMA mode: {} {} (EMA 5/13)'.format('reverse' if cur else 'open', ema_dir)}
+           'reason': 'EMA mode: {} {} (EMA 5/13, trend-aligned)'.format('reverse' if cur else 'open', ema_dir)}
     f = {str(k).lower(): v for k, v in (ema.get('fields') or {}).items()}
     slp = _tv_num(f.get('slpct')); tpp = _tv_num(f.get('tppct'))
     slp = slp if (slp and slp > 0) else float(cfg.get('slPct') or 1.0)
@@ -16750,6 +16767,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="aiBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="aiBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
         <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="aiBotTrendGate" checked> Trend gate (EMA50/200)</label>
+        <label title="Loose = enter when price is on the right side of EMA200 only (skip the EMA50>EMA200 condition). Unticked = strict (needs both). EMA50/200 read from the SuperTrend alert."><input type="checkbox" id="aiBotTrendGateLoose"> Loose</label>
         <label title="A signal skipped in chop is held this many seconds and taken if ER recovers (deferred entry). 0 = off.">Defer ER (s) <input type="number" id="aiBotPendingSec" value="60" min="0" max="3600" step="10" style="width:60px"></label>
       </div>
 
@@ -16982,6 +17000,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="mtBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="mtBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
         <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="mtBotTrendGate" checked> Trend gate (EMA50/200)</label>
+        <label title="Loose = enter when price is on the right side of EMA200 only (skip the EMA50>EMA200 condition). Unticked = strict (needs both). EMA50/200 read from the SuperTrend alert."><input type="checkbox" id="mtBotTrendGateLoose"> Loose</label>
         <label title="A signal skipped in chop is held this many seconds and taken if ER recovers (deferred entry). 0 = off.">Defer ER (s) <input type="number" id="mtBotPendingSec" value="60" min="0" max="3600" step="10" style="width:60px"></label>
       </div>
 
@@ -17170,6 +17189,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Cap how many TP-continuation re-entries a chain can stack before waiting for a fresh SuperTrend">Max cont. <input type="number" id="deltaBotMaxCont" value="4" min="1" max="20" step="1" style="width:52px"></label>
         <label title="SL% for continuation legs (0 = use TP%, i.e. 1:1 — locks in banked profit)">Cont. SL% <input type="number" id="deltaBotContSl" value="0" min="0" max="10" step="0.05" style="width:58px"></label>
         <label title="Only enter WITH the higher trend — needs ma4 (EMA50) + ma5 (EMA200) in the SuperTrend alert. BUY only above EMA200, SELL only below."><input type="checkbox" id="deltaBotTrendGate" checked> Trend gate (EMA50/200)</label>
+        <label title="Loose = enter when price is on the right side of EMA200 only (skip the EMA50>EMA200 condition). Unticked = strict (needs both). EMA50/200 read from the SuperTrend alert."><input type="checkbox" id="deltaBotTrendGateLoose"> Loose</label>
         <label title="A signal skipped in chop is held this many seconds and taken if ER recovers (deferred entry). 0 = off.">Defer ER (s) <input type="number" id="deltaBotPendingSec" value="60" min="0" max="3600" step="10" style="width:60px"></label>
       </div>
 
@@ -23599,6 +23619,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxCont:     parseInt((document.getElementById('aiBotMaxCont')||{}).value) || 4,
         contSlPct:   parseFloat((document.getElementById('aiBotContSl')||{}).value) || 0,
         trendGate:   !!(document.getElementById('aiBotTrendGate')||{}).checked,
+        trendGateLoose: !!(document.getElementById('aiBotTrendGateLoose')||{}).checked,
         emaMode:     !!(document.getElementById('aiBotEmaMode')||{}).checked,
         pendingSec:  parseInt((document.getElementById('aiBotPendingSec')||{}).value) || 0,
         api_key:     s.apiKey || ''
@@ -24612,6 +24633,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxCont:    parseInt((document.getElementById('mtBotMaxCont')||{}).value) || 4,
         contSlPct:  parseFloat((document.getElementById('mtBotContSl')||{}).value) || 0,
         trendGate:  !!(document.getElementById('mtBotTrendGate')||{}).checked,
+        trendGateLoose: !!(document.getElementById('mtBotTrendGateLoose')||{}).checked,
         emaMode:    !!(document.getElementById('mtBotEmaMode')||{}).checked,
         pendingSec: parseInt((document.getElementById('mtBotPendingSec')||{}).value) || 0,
         mt5_id: s.id || ''
@@ -25516,6 +25538,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxCont:    parseInt((document.getElementById('deltaBotMaxCont')||{}).value) || 4,
         contSlPct:  parseFloat((document.getElementById('deltaBotContSl')||{}).value) || 0,
         trendGate:  !!(document.getElementById('deltaBotTrendGate')||{}).checked,
+        trendGateLoose: !!(document.getElementById('deltaBotTrendGateLoose')||{}).checked,
         emaMode:    !!(document.getElementById('deltaBotEmaMode')||{}).checked,
         pendingSec: parseInt((document.getElementById('deltaBotPendingSec')||{}).value) || 0,
         api_key:    (DeltaStore.getSession().apiKey) || ''
