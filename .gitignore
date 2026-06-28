@@ -19,5 +19,7 @@ Journal.xlsx
 server.log
 # Persisted Zerodha/Kite session (access token — secret, never commit)
 zerodha_session.json
+# Persisted Telegram bot token + chat_id (secret, never commit)
+telegram_config.json
 # Third-party TradingView Pine scripts kept locally for reference (not app code)
 *.pine

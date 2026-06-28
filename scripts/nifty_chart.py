@@ -3001,6 +3001,28 @@ _TG_STATE = {
 }
 _TG_LOCK = _threading.Lock()
 _TG_QUEUE = []
+# Persist the Telegram token / chat_id / toggles so they're reused on every restart
+# (gitignored — the token is a secret). File overrides env defaults when present.
+_TG_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'telegram_config.json')
+
+def _tg_save():
+    try:
+        import json as _j
+        with open(_TG_CFG_PATH, 'w', encoding='utf-8') as f:
+            _j.dump({k: _TG_STATE.get(k) for k in ('token', 'chat_id', 'events', 'schedule')}, f)
+    except Exception:
+        pass
+
+def _tg_load():
+    try:
+        import json as _j
+        with open(_TG_CFG_PATH, encoding='utf-8') as f:
+            d = _j.load(f) or {}
+        for k in ('token', 'chat_id', 'events', 'schedule'):
+            if k in d and d.get(k) is not None and d.get(k) != '':
+                _TG_STATE[k] = d[k]
+    except Exception:
+        pass
 _TG_MARKETS = [
     ('NIFTY 50', 'NSE:NIFTY'), ('SENSEX', 'BSE:SENSEX'), ('Bank Nifty', 'NSE:BANKNIFTY'),
     ('Crude Oil MCX', 'MCX:CRUDEOIL1!'), ('Gold MCX', 'MCX:GOLD1!'),
@@ -3164,6 +3186,12 @@ def _tg_ensure_threads():
     _threading.Thread(target=_tg_flush_loop, daemon=True, name='tg-flush').start()
     _threading.Thread(target=_tg_scheduler_loop, daemon=True, name='tg-sched').start()
 
+# Restore saved token/chat_id/toggles on boot, and start the threads if a schedule
+# or event-forwarding was previously enabled (so it keeps working after a restart).
+_tg_load()
+if _TG_STATE.get('schedule') or _TG_STATE.get('events'):
+    _tg_ensure_threads()
+
 @app.route('/api/telegram/status')
 @login_required
 def telegram_status():
@@ -3180,6 +3208,7 @@ def telegram_config():
     if 'events' in data:             _TG_STATE['events']   = bool(data['events'])
     if 'schedule' in data:           _TG_STATE['schedule'] = bool(data['schedule'])
     _tg_ensure_threads()
+    _tg_save()
     _persist_log_line('[TELEGRAM] config events={} schedule={} chat={}'.format(
         _TG_STATE['events'], _TG_STATE['schedule'], _TG_STATE['chat_id'] or '-'))
     return jsonify({'success': True, 'events': _TG_STATE['events'], 'schedule': _TG_STATE['schedule'],
@@ -3191,6 +3220,7 @@ def telegram_detect_chat():
     cid, err = _tg_detect_chat(request.args.get('token') or _TG_STATE.get('token'))
     if cid:
         _TG_STATE['chat_id'] = cid
+        _tg_save()
     return jsonify({'success': bool(cid), 'chatId': cid, 'error': err})
 
 @app.route('/api/telegram/test', methods=['POST'])
@@ -3198,6 +3228,7 @@ def telegram_detect_chat():
 def telegram_test():
     if request.json and request.json.get('token'): _TG_STATE['token'] = str(request.json['token']).strip()
     if request.json and 'chat_id' in request.json:  _TG_STATE['chat_id'] = str(request.json.get('chat_id') or '').strip()
+    _tg_save()
     ok, err = _tg_send('Nifty_MV_bot connected — test message at ' + _now_ist_str())
     return jsonify({'success': ok, 'error': err})
 
