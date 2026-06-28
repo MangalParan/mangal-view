@@ -2997,7 +2997,7 @@ def _call_claude(system, messages, max_tokens=1024, model=None):
 _TG_STATE = {
     'token':   os.environ.get('TELEGRAM_BOT_TOKEN', '').strip(),
     'chat_id': os.environ.get('TELEGRAM_CHAT_ID', '').strip(),
-    'events': False, 'schedule': False, 'morning_date': '', 'started': False,
+    'events': False, 'schedule': False, 'morning_date': '', 'stocks_date': '', 'started': False,
 }
 _TG_LOCK = _threading.Lock()
 _TG_QUEUE = []
@@ -3079,6 +3079,48 @@ def _tg_morning_text():
         return 'Nifty_MV morning brief — ' + _now_ist_str() + '\n\n(AI analysis unavailable: ' + err + ')\n\nSnapshot:\n' + snap
     return 'Nifty_MV morning brief — ' + _now_ist_str() + '\n\n' + (text or '').strip()
 
+# Liquid NSE F&O names scanned for the 9:30 intraday stock-picks message.
+_TG_FNO = ['RELIANCE', 'HDFCBANK', 'ICICIBANK', 'INFY', 'TCS', 'SBIN', 'AXISBANK', 'KOTAKBANK',
+           'LT', 'ITC', 'HINDUNILVR', 'BAJFINANCE', 'BHARTIARTL', 'MARUTI', 'TATAMOTORS',
+           'TATASTEEL', 'SUNPHARMA', 'WIPRO', 'HCLTECH', 'ADANIENT', 'ADANIPORTS', 'TITAN',
+           'ULTRACEMCO', 'POWERGRID', 'NTPC', 'ONGC', 'COALINDIA', 'HINDALCO', 'JSWSTEEL',
+           'BAJAJFINSV', 'M_M', 'TECHM', 'GRASIM', 'DRREDDY', 'CIPLA', 'EICHERMOT',
+           'BAJAJ_AUTO', 'NESTLEIND', 'DLF', 'VEDL', 'SAIL', 'BANKBARODA', 'PNB', 'IDFCFIRSTB']
+
+def _tg_stock_snapshot():
+    """Daily TA snapshot for the F&O universe, sorted by TradingView rating (most
+    bullish first). Returns (snapshot_text, count). NSE tickers: M&M -> M_M etc."""
+    rows = []
+    for sym in _TG_FNO:
+        tvsym = 'NSE:' + sym.replace('_', '&') if sym in ('M_M', 'BAJAJ_AUTO') else 'NSE:' + sym
+        ta = _tv_fetch_ta(tvsym, '1D') or _tv_fetch_ta(tvsym, '')
+        if ta and ta.get('close') is not None:
+            rows.append((ta.get('ratingScore') or 0.0, sym.replace('_', '&'), ta))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    lines = ['{}: close={} rating={} RSI={} MACDh={} ADX={}'.format(
+        s, ta.get('close'), ta.get('rating'), ta.get('rsi'), ta.get('macdHist'), ta.get('adx'))
+        for _sc, s, ta in rows]
+    return '\n'.join(lines), len(rows)
+
+def _tg_stock_picks_text():
+    snap, n = _tg_stock_snapshot()
+    if n == 0:
+        return 'Nifty_MV F&O picks — ' + _now_ist_str() + '\n\n(No data available right now.)'
+    system = ("You are an Indian-markets intraday analyst. From the NSE F&O daily technical snapshot "
+              "(close, TradingView rating, RSI, MACD histogram, ADX), pick the 10 BEST intraday candidates "
+              "for today — a mix of BULLISH (momentum up) and BEARISH (momentum down) names. Output, in order:\n"
+              "1) One line on overall market tone.\n"
+              "2) BULLISH MOMENTUM — then BEARISH MOMENTUM, each as a list. For EVERY stock give ONE line:\n"
+              "   TICKER — BULL/BEAR | rating, RSI, MACD, ADX | Entry <zone> | Stop <px> | Target <px>\n"
+              "Exactly 10 stocks total. Base entry/stop/target on the close + momentum (state they are "
+              "technical estimates; intraday). Keep under 380 words, plain text (no markdown bold/headers), "
+              "minimal emojis.")
+    user = "NSE F&O daily snapshot ({}), sorted most-bullish first:\n{}\n\nGive the 10 best intraday picks.".format(_now_ist_str(), snap)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=1500, model='sonnet')
+    if err:
+        return 'Nifty_MV F&O picks — ' + _now_ist_str() + '\n\n(AI unavailable: ' + err + ')\n\nTop by rating:\n' + snap
+    return '📈 Nifty_MV — Best intraday F&O stocks — ' + _now_ist_str() + '\n\n' + (text or '').strip()
+
 def _tg_enqueue(line):
     if not _TG_STATE.get('events'):
         return
@@ -3107,6 +3149,10 @@ def _tg_scheduler_loop():
                     _TG_STATE['morning_date'] = today
                     ok, err = _tg_send(_tg_morning_text())
                     _persist_log_line('[TELEGRAM] morning brief sent={} {}'.format(ok, err or ''))
+                if now.weekday() < 5 and now.hour == 9 and 30 <= now.minute < 45 and _TG_STATE.get('stocks_date') != today:
+                    _TG_STATE['stocks_date'] = today
+                    ok, err = _tg_send(_tg_stock_picks_text())
+                    _persist_log_line('[TELEGRAM] F&O stock picks sent={} {}'.format(ok, err or ''))
         except Exception:
             pass
         _zd_time.sleep(30)
@@ -3160,6 +3206,14 @@ def telegram_test():
 def telegram_morning():
     _tg_ensure_threads()
     txt = _tg_morning_text()
+    ok, err = _tg_send(txt)
+    return jsonify({'success': ok, 'error': err, 'preview': txt[:4000]})
+
+@app.route('/api/telegram/stocks', methods=['POST'])
+@login_required
+def telegram_stocks():
+    _tg_ensure_threads()
+    txt = _tg_stock_picks_text()
     ok, err = _tg_send(txt)
     return jsonify({'success': ok, 'error': err, 'preview': txt[:4000]})
 
@@ -15979,12 +16033,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button id="nmvDetect" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:5px;padding:0 10px;cursor:pointer">Detect</button>
     </div>
     <div style="font-size:11px;color:#787b86;margin-top:3px">Detect: send any message to your bot in Telegram first, then click Detect.</div>
-    <label style="display:flex;align-items:center;gap:8px;margin:12px 0 4px"><input type="checkbox" id="nmvSchedule"> &#9200; Daily morning brief at 8:30 AM IST (Mon–Fri)</label>
+    <label style="display:flex;align-items:center;gap:8px;margin:12px 0 4px"><input type="checkbox" id="nmvSchedule"> &#9200; Daily 8:30 AM brief + 9:30 AM F&O stock picks (Mon–Fri)</label>
     <label style="display:flex;align-items:center;gap:8px;margin:4px 0"><input type="checkbox" id="nmvEvents"> &#128276; Forward all bot events (log.txt) to Telegram</label>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">
       <button id="nmvSave" type="button" style="background:#26a69a;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Save</button>
       <button id="nmvTest" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Test message</button>
       <button id="nmvMorning" type="button" style="background:#5b8def;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Send morning brief now</button>
+      <button id="nmvStocks" type="button" style="background:#7e57c2;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Send F&amp;O stock picks now</button>
     </div>
     <div id="nmvStatus" style="margin-top:12px;font-size:12px;color:#9aa0ac;white-space:pre-wrap"></div>
   </div>
@@ -16012,6 +16067,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if(d&&d.success){ $('nmvChat').value=d.chatId; say('Chat id detected: '+d.chatId); } else say(d&&d.error||'Detect failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
   if($('nmvTest')) $('nmvTest').addEventListener('click',function(){ say('Sending test…'); post('/api/telegram/test',body()).then(function(d){ say(d&&d.success?'Test sent ✓ (check Telegram)':'Failed: '+((d&&d.error)||'?'),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
   if($('nmvMorning')) $('nmvMorning').addEventListener('click',function(){ say('Generating brief (Claude + TradingView)…'); post('/api/telegram/morning',{}).then(function(d){ say((d&&d.success?'Sent ✓\n\n':'Send failed: '+((d&&d.error)||'?')+'\n\n')+((d&&d.preview)||''),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvStocks')) $('nmvStocks').addEventListener('click',function(){ say('Scanning F&O stocks (Claude + TradingView)…'); post('/api/telegram/stocks',{}).then(function(d){ say((d&&d.success?'Sent ✓\n\n':'Send failed: '+((d&&d.error)||'?')+'\n\n')+((d&&d.preview)||''),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
 })();
 </script>
 
