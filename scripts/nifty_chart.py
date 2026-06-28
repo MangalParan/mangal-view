@@ -1656,6 +1656,10 @@ def _persist_log_line(line):
             f.write('[' + ts + '] ' + line + '\n')
     except Exception:
         pass
+    try:
+        _tg_enqueue('[' + ts + '] ' + line)   # forward to Telegram if events-forwarding is on
+    except Exception:
+        pass
 
 # --- Build a signal-summary dict for the bot, mirroring api_candles --
 # Doesn't need request context. Reuses every compute_*/generate_*_signals
@@ -2984,6 +2988,179 @@ def _call_claude(system, messages, max_tokens=1024, model=None):
     parts = data.get('content') or []
     text  = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
     return text, None
+
+# =============================== Telegram (Nifty_MV_bot) ======================
+# Sends a daily pre-market brief (Claude + live TradingView TA) and forwards bot
+# events from log.txt to a Telegram chat. Token from env TELEGRAM_BOT_TOKEN or UI;
+# chat_id from env TELEGRAM_CHAT_ID or UI. Threads idle until a toggle is on.
+_TG_STATE = {
+    'token':   os.environ.get('TELEGRAM_BOT_TOKEN', '').strip(),
+    'chat_id': os.environ.get('TELEGRAM_CHAT_ID', '').strip(),
+    'events': False, 'schedule': False, 'morning_date': '', 'started': False,
+}
+_TG_LOCK = _threading.Lock()
+_TG_QUEUE = []
+_TG_MARKETS = [
+    ('NIFTY 50', 'NSE:NIFTY'), ('SENSEX', 'BSE:SENSEX'), ('Bank Nifty', 'NSE:BANKNIFTY'),
+    ('Crude Oil MCX', 'MCX:CRUDEOIL1!'), ('Gold MCX', 'MCX:GOLD1!'),
+    ('Gold (global)', 'TVC:GOLD'), ('WTI crude', 'TVC:USOIL'),
+    ('US Dollar idx', 'TVC:DXY'), ('Nasdaq 100', 'NASDAQ:NDX'), ('S&P 500', 'SP:SPX'),
+]
+
+def _tg_now_ist():
+    from datetime import datetime as _dt, timezone as _tzc, timedelta as _tdc
+    return _dt.now(_tzc(_tdc(seconds=IST_OFFSET)))
+
+def _now_ist_str():
+    return _tg_now_ist().strftime('%Y-%m-%d %H:%M IST')
+
+def _tg_api(method, params, token=None):
+    token = (token or _TG_STATE.get('token') or '').strip()
+    if not token:
+        return None, 'No Telegram token set.'
+    import urllib.request as _ur, urllib.parse as _up, json as _j
+    url = 'https://api.telegram.org/bot{}/{}'.format(token, method)
+    try:
+        with _ur.urlopen(_ur.Request(url, data=_up.urlencode(params).encode('utf-8')), timeout=20) as resp:
+            return _j.loads(resp.read().decode('utf-8')), None
+    except Exception as e:
+        detail = ''
+        try: detail = e.read().decode('utf-8')   # type: ignore[attr-defined]
+        except Exception: pass
+        return None, ('Telegram error: {} {}'.format(e, detail))[:300]
+
+def _tg_send(text, token=None, chat_id=None):
+    chat_id = (chat_id or _TG_STATE.get('chat_id') or '').strip()
+    if not chat_id:
+        return False, 'No chat_id — set it (or click Detect chat id after messaging the bot).'
+    ok_any, err = False, None
+    for i in range(0, len(text) or 1, 3800):                       # Telegram caps at 4096 chars/msg
+        res, e = _tg_api('sendMessage', {'chat_id': chat_id, 'text': text[i:i + 3800],
+                                         'disable_web_page_preview': 'true'}, token)
+        if res and res.get('ok'): ok_any = True
+        else: err = e or (res or {}).get('description') or 'send failed'
+    return ok_any, err
+
+def _tg_detect_chat(token=None):
+    res, e = _tg_api('getUpdates', {'limit': '8'}, token)
+    if e: return None, e
+    for upd in reversed(res.get('result') or []):
+        chat = ((upd.get('message') or upd.get('channel_post') or upd.get('my_chat_member') or {}).get('chat') or {})
+        if chat.get('id') is not None:
+            return str(chat['id']), None
+    return None, 'No recent messages. Send any message to your bot in Telegram first, then retry.'
+
+def _tg_market_snapshot():
+    rows = []
+    for name, sym in _TG_MARKETS:
+        ta = _tv_fetch_ta(sym, '1D') or _tv_fetch_ta(sym, '')
+        if ta and ta.get('close') is not None:
+            rows.append('{}: close={} rating={} RSI={} MACDh={} ADX={}'.format(
+                name, ta.get('close'), ta.get('rating'), ta.get('rsi'), ta.get('macdHist'), ta.get('adx')))
+        else:
+            rows.append('{}: (no data)'.format(name))
+    return '\n'.join(rows)
+
+def _tg_morning_text():
+    snap = _tg_market_snapshot()
+    system = ("You are an experienced Indian-markets analyst writing a concise pre-market brief for an "
+              "intraday trader. Use ONLY the daily technical snapshot provided (close, TradingView rating, "
+              "RSI, MACD histogram, ADX). Be specific and practical, not generic. Sections, in this order:\n"
+              "1) Global cues (US indices, DXY, WTI crude, gold) in 2-3 lines.\n"
+              "2) Nifty & Sensex view + intraday bias (up/down/range).\n"
+              "3) Key levels — for NIFTY, SENSEX, CRUDEOIL, GOLD give Support 1/2 and Resistance 1/2 "
+              "estimated from close + momentum (note they are technical estimates).\n"
+              "4) Today's trade idea: 1-2 actionable setups with entry zone, stop and target.\n"
+              "Keep under 320 words. Plain text only (no markdown headers/bold). A few emojis are fine.")
+    user = "Daily snapshot ({}):\n{}\n\nWrite the brief.".format(_now_ist_str(), snap)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=1100, model='sonnet')
+    if err:
+        return 'Nifty_MV morning brief — ' + _now_ist_str() + '\n\n(AI analysis unavailable: ' + err + ')\n\nSnapshot:\n' + snap
+    return 'Nifty_MV morning brief — ' + _now_ist_str() + '\n\n' + (text or '').strip()
+
+def _tg_enqueue(line):
+    if not _TG_STATE.get('events'):
+        return
+    with _TG_LOCK:
+        _TG_QUEUE.append(line)
+        del _TG_QUEUE[:-200]            # cap backlog
+
+def _tg_flush_loop():
+    while True:
+        try:
+            if _TG_STATE.get('events') and _TG_QUEUE and _TG_STATE.get('chat_id'):
+                with _TG_LOCK:
+                    batch = _TG_QUEUE[:]; _TG_QUEUE[:] = []
+                if batch:
+                    _tg_send('\n'.join(batch))
+        except Exception:
+            pass
+        _zd_time.sleep(6)
+
+def _tg_scheduler_loop():
+    while True:
+        try:
+            if _TG_STATE.get('schedule'):
+                now = _tg_now_ist(); today = now.strftime('%Y-%m-%d')
+                if now.weekday() < 5 and now.hour == 8 and 30 <= now.minute < 45 and _TG_STATE.get('morning_date') != today:
+                    _TG_STATE['morning_date'] = today
+                    ok, err = _tg_send(_tg_morning_text())
+                    _persist_log_line('[TELEGRAM] morning brief sent={} {}'.format(ok, err or ''))
+        except Exception:
+            pass
+        _zd_time.sleep(30)
+
+def _tg_ensure_threads():
+    if _TG_STATE.get('started'):
+        return
+    _TG_STATE['started'] = True
+    _threading.Thread(target=_tg_flush_loop, daemon=True, name='tg-flush').start()
+    _threading.Thread(target=_tg_scheduler_loop, daemon=True, name='tg-sched').start()
+
+@app.route('/api/telegram/status')
+@login_required
+def telegram_status():
+    return jsonify({'success': True, 'hasToken': bool(_TG_STATE.get('token')),
+                    'chatId': _TG_STATE.get('chat_id'), 'events': _TG_STATE.get('events'),
+                    'schedule': _TG_STATE.get('schedule')})
+
+@app.route('/api/telegram/config', methods=['POST'])
+@login_required
+def telegram_config():
+    data = request.json or {}
+    if data.get('token'):            _TG_STATE['token']   = str(data['token']).strip()
+    if 'chat_id' in data:            _TG_STATE['chat_id'] = str(data.get('chat_id') or '').strip()
+    if 'events' in data:             _TG_STATE['events']   = bool(data['events'])
+    if 'schedule' in data:           _TG_STATE['schedule'] = bool(data['schedule'])
+    _tg_ensure_threads()
+    _persist_log_line('[TELEGRAM] config events={} schedule={} chat={}'.format(
+        _TG_STATE['events'], _TG_STATE['schedule'], _TG_STATE['chat_id'] or '-'))
+    return jsonify({'success': True, 'events': _TG_STATE['events'], 'schedule': _TG_STATE['schedule'],
+                    'chatId': _TG_STATE['chat_id'], 'hasToken': bool(_TG_STATE['token'])})
+
+@app.route('/api/telegram/detect_chat')
+@login_required
+def telegram_detect_chat():
+    cid, err = _tg_detect_chat(request.args.get('token') or _TG_STATE.get('token'))
+    if cid:
+        _TG_STATE['chat_id'] = cid
+    return jsonify({'success': bool(cid), 'chatId': cid, 'error': err})
+
+@app.route('/api/telegram/test', methods=['POST'])
+@login_required
+def telegram_test():
+    if request.json and request.json.get('token'): _TG_STATE['token'] = str(request.json['token']).strip()
+    if request.json and 'chat_id' in request.json:  _TG_STATE['chat_id'] = str(request.json.get('chat_id') or '').strip()
+    ok, err = _tg_send('Nifty_MV_bot connected — test message at ' + _now_ist_str())
+    return jsonify({'success': ok, 'error': err})
+
+@app.route('/api/telegram/morning', methods=['POST'])
+@login_required
+def telegram_morning():
+    _tg_ensure_threads()
+    txt = _tg_morning_text()
+    ok, err = _tg_send(txt)
+    return jsonify({'success': ok, 'error': err, 'preview': txt[:4000]})
 
 def _extract_config_patch(text):
     """Pull a ```json {...}``` block carrying a configPatch out of Claude's reply.
@@ -15765,8 +15942,61 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="price-info">
     <span class="current-price" id="currentPrice">--</span>
     <span class="price-change" id="priceChange">--</span>
+    <button id="nmvBtn" type="button" title="Nifty_MV_bot — Telegram morning brief + live bot-event alerts"
+      style="margin-left:12px;background:#229ED9;color:#fff;border:none;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer;white-space:nowrap">&#128241; Nifty_MV_bot</button>
   </div>
 </div>
+
+<!-- Nifty_MV_bot: Telegram morning brief + bot-event alerts -->
+<div id="nmvModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55)">
+  <div style="position:absolute;top:8%;left:50%;transform:translateX(-50%);width:min(460px,94vw);background:#1b2130;border:1px solid #2a2e39;border-radius:10px;padding:16px 18px;color:#d1d4dc;font-size:13px;max-height:84vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <b style="font-size:15px">&#128241; Nifty_MV_bot (Telegram)</b>
+      <span id="nmvClose" style="cursor:pointer;font-size:18px;color:#9aa0ac">&times;</span>
+    </div>
+    <label style="display:block;margin:8px 0 2px;color:#9aa0ac">Bot token</label>
+    <input id="nmvToken" type="password" placeholder="123456:ABC… (blank = use server TELEGRAM_BOT_TOKEN)" style="width:100%;padding:6px;background:#131722;border:1px solid #2a2e39;border-radius:5px;color:#d1d4dc">
+    <label style="display:block;margin:8px 0 2px;color:#9aa0ac">Chat ID</label>
+    <div style="display:flex;gap:6px">
+      <input id="nmvChat" type="text" placeholder="your chat id" style="flex:1;padding:6px;background:#131722;border:1px solid #2a2e39;border-radius:5px;color:#d1d4dc">
+      <button id="nmvDetect" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:5px;padding:0 10px;cursor:pointer">Detect</button>
+    </div>
+    <div style="font-size:11px;color:#787b86;margin-top:3px">Detect: send any message to your bot in Telegram first, then click Detect.</div>
+    <label style="display:flex;align-items:center;gap:8px;margin:12px 0 4px"><input type="checkbox" id="nmvSchedule"> &#9200; Daily morning brief at 8:30 AM IST (Mon–Fri)</label>
+    <label style="display:flex;align-items:center;gap:8px;margin:4px 0"><input type="checkbox" id="nmvEvents"> &#128276; Forward all bot events (log.txt) to Telegram</label>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">
+      <button id="nmvSave" type="button" style="background:#26a69a;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Save</button>
+      <button id="nmvTest" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Test message</button>
+      <button id="nmvMorning" type="button" style="background:#5b8def;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Send morning brief now</button>
+    </div>
+    <div id="nmvStatus" style="margin-top:12px;font-size:12px;color:#9aa0ac;white-space:pre-wrap"></div>
+  </div>
+</div>
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  var modal=$('nmvModal'), st=$('nmvStatus');
+  function say(msg,bad){ if(st){ st.textContent=msg; st.style.color=bad?'#ef5350':'#26a69a'; } }
+  function open(){ modal.style.display='block'; fetch('/api/telegram/status').then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success) return;
+      $('nmvChat').value=d.chatId||''; $('nmvSchedule').checked=!!d.schedule; $('nmvEvents').checked=!!d.events;
+      $('nmvToken').placeholder=d.hasToken?'token set on server (leave blank to keep)':'123456:ABC…';
+      say(d.hasToken?'Token configured. Set chat id, then Save.':'No token on server — paste one above.');
+    }).catch(function(){}); }
+  if($('nmvBtn')) $('nmvBtn').addEventListener('click',open);
+  if($('nmvClose')) $('nmvClose').addEventListener('click',function(){modal.style.display='none';});
+  if(modal) modal.addEventListener('click',function(e){ if(e.target===modal) modal.style.display='none'; });
+  function body(){ return {token:$('nmvToken').value.trim(), chat_id:$('nmvChat').value.trim(),
+                           schedule:$('nmvSchedule').checked, events:$('nmvEvents').checked}; }
+  function post(url,b){ return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(function(r){return r.json();}); }
+  if($('nmvSave')) $('nmvSave').addEventListener('click',function(){ say('Saving…'); post('/api/telegram/config',body()).then(function(d){
+      if(d&&d.success){ $('nmvChat').value=d.chatId||$('nmvChat').value; say('Saved. schedule='+d.schedule+' events='+d.events+(d.hasToken?'':' (no token!)'),!d.hasToken);} else say('Save failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvDetect')) $('nmvDetect').addEventListener('click',function(){ say('Detecting…'); fetch('/api/telegram/detect_chat?token='+encodeURIComponent($('nmvToken').value.trim())).then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){ $('nmvChat').value=d.chatId; say('Chat id detected: '+d.chatId); } else say(d&&d.error||'Detect failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvTest')) $('nmvTest').addEventListener('click',function(){ say('Sending test…'); post('/api/telegram/test',body()).then(function(d){ say(d&&d.success?'Test sent ✓ (check Telegram)':'Failed: '+((d&&d.error)||'?'),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvMorning')) $('nmvMorning').addEventListener('click',function(){ say('Generating brief (Claude + TradingView)…'); post('/api/telegram/morning',{}).then(function(d){ say((d&&d.success?'Sent ✓\n\n':'Send failed: '+((d&&d.error)||'?')+'\n\n')+((d&&d.preview)||''),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
+})();
+</script>
 
 <div class="toolbar">
   <div class="period-dropdown-wrapper">
