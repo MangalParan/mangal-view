@@ -39,7 +39,17 @@ ENTRY_RE = re.compile(
 
 EXIT_RE = re.compile(
     r'EXIT (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
-    r'\(entry (?P<entry>[\d.]+)\) PnL=(?P<pnl>[+-][\d.]+) reason=(?P<reason>.+?) strat=(?P<strat>\S+)$')
+    r'\(entry (?P<entry>[\d.]+)\) PnL=(?P<pnl>\S+) reason=(?P<reason>.+?) strat=(?P<strat>\S+)$')
+
+def _pnl(s):
+    """Parse a PnL token tolerant of currency symbols (₹/$, or the â¹ mojibake) and
+    the odd '+-0.0000' the bot prints for a flat close. Sign from any leading '-'."""
+    s = (s or '').replace('+-', '-')
+    neg = '-' in s
+    m = re.search(r'\d+\.?\d*', s)
+    if not m:
+        return 0.0
+    return -float(m.group()) if neg else float(m.group())
 
 ALERT_RE = re.compile(r'\[TV-ALERT\]\s+(?P<sym>\S+)\s+(?P<sig>BUY|SELL)\s+(?P<kv>.*)$')
 KV_RE = re.compile(r'(\w+)=("[^"]*"|\S+)')
@@ -63,6 +73,11 @@ def parse_files(paths):
     open_pos = {}
     last_event_idx_by_bot = {}
 
+    # Gather every line from every file, drop exact duplicates (the session logs
+    # overlap heavily), and sort by timestamp ascending so the journal is a single
+    # clean chronological record (earliest first) regardless of file order.
+    rows = []
+    seen = set()
     for path in paths:
         if not os.path.exists(path):
             print('skip (missing):', path)
@@ -71,11 +86,16 @@ def parse_files(paths):
             for raw in fh:
                 line = raw.rstrip('\n')
                 m = LINE_RE.match(line)
-                if not m:
+                if not m or line in seen:
                     continue
-                ts = m.group('ts')
-                rest = m.group('rest')
+                seen.add(line)
+                rows.append((m.group('ts'), m.group('rest')))
+    rows.sort(key=lambda r: r[0])   # ISO timestamps sort chronologically
+    print('Merged {} unique log lines from {} file(s).'.format(len(rows), len(paths)))
 
+    if True:
+        if True:
+            for ts, rest in rows:
                 # category tags like [DELTA] [LIVE] / [TV-ALERT] / [DELTA] [STOP]
                 bot, category, msg = '', '', rest
                 tags = re.findall(r'^(?:\[([^\]]+)\]\s*)', rest)
@@ -146,7 +166,7 @@ def parse_files(paths):
                         trades.append(leg)
                     leg['exit_time'] = ts
                     leg['exit_px'] = float(xm.group('px'))
-                    leg['pnl'] = float(xm.group('pnl'))
+                    leg['pnl'] = _pnl(xm.group('pnl'))
                     leg['exit_reason'] = xm.group('reason').strip()
                     open_pos[bot] = None
                     last_event_idx_by_bot[bot] = (leg, 'exit')
