@@ -2822,6 +2822,7 @@ def delta_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'trendGateLoose': bool(data.get('trendGateLoose', False)),  # loose = price vs EMA200 only (skip the EMA50>EMA200 condition)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
+            'seedRiskFrac': float(data.get('seedRiskFrac', 0.5) or 0.5),  # a seed/manual SL may risk at most this × maxLoss
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
             'includeMM':  bool(data.get('includeMM', False)),
@@ -4153,6 +4154,7 @@ def zd_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'trendGateLoose': bool(data.get('trendGateLoose', False)),  # loose = price vs EMA200 only (skip the EMA50>EMA200 condition)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
+            'seedRiskFrac': float(data.get('seedRiskFrac', 0.5) or 0.5),  # a seed/manual SL may risk at most this × maxLoss
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
             'includeMM':  bool(data.get('includeMM', False)),
@@ -5475,6 +5477,7 @@ def mt_aibot_start():
             'trendGate':  bool(data.get('trendGate', True)),         # only enter WITH the EMA50/200 trend (ma4/ma5 in the SuperTrend alert)
             'trendGateLoose': bool(data.get('trendGateLoose', False)),  # loose = price vs EMA200 only (skip the EMA50>EMA200 condition)
             'maxSeedSlPct': float(data.get('maxSeedSlPct', 2.0) or 2.0),  # cap SL% on manual seed/Open (no 5% panel default)
+            'seedRiskFrac': float(data.get('seedRiskFrac', 0.5) or 0.5),  # a seed/manual SL may risk at most this × maxLoss
             'emaMode':    bool(data.get('emaMode', False)),          # 'EMA 5/13' mode: EMA alert is entry+exit, SuperTrend ignored
             'pendingSec': int(data.get('pendingSec') if data.get('pendingSec') is not None else 60),  # chop-skipped entry waits this long for ER to recover (0 = off)
             'includeMM':  bool(data.get('includeMM', False)),
@@ -5921,7 +5924,14 @@ def _seed_sltp(cfg, symbol):
     slp = slp if (slp and slp > 0) else float(cfg.get('slPct') or 1.0)
     tpp = tpp if (tpp and tpp > 0) else float(cfg.get('tpPct') or 0.4)
     cap = float(cfg.get('maxSeedSlPct', 2.0) or 2.0)
-    return {'slPct': min(max(slp, 0.05), cap), 'tpPct': max(tpp, 0.05)}
+    # Risk cap: a seed/manual SL may risk at most seedRiskFrac × maxLoss. With Delta's
+    # capital×leverage sizing, loss at SL ≈ slPct/100 × capital × leverage, so
+    # slPct ≤ frac×maxLoss / (capital×lev) × 100. (2% × 25x × $100 = $50 = a whole day.)
+    capital = float(cfg.get('capital') or 0); lev = float(cfg.get('leverage') or 0)
+    maxloss = float(cfg.get('maxLoss') or 0); frac = float(cfg.get('seedRiskFrac', 0.5) or 0.5)
+    if capital > 0 and lev > 0 and maxloss > 0:
+        cap = min(cap, (frac * maxloss) / (capital * lev) * 100.0)
+    return {'slPct': min(max(slp, 0.05), max(cap, 0.05)), 'tpPct': max(tpp, 0.05)}
 
 def _tv_dual_signal(state, cfg, symbol, inds):
     """Dual-indicator logic — SuperTrend is PRIMARY (the only thing that OPENS a
@@ -6055,9 +6065,15 @@ def _tv_alert_signal(state, cfg, symbol):
     if seed in ('BUY', 'SELL'):
         state.pop('seedBias', None)                  # consume once, whatever happens
         if not state.get('position'):
+            # Seed now respects the trend gate: a counter-trend seed is dropped
+            # (don't bypass the gate into a wrong-way trade like the -49.5 SOL seed).
+            ok, why = _tv_trend_gate_ok(_tv_ind_for(cfg, symbol).get('SUPERTREND'), seed, cfg)
+            if not ok:
+                return {'name': 'tv', 'signal': 'HOLD', 'score': 0.0,
+                        'reason': 'Seed {} dropped — {}'.format(seed, why)}
             out = {'name': 'tv', 'signal': seed, 'score': 10.0, 'seed': True,
                    'reason': 'Manual SuperTrend bias seed: open ' + seed}
-            out.update(_seed_sltp(cfg, symbol))   # SuperTrend's SL/TP if any, else panel — SL capped (no 5%)
+            out.update(_seed_sltp(cfg, symbol))   # SL capped by maxSeedSlPct + seedRiskFrac×maxLoss
             return out
     if cfg.get('emaMode'):                          # 'EMA 5/13' checkbox -> EMA is entry+exit, SuperTrend ignored
         return _tv_ema_signal(state, cfg, symbol)
