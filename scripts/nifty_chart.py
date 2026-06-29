@@ -6186,6 +6186,13 @@ def aibot_tv_webhook():
             'fields': fields, 'ts': _TV_WEBHOOK[sym]['ts'],
         }
     _tv_log_alert(sym, _TV_WEBHOOK[sym])
+    # Trend-gate diagnostic: the gate reads ma4(EMA50)/ma5(EMA200) from the SuperTrend
+    # alert. If either isn't numeric, the gate fails OPEN (passes everything) — log the
+    # RAW values TradingView sent so a bad {{plot_N}} mapping (NaN/blank) is visible.
+    if _ind == 'SUPERTREND' and not is_test:
+        if _tv_num(data.get('ma4')) is None or _tv_num(data.get('ma5')) is None:
+            _persist_log_line('[TV-ALERT] {} trend gate INERT — ma4/ma5 not numeric: ma4={!r} ma5={!r} (check {{{{plot_N}}}} index)'.format(
+                sym, data.get('ma4'), data.get('ma5')))
     return jsonify({'success': True})
 
 @app.route('/api/aibot/tv/bias')
