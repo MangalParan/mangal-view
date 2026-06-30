@@ -2083,7 +2083,7 @@ def _tv_context(cfg, broker, symbol, exchange):
                        ' — use an EXCHANGE:SYMBOL ticker (e.g. BINANCE:BTCUSDT, NSE:RELIANCE) or leave blank for auto')
     return out
 
-def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None, extra_ctx=None):
+def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None, extra_ctx=None, images=None):
     """Autonomous Claude strategy. Sends recent OHLCV plus market context (multi-
     window trend, volume/liquidity, volatility), the CURRENT position (so it
     doesn't whipsaw) and recent closed trades (so it learns) and gets a decision.
@@ -2238,6 +2238,11 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
         + tv_block
+        + (("CHART IMAGE: A chart screenshot is attached (SuperTrend, EMA, PSAR, support/resistance, often "
+            "multiple timeframes). Treat it as the PRIMARY structure read: judge trend, key S/R, and indicator "
+            "alignment from what you SEE, and align the decision with the chart. If the picture contradicts the "
+            "numeric fields, trust the chart's structure. It is the user's latest manual view — weight it heavily.\n")
+           if images else "")
         + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
     )
@@ -2256,7 +2261,7 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
     if extra_ctx:
         _payload.update(extra_ctx)
     user = _json.dumps(_payload, default=str)
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'))
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'), images=images)
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:220]}
     sig, score, reason, sl_pct, tp_pct = 'HOLD', 0.0, '', None, None
@@ -2572,7 +2577,8 @@ def _delta_bot_tick():
     elif _bot_is_claude(cfg) and delta_ai_state.get('_decide', True):
         _tv = _tv_context(cfg, 'delta', symbol, '')
         strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
-                                     extra_ctx=({'tradingview': _tv} if _tv else None))
+                                     extra_ctx=({'tradingview': _tv} if _tv else None),
+                                     images=_chart_images_for(delta_ai_state))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -2953,14 +2959,75 @@ def _resolve_claude_model(name):
         return key
     return os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6').strip() or 'claude-sonnet-4-6'
 
-def _call_claude(system, messages, max_tokens=1024, model=None):
+# ---- Vision: chart-image input for Claude (base64 image content blocks) ------
+# A user can upload a TradingView chart (SuperTrend / EMA / PSAR / S-R, multi-TF) in
+# the bot chat. We keep the LATEST image per bot in its state dict ('chartImg') and
+# feed it to Claude both in chat replies and in the live trade-decision loop, so the
+# Claude strategy reads real chart structure on top of the numeric data.
+_CHART_MAX_AGE = 3 * 3600   # an uploaded chart stays "current" for 3h
+
+def _parse_data_url(s):
+    """'data:image/png;base64,XXXX' -> {'media','data'} or None (size-guarded ~5MB)."""
+    m = re.match(r'^data:(image/[A-Za-z0-9.+-]+);base64,(.+)$', (s or '').strip(), re.DOTALL)
+    if not m:
+        return None
+    media, b64 = m.group(1), m.group(2).strip()
+    if not b64 or len(b64) > 7_000_000:
+        return None
+    return {'media': media, 'data': b64}
+
+def _chart_store(state, lock, data_url, note=''):
+    """Save the latest uploaded chart on a bot's state. Returns True if stored."""
+    img = _parse_data_url(data_url)
+    if not img:
+        return False
+    img['ts'] = int(_zd_time.time())
+    img['note'] = str(note or '')[:200]
+    with lock:
+        state['chartImg'] = img
+    return True
+
+def _chart_images_for(state, max_age_sec=_CHART_MAX_AGE):
+    """[{'media','data'}] for _call_claude if the bot has a fresh chart, else []."""
+    img = state.get('chartImg') if isinstance(state, dict) else None
+    if not img or not img.get('data'):
+        return []
+    if max_age_sec and (int(_zd_time.time()) - int(img.get('ts', 0))) > max_age_sec:
+        return []
+    return [{'media': img.get('media', 'image/png'), 'data': img['data']}]
+
+def _img_block(img):
+    return {'type': 'image', 'source': {'type': 'base64',
+            'media_type': img.get('media', 'image/png'), 'data': img.get('data', '')}}
+
+def _attach_images(messages, images):
+    """Prepend image content blocks to the LATEST user message (vision input)."""
+    blocks = [_img_block(i) for i in (images or []) if i and i.get('data')]
+    if not blocks:
+        return messages
+    msgs = [dict(m) for m in messages]
+    idx = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get('role') == 'user'), None)
+    if idx is None:
+        msgs.append({'role': 'user', 'content': list(blocks)})
+        return msgs
+    c = msgs[idx].get('content')
+    if isinstance(c, list):
+        msgs[idx]['content'] = list(blocks) + c
+    else:
+        msgs[idx]['content'] = list(blocks) + [{'type': 'text', 'text': str(c)}]
+    return msgs
+
+def _call_claude(system, messages, max_tokens=1024, model=None, images=None):
     """Call the Anthropic Messages API via stdlib only (no SDK dependency).
     Reads ANTHROPIC_API_KEY from the environment. `model` is a panel choice
-    (haiku/sonnet/opus) or full id; None uses the env default. Returns (text, error)."""
+    (haiku/sonnet/opus) or full id; None uses the env default. `images` is an
+    optional list of {'media','data'} base64 chart blocks (vision). Returns (text, error)."""
     api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
     if not api_key:
         return None, 'ANTHROPIC_API_KEY is not set on the server. Add it in your environment (Render → Environment) and redeploy.'
     model = _resolve_claude_model(model)
+    if images:
+        messages = _attach_images(messages, images)
     import urllib.request as _ur, json as _json
     body = _json.dumps({
         'model': model, 'max_tokens': max_tokens,
@@ -3525,8 +3592,14 @@ def delta_aibot_chat():
     and may propose a config patch (applied only when the user clicks Apply)."""
     data    = request.json or {}
     message = (data.get('message') or '').strip()
-    if not message:
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(delta_ai_state, delta_ai_lock, img_url, note=message)
+    if not message and not img_url:
         return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
+    chat_imgs = _chart_images_for(delta_ai_state) if img_url else []
     history = data.get('history') or []   # [{role, content}, ...]
 
     with delta_ai_lock:
@@ -3573,7 +3646,7 @@ def delta_aibot_chat():
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
 
-    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -3937,7 +4010,8 @@ def _zd_bot_tick():
     elif _bot_is_claude(cfg) and zd_ai_state.get('_decide', True):
         _tv = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
         strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
-                                     extra_ctx=({'tradingview': _tv} if _tv else None))
+                                     extra_ctx=({'tradingview': _tv} if _tv else None),
+                                     images=_chart_images_for(zd_ai_state))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -4297,8 +4371,14 @@ def zd_aibot_apply_config():
 def zd_aibot_chat():
     data    = request.json or {}
     message = (data.get('message') or '').strip()
-    if not message:
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(zd_ai_state, zd_ai_lock, img_url, note=message)
+    if not message and not img_url:
         return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
+    chat_imgs = _chart_images_for(zd_ai_state) if img_url else []
     history = data.get('history') or []
     with zd_ai_lock:
         cfg     = {k: v for k, v in (zd_ai_state.get('config') or {}).items() if k != 'api_key'}
@@ -4341,7 +4421,7 @@ def zd_aibot_chat():
         content = str(h.get('content', ''))[:4000]
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
-    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -4683,7 +4763,8 @@ def _zo_bot_tick():
             leg_ctx['sellerEnabled'] = seller
             if tv_ctx: leg_ctx['tradingview'] = tv_ctx
         if _zo_decide:
-            strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx)
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx,
+                                         images=_chart_images_for(zo_ai_state))
         elif is_claude:
             strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
         else:
@@ -4940,8 +5021,14 @@ def zo_aibot_apply_config():
 def zo_aibot_chat():
     data    = request.json or {}
     message = (data.get('message') or '').strip()
-    if not message:
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(zo_ai_state, zo_ai_lock, img_url, note=message)
+    if not message and not img_url:
         return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
+    chat_imgs = _chart_images_for(zo_ai_state) if img_url else []
     history = data.get('history') or []
     with zo_ai_lock:
         cfg     = {k: v for k, v in (zo_ai_state.get('config') or {}).items() if k != 'api_key'}
@@ -4982,7 +5069,7 @@ def zo_aibot_chat():
         content = str(h.get('content', ''))[:4000]
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
-    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -5296,7 +5383,8 @@ def _mt_bot_tick():
     elif _bot_is_claude(cfg) and mt_ai_state.get('_decide', True):
         _tv = _tv_context(cfg, 'mt5', symbol, '')
         strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
-                                     extra_ctx=({'tradingview': _tv} if _tv else None))
+                                     extra_ctx=({'tradingview': _tv} if _tv else None),
+                                     images=_chart_images_for(mt_ai_state))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -5619,8 +5707,14 @@ def mt_aibot_apply_config():
 def mt_aibot_chat():
     data    = request.json or {}
     message = (data.get('message') or '').strip()
-    if not message:
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(mt_ai_state, mt_ai_lock, img_url, note=message)
+    if not message and not img_url:
         return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
+    chat_imgs = _chart_images_for(mt_ai_state) if img_url else []
     history = data.get('history') or []
     with mt_ai_lock:
         cfg     = {k: v for k, v in (mt_ai_state.get('config') or {}).items() if k != 'mt5_id'}
@@ -5657,7 +5751,7 @@ def mt_aibot_chat():
         content = str(h.get('content', ''))[:4000]
         if content: msgs.append({'role': role, 'content': content})
     msgs.append({'role': 'user', 'content': message})
-    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')))
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
     if err:
         return jsonify({'success': False, 'error': err}), 502
     patch, summary, clean_text = _extract_config_patch(text or '')
@@ -24032,6 +24126,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const inputEl = document.getElementById('zerodhaChatInput');
       const sendEl  = document.getElementById('zerodhaChatSend');
       if (!msgsEl || !inputEl || !sendEl) return;
+      let pendingChartImg = '', chartAttachBtn = null;
+      (function(){
+        chartAttachBtn = document.createElement('button');
+        chartAttachBtn.type = 'button'; chartAttachBtn.className = 'dbot-chat-send';
+        chartAttachBtn.title = 'Attach a chart image (SuperTrend / EMA / PSAR / support-resistance, any timeframe) for Claude';
+        chartAttachBtn.textContent = '📎'; chartAttachBtn.style.marginRight = '4px';
+        const chartFile = document.createElement('input');
+        chartFile.type = 'file'; chartFile.accept = 'image/*'; chartFile.style.display = 'none';
+        sendEl.parentNode.insertBefore(chartAttachBtn, sendEl);
+        sendEl.parentNode.appendChild(chartFile);
+        chartAttachBtn.addEventListener('click', function(){ chartFile.click(); });
+        chartFile.addEventListener('change', function(){
+          const f = chartFile.files && chartFile.files[0]; chartFile.value = '';
+          if (!f) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function(){ pendingChartImg = String(rd.result || '');
+            chartAttachBtn.textContent = '📎✓'; chartAttachBtn.style.color = '#26a69a';
+            addMsg('Chart attached — sent to Claude with your next message and used as the primary chart for trading decisions (valid ~3h).', 'bot'); };
+          rd.readAsDataURL(f);
+        });
+      })();
+      function takeImg(){ const i = pendingChartImg; pendingChartImg = '';
+        if (chartAttachBtn){ chartAttachBtn.textContent = '📎'; chartAttachBtn.style.color = ''; } return i; }
       const history = [];
       function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
       function addMsg(text, cls) {
@@ -24076,13 +24194,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       function send() {
         const msg = inputEl.value.trim();
-        if (!msg) return;
+        if (!msg && !pendingChartImg) return;
         addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
         inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
         const thinking = addMsg('Thinking…', 'bot');
         fetch('/api/aibot/zerodha/chat', {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') })
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''), image: takeImg() })
         }).then(r => r.json()).then(res => {
           thinking.remove();
           if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
@@ -24499,6 +24617,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const inputEl = document.getElementById('zoChatInput');
       const sendEl = document.getElementById('zoChatSend');
       if (!msgsEl || !inputEl || !sendEl) return;
+      let pendingChartImg = '', chartAttachBtn = null;
+      (function(){
+        chartAttachBtn = document.createElement('button');
+        chartAttachBtn.type = 'button'; chartAttachBtn.className = 'dbot-chat-send';
+        chartAttachBtn.title = 'Attach a chart image (SuperTrend / EMA / PSAR / support-resistance, any timeframe) for Claude';
+        chartAttachBtn.textContent = '📎'; chartAttachBtn.style.marginRight = '4px';
+        const chartFile = document.createElement('input');
+        chartFile.type = 'file'; chartFile.accept = 'image/*'; chartFile.style.display = 'none';
+        sendEl.parentNode.insertBefore(chartAttachBtn, sendEl);
+        sendEl.parentNode.appendChild(chartFile);
+        chartAttachBtn.addEventListener('click', function(){ chartFile.click(); });
+        chartFile.addEventListener('change', function(){
+          const f = chartFile.files && chartFile.files[0]; chartFile.value = '';
+          if (!f) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function(){ pendingChartImg = String(rd.result || '');
+            chartAttachBtn.textContent = '📎✓'; chartAttachBtn.style.color = '#26a69a';
+            addMsg('Chart attached — sent to Claude with your next message and used as the primary chart for trading decisions (valid ~3h).', 'bot'); };
+          rd.readAsDataURL(f);
+        });
+      })();
+      function takeImg(){ const i = pendingChartImg; pendingChartImg = '';
+        if (chartAttachBtn){ chartAttachBtn.textContent = '📎'; chartAttachBtn.style.color = ''; } return i; }
       const history = [];
       function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
       function addMsg(text, cls) { const d = document.createElement('div'); d.className = 'dbot-msg ' + (cls || 'bot'); d.innerHTML = esc(text); msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d; }
@@ -24530,11 +24672,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         card.appendChild(btn); msgsEl.appendChild(card); msgsEl.scrollTop = msgsEl.scrollHeight;
       }
       function send() {
-        const msg = inputEl.value.trim(); if (!msg) return;
+        const msg = inputEl.value.trim(); if (!msg && !pendingChartImg) return;
         addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
         inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
         const thinking = addMsg('Thinking…', 'bot');
-        fetch('/api/aibot/zoptions/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') }) })
+        fetch('/api/aibot/zoptions/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''), image: takeImg() }) })
           .then(r => r.json()).then(res => {
             thinking.remove();
             if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
@@ -24956,6 +25098,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const inputEl = document.getElementById('mtChatInput');
       const sendEl = document.getElementById('mtChatSend');
       if (!msgsEl || !inputEl || !sendEl) return;
+      let pendingChartImg = '', chartAttachBtn = null;
+      (function(){
+        chartAttachBtn = document.createElement('button');
+        chartAttachBtn.type = 'button'; chartAttachBtn.className = 'dbot-chat-send';
+        chartAttachBtn.title = 'Attach a chart image (SuperTrend / EMA / PSAR / support-resistance, any timeframe) for Claude';
+        chartAttachBtn.textContent = '📎'; chartAttachBtn.style.marginRight = '4px';
+        const chartFile = document.createElement('input');
+        chartFile.type = 'file'; chartFile.accept = 'image/*'; chartFile.style.display = 'none';
+        sendEl.parentNode.insertBefore(chartAttachBtn, sendEl);
+        sendEl.parentNode.appendChild(chartFile);
+        chartAttachBtn.addEventListener('click', function(){ chartFile.click(); });
+        chartFile.addEventListener('change', function(){
+          const f = chartFile.files && chartFile.files[0]; chartFile.value = '';
+          if (!f) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function(){ pendingChartImg = String(rd.result || '');
+            chartAttachBtn.textContent = '📎✓'; chartAttachBtn.style.color = '#26a69a';
+            addMsg('Chart attached — sent to Claude with your next message and used as the primary chart for trading decisions (valid ~3h).', 'bot'); };
+          rd.readAsDataURL(f);
+        });
+      })();
+      function takeImg(){ const i = pendingChartImg; pendingChartImg = '';
+        if (chartAttachBtn){ chartAttachBtn.textContent = '📎'; chartAttachBtn.style.color = ''; } return i; }
       const history = [];
       function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
       function addMsg(text, cls) { const d = document.createElement('div'); d.className = 'dbot-msg ' + (cls || 'bot'); d.innerHTML = esc(text); msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d; }
@@ -24986,11 +25152,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         card.appendChild(btn); msgsEl.appendChild(card); msgsEl.scrollTop = msgsEl.scrollHeight;
       }
       function send() {
-        const msg = inputEl.value.trim(); if (!msg) return;
+        const msg = inputEl.value.trim(); if (!msg && !pendingChartImg) return;
         addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
         inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
         const thinking = addMsg('Thinking…', 'bot');
-        fetch('/api/aibot/mt5/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') }) })
+        fetch('/api/aibot/mt5/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''), image: takeImg() }) })
           .then(r => r.json()).then(res => {
             thinking.remove();
             if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
@@ -25870,6 +26036,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const inputEl = document.getElementById('deltaChatInput');
       const sendEl  = document.getElementById('deltaChatSend');
       if (!msgsEl || !inputEl || !sendEl) return;
+      let pendingChartImg = '', chartAttachBtn = null;
+      (function(){
+        chartAttachBtn = document.createElement('button');
+        chartAttachBtn.type = 'button'; chartAttachBtn.className = 'dbot-chat-send';
+        chartAttachBtn.title = 'Attach a chart image (SuperTrend / EMA / PSAR / support-resistance, any timeframe) for Claude';
+        chartAttachBtn.textContent = '📎'; chartAttachBtn.style.marginRight = '4px';
+        const chartFile = document.createElement('input');
+        chartFile.type = 'file'; chartFile.accept = 'image/*'; chartFile.style.display = 'none';
+        sendEl.parentNode.insertBefore(chartAttachBtn, sendEl);
+        sendEl.parentNode.appendChild(chartFile);
+        chartAttachBtn.addEventListener('click', function(){ chartFile.click(); });
+        chartFile.addEventListener('change', function(){
+          const f = chartFile.files && chartFile.files[0]; chartFile.value = '';
+          if (!f) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function(){ pendingChartImg = String(rd.result || '');
+            chartAttachBtn.textContent = '📎✓'; chartAttachBtn.style.color = '#26a69a';
+            addMsg('Chart attached — sent to Claude with your next message and used as the primary chart for trading decisions (valid ~3h).', 'bot'); };
+          rd.readAsDataURL(f);
+        });
+      })();
+      function takeImg(){ const i = pendingChartImg; pendingChartImg = '';
+        if (chartAttachBtn){ chartAttachBtn.textContent = '📎'; chartAttachBtn.style.color = ''; } return i; }
       const history = [];   // [{role:'user'|'assistant', content}]
 
       function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -25921,7 +26111,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       function send() {
         const msg = inputEl.value.trim();
-        if (!msg) return;
+        if (!msg && !pendingChartImg) return;
         addMsg(msg, 'user');
         history.push({ role: 'user', content: msg });
         inputEl.value = '';
@@ -25929,7 +26119,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const thinking = addMsg('Thinking…', 'bot');
         fetch('/api/aibot/delta/chat', {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : '') })
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1), model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''), image: takeImg() })
         }).then(r => r.json()).then(res => {
           thinking.remove();
           if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
