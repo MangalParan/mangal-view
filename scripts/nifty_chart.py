@@ -5401,11 +5401,31 @@ def _mt_bot_tick():
     try:
         candles = _bot_fetch_candles(symbol, interval, 'mt5', api_key=cfg.get('mt5_id'))
     except Exception as e:
-        _mt_log('[Tick] ERROR fetching MT5 data: ' + str(e)); return
+        _mt_log('[Tick] ERROR fetching MT5 data: ' + str(e)); candles = []
+    # TradingView fallback: in PAPER mode with the TradingView toggle on, if the MT5
+    # (MCP/EA) feed is unavailable, fetch candles from TradingView so paper trading
+    # keeps running. MCP stays primary; TV only fills in when MT5 returns nothing.
+    src_used = 'mt5'
+    if not candles and cfg.get('mode', 'paper') == 'paper' and cfg.get('tvEnabled'):
+        tv_sym = (cfg.get('tvSymbol') or symbol or '').strip().upper()
+        if tv_sym:
+            try:
+                candles = fetch_tradingview_data(interval, tv_sym) or []
+            except Exception as e:
+                _mt_log('[Tick] TradingView fallback error: ' + str(e)); candles = []
+            if candles:
+                src_used = 'tv'
+                if not mt_ai_state.get('_tv_fallback'):
+                    mt_ai_state['_tv_fallback'] = True
+                    _mt_log('[Tick] MT5 feed unavailable — using TradingView ({}) for {} (paper)'.format(tv_sym, symbol))
+    if candles and src_used == 'mt5' and mt_ai_state.get('_tv_fallback'):
+        mt_ai_state['_tv_fallback'] = False
+        _mt_log('[Tick] MT5 feed restored — back to MT5 data for ' + symbol)
     if not candles:
         with mt_ai_lock:
             mt_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
-        _mt_log('[Tick] no MT5 candles for ' + symbol + ' — check MT5 connection / symbol / MT5_BACKEND')
+        _hint = '' if (cfg.get('tvEnabled') and cfg.get('mode', 'paper') == 'paper') else ' (enable TradingView + paper mode for a fallback feed)'
+        _mt_log('[Tick] no candles for ' + symbol + ' — MT5 connection/symbol down' + _hint)
         return
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
