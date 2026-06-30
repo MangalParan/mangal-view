@@ -3087,7 +3087,18 @@ _TG_LOCK = _threading.Lock()
 _TG_QUEUE = []
 # Persist token / chat_id / toggles / per-alert schedule so they're reused on every
 # restart (gitignored — the token is a secret). File overrides env defaults.
-_TG_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'telegram_config.json')
+# IMPORTANT: store it on the SAME persistent volume as the SQLite DB (Render mounts
+# /data). The repo/app dir is EPHEMERAL on Render — writing there means the config
+# (events + per-alert on/off flags) is wiped on every restart, which silently turns
+# OFF scheduled alerts and event-forwarding while manual sends (token from env) keep
+# working. Fall back to the repo dir for local dev where there's no DB volume.
+def _tg_cfg_path():
+    db = (os.environ.get('DB_PATH', '') or '').strip()
+    d = os.path.dirname(db) if db else ''
+    if d and os.path.isdir(d):
+        return os.path.join(d, 'telegram_config.json')
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'telegram_config.json')
+_TG_CFG_PATH = _tg_cfg_path()
 
 def _tg_save():
     try:
@@ -3353,6 +3364,7 @@ def _tg_enqueue(line):
 def _tg_flush_loop():
     while True:
         try:
+            _TG_STATE['_flush_tick'] = int(_zd_time.time())
             if _TG_STATE.get('masterOn') and _TG_STATE.get('events') and _TG_QUEUE and _TG_STATE.get('chat_id'):
                 with _TG_LOCK:
                     batch = _TG_QUEUE[:]; _TG_QUEUE[:] = []
@@ -3371,6 +3383,7 @@ def _tg_parse_hhmm(s):
 def _tg_scheduler_loop():
     while True:
         try:
+            _TG_STATE['_sched_tick'] = int(_zd_time.time())
             if _TG_STATE.get('masterOn'):
                 now = _tg_now_ist(); today = now.strftime('%Y-%m-%d')
                 if now.weekday() < 5:                       # Mon–Fri
@@ -3388,12 +3401,19 @@ def _tg_scheduler_loop():
             pass
         _zd_time.sleep(30)
 
+_TG_THREADS = {}
 def _tg_ensure_threads():
-    if _TG_STATE.get('started'):
-        return
+    """(Re)start the flush + scheduler threads. Self-healing: if a daemon thread
+    ever dies (unhandled error, worker hiccup), the next call restarts it. Called at
+    import AND on every status poll so the loops can't stay dead silently."""
+    for nm, target in (('flush', _tg_flush_loop), ('sched', _tg_scheduler_loop)):
+        th = _TG_THREADS.get(nm)
+        if th is not None and th.is_alive():
+            continue
+        t = _threading.Thread(target=target, daemon=True, name='tg-' + nm)
+        _TG_THREADS[nm] = t
+        t.start()
     _TG_STATE['started'] = True
-    _threading.Thread(target=_tg_flush_loop, daemon=True, name='tg-flush').start()
-    _threading.Thread(target=_tg_scheduler_loop, daemon=True, name='tg-sched').start()
 
 # Restore saved config on boot and start the scheduler/flush threads (they idle on the
 # masterOn / per-alert flags), so scheduled alerts keep working after a restart.
@@ -3401,13 +3421,24 @@ _tg_load()
 _tg_ensure_threads()
 
 def _tg_public_state():
+    now = int(_zd_time.time())
+    def _ago(k):
+        t = _TG_STATE.get(k)
+        return (now - int(t)) if t else None
     return {'hasToken': bool(_TG_STATE.get('token')), 'chatId': _TG_STATE.get('chat_id'),
             'events': _TG_STATE.get('events'), 'masterOn': _TG_STATE.get('masterOn'),
-            'alerts': _TG_STATE.get('alerts'), 'labels': _TG_ALERT_LABELS}
+            'alerts': _TG_STATE.get('alerts'), 'labels': _TG_ALERT_LABELS,
+            # diagnostics so the user can SEE the loops are alive and what time the
+            # server is on (scheduled alerts fire on this IST clock, Mon–Fri).
+            'nowIst': _tg_now_ist().strftime('%Y-%m-%d %H:%M:%S IST'),
+            'schedAliveSec': _ago('_sched_tick'), 'flushAliveSec': _ago('_flush_tick'),
+            'queue': len(_TG_QUEUE), 'cfgPath': _TG_CFG_PATH,
+            'lastFired': {k: v for k, v in (_TG_STATE.get('_last') or {}).items()}}
 
 @app.route('/api/telegram/status')
 @login_required
 def telegram_status():
+    _tg_ensure_threads()   # self-heal: restart the loops if they ever died
     return jsonify(dict({'success': True}, **_tg_public_state()))
 
 @app.route('/api/telegram/config', methods=['POST'])
@@ -16373,7 +16404,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       $('nmvChat').value=d.chatId||''; $('nmvMaster').checked=!!d.masterOn; $('nmvEvents').checked=!!d.events;
       $('nmvToken').placeholder=d.hasToken?'token set (leave blank to keep)':'123456:ABC…';
       renderAlerts(d.alerts,d.labels);
-      say(d.hasToken?'Token set. Set chat id + times, tick Master, then Save.':'No token — paste one above.');
+      var diag='Server '+(d.nowIst||'?')+' · scheduler '+(d.schedAliveSec==null?'DOWN':d.schedAliveSec+'s ago')+' · forwarder '+(d.flushAliveSec==null?'DOWN':d.flushAliveSec+'s ago')+(d.queue?(' · queue '+d.queue):'');
+      say((d.hasToken?'Token set. Set chat id + times, tick Master, then Save.':'No token — paste one above.')+'\n'+diag, !d.hasToken || d.schedAliveSec==null);
     }).catch(function(){}); }
   if($('nmvBtn')) $('nmvBtn').addEventListener('click',open);
   if($('nmvClose')) $('nmvClose').addEventListener('click',function(){modal.style.display='none';});
