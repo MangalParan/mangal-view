@@ -307,6 +307,75 @@ def build_workbook(events, alerts, trades, out_path):
     for c in range(1, 13):
         wsum.cell(row=wsum.max_row, column=c).font = Font(bold=True)
 
+    # ---- Claude (the Claude AI strategy only — tracked apart from TV/algo trades,
+    #      which trade very differently). Net is only summed WITHIN a symbol because
+    #      Claude spans $ (Delta) and ₹ (Zerodha), so R (reward:risk realised) is the
+    #      currency-agnostic headline. 'chart' flags entries whose reason cites the
+    #      uploaded chart image (vision). ----
+    def _rnum(x):
+        try: return float(x)
+        except Exception: return None
+    cl = [t for t in closed if str(t.get('strategy', '')).lower() == 'claude']
+    wcl = wb.create_sheet('Claude')
+    tcols = [('Entry Time', 'entry_time'), ('Exit Time', 'exit_time'), ('Bot', 'bot'),
+             ('Symbol', 'symbol'), ('Side', 'side'), ('Qty', 'qty'), ('Entry Px', 'entry_px'),
+             ('SL', 'sl'), ('TP', 'tp'), ('Exit Px', 'exit_px'), ('PnL', 'pnl'), ('Move %', 'move_pct'),
+             ('R', 'R'), ('Mins', 'mins'), ('Exit Reason', 'exit_reason'), ('Score', 'score'),
+             ('Chart?', '_chart'), ('Entry Note', 'entry_note')]
+    if not cl:
+        wcl.append(['No Claude-strategy trades yet.'])
+    else:
+        wins = [t for t in cl if t['pnl'] >= 0]; losses = [t for t in cl if t['pnl'] < 0]
+        Rs = [r for r in (_rnum(t.get('R')) for t in cl) if r is not None]
+        charted = [t for t in cl if 'chart' in str(t.get('entry_note', '')).lower()]
+        for k, v in [('Metric', 'Value'),
+                     ('Claude trades (closed)', len(cl)),
+                     ('Wins / Losses', '{} / {}'.format(len(wins), len(losses))),
+                     ('Win %', round(len(wins) / len(cl) * 100, 1)),
+                     ('Avg R (reward:risk realised)', round(sum(Rs) / len(Rs), 2) if Rs else ''),
+                     ('Avg win / avg loss (per symbol ccy)', '{} / {}'.format(
+                         round(sum(t['pnl'] for t in wins) / len(wins), 2) if wins else 0,
+                         round(sum(t['pnl'] for t in losses) / len(losses), 2) if losses else 0)),
+                     ('Trades citing the chart image', '{} of {}'.format(len(charted), len(cl)))]:
+            wcl.append([k, v])
+        wcl.cell(row=1, column=1).font = Font(bold=True)
+        wcl.cell(row=1, column=2).font = Font(bold=True)
+        wcl.append([])
+        wcl.append(['Symbol', 'Trades', 'Wins', 'Win %', 'Net (own ccy)', 'Avg R'])
+        _hdr2 = wcl.max_row
+        bysym = {}
+        for t in cl:
+            bysym.setdefault(t['symbol'], []).append(t)
+        for s in sorted(bysym):
+            v = bysym[s]; w = [t for t in v if t['pnl'] >= 0]
+            rr = [r for r in (_rnum(t.get('R')) for t in v) if r is not None]
+            wcl.append([s, len(v), len(w), round(len(w) / len(v) * 100),
+                        round(sum(t['pnl'] for t in v), 2), round(sum(rr) / len(rr), 2) if rr else ''])
+        for c in range(1, 7):
+            wcl.cell(row=_hdr2, column=c).font = Font(bold=True)
+        wcl.append([])
+        # full Claude trade list (newest last), color-coded by PnL
+        _hdr3 = wcl.max_row + 1
+        wcl.append([h for h, _ in tcols])
+        for t in cl:
+            row = []
+            for _, k in tcols:
+                if k == '_chart':
+                    row.append('yes' if 'chart' in str(t.get('entry_note', '')).lower() else '')
+                else:
+                    row.append(t.get(k, ''))
+            wcl.append(row)
+        pcol = [k for _, k in tcols].index('pnl') + 1
+        for r in range(_hdr3 + 1, wcl.max_row + 1):
+            v = wcl.cell(row=r, column=pcol).value
+            if isinstance(v, (int, float)):
+                fill = WIN_FILL if v >= 0 else LOSS_FILL
+                for c in range(1, len(tcols) + 1):
+                    wcl.cell(row=r, column=c).fill = fill
+        for c in range(1, len(tcols) + 1):
+            wcl.cell(row=_hdr3, column=c).font = Font(bold=True)
+    _autofit(wcl, maxw=70)
+
     wb.save(out_path)
     return len(trades), len(alerts), len(events), len(closed)
 
