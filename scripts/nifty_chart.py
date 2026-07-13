@@ -2462,6 +2462,14 @@ def _delta_bot_open(side, price, strat, mode):
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    # LIVE: place first; open the internal position ONLY if the exchange accepted the
+    # order. A rejected entry must NOT create a phantom position (which would later fire
+    # a REAL exit and could close a trade you placed manually).
+    if mode == 'live':
+        if not _delta_bot_place_live(side, qty, cfg):
+            _bot_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}).'.format(cfg.get('symbol'), side, qty))
+            _persist_log_line('[DELTA] [LIVE] ENTRY REJECTED — no position opened ' + str(cfg.get('symbol')))
+            return
     delta_ai_state['position'] = {
         'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 4), 'tp': round(tp, 4),
@@ -2475,8 +2483,6 @@ def _delta_bot_open(side, price, strat, mode):
         strat['name'], strat['score'], _cap_note, strat.get('reason', ''))
     _bot_log(line)
     _persist_log_line('[DELTA] ' + line)
-    if mode == 'live':
-        _delta_bot_place_live(side, qty, cfg)
 
 def _delta_calc_pnl(entry, exit_, qty, side, product):
     """Approximate P/L for a Delta contract.
@@ -2544,16 +2550,17 @@ def _delta_bot_close(price, reason, mode):
         delta_ai_state['running'] = False
 
 def _delta_bot_place_live(side, qty, cfg):
+    """Place a live Delta order. Returns True only if the exchange ACCEPTED it."""
     api_key = cfg.get('api_key') or ''
     if not api_key or api_key not in delta_v2_sessions:
         _bot_log('[LIVE] Delta order skipped — not connected.')
         _persist_log_line('[DELTA] [LIVE] order skipped: not connected')
-        return
+        return False
     products = _load_delta_products()
     p = products.get(cfg['symbol'].upper())
     if not p or not p.get('id'):
         _bot_log('[LIVE] Unknown Delta symbol: ' + cfg['symbol'])
-        return
+        return False
     api_secret = delta_v2_sessions[api_key]['api_secret']
     sess_base  = delta_v2_sessions[api_key].get('base_url') or _DELTA_BASES[0]
     body = {
@@ -2566,10 +2573,11 @@ def _delta_bot_place_live(side, qty, cfg):
         oid = (result.get('result') or {}).get('id', '')
         _bot_log('[LIVE] Delta accepted #' + str(oid))
         _persist_log_line('[DELTA] [LIVE] Delta accepted #' + str(oid))
-    else:
-        err = result.get('error', 'unknown')
-        _bot_log('[LIVE] Delta order failed: ' + str(err))
-        _persist_log_line('[DELTA] [LIVE] Delta order failed: ' + str(err))
+        return True
+    err = result.get('error', 'unknown')
+    _bot_log('[LIVE] Delta order failed: ' + str(err))
+    _persist_log_line('[DELTA] [LIVE] Delta order failed: ' + str(err))
+    return False
 
 def _delta_bot_tick():
     cfg = delta_ai_state.get('config') or {}
@@ -3811,6 +3819,14 @@ def _zd_bot_open(side, price, strat, mode):
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 3.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    # LIVE: place the entry FIRST; open the internal position ONLY if Kite accepted it.
+    # A rejected entry must NOT create a phantom position (which would later fire a REAL
+    # exit and could close a trade you placed manually).
+    if mode == 'live':
+        if not _zd_bot_place_live(side, qty, price, cfg):
+            _zd_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}).'.format(cfg.get('symbol'), side, qty))
+            _persist_log_line('[ZERODHA] [LIVE] ENTRY REJECTED — no position opened ' + str(cfg.get('symbol')))
+            return
     zd_ai_state['position'] = {
         'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 2), 'tp': round(tp, 2),
@@ -3824,15 +3840,13 @@ def _zd_bot_open(side, price, strat, mode):
         strat['name'], strat['score'], _cap_note, strat.get('reason', ''))
     _zd_log(line)
     _persist_log_line('[ZERODHA] ' + line)
-    if mode == 'live':
-        _zd_bot_place_live(side, qty, price, cfg)
-        # Resting broker hard stop (SL-M) so the loss is capped intrabar, not at
-        # the next tick. Falls back to the soft stop if placement fails.
-        if cfg.get('hardStop', True):
-            oid = _zd_place_stop_live('SELL' if side == 'BUY' else 'BUY', qty, sl, cfg)
-            if oid:
-                zd_ai_state['position']['sl_order_id'] = oid
-                zd_ai_state['position']['sl_order_trigger'] = round(sl, 2)
+    if mode == 'live' and cfg.get('hardStop', True):
+        # Resting broker hard stop (SL-M) so the loss is capped intrabar, not at the
+        # next tick. Falls back to the soft stop if placement fails.
+        oid = _zd_place_stop_live('SELL' if side == 'BUY' else 'BUY', qty, sl, cfg)
+        if oid:
+            zd_ai_state['position']['sl_order_id'] = oid
+            zd_ai_state['position']['sl_order_trigger'] = round(sl, 2)
 
 def _zd_bot_close(price, reason, mode, skip_order=False):
     pos = zd_ai_state.get('position')
@@ -3895,12 +3909,12 @@ def _zd_bot_place_live(side, qty, price, cfg, order_type='LIMIT'):
     if not api_key or api_key not in zerodha_sessions:
         _zd_log('[LIVE] Kite order skipped — not connected.')
         _persist_log_line('[ZERODHA] [LIVE] order skipped: not connected')
-        return
+        return False
     access_token = zerodha_sessions[api_key].get('access_token', '')
     if not access_token:
         _zd_log('[LIVE] No access_token — re-Connect Zerodha.')
         _persist_log_line('[ZERODHA] [LIVE] order skipped: no access_token')
-        return
+        return False
     symbol   = (cfg.get('symbol') or '').upper()
     exchange = (cfg.get('exchange') or '').upper() or _zd_infer_exchange(symbol) or 'NSE'
     product  = 'NRML' if exchange in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCO') else 'MIS'
@@ -3929,14 +3943,15 @@ def _zd_bot_place_live(side, qty, price, cfg, order_type='LIMIT'):
         except Exception: pass
         _zd_log('[LIVE] Kite order failed: ' + (str(err) or str(e))[:200])
         _persist_log_line('[ZERODHA] [LIVE] Kite order failed: ' + (str(err) or str(e))[:200])
-        return
+        return False
     if rd.get('status') == 'success':
         oid = (rd.get('data') or {}).get('order_id', '')
         _zd_log('[LIVE] Kite accepted #' + str(oid))
         _persist_log_line('[ZERODHA] [LIVE] Kite accepted #' + str(oid))
-    else:
-        _zd_log('[LIVE] Kite rejected: ' + str(rd.get('message', rd))[:200])
-        _persist_log_line('[ZERODHA] [LIVE] Kite rejected: ' + str(rd.get('message', ''))[:200])
+        return True
+    _zd_log('[LIVE] Kite rejected: ' + str(rd.get('message', rd))[:200])
+    _persist_log_line('[ZERODHA] [LIVE] Kite rejected: ' + str(rd.get('message', ''))[:200])
+    return False
 
 # --- Broker-side HARD STOP (SL-M) ------------------------------------------
 # The soft stop is only evaluated each tick; a violent candle can slip far past
@@ -4560,6 +4575,7 @@ def _kite_limit_order(api_key, symbol, exchange, side, qty, price):
     return False, str(rd.get('message', rd))[:200]
 
 def _zo_place_live(leg, side, qty, price, cfg):
+    """Place a live Kite order. Returns True only if the broker ACCEPTED it."""
     ok, msg = _kite_limit_order(cfg.get('api_key'), leg['symbol'], leg['exchange'], side, qty, price)
     if ok:
         _zo_log('[LIVE] Kite accepted #' + msg + ' (' + leg['symbol'] + ')')
@@ -4567,6 +4583,7 @@ def _zo_place_live(leg, side, qty, price, cfg):
     else:
         _zo_log('[LIVE] order failed (' + leg['symbol'] + '): ' + msg)
         _persist_log_line('[ZOPTIONS] [LIVE] order failed: ' + msg)
+    return ok
 
 # Index/options lot sizes change over time — the live Kite instrument dump is the
 # source of truth (it carries lot_size per contract). This map is only a fallback if
@@ -4605,6 +4622,17 @@ def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
     is_long = open_side == 'BUY'
     sl = price * (1 - sl_pct/100.0) if is_long else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if is_long else price * (1 - tp_pct/100.0)
+    # LIVE: place the entry order FIRST and open the internal position ONLY if the
+    # broker ACCEPTED it. A rejected entry (insufficient margin, etc.) must NOT create
+    # a phantom position — otherwise a later 'SL/TP' fires a REAL exit order against a
+    # position that never existed (the 13-Jul bug: rejected short → real BUY booked).
+    if mode == 'live':
+        if not _zo_place_live(leg, open_side, qty, price, cfg):
+            _zo_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}). Fix margin/funds or reduce lots.'.format(
+                leg['symbol'], open_side, qty))
+            _persist_log_line('[ZOPTIONS] [LIVE] ENTRY REJECTED — no position opened ' + leg['symbol'])
+            leg['last_exit_time'] = int(_zd_time.time())   # brief cooldown before retrying
+            return
     _m = _zo_option_meta(leg['symbol'], leg.get('exchange'), 0)   # strike/type/dte (no spot needed)
     leg['position'] = {
         'side': open_side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
@@ -4618,8 +4646,6 @@ def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
         round(sl, 2), round(tp, 2), strat['name'], strat['score'], lots, lot, strat.get('reason', ''))
     _zo_log(line)
     _persist_log_line('[ZOPTIONS] ' + line)
-    if mode == 'live':
-        _zo_place_live(leg, open_side, qty, price, cfg)
 
 def _zo_close_leg(leg, price, reason, cfg, mode):
     pos = leg.get('position')
@@ -5402,6 +5428,7 @@ def _mt_log(msg):
             del buf[:len(buf) - 200]
 
 def _mt_bot_place_live(side, qty, price, cfg, sl=0.0, tp=0.0):
+    """Place a live MT5 order. Returns True only if the terminal ACCEPTED it."""
     ok, msg = _mt5_place_order(cfg.get('mt5_id'), cfg.get('symbol'), side, qty, price, sl=sl, tp=tp)
     if ok:
         _mt_log('[LIVE] MT5 order #' + msg + (' (SL={} TP={})'.format(sl, tp) if (sl or tp) else ''))
@@ -5409,6 +5436,7 @@ def _mt_bot_place_live(side, qty, price, cfg, sl=0.0, tp=0.0):
     else:
         _mt_log('[LIVE] MT5 order failed: ' + msg)
         _persist_log_line('[MT5] [LIVE] MT5 order failed: ' + msg)
+    return ok
 
 def _mt_bot_open(side, price, strat, mode):
     cfg    = mt_ai_state['config']
@@ -5426,6 +5454,17 @@ def _mt_bot_open(side, price, strat, mode):
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
     sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    # LIVE: place first (SL/TP attached to the deal so MT5 enforces them server-side,
+    # unless hardStop=false); open the internal position ONLY if the terminal accepted
+    # it. A rejected entry must NOT create a phantom position (which would later fire a
+    # REAL exit and could close a trade you placed manually).
+    if mode == 'live':
+        _hs = cfg.get('hardStop', True)
+        if not _mt_bot_place_live(side, qty, price, cfg,
+                                  sl=(sl if _hs else 0.0), tp=(tp if _hs else 0.0)):
+            _mt_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}).'.format(cfg.get('symbol'), side, qty))
+            _persist_log_line('[MT5] [LIVE] ENTRY REJECTED — no position opened ' + str(cfg.get('symbol')))
+            return
     mt_ai_state['position'] = {
         'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 5), 'tp': round(tp, 5),
@@ -5438,12 +5477,6 @@ def _mt_bot_open(side, price, strat, mode):
         round(sl, 5), round(tp, 5), strat['name'], strat['score'], _cap_note, strat.get('reason', ''))
     _mt_log(line)
     _persist_log_line('[MT5] ' + line)
-    if mode == 'live':
-        # Attach SL/TP to the deal so MT5 enforces them server-side (hard stop),
-        # not just at the bot's next tick — unless disabled via hardStop=false.
-        _hs = cfg.get('hardStop', True)
-        _mt_bot_place_live(side, qty, price, cfg,
-                           sl=(sl if _hs else 0.0), tp=(tp if _hs else 0.0))
 
 def _mt_bot_close(price, reason, mode):
     pos = mt_ai_state.get('position')
