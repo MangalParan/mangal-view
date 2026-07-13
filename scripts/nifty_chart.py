@@ -4605,10 +4605,12 @@ def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
     is_long = open_side == 'BUY'
     sl = price * (1 - sl_pct/100.0) if is_long else price * (1 + sl_pct/100.0)
     tp = price * (1 + tp_pct/100.0) if is_long else price * (1 - tp_pct/100.0)
+    _m = _zo_option_meta(leg['symbol'], leg.get('exchange'), 0)   # strike/type/dte (no spot needed)
     leg['position'] = {
         'side': open_side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
         'qty': qty, 'sl': round(sl, 2), 'tp': round(tp, 2),
         'strategy': strat['name'], 'mode': mode,
+        'optionType': _m.get('optionType'), 'strike': _m.get('strike'), 'dte': _m.get('dte'),
     }
     kind = 'BUY-to-open (long)' if is_long else 'SELL-to-open (short)'
     line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} [{} lot×{}] — {}'.format(
@@ -4639,6 +4641,11 @@ def _zo_close_leg(leg, price, reason, cfg, mode):
         _zo_place_live(leg, close_side, pos['qty'], price, cfg)
     leg['position'] = None
     leg['last_exit_time'] = int(_zd_time.time())
+    # Remember a losing exit so we don't re-enter the SAME side right after (guard).
+    if pnl < 0 or 'SL' in str(reason):
+        leg['last_loss'] = {'side': pos['side'], 'ts': int(_zd_time.time())}
+    elif pnl > 0:
+        leg['last_loss'] = {}
 
 def _zo_apply_breakers(cfg, mode):
     """Global circuit breakers across both legs. Closes all open legs + stops."""
@@ -4900,6 +4907,19 @@ def _zo_bot_tick():
                 else:
                     if hi >= pos['sl']:    reason, exit_px = 'SL hit', pos['sl']
                     elif lo <= pos['tp']:  reason, exit_px = 'TP hit', pos['tp']
+                # Underlying-based stop for a NEAR-EXPIRY SHORT: bail before gamma blows
+                # the premium-% stop. Exit the short when the underlying reaches (within
+                # nearExpiryStopPct) the short strike — CE risk = spot rising to strike,
+                # PE risk = spot falling to strike. Only when dte<=1 and spot is known.
+                if reason is None and (not is_long) and pos.get('strike') and (pos.get('dte') is not None and pos['dte'] <= 1):
+                    uspot = (base_ctx or {}).get('underlyingSpot')
+                    if uspot:
+                        k = float(pos['strike']); ot = pos.get('optionType')
+                        buf = float(cfg.get('nearExpiryStopPct', 0.15) or 0.15) / 100.0
+                        if ot == 'CE' and uspot >= k * (1 - buf):
+                            reason, exit_px = 'underlying near short-call strike (expiry gamma)', price
+                        elif ot == 'PE' and uspot <= k * (1 + buf):
+                            reason, exit_px = 'underlying near short-put strike (expiry gamma)', price
                 if reason is None:
                     if is_long and sig == 'SELL':            reason = 'signal reversal'
                     elif (not is_long) and sig == 'BUY':       reason = 'signal reversal'
@@ -4913,10 +4933,15 @@ def _zo_bot_tick():
                 if sig == 'BUY' and buyer:    open_side = 'BUY'    # long the option
                 elif sig == 'SELL' and seller: open_side = 'SELL'  # short the option
                 if open_side:
-                    cooldown = int(cfg.get('cooldownSec', 60) or 0)
+                    now_t     = int(_zd_time.time())
+                    cooldown  = int(cfg.get('cooldownSec', 60) or 0)
                     last_exit = leg.get('last_exit_time') or 0
-                    if cooldown and (int(_zd_time.time()) - last_exit) < cooldown:
+                    ll        = leg.get('last_loss') or {}
+                    losscd    = int(cfg.get('lossCooldownSec', 300) or 0)
+                    if cooldown and (now_t - last_exit) < cooldown:
                         _zo_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, open_side, cooldown))
+                    elif losscd and ll.get('side') == open_side and (now_t - int(ll.get('ts', 0) or 0)) < losscd:
+                        _zo_log('[Tick] {} {} skipped — loss cooldown {}s (not re-entering the same side right after an SL)'.format(symbol, open_side, losscd))
                     else:
                         ok, qreason = (True, '') if _bot_is_claude(cfg) else _bot_entry_quality(open_side, candles, regime, cfg)
                         if ok:
@@ -5001,6 +5026,8 @@ def zo_aibot_start():
             'mode':       data.get('mode', 'paper'),
             'optionBuyer':  buyer,
             'optionSeller': seller,
+            'lossCooldownSec': int(data.get('lossCooldownSec', 300) or 0),   # block re-entering the same side for N s after an SL
+            'nearExpiryStopPct': float(data.get('nearExpiryStopPct', 0.15) or 0.15),  # exit a short when the underlying is within this % of the short strike (dte<=1)
             'slPct':      float(data.get('slPct', 10.0)),
             'tpPct':      float(data.get('tpPct', 10.0)),
             'maxConsec':  int(data.get('maxConsec', 3) or 3),
