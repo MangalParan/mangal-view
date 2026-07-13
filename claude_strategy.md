@@ -40,6 +40,8 @@ The system prompt frames Claude as an **elite intraday trader** optimizing for *
 5. **Anti-whipsaw** — if already in a position, DEFAULT to staying (HOLD to keep, or same-direction). Only flip on a genuine structural reversal (level break + reclaim against the position). Don't flip on noise — costs add up.
 6. **Learn** — review `recentTrades`. If recent trades lost in conditions like now (especially `signal reversal` exits), be more selective and HOLD more.
 
+**What it deliberately avoids (by design).** It does **not** chase vertical breakouts / runaway moves. Buying a fast, extended rally means buying *into* resistance with a wide stop — exactly the "be the liquidity" trap. In fast, wide-bar, range-expanding conditions it **HOLDs** and waits for the **pullback / retest** of the breakout level (or a clean support bounce) to enter with a tight stop and ≥ 1.5 R:R. So sitting out a strong one-way move is the strategy working as intended, not a fault — the edge is selective structure entries with small losses, not catching every move. (It also only re-decides every `tickSec`, so a fast move can complete between decisions; by the time it looks, price is extended → HOLD.)
+
 ---
 
 ## 3. Self-scoring (Claude's own conviction)
@@ -112,14 +114,31 @@ Each panel has a **📊 TradingView** toggle. There's no official API for a user
 - For the **Options** bot, TradingView is read on the **underlying** (e.g. NSE:NIFTY), since option contracts aren't on TradingView TA.
 - Influence is **context only**: Claude lifts conviction when TV aligns with its own read and raises its bar when TV opposes — it never trades against its own structure read just because TV disagrees. A stale webhook (large `ageSec`) is weighted weakly.
 
-## 9. Model & cadence
+## 9. Chart image input (vision)
 
-- The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
-- **Tick** sets how often the bot checks the market and calls Claude (15s … 10m). Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost.
+Each bot chat has a **📎 attach** button. Upload a TradingView chart screenshot (SuperTrend / EMA / PSAR / support-resistance, any or multiple timeframes) and Claude uses it as **vision input** (base64 image blocks on the Anthropic Messages API):
+
+- **In the chat** — it reads the chart to answer questions about the current setup.
+- **In the live trade loop** — the latest uploaded chart is fed to Claude on **every decision** while the bot runs, and the prompt tells it to treat the chart as the **PRIMARY structure read**: trend, key S/R and indicator alignment come from what it *sees*, and it aligns the decision with the chart. If the picture contradicts the numeric fields, it trusts the chart's structure.
+- The chart stays "current" for **~3 hours**, then expires so a stale picture can't keep driving trades. **Re-upload anytime** during a trade to re-steer the strategy around the newest chart.
+- Available on all four bots (Delta / Zerodha / MT5 / Options). See [`_call_claude`](scripts/nifty_chart.py) (the `images` param) and the per-bot chart store (`_chart_store` / `_chart_images_for`).
 
 ---
 
-## 10. Honest caveats
+## 10. Data source & fallback
+
+Candles come from the bot's broker feed — Delta, Kite (Zerodha), or MT5. For the **MT5 bot in paper mode with the TradingView toggle on**, if the MT5 (MCP/EA) feed is unavailable the bot **falls back to TradingView candles** (`cfg.tvSymbol`, e.g. `OANDA:XAUUSD`) so paper trading keeps running; MT5 stays primary and it switches back when the feed recovers. Live mode has no such fallback (you can't place live MT5 orders without the bridge).
+
+---
+
+## 11. Model & cadence
+
+- The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
+- **Tick** sets how often the bot checks the market and calls Claude (15s … 10m). Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost. A slower tick (e.g. 180s) = fewer, more-considered trades and lower cost.
+
+---
+
+## 12. Honest caveats
 
 - This is a **discretionary, LLM-judgment** strategy, **not** a backtested quant edge. The prompt steers Claude toward selective, structure-based trades to favour win rate, but **no strategy guarantees profit** — markets gap and reverse.
 - The **circuit breakers** (max consecutive losses, max daily loss/profit) and **SL on every trade** are what cap the downside.
