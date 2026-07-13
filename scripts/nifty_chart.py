@@ -2207,6 +2207,16 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
                 "when in doubt, HOLD.")
     else:
         gate = ("Only choose BUY or SELL when your conviction |score| >= " + str(min_enter) + " (score sign matches signal).")
+    # Operator note: the user's latest chat message is stored on the config and fed to
+    # the live decision loop as guidance (a bias, a level, "only longs", "stay flat"…).
+    note_txt, note_age = '', None
+    _note = cfg.get('userNote') or {}
+    if isinstance(_note, dict) and _note.get('text'):
+        note_age = int(_zd_time.time()) - int(_note.get('ts', 0) or 0)
+        if note_age <= 3600:                       # honour it for 1h
+            note_txt = str(_note['text'])[:400]
+        else:
+            note_age = None
     system = (
         "You are an ELITE intraday trader. Your job: make the MAXIMUM profit with a HIGH WIN RATE so the customer is "
         "happy. Trade like a professional reading order flow and market-maker (smart-money) behaviour — NOT a "
@@ -2246,7 +2256,13 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "options, the strike & side) with it. If the image contradicts the numeric fields, trust the image. It "
             "is the user's latest manual view — weight it heavily.\n")
            if images else "")
+        + (("OPERATOR NOTE: 'operatorNote' is the user's latest instruction/context typed in the chat "
+            "(e.g. a directional bias, a level to watch, 'only longs today', 'stay flat', 'be aggressive'). "
+            "FACTOR IT INTO your decision and strike/side. It is guidance, not a hard override — you still own "
+            "risk and may HOLD if the setup is poor. Treat an older note (large operatorNoteAgeSec) as weaker.\n")
+           if note_txt else "")
         + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
+        "\"fcastPct\":<your forecast of the % price move over the next ~5-10 bars; + up / - down, e.g. 0.6 or -1.2>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
     )
     _payload = {
@@ -2261,13 +2277,16 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         'position': pos_ctx, 'recentTrades': trades_ctx, 'recentWinRate': (round(wins/len(trades_ctx)*100) if trades_ctx else None),
         'ohlcv': ohlcv,
     }
+    if note_txt:
+        _payload['operatorNote'] = note_txt
+        _payload['operatorNoteAgeSec'] = note_age
     if extra_ctx:
         _payload.update(extra_ctx)
     user = _json.dumps(_payload, default=str)
     text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'), images=images)
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:220]}
-    sig, score, reason, sl_pct, tp_pct = 'HOLD', 0.0, '', None, None
+    sig, score, reason, sl_pct, tp_pct, fcast = 'HOLD', 0.0, '', None, None, None
     try:
         m = _re.search(r'\{.*\}', text or '', _re.DOTALL)
         obj = _json.loads(m.group(0)) if m else {}
@@ -2275,13 +2294,18 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         if sig not in ('BUY', 'SELL', 'HOLD'): sig = 'HOLD'
         score = float(obj.get('score', 0) or 0)
         reason = str(obj.get('reason', ''))[:180]
+        if obj.get('fcastPct') is not None:
+            fcast = max(-99.0, min(99.0, float(obj.get('fcastPct'))))
         if obj.get('slPct') is not None:
             sl_pct = min(50.0, max(0.2, float(obj.get('slPct'))))
         if obj.get('tpPct') is not None:
             tp_pct = min(50.0, max(0.2, float(obj.get('tpPct'))))
     except Exception:
         sig, score, reason = 'HOLD', 0.0, 'parse error: ' + (text or '')[:80]
-    out = {'name': 'claude', 'signal': sig, 'score': score, 'reason': 'Claude: ' + reason}
+    # Prepend the next-move forecast so it shows in every entry log / tick / journal.
+    tag = ('f{:+.1f}% '.format(fcast)) if fcast is not None else ''
+    out = {'name': 'claude', 'signal': sig, 'score': score, 'reason': 'Claude: ' + tag + reason}
+    if fcast is not None: out['fcastPct'] = fcast
     if sl_pct is not None: out['slPct'] = sl_pct
     if tp_pct is not None: out['tpPct'] = tp_pct
     return out
@@ -2999,6 +3023,18 @@ def _chart_images_for(state, max_age_sec=_CHART_MAX_AGE):
         return []
     return [{'media': img.get('media', 'image/png'), 'data': img['data']}]
 
+def _bot_set_note(state, lock, message):
+    """Store the user's latest chat message as a steering note on the bot config so the
+    LIVE Claude decision loop factors it in (a bias, a level, 'only longs', 'stay flat').
+    Honoured for ~1h (see _claude_trade_signal). Skips the auto chart-upload placeholder."""
+    msg = (message or '').strip()
+    if not msg or msg.startswith('I uploaded the latest chart'):
+        return
+    with lock:
+        cfg = state.get('config')
+        if cfg is not None:
+            cfg['userNote'] = {'text': msg[:400], 'ts': int(_zd_time.time())}
+
 def _img_block(img):
     return {'type': 'image', 'source': {'type': 'base64',
             'media_type': img.get('media', 'image/png'), 'data': img.get('data', '')}}
@@ -3634,6 +3670,7 @@ def delta_aibot_chat():
     if not message:
         message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
     chat_imgs = _chart_images_for(delta_ai_state) if img_url else []
+    _bot_set_note(delta_ai_state, delta_ai_lock, message)
     history = data.get('history') or []   # [{role, content}, ...]
 
     with delta_ai_lock:
@@ -4413,6 +4450,7 @@ def zd_aibot_chat():
     if not message:
         message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
     chat_imgs = _chart_images_for(zd_ai_state) if img_url else []
+    _bot_set_note(zd_ai_state, zd_ai_lock, message)
     history = data.get('history') or []
     with zd_ai_lock:
         cfg     = {k: v for k, v in (zd_ai_state.get('config') or {}).items() if k != 'api_key'}
@@ -5093,6 +5131,7 @@ def zo_aibot_chat():
     if not message:
         message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
     chat_imgs = _chart_images_for(zo_ai_state) if img_url else []
+    _bot_set_note(zo_ai_state, zo_ai_lock, message)
     history = data.get('history') or []
     with zo_ai_lock:
         cfg     = {k: v for k, v in (zo_ai_state.get('config') or {}).items() if k != 'api_key'}
@@ -5799,6 +5838,7 @@ def mt_aibot_chat():
     if not message:
         message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
     chat_imgs = _chart_images_for(mt_ai_state) if img_url else []
+    _bot_set_note(mt_ai_state, mt_ai_lock, message)
     history = data.get('history') or []
     with mt_ai_lock:
         cfg     = {k: v for k, v in (mt_ai_state.get('config') or {}).items() if k != 'mt5_id'}
