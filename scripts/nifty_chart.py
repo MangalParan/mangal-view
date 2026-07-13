@@ -4784,24 +4784,42 @@ def _zo_resolve_auto_strikes(cfg):
         return None, None, opt_exch, 'no strikes for ' + base
     atm  = min(strikes, key=lambda s: abs(s - spot))
     ai   = strikes.index(atm)
-    cand = strikes[max(0, ai - 3): ai + 4]   # ATM ±3 strikes
-    ce_strike = pe_strike = atm
+    # SELL bias → prefer OTM strikes (a cushion before the short goes ITM). A short CE
+    # is safer ABOVE spot, a short PE BELOW spot; at least sellOtmPct% away. Selling
+    # ATM/ITM is what got run over on small underlying moves. Buyers keep ATM.
+    sell_bias = bool(cfg.get('optionSeller'))
+    otm_pct   = float(cfg.get('sellOtmPct', 0.25) or 0.25)
+    if sell_bias:
+        ce_min = spot * (1 + otm_pct / 100.0)
+        pe_max = spot * (1 - otm_pct / 100.0)
+        ce_otm = [s for s in strikes if s >= ce_min] or [s for s in strikes if s > spot] or [atm]
+        pe_otm = [s for s in strikes if s <= pe_max] or [s for s in strikes if s < spot] or [atm]
+        ce_strike = min(ce_otm)                    # nearest OTM call meeting the cushion
+        pe_strike = max(pe_otm)                     # nearest OTM put meeting the cushion
+        ci = strikes.index(ce_strike); pi = strikes.index(pe_strike)
+        ce_cand = strikes[ci: ci + 4]              # OTM calls, cushion outward
+        pe_cand = strikes[max(0, pi - 3): pi + 1]  # OTM puts, cushion outward
+    else:
+        ce_cand = pe_cand = strikes[max(0, ai - 3): ai + 4]   # ATM ±3
+        ce_strike = pe_strike = atm
     try:
         if _bot_is_claude(cfg):
-            system = ("You select option strikes for an intraday options bot. Given the underlying spot and the "
-                      "available strikes for the nearest expiry, choose ONE strike for the CE (call) leg and ONE "
-                      "for the PE (put) leg to trade now — ATM or slightly OTM for a good risk:reward. Respond "
-                      "STRICT JSON ONLY: {\"ceStrike\":<number>,\"peStrike\":<number>,\"reason\":\"<=120 chars\"}.")
-            user = _json.dumps({'underlying': base, 'spot': round(spot, 2), 'atm': atm,
-                                'availableStrikes': cand, 'expiry': expiry})
+            system = ("You select option strikes for an intraday options bot. Choose ONE CE strike (from "
+                      "ceCandidates) and ONE PE strike (from peCandidates) for the nearest expiry. If sellBias is "
+                      "true the bot SELLS premium — pick clearly OTM strikes (CE above spot, PE below spot) with a "
+                      "cushion so a small underlying move can't push them ITM; prefer MORE OTM (safety) over a richer "
+                      "premium. Otherwise pick ATM/slightly-OTM. Respond STRICT JSON ONLY: "
+                      "{\"ceStrike\":<number>,\"peStrike\":<number>,\"reason\":\"<=120 chars\"}.")
+            user = _json.dumps({'underlying': base, 'spot': round(spot, 2), 'atm': atm, 'sellBias': sell_bias,
+                                'ceCandidates': ce_cand, 'peCandidates': pe_cand, 'expiry': expiry})
             text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=200, model=cfg.get('model'))
             if not err and text:
                 obj = _json.loads(_re.search(r'\{.*\}', text, _re.DOTALL).group(0))
-                cs  = float(obj.get('ceStrike') or atm); ps = float(obj.get('peStrike') or atm)
-                ce_strike = min(cand, key=lambda s: abs(s - cs))
-                pe_strike = min(cand, key=lambda s: abs(s - ps))
+                cs  = float(obj.get('ceStrike') or ce_strike); ps = float(obj.get('peStrike') or pe_strike)
+                ce_strike = min(ce_cand, key=lambda s: abs(s - cs))
+                pe_strike = min(pe_cand, key=lambda s: abs(s - ps))
     except Exception:
-        ce_strike = pe_strike = atm
+        pass   # keep the deterministic OTM/ATM defaults
     ce_row = next((i for i in chain if i['type'] == 'CE' and abs(i['strike'] - ce_strike) < 1e-6), None)
     pe_row = next((i for i in chain if i['type'] == 'PE' and abs(i['strike'] - pe_strike) < 1e-6), None)
     if not ce_row or not pe_row:
@@ -5024,6 +5042,8 @@ def zo_aibot_start():
             _rcfg = {'baseSymbol': base_symbol, 'tf': data.get('tf', '5m'),
                      'api_key': (data.get('api_key') or '').strip(),
                      'model': (data.get('model') or '').strip(),
+                     'optionSeller': seller, 'optionBuyer': buyer,
+                     'sellOtmPct': float(data.get('sellOtmPct', 0.25) or 0.25),   # min % OTM for sold strikes
                      'allowedStrategies': [s for s in (data.get('allowedStrategies') or ['claude']) if s in _BOT_CONFIGURABLE_ALGOS] or ['claude']}
             ce_sym, pe_sym, opt_exch_auto, auto_info = _zo_resolve_auto_strikes(_rcfg)
             if not ce_sym or not pe_sym:
@@ -5052,6 +5072,7 @@ def zo_aibot_start():
             'mode':       data.get('mode', 'paper'),
             'optionBuyer':  buyer,
             'optionSeller': seller,
+            'sellOtmPct': float(data.get('sellOtmPct', 0.25) or 0.25),   # sold strikes are chosen at least this % OTM
             'lossCooldownSec': int(data.get('lossCooldownSec', 300) or 0),   # block re-entering the same side for N s after an SL
             'nearExpiryStopPct': float(data.get('nearExpiryStopPct', 0.15) or 0.15),  # exit a short when the underlying is within this % of the short strike (dte<=1)
             'slPct':      float(data.get('slPct', 10.0)),
