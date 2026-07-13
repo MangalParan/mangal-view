@@ -2238,10 +2238,13 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
         + tv_block
-        + (("CHART IMAGE: A chart screenshot is attached (SuperTrend, EMA, PSAR, support/resistance, often "
-            "multiple timeframes). Treat it as the PRIMARY structure read: judge trend, key S/R, and indicator "
-            "alignment from what you SEE, and align the decision with the chart. If the picture contradicts the "
-            "numeric fields, trust the chart's structure. It is the user's latest manual view — weight it heavily.\n")
+        + (("IMAGE ATTACHED: A screenshot is attached — it may be a PRICE CHART (SuperTrend/EMA/PSAR/"
+            "support-resistance, often multiple timeframes) and/or OPTION-CHAIN / OPEN-INTEREST (OI) / max-pain "
+            "data. Read whatever it shows and treat it as the PRIMARY read: from a chart take trend, key S/R and "
+            "indicator alignment; from OI/option-chain data infer support/resistance from high-OI strikes, PCR, OI "
+            "build-up vs unwinding, and the likely pin / max-pain level — then align your decision (and, for "
+            "options, the strike & side) with it. If the image contradicts the numeric fields, trust the image. It "
+            "is the user's latest manual view — weight it heavily.\n")
            if images else "")
         + "Respond with STRICT JSON ONLY, no prose: {\"signal\":\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,"
         "\"reason\":\"<=160 chars, mention trend+why\",\"slPct\":<optional>,\"tpPct\":<optional>}. " + gate
@@ -4527,9 +4530,38 @@ def _zo_place_live(leg, side, qty, price, cfg):
         _zo_log('[LIVE] order failed (' + leg['symbol'] + '): ' + msg)
         _persist_log_line('[ZOPTIONS] [LIVE] order failed: ' + msg)
 
+# Index/options lot sizes change over time — the live Kite instrument dump is the
+# source of truth (it carries lot_size per contract). This map is only a fallback if
+# the instrument lookup fails. The panel's Qty field is now LOTS; the order quantity
+# = lots × lot_size, so orders are always a valid multiple (fixes 'quantity should be
+# multiple of 65' rejections).
+_ZO_LOT_FALLBACK = {'NIFTY': 65, 'BANKNIFTY': 35, 'FINNIFTY': 65, 'MIDCPNIFTY': 120,
+                    'SENSEX': 20, 'BANKEX': 30}
+def _zo_lot_size(symbol, exchange, base=''):
+    """Shares per lot for an option contract — from the live instrument dump, else a
+    per-underlying fallback map, else 1."""
+    sym = (symbol or '').upper().strip()
+    try:
+        for i in _zo_load_opt_instruments((exchange or 'NFO').upper()):
+            if (i.get('symbol') or '').upper() == sym:
+                ls = int(float(i.get('lot_size') or 0))
+                if ls > 0:
+                    return ls
+    except Exception:
+        pass
+    b = (base or '').upper().strip()
+    if not b:                                  # derive base from the option symbol prefix
+        for k in _ZO_LOT_FALLBACK:
+            if sym.startswith(k):
+                b = k; break
+    return _ZO_LOT_FALLBACK.get(b, 1)
+
 def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
-    """open_side 'BUY' = long the option (exit SELL); 'SELL' = short (exit BUY)."""
-    qty    = int(cfg.get('qty', 1))
+    """open_side 'BUY' = long the option (exit SELL); 'SELL' = short (exit BUY).
+    The panel Qty is LOTS — actual order quantity = lots × the contract's lot_size."""
+    lots   = max(1, int(cfg.get('qty', 1) or 1))
+    lot    = _zo_lot_size(leg['symbol'], leg.get('exchange') or cfg.get('exch1') or 'NFO', cfg.get('baseSymbol'))
+    qty    = lots * lot
     sl_pct = float(strat.get('slPct') or cfg.get('slPct', 10.0))   # Claude can set its own SL/TP
     tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 10.0))
     is_long = open_side == 'BUY'
@@ -4541,9 +4573,9 @@ def _zo_open_leg(leg, open_side, price, strat, cfg, mode):
         'strategy': strat['name'], 'mode': mode,
     }
     kind = 'BUY-to-open (long)' if is_long else 'SELL-to-open (short)'
-    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} [{} lot×{}] — {}'.format(
         mode.upper(), kind, qty, leg['symbol'], round(price, 2),
-        round(sl, 2), round(tp, 2), strat['name'], strat['score'], strat.get('reason', ''))
+        round(sl, 2), round(tp, 2), strat['name'], strat['score'], lots, lot, strat.get('reason', ''))
     _zo_log(line)
     _persist_log_line('[ZOPTIONS] ' + line)
     if mode == 'live':
@@ -4636,7 +4668,8 @@ def _zo_load_opt_instruments(exchange):
                 continue
             rows.append({'symbol': row.get('tradingsymbol', ''), 'name': row.get('name', ''),
                          'expiry': row.get('expiry', ''), 'strike': float(row.get('strike') or 0),
-                         'type': row.get('instrument_type', ''), 'exchange': exchange})
+                         'type': row.get('instrument_type', ''), 'exchange': exchange,
+                         'lot_size': row.get('lot_size', '')})
         _ZO_OPT_CACHE[exchange] = {'ts': now, 'data': rows}
         return rows
     except Exception:
@@ -17744,7 +17777,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </select>
         </label>
         </span>
-        <label><span>Qty</span><input type="number" id="zoBotQty" value="1" min="1" style="width:70px"></label>
+        <label title="Number of LOTS. Actual order quantity = lots × the contract's lot size (NIFTY 65, SENSEX 20, …), looked up live from the instrument. So enter 1 for one lot."><span>Lots</span><input type="number" id="zoBotQty" value="1" min="1" style="width:70px"></label>
         <label>
           <span>Timeframe</span>
           <select id="zoBotTF">
