@@ -4826,7 +4826,11 @@ def _zo_option_meta(symbol, exchange, spot):
         if exp:
             meta['expiry'] = exp
             try:
-                meta['dte'] = max(0, (datetime.strptime(exp, '%Y-%m-%d') - datetime.now()).days)
+                # DTE = whole calendar days to expiry in IST. Compare DATES, not
+                # datetimes: (expiry_midnight - now_with_time).days truncated the
+                # partial last day to 0, so a NEXT-day expiry read as "DTE=0 expiry
+                # today" and drove a false same-day theta-crush thesis.
+                meta['dte'] = max(0, (datetime.strptime(exp, '%Y-%m-%d').date() - _tg_now_ist().date()).days)
             except Exception:
                 pass
     return meta
