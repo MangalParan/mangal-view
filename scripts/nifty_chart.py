@@ -6681,7 +6681,7 @@ do_ai_state = {'running': False, 'paused': False, 'config': {}, 'legs': [], 'tra
 do_ai_lock = _threading.Lock()
 
 def _do_log(msg):
-    ts = datetime.now(timezone(timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S')
+    ts = _bot_log_ts()
     buf = do_ai_state.setdefault('log', [])
     buf.append('[' + ts + '] ' + msg)
     if len(buf) > 200:
@@ -7126,7 +7126,7 @@ tvb_ai_state = {'running': False, 'paused': False, 'config': {}, 'position': Non
 tvb_ai_lock = _threading.Lock()
 
 def _tvb_log(msg):
-    ts = datetime.now(timezone(timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S')
+    ts = _bot_log_ts()
     buf = tvb_ai_state.setdefault('log', [])
     buf.append('[' + ts + '] ' + msg)
     if len(buf) > 200:
