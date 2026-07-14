@@ -7101,6 +7101,267 @@ def do_aibot_resolve():
                                        otm_pct=float(data.get('sellOtmPct', 0.25) or 0.25))
     return jsonify({'success': bool(ce and pe), 'ce': ce, 'pe': pe, 'info': info})
 
+# ========================== TradingView AI bot (paper) =======================
+# Paper-trades ANY TradingView symbol (XAUUSD, USOIL, NSE:RELIANCE, MCX:GOLD1!, …)
+# using TradingView candles. Same engine as the other bots: Claude strategy OR the
+# TradingView webhook-alert strategy (SuperTrend/EMA). Currency label USD or INR.
+tvb_ai_state = {'running': False, 'paused': False, 'config': {}, 'position': None,
+                'trades': [], 'consec_losses': 0, 'log': [], '_decide': True, '_last_decision_ts': 0}
+tvb_ai_lock = _threading.Lock()
+
+def _tvb_log(msg):
+    ts = datetime.now(timezone(timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S')
+    buf = tvb_ai_state.setdefault('log', [])
+    buf.append('[' + ts + '] ' + msg)
+    if len(buf) > 200:
+        del buf[:len(buf) - 200]
+
+def _tvb_ccy(cfg):
+    return '₹' if (cfg.get('currency') or 'USD').upper() == 'INR' else '$'
+
+def _tvb_bot_open(side, price, strat, cfg):
+    capital = float(cfg.get('capital') or 0)
+    lev     = min(125.0, max(1.0, float(strat.get('leverage') or cfg.get('leverage') or 1)))
+    if capital > 0 and price > 0:
+        qty = round(capital * lev / price, 4)
+        cfg['leverage'] = lev
+    else:
+        qty = float(cfg.get('qty', 1) or 1)
+    sl_pct = float(strat.get('slPct') or cfg.get('slPct', 1.0))
+    tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 2.0))
+    sl = price * (1 - sl_pct/100.0) if side == 'BUY' else price * (1 + sl_pct/100.0)
+    tp = price * (1 + tp_pct/100.0) if side == 'BUY' else price * (1 - tp_pct/100.0)
+    tvb_ai_state['position'] = {'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+                                'qty': qty, 'sl': round(sl, 5), 'tp': round(tp, 5),
+                                'slPct': sl_pct, 'tpPct': tp_pct, 'strategy': strat['name'], 'mode': 'paper'}
+    line = '[PAPER] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
+        side, qty, cfg.get('symbol'), round(price, 5), round(sl, 5), round(tp, 5),
+        strat['name'], strat.get('score', 0), strat.get('reason', ''))
+    _tvb_log(line); _persist_log_line('[TVBOT] ' + line)
+
+def _tvb_bot_close(price, reason, cfg):
+    pos = tvb_ai_state.get('position')
+    if not pos: return
+    direction = 1 if pos['side'] == 'BUY' else -1
+    pnl = (float(price) - float(pos['entryPrice'])) * float(pos['qty']) * direction
+    closed = dict(pos); closed.update({'symbol': cfg.get('symbol'), 'exitPrice': round(price, 5),
+                   'exitTime': int(_zd_time.time()), 'pnl': round(pnl, 4), 'reason': reason})
+    tvb_ai_state['trades'].append(closed)
+    tvb_ai_state['consec_losses'] = tvb_ai_state.get('consec_losses', 0) + 1 if pnl < 0 else 0
+    close_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
+    line = '[PAPER] EXIT {} {} {} @ {} (entry {}) PnL={}{}{:.4f} reason={} strat={}'.format(
+        close_side, pos['qty'], cfg.get('symbol'), round(price, 5), pos['entryPrice'],
+        '+' if pnl >= 0 else '', _tvb_ccy(cfg), pnl, reason, pos['strategy'])
+    _tvb_log(line); _persist_log_line('[TVBOT] ' + line)
+    tvb_ai_state['position'] = None
+    tvb_ai_state['last_exit_time'] = int(_zd_time.time())
+
+def _tvb_bot_tick():
+    cfg = tvb_ai_state.get('config') or {}
+    if not cfg: return
+    symbol = (cfg.get('symbol') or '').strip()
+    interval = cfg.get('tf', '5m')
+    if not symbol: return
+    try:
+        candles = fetch_tradingview_data(interval, symbol)
+    except Exception as e:
+        _tvb_log('[Tick] data error: ' + str(e)); return
+    if not candles:
+        with tvb_ai_lock:
+            tvb_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
+        _tvb_log('[Tick] no TradingView candles for ' + symbol + ' — check the symbol (e.g. XAUUSD, OANDA:XAUUSD, MCX:GOLD1!)')
+        return
+    price = candles[-1]['close']; regime = _bot_detect_regime(candles)
+    decide = tvb_ai_state.get('_decide', True)
+    if _bot_is_claude(cfg) and decide:
+        _tv = _tv_context(cfg, 'tradingview', symbol, '') if cfg.get('tvEnabled') else None
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
+                                     tvb_ai_state.get('trades'), extra_ctx=({'tradingview': _tv} if _tv else None),
+                                     images=_chart_images_for(tvb_ai_state))
+    elif _bot_is_claude(cfg):
+        strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
+    else:
+        strat = _tv_alert_signal(tvb_ai_state, cfg, symbol)   # TradingView webhook alerts (SuperTrend/EMA)
+    sig = strat['signal']
+    with tvb_ai_lock:
+        tvb_ai_state['last_candles'] = candles[-150:]
+        tvb_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'price': price, 'strategy': strat['name'],
+                                     'signal': sig, 'score': strat['score'], 'reason': strat['reason'],
+                                     'regime': '{} vol, {}'.format(regime['volatility'], 'trending ' + regime['direction'] if regime['trending'] else 'range')}
+        pos = tvb_ai_state.get('position')
+        if pos:
+            is_long = pos['side'] == 'BUY'; reason = None; exit_px = price
+            bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+            if is_long:
+                if lo <= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
+                elif hi >= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
+            else:
+                if hi >= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
+                elif lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
+            if reason is None:
+                if is_long and sig == 'SELL':        reason = 'signal reversal'
+                elif (not is_long) and sig == 'BUY': reason = 'signal reversal'
+            if reason:
+                _tvb_bot_close(exit_px, reason, cfg)
+                if reason == 'signal reversal':      # flip into the new side
+                    _tvb_bot_open(sig, price, strat, cfg)
+            else:
+                _tvb_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(symbol, round(price, 5), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
+        else:
+            if sig in ('BUY', 'SELL'):
+                cd = int(cfg.get('cooldownSec', 60) or 0)
+                if cd and (int(_zd_time.time()) - (tvb_ai_state.get('last_exit_time') or 0)) < cd:
+                    _tvb_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, sig, cd))
+                else:
+                    _tvb_bot_open(sig, price, strat, cfg)
+            else:
+                _tvb_log('[Tick] {} px={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 5), strat['reason'], strat['score']))
+        # circuit breakers
+        trades = tvb_ai_state['trades']; realized = sum(t['pnl'] for t in trades)
+        unreal = 0.0
+        p2 = tvb_ai_state.get('position'); lt = tvb_ai_state.get('last_tick') or {}
+        if p2 and lt.get('price'):
+            unreal = (lt['price'] - p2['entryPrice']) * p2['qty'] * (1 if p2['side'] == 'BUY' else -1)
+        trip = None
+        if tvb_ai_state['consec_losses'] >= int(cfg.get('maxConsec', 3)):    trip = 'Max consecutive losses'
+        elif realized < -abs(float(cfg.get('maxLoss', 50))):                 trip = 'Max daily loss'
+        elif float(cfg.get('maxProfit', 0) or 0) > 0 and (realized + unreal) >= float(cfg.get('maxProfit')): trip = 'Max daily profit'
+        if trip:
+            if tvb_ai_state.get('position'):
+                _tvb_bot_close(lt.get('price') or price, trip, cfg)
+            tvb_ai_state['running'] = False
+            _tvb_log('[STOP] ' + trip); _persist_log_line('[TVBOT] [STOP] ' + trip)
+
+def _tvb_bot_loop():
+    while True:
+        with tvb_ai_lock:
+            running = tvb_ai_state.get('running', False); paused = tvb_ai_state.get('paused', False)
+        if not running: break
+        if not paused:
+            _cfg = tvb_ai_state.get('config') or {}; _now = _zd_time.time()
+            _dsec = max(5, int(_cfg.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC))
+            tvb_ai_state['_decide'] = (_now - tvb_ai_state.get('_last_decision_ts', 0)) >= _dsec
+            try: _tvb_bot_tick()
+            except Exception as e: _tvb_log('[Tick] ERROR: ' + str(e))
+            if tvb_ai_state.get('_decide'): tvb_ai_state['_last_decision_ts'] = _now
+        _bot_gc_tick()
+        _zd_time.sleep(max(5, int((tvb_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
+
+@app.route('/api/aibot/tvbot/start', methods=['POST'])
+@login_required
+def tvb_aibot_start():
+    data = request.json or {}
+    with tvb_ai_lock:
+        if tvb_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+        symbol = (data.get('symbol') or '').strip().upper()
+        if not symbol:
+            return jsonify({'success': False, 'error': 'Enter a TradingView symbol (e.g. XAUUSD, USOIL, NSE:RELIANCE, MCX:GOLD1!)'}), 400
+        claude = bool(data.get('claude', True))
+        tvb_ai_state['config'] = {
+            'symbol': symbol, 'currency': (data.get('currency') or 'USD').upper(),
+            'strategies': 'claude' if claude else 'tv', 'tvEnabled': bool(data.get('tvEnabled', True)),
+            'tvSymbol': symbol, 'emaMode': bool(data.get('emaMode', False)),
+            'trendGate': bool(data.get('trendGate', False)), 'avoidRange': bool(data.get('avoidRange', False)),
+            'minER': float(data.get('minER', 0.0) or 0.0), 'maxCont': int(data.get('maxCont', 0) or 0),
+            'contSlPct': float(data.get('contSlPct', 0.0) or 0.0), 'seedBias': (data.get('seedBias') or '').upper(),
+            'capital': float(data.get('capital') or 0), 'leverage': float(data.get('leverage') or 1),
+            'qty': float(data.get('qty', 1) or 1), 'tf': data.get('tf', '5m'), 'mode': 'paper',
+            'slPct': float(data.get('slPct', 1.0)), 'tpPct': float(data.get('tpPct', 2.0)),
+            'maxConsec': int(data.get('maxConsec', 3) or 3), 'maxLoss': float(data.get('maxLoss', 50) or 50),
+            'maxProfit': float(data.get('maxProfit', 0) or 0),
+            'minScore': float(data.get('minScore') if data.get('minScore') is not None else 0.0),
+            'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 0.0),
+            'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'tickSec': max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
+            'model': (data.get('model') or '').strip(),
+        }
+        if data.get('seedBias') in ('BUY', 'SELL'):
+            tvb_ai_state['seedBias'] = data.get('seedBias')
+        tvb_ai_state['position'] = None; tvb_ai_state['trades'] = []; tvb_ai_state['consec_losses'] = 0
+        tvb_ai_state['running'] = True; tvb_ai_state['paused'] = False; tvb_ai_state['_last_decision_ts'] = 0
+        _tvb_log('[PAPER] BOT START {} ({}) strat={} TF={}'.format(symbol, tvb_ai_state['config']['currency'],
+                 'claude' if claude else 'tradingview', tvb_ai_state['config']['tf']))
+        _persist_log_line('[TVBOT] [PAPER] BOT START {} strat={}'.format(symbol, 'claude' if claude else 'tv'))
+        _threading.Thread(target=_tvb_bot_loop, daemon=True, name='tvbot-aibot').start()
+    return jsonify({'success': True, 'symbol': symbol})
+
+@app.route('/api/aibot/tvbot/stop', methods=['POST'])
+@login_required
+def tvb_aibot_stop():
+    with tvb_ai_lock:
+        cfg = tvb_ai_state.get('config') or {}
+        if tvb_ai_state.get('position'):
+            lt = tvb_ai_state.get('last_tick') or {}
+            _tvb_bot_close(lt.get('price') or tvb_ai_state['position']['entryPrice'], 'bot stop', cfg)
+        tvb_ai_state['running'] = False; tvb_ai_state['paused'] = False
+    _tvb_log('[PAPER] BOT STOP'); _persist_log_line('[TVBOT] [PAPER] BOT STOP')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/tvbot/pause', methods=['POST'])
+@login_required
+def tvb_aibot_pause():
+    with tvb_ai_lock:
+        tvb_ai_state['paused'] = not tvb_ai_state.get('paused', False); paused = tvb_ai_state['paused']
+    _tvb_log('Bot ' + ('PAUSED' if paused else 'RESUMED'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/tvbot/status', methods=['GET'])
+@login_required
+def tvb_aibot_status():
+    with tvb_ai_lock:
+        cfg = dict(tvb_ai_state.get('config') or {})
+        trades = list(tvb_ai_state.get('trades', []))
+        pos = tvb_ai_state.get('position'); lt = tvb_ai_state.get('last_tick', {})
+        log_buf = list(tvb_ai_state.get('log', []))[-200:]
+        running = tvb_ai_state.get('running', False); paused = tvb_ai_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    return jsonify({'success': True, 'running': running, 'paused': paused, 'config': cfg,
+                    'position': pos, 'lastTick': lt, 'trades': trades[-40:], 'realizedPnl': round(realized, 4),
+                    'winRate': round(wins / len(trades) * 100, 1) if trades else None,
+                    'ccy': '₹' if (cfg.get('currency') or 'USD').upper() == 'INR' else '$', 'log': log_buf})
+
+@app.route('/api/aibot/tvbot/reset', methods=['POST'])
+@login_required
+def tvb_aibot_reset():
+    _reset_bot_state(tvb_ai_state, tvb_ai_lock); _tvb_log('Bot reset to initial state.')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/tvbot/chat', methods=['POST'])
+@login_required
+def tvb_aibot_chat():
+    data = request.json or {}
+    message = (data.get('message') or '').strip()
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(tvb_ai_state, tvb_ai_lock, img_url, note=message)
+    if not message and not img_url:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
+    chat_imgs = _chart_images_for(tvb_ai_state) if img_url else []
+    _bot_set_note(tvb_ai_state, tvb_ai_lock, message)
+    history = data.get('history') or []
+    with tvb_ai_lock:
+        cfg = dict(tvb_ai_state.get('config') or {}); trades = list(tvb_ai_state.get('trades', []))[-20:]
+    import json as _json
+    system = ("You are the strategy co-pilot for a server-side PAPER trading bot on TradingView data "
+              "(any symbol — XAUUSD, USOIL, indices, stocks, MCX). Help the user reach a sustained high win rate "
+              "with disciplined risk. Be concise.\n\nCURRENT BOT STATE:\n" + _json.dumps(
+                  {'config': cfg, 'recentTrades': [{'side': t.get('side'), 'pnl': round(t.get('pnl', 0), 2),
+                   'reason': t.get('reason')} for t in trades]}, default=str)[:5000])
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        c = str(h.get('content', ''))[:4000]
+        if c: msgs.append({'role': role, 'content': c})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    return jsonify({'success': True, 'reply': text})
+
 @app.route('/api/aibot/suggest_symbols', methods=['POST'])
 @login_required
 def aibot_suggest_symbols():
@@ -17218,6 +17479,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="automation-item" id="btnDOptionsBot">&#127919; Delta Options AI Bot</button>
       <button class="automation-item" id="btnMT5Login">&#128272; MT5 Login</button>
       <button class="automation-item" id="btnMT5Bot">&#129504; MT5 AI Bot</button>
+      <button class="automation-item" id="btnTVBot">&#128200; TradingView AI Bot (paper)</button>
     </div>
   </div>
   <div class="separator"></div>
@@ -18329,6 +18591,59 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="dbot-chat-input">
           <input type="text" id="deltaChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
           <button class="dbot-chat-send" id="deltaChatSend">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TradingView AI Bot Panel (paper, any symbol) -->
+  <div class="zerodha-panel" id="tvBotPanel" style="width:900px;display:none">
+    <div class="zd-header" id="tvBotHeader">
+      <h3><span style="color:#2962ff">&#128200;</span> TradingView AI Bot <span style="color:#787b86;font-size:12px">(paper)</span></h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="tvBotResetBtn" title="Reset bot (stop &amp; clear)">&#8634;</button>
+        <button class="zd-close" id="tvBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="ai-input-bar">
+        <label title="Any TradingView symbol — XAUUSD, USOIL, OANDA:XAUUSD, NSE:RELIANCE, MCX:GOLD1!, BINANCE:BTCUSDT …"><span>Symbol</span><input type="text" id="tvBotSymbol" placeholder="XAUUSD" style="min-width:180px"></label>
+        <label title="Currency label for P/L (USD for XAUUSD/USOIL; INR for NSE/MCX).">Currency<select id="tvBotCurrency"><option value="USD" selected>USD $</option><option value="INR">INR ₹</option></select></label>
+        <label title="Claude AI decides trades, or trade on your TradingView webhook alerts (SuperTrend/EMA).">Strategy<select id="tvBotStrategy"><option value="claude" selected>&#129302; Claude AI</option><option value="tv">&#128200; TradingView alerts</option></select></label>
+        <label>TF<select id="tvBotTF"><option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option><option value="15m">15m</option><option value="1h">1h</option></select></label>
+      </div>
+      <div class="ai-input-bar">
+        <label title="Paper capital in the chosen currency (context + capital-based sizing).">Capital<input type="number" id="tvBotCapital" value="1000" min="0" step="100" style="width:100px"></label>
+        <label title="Leverage for capital-based sizing (qty = capital × leverage ÷ price).">Lev<input type="number" id="tvBotLeverage" value="1" min="1" max="125" style="width:56px"></label>
+        <label title="Fixed units to trade if Capital is 0.">Qty<input type="number" id="tvBotQty" value="1" min="0" step="0.01" style="width:70px"></label>
+        <label>SL%<input type="number" id="tvBotSlPct" value="1.0" min="0.1" step="0.1" style="width:60px"></label>
+        <label>TP%<input type="number" id="tvBotTpPct" value="2.0" min="0.1" step="0.1" style="width:60px"></label>
+        <label>Model<select id="tvBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+        <label>Tick<select id="tvBotTickSec"><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option></select></label>
+      </div>
+      <div class="ai-input-bar" id="tvBotTvOpts" style="display:none">
+        <label title="EMA 5/13 exit-only mode (SuperTrend = entry). Off = dual signal."><input type="checkbox" id="tvBotEmaMode"> EMA mode</label>
+        <label title="Only enter WITH the EMA50/200 trend (needs ma4/ma5 in the SuperTrend alert)."><input type="checkbox" id="tvBotTrendGate"> Trend gate</label>
+        <span style="color:#787b86;font-size:10px">Send TradingView webhook alerts to <code>/api/aibot/tv/webhook?token=…</code> for this symbol.</span>
+      </div>
+      <div class="ai-risk-bar">
+        <label>Daily loss <input type="number" id="tvBotMaxLoss" value="50" min="1" style="width:70px"></label>
+        <label>Daily profit <input type="number" id="tvBotMaxProfit" value="0" min="0" style="width:70px"></label>
+        <label>Max consec losses <input type="number" id="tvBotMaxConsec" value="3" min="1" style="width:50px"></label>
+        <label title="Re-entry cooldown after an exit.">Cooldown s <input type="number" id="tvBotCooldown" value="60" min="0" style="width:56px"></label>
+      </div>
+      <div class="ai-input-bar">
+        <button class="zd-add-btn" id="tvBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
+        <button class="zd-add-btn" id="tvBotStopBtn" style="padding:7px 16px">&#9632; Stop</button>
+        <button class="zd-add-btn" id="tvBotPauseBtn" style="padding:7px 12px">&#10073;&#10073; Pause</button>
+        <span id="tvBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
+      </div>
+      <div class="dbot-chat-msgs" id="tvBotLog" style="height:150px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#b7bdc9;white-space:pre-wrap"></div>
+      <div class="dbot-chat" style="margin-top:8px">
+        <div class="dbot-chat-msgs" id="tvBotChatMsgs" style="height:120px;overflow:auto"></div>
+        <div class="dbot-chat-input">
+          <input type="text" id="tvBotChatInput" placeholder="Ask Claude, or drop a directive (e.g. only longs) …" autocomplete="off">
+          <button class="dbot-chat-send" id="tvBotChatSend">Send</button>
         </div>
       </div>
     </div>
@@ -25031,6 +25346,67 @@ HTML_PAGE = r"""<!DOCTYPE html>
     setInterval(function() {
       fetch('/api/ping').catch(() => {});
     }, 10 * 60 * 1000);
+  })();
+
+  // ---- TradingView AI Bot Panel (paper, any symbol) ----
+  (function() {
+    const panel = document.getElementById('tvBotPanel');
+    if (!panel) return;
+    const $ = function(id){ return document.getElementById(id); };
+    const logEl=$('tvBotLog'), msgsEl=$('tvBotChatMsgs'), inputEl=$('tvBotChatInput'), sendEl=$('tvBotChatSend');
+    let pendingChartImg='', chartBtn=null, pollTimer=null;
+    function post(url,b){ return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()); }
+    function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    (function(){ const h=$('tvBotHeader'); if(!h) return; let dx=0,dy=0,drag=false; h.style.cursor='move';
+      h.addEventListener('mousedown',function(e){ if(e.target.closest('button'))return; drag=true; dx=e.clientX-panel.offsetLeft; dy=e.clientY-panel.offsetTop; e.preventDefault(); });
+      document.addEventListener('mousemove',function(e){ if(!drag)return; panel.style.left=(e.clientX-dx)+'px'; panel.style.top=(e.clientY-dy)+'px'; panel.style.transform='none'; });
+      document.addEventListener('mouseup',function(){ drag=false; }); })();
+    const stratSel=$('tvBotStrategy');
+    if(stratSel) stratSel.addEventListener('change', function(){ const o=$('tvBotTvOpts'); if(o) o.style.display = stratSel.value==='tv' ? 'flex' : 'none'; });
+    function cfg(){ const claude = $('tvBotStrategy').value==='claude';
+      return { symbol:($('tvBotSymbol').value||'').trim().toUpperCase(), currency:$('tvBotCurrency').value,
+        claude:claude, tvEnabled:true, emaMode:!!$('tvBotEmaMode').checked, trendGate:!!$('tvBotTrendGate').checked,
+        capital:parseFloat($('tvBotCapital').value)||0, leverage:parseFloat($('tvBotLeverage').value)||1,
+        qty:parseFloat($('tvBotQty').value)||1, tf:$('tvBotTF').value, slPct:parseFloat($('tvBotSlPct').value)||1,
+        tpPct:parseFloat($('tvBotTpPct').value)||2, maxLoss:parseFloat($('tvBotMaxLoss').value)||50,
+        maxProfit:parseFloat($('tvBotMaxProfit').value)||0, maxConsec:parseInt($('tvBotMaxConsec').value)||3,
+        cooldownSec:parseInt($('tvBotCooldown').value)||0, model:$('tvBotModel').value, tickSec:parseInt($('tvBotTickSec').value)||120 }; }
+    function addMsg(t,cls){ const d=document.createElement('div'); d.className='dbot-msg '+(cls||'bot'); d.innerHTML=esc(t); msgsEl.appendChild(d); msgsEl.scrollTop=msgsEl.scrollHeight; return d; }
+    function renderStatus(d){ if(!d||!d.success) return;
+      $('tvBotPnl').textContent='P/L '+(d.ccy||'$')+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+(d.winRate!=null?('  ·  win '+d.winRate+'%'):'')+(d.running?(d.paused?'  · paused':'  · running'):'  · stopped');
+      if(logEl && d.log){ logEl.textContent=d.log.join('\n'); logEl.scrollTop=logEl.scrollHeight; } }
+    function poll(){ fetch('/api/aibot/tvbot/status').then(r=>r.json()).then(renderStatus).catch(()=>{}); }
+    function startPolling(){ if(pollTimer) return; pollTimer=setInterval(poll,3000); poll(); }
+    if($('tvBotStartBtn')) $('tvBotStartBtn').addEventListener('click', function(){ const c=cfg();
+      if(!c.symbol){ addMsg('Enter a TradingView symbol (e.g. XAUUSD).','err'); return; }
+      addMsg('Starting TradingView paper bot on '+c.symbol+' ('+(c.claude?'Claude':'TV alerts')+')…','user');
+      post('/api/aibot/tvbot/start', c).then(function(d){ if(d&&d.success){ addMsg('Started on '+d.symbol,'bot'); startPolling(); } else addMsg('Start failed: '+((d&&d.error)||'?'),'err'); }).catch(e=>addMsg('Error: '+e.message,'err')); });
+    if($('tvBotStopBtn')) $('tvBotStopBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/stop',{}).then(poll); });
+    if($('tvBotPauseBtn')) $('tvBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
+    if($('tvBotResetBtn')) $('tvBotResetBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
+    if($('tvBotClose')) $('tvBotClose').addEventListener('click', function(){ panel.style.display='none'; if(pollTimer){clearInterval(pollTimer); pollTimer=null;} });
+    if(sendEl && inputEl){
+      chartBtn=document.createElement('button'); chartBtn.type='button'; chartBtn.className='dbot-chat-send';
+      chartBtn.title='Attach a chart image for Claude'; chartBtn.textContent='📎'; chartBtn.style.marginRight='4px';
+      const f=document.createElement('input'); f.type='file'; f.accept='image/*'; f.style.display='none';
+      sendEl.parentNode.insertBefore(chartBtn, sendEl); sendEl.parentNode.appendChild(f);
+      chartBtn.addEventListener('click', ()=>f.click());
+      f.addEventListener('change', function(){ const file=f.files&&f.files[0]; f.value=''; if(!file) return;
+        if(file.size>5*1024*1024){ addMsg('Image too large (max 5MB).','err'); return; }
+        const rd=new FileReader(); rd.onload=function(){ pendingChartImg=String(rd.result||''); chartBtn.textContent='📎✓'; chartBtn.style.color='#26a69a'; addMsg('Image attached — used for decisions.','bot'); }; rd.readAsDataURL(file); }); }
+    function takeImg(){ const i=pendingChartImg; pendingChartImg=''; if(chartBtn){chartBtn.textContent='📎'; chartBtn.style.color='';} return i; }
+    const hist=[];
+    function send(){ const msg=inputEl.value.trim(); if(!msg && !pendingChartImg) return;
+      if(msg){ addMsg(msg,'user'); hist.push({role:'user',content:msg}); }
+      inputEl.value=''; sendEl.disabled=true; const think=addMsg('…','bot');
+      post('/api/aibot/tvbot/chat',{message:msg, history:hist.slice(0,-1), model:$('tvBotModel').value, image:takeImg()}).then(function(d){
+        think.remove(); if(!d||!d.success){ addMsg((d&&d.error)||'Claude unavailable.','err'); return; }
+        addMsg(d.reply||'(no reply)','bot'); hist.push({role:'assistant',content:d.reply||''});
+      }).catch(e=>{ think.remove(); addMsg('Error: '+e.message,'err'); }).finally(()=>{ sendEl.disabled=false; inputEl.focus(); }); }
+    if(sendEl) sendEl.addEventListener('click', send);
+    if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
+    const openBtn=document.getElementById('btnTVBot');
+    if(openBtn) openBtn.addEventListener('click', function(){ panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none'; startPolling(); });
   })();
 
   // ---- Delta Options AI Bot Panel (BTC/ETH calls & puts) ----
