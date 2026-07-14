@@ -18653,6 +18653,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="tvBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
         <button class="zd-add-btn" id="tvBotStopBtn" style="padding:7px 16px">&#9632; Stop</button>
         <button class="zd-add-btn" id="tvBotPauseBtn" style="padding:7px 12px">&#10073;&#10073; Pause</button>
+        <button class="bot-log-btn" id="tvBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
+        <button class="bot-log-btn" id="tvBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
         <span id="tvBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
       </div>
       <div class="dbot-chat-msgs" id="tvBotLog" style="height:150px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#b7bdc9;white-space:pre-wrap"></div>
@@ -18713,6 +18715,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="doBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
         <button class="zd-add-btn" id="doBotStopBtn" style="padding:7px 16px">&#9632; Stop</button>
         <button class="zd-add-btn" id="doBotPauseBtn" style="padding:7px 12px">&#10073;&#10073; Pause</button>
+        <button class="bot-log-btn" id="doBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
+        <button class="bot-log-btn" id="doBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
         <span id="doBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
       </div>
       <div class="dbot-chat-msgs" id="doBotLog" style="height:150px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#b7bdc9;white-space:pre-wrap"></div>
@@ -25402,6 +25406,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if(!c.symbol){ addMsg('Enter a TradingView symbol (e.g. XAUUSD).','err'); return; }
       addMsg('Starting TradingView paper bot on '+c.symbol+' ('+(c.claude?'Claude':'TV alerts')+')…','user');
       post('/api/aibot/tvbot/start', c).then(function(d){ if(d&&d.success){ addMsg('Started on '+d.symbol,'bot'); startPolling(); } else addMsg('Start failed: '+((d&&d.error)||'?'),'err'); }).catch(e=>addMsg('Error: '+e.message,'err')); });
+    if($('tvBotLogBtn')) $('tvBotLogBtn').addEventListener('click', function(){ window.open('/api/aibot/log_download', '_blank'); });
+    if($('tvBotDlBtn')) $('tvBotDlBtn').addEventListener('click', function(){
+      const txt = (logEl && logEl.textContent) || '(no log yet)';
+      const blob = new Blob([txt], {type:'text/plain;charset=utf-8'}); const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob); a.download='tradingview_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); });
     if($('tvBotStopBtn')) $('tvBotStopBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/stop',{}).then(poll); });
     if($('tvBotPauseBtn')) $('tvBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
     if($('tvBotResetBtn')) $('tvBotResetBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
@@ -25487,6 +25497,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         else addMsg('Start failed: '+((d&&d.error)||'?'),'err');
       }).catch(e=>addMsg('Error: '+e.message,'err'));
     });
+    if($('doBotLogBtn')) $('doBotLogBtn').addEventListener('click', function(){ window.open('/api/aibot/log_download', '_blank'); });
+    if($('doBotDlBtn')) $('doBotDlBtn').addEventListener('click', function(){
+      const txt = (logEl && logEl.textContent) || '(no log yet)';
+      const blob = new Blob([txt], {type:'text/plain;charset=utf-8'}); const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob); a.download='delta_options_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); });
     if($('doBotStopBtn')) $('doBotStopBtn').addEventListener('click', function(){ post('/api/aibot/doptions/stop',{}).then(poll); });
     if($('doBotPauseBtn')) $('doBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/doptions/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
     if($('doBotResetBtn')) $('doBotResetBtn').addEventListener('click', function(){ post('/api/aibot/doptions/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
