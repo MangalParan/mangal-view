@@ -4064,6 +4064,27 @@ def _within_market_hours(exchange):
         return 9 * 60 + 15 <= mins <= 15 * 60 + 30      # 09:15–15:30
     return 9 * 60 + 15 <= mins <= 15 * 60 + 30          # default = equity hours
 
+# Kite's historical-data API for MCX commodities is often unavailable (subscription-
+# gated / stale), so a commodity bot gets no candles and can't trade. TradingView has
+# the live MCX feed, so we map the contract to its MCX continuous symbol and fall back.
+_MCX_ROOTS = ('GOLDTEN', 'GOLDGUINEA', 'GOLDPETAL', 'GOLDM', 'GOLD', 'SILVERMIC', 'SILVERM',
+              'SILVER', 'CRUDEOILM', 'CRUDEOIL', 'NATURALGAS', 'NATGASMINI', 'COPPER',
+              'ZINCMINI', 'ZINC', 'ALUMINI', 'ALUMINIUM', 'LEADMINI', 'LEAD', 'NICKEL',
+              'MENTHAOIL', 'COTTONCNDY', 'COTTON', 'CPO')
+def _zd_commodity_tv_symbol(symbol, exchange=''):
+    """Map a Kite MCX futures tradingsymbol (e.g. GOLDTEN26JULFUT / CRUDEOILM26JUNFUT)
+    to its TradingView MCX continuous symbol (MCX:GOLDTEN1!). None if not a commodity."""
+    sym = (symbol or '').upper().strip()
+    for r in sorted(_MCX_ROOTS, key=len, reverse=True):   # longest root first (GOLDTEN before GOLD)
+        if sym.startswith(r):
+            return 'MCX:' + r + '1!'
+    if (exchange or '').upper() == 'MCX':
+        root = re.sub(r'\d{2}[A-Z]{3}FUT$', '', sym) or sym
+        root = re.sub(r'[^A-Z]', '', root)
+        if root:
+            return 'MCX:' + root + '1!'
+    return None
+
 def _zd_bot_tick():
     cfg = zd_ai_state.get('config') or {}
     if not cfg: return
@@ -4081,12 +4102,25 @@ def _zd_bot_tick():
     try:
         candles = _bot_fetch_candles(symbol, interval, 'kite', api_key=cfg.get('api_key'))
     except Exception as e:
-        _zd_log('[Tick] ERROR fetching Kite data: ' + str(e))
-        return
+        _zd_log('[Tick] ERROR fetching Kite data: ' + str(e)); candles = []
+    # Commodity fallback: Kite MCX historical is frequently unavailable, so pull the
+    # candles from TradingView's MCX feed (orders still route to Kite/MCX).
+    if not candles:
+        tv_sym = _zd_commodity_tv_symbol(symbol, cfg.get('exchange'))
+        if tv_sym:
+            try:
+                candles = fetch_tradingview_data(interval, tv_sym) or []
+            except Exception as e:
+                _zd_log('[Tick] TradingView commodity fallback error: ' + str(e)); candles = []
+            if candles and not zd_ai_state.get('_tv_fallback'):
+                zd_ai_state['_tv_fallback'] = True
+                _zd_log('[Tick] Kite candles unavailable for {} — using TradingView {} (MCX feed)'.format(symbol, tv_sym))
+    if candles and zd_ai_state.get('_tv_fallback') and not _zd_commodity_tv_symbol(symbol, cfg.get('exchange')):
+        zd_ai_state['_tv_fallback'] = False
     if not candles:
         with zd_ai_lock:
             zd_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
-        _zd_log('[Tick] no Kite candles for ' + symbol + ' — check connection / symbol / exchange')
+        _zd_log('[Tick] no candles for {} — Kite historical unavailable (MCX often needs a data subscription); TradingView fallback also empty. Check symbol.'.format(symbol))
         return
 
     price  = candles[-1]['close']
@@ -4827,6 +4861,36 @@ def _zo_resolve_auto_strikes(cfg):
     info = '{} spot {:.1f} → CE {} / PE {} (exp {})'.format(base, spot, int(ce_strike), int(pe_strike), expiry)
     return ce_row['symbol'], pe_row['symbol'], opt_exch, info
 
+def _zo_resolve_manual_strikes(base, ce_strike, pe_strike):
+    """Build CE/PE option symbols for USER-entered strikes on the nearest expiry of the
+    Underlying base (Auto-strikes OFF). Snaps to the nearest available strike. Returns
+    (ce_symbol, pe_symbol, opt_exchange, info) — ce/pe None with a reason on failure."""
+    base = (base or '').upper().strip()
+    if not base:
+        return None, None, 'NFO', 'pick an Underlying base to enter strikes'
+    _ss, _se, opt_exch = _zo_base_meta(base)
+    chain_all = [i for i in _zo_load_opt_instruments(opt_exch) if i.get('name', '').upper() == base]
+    if not chain_all:
+        return None, None, opt_exch, 'no option chain for ' + base + ' on ' + opt_exch
+    today    = datetime.now().strftime('%Y-%m-%d')
+    expiries = sorted({i['expiry'] for i in chain_all if i.get('expiry') and i['expiry'] >= today}) \
+               or sorted({i['expiry'] for i in chain_all if i.get('expiry')})
+    if not expiries:
+        return None, None, opt_exch, 'no expiries for ' + base
+    expiry = expiries[0]
+    chain  = [i for i in chain_all if i.get('expiry') == expiry]
+    def _nearest(otype, strike):
+        try: strike = float(strike)
+        except Exception: return None
+        cands = [i for i in chain if i['type'] == otype and i['strike'] > 0]
+        return min(cands, key=lambda i: abs(i['strike'] - strike)) if cands else None
+    ce_row = _nearest('CE', ce_strike) if (ce_strike not in (None, '', 0)) else None
+    pe_row = _nearest('PE', pe_strike) if (pe_strike not in (None, '', 0)) else None
+    if not ce_row or not pe_row:
+        return None, None, opt_exch, 'could not find CE/PE strikes in the {} chain for {}'.format(expiry, base)
+    info = '{} manual → CE {} / PE {} (exp {})'.format(base, int(ce_row['strike']), int(pe_row['strike']), expiry)
+    return ce_row['symbol'], pe_row['symbol'], opt_exch, info
+
 def _zo_underlying_ctx(cfg):
     """Recent underlying trend context for the option legs' Claude calls. {} if N/A."""
     base = (cfg.get('baseSymbol') or '').upper().strip()
@@ -5053,13 +5117,26 @@ def zo_aibot_start():
                 {'symbol': pe_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
             ]
         else:
-            for n in ('1', '2'):
-                sym = (data.get('sym' + n) or '').upper().strip()
-                if sym:
-                    legs.append({'symbol': sym, 'exchange': (data.get('exch' + n) or '').upper().strip(),
-                                 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
-            if not legs:
-                return jsonify({'success': False, 'error': 'Select at least one option instrument (or enable Auto strikes)'}), 400
+            # Manual strike entry: user gives the Underlying base + CE/PE STRIKE numbers,
+            # the bot builds the symbols for the nearest expiry. Falls back to full
+            # option symbols (sym1/sym2) if no strikes are entered.
+            ce_strike = data.get('ceStrike'); pe_strike = data.get('peStrike')
+            if base_symbol and (ce_strike not in (None, '', 0) or pe_strike not in (None, '', 0)):
+                ce_sym, pe_sym, opt_exch_auto, auto_info = _zo_resolve_manual_strikes(base_symbol, ce_strike, pe_strike)
+                if not ce_sym or not pe_sym:
+                    return jsonify({'success': False, 'error': 'Manual strikes failed: ' + str(auto_info)}), 502
+                legs = [
+                    {'symbol': ce_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
+                    {'symbol': pe_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
+                ]
+            else:
+                for n in ('1', '2'):
+                    sym = (data.get('sym' + n) or '').upper().strip()
+                    if sym:
+                        legs.append({'symbol': sym, 'exchange': (data.get('exch' + n) or '').upper().strip(),
+                                     'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
+                if not legs:
+                    return jsonify({'success': False, 'error': 'Enter CE/PE strike prices (with an Underlying base), pick option symbols, or enable Auto strikes'}), 400
         zo_ai_state['config'] = {
             'autoStrikes':  auto_strikes,
             'baseSymbol':   base_symbol,
@@ -17875,6 +17952,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <div class="ai-input-bar">
         <span id="zoBotManualStrikes" style="display:contents">
+        <label title="Enter the CE strike price (e.g. 24200). With an Underlying base set, the bot builds the CE symbol for the nearest expiry. Leave blank to use the full symbol instead."><span>CE strike</span><input type="number" id="zoBotCeStrike" placeholder="24200" style="width:100px"></label>
+        <label title="Enter the PE strike price (e.g. 24100)."><span>PE strike</span><input type="number" id="zoBotPeStrike" placeholder="24100" style="width:100px"></label>
+        <span style="color:#787b86;font-size:10px;align-self:center">— or full symbols —</span>
         <label>
           <span>CE option</span>
           <span style="display:flex;gap:6px">
@@ -24760,10 +24840,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const baseSelEl = document.getElementById('zoBotBaseSel');
       let baseSymbol = baseSelEl ? baseSelEl.value : '';
       if (baseSymbol === '__custom') baseSymbol = ((document.getElementById('zoBotBaseCustom') || {}).value || '').trim().toUpperCase();
+      const ceStrike = parseFloat((document.getElementById('zoBotCeStrike') || {}).value) || 0;
+      const peStrike = parseFloat((document.getElementById('zoBotPeStrike') || {}).value) || 0;
       if (autoStrikes) {
         if (!baseSymbol) { logLine('Pick an Underlying base for Auto strikes.', 'info'); return; }
+      } else if (baseSymbol && (ceStrike || peStrike)) {
+        logLine('Building CE/PE symbols for ' + baseSymbol + ' at your strikes (nearest expiry)…', 'info');
       } else if (!sym1 && !sym2) {
-        logLine('Pick at least one option (+ Add), or enable Auto strikes.', 'info'); return;
+        logLine('Enter CE/PE strike prices (with an Underlying base), pick option symbols (+ Add), or enable Auto strikes.', 'info'); return;
       }
       if (!buyerChk.checked && !sellerChk.checked) { logLine('Enable Option Buyer and/or Option Seller.', 'info'); return; }
       if (autoStrikes) logLine('Resolving CE/PE strikes for ' + baseSymbol + ' via Claude…', 'info');
@@ -24771,6 +24855,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         sym1: sym1, exch1: (exchEls[0].value || '').trim().toUpperCase(),
         sym2: sym2, exch2: (exchEls[1].value || '').trim().toUpperCase(),
         autoStrikes: autoStrikes, baseSymbol: baseSymbol,
+        ceStrike: ceStrike, peStrike: peStrike,
         capital: parseFloat((document.getElementById('zoBotCapital') || {}).value) || 0,
         qty: parseInt(qtyEl.value) || 1,
         tf: tfEl.value, mode: currentMode(),
