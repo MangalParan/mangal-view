@@ -60,6 +60,22 @@ _load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
+# Return JSON (not an HTML error page) for /api/* failures, so the front-end never
+# gets `Unexpected token '<', "<!doctype "... is not valid JSON`. A 404 here usually
+# means the server is running older code than the UI (restart / redeploy).
+@app.errorhandler(404)
+def _api_json_404(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'success': False,
+                        'error': 'Endpoint not found: ' + request.path + ' — the server may be running an older build; restart or redeploy it.'}), 404
+    return e
+
+@app.errorhandler(500)
+def _api_json_500(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'success': False, 'error': 'Server error on ' + request.path + '. Check the server logs.'}), 500
+    return e
+
 # --- User Database ---
 _default_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "users.db")
 DB_PATH = os.environ.get("DB_PATH", _default_db)
@@ -18602,6 +18618,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <h3><span style="color:#2962ff">&#128200;</span> TradingView AI Bot <span style="color:#787b86;font-size:12px">(paper)</span></h3>
       <div class="zd-header-actions">
         <button class="zd-header-btn" id="tvBotResetBtn" title="Reset bot (stop &amp; clear)">&#8634;</button>
+        <button class="zd-header-btn" id="tvBotMaximizeBtn" title="Maximize / restore">&#9633;</button>
         <button class="zd-close" id="tvBotClose" title="Close">&times;</button>
       </div>
     </div>
@@ -18655,6 +18672,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <h3><span style="color:#f7a600">&#127919;</span> Delta Options AI Bot</h3>
       <div class="zd-header-actions">
         <button class="zd-header-btn" id="doBotResetBtn" title="Reset bot (stop &amp; clear)">&#8634;</button>
+        <button class="zd-header-btn" id="doBotMaximizeBtn" title="Maximize / restore">&#9633;</button>
+        <button class="zd-header-btn" id="doBotPopoutBtn" title="Open in a new window">&#8599;</button>
         <button class="zd-close" id="doBotClose" title="Close">&times;</button>
       </div>
     </div>
@@ -25361,6 +25380,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       h.addEventListener('mousedown',function(e){ if(e.target.closest('button'))return; drag=true; dx=e.clientX-panel.offsetLeft; dy=e.clientY-panel.offsetTop; e.preventDefault(); });
       document.addEventListener('mousemove',function(e){ if(!drag)return; panel.style.left=(e.clientX-dx)+'px'; panel.style.top=(e.clientY-dy)+'px'; panel.style.transform='none'; });
       document.addEventListener('mouseup',function(){ drag=false; }); })();
+    (function(){ let mx=false; const mb=$('tvBotMaximizeBtn');
+      if(mb) mb.addEventListener('click', function(){ mx=!mx; panel.classList.toggle('maximized', mx); this.innerHTML=mx?'&#9635;':'&#9633;'; }); })();
     const stratSel=$('tvBotStrategy');
     if(stratSel) stratSel.addEventListener('change', function(){ const o=$('tvBotTvOpts'); if(o) o.style.display = stratSel.value==='tv' ? 'flex' : 'none'; });
     function cfg(){ const claude = $('tvBotStrategy').value==='claude';
@@ -25425,6 +25446,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       h.addEventListener('mousedown',function(e){ if(e.target.closest('button'))return; drag=true; dx=e.clientX-panel.offsetLeft; dy=e.clientY-panel.offsetTop; e.preventDefault(); });
       document.addEventListener('mousemove',function(e){ if(!drag)return; panel.style.left=(e.clientX-dx)+'px'; panel.style.top=(e.clientY-dy)+'px'; panel.style.transform='none'; });
       document.addEventListener('mouseup',function(){ drag=false; });
+    })();
+    (function(){ let mx=false; const mb=$('doBotMaximizeBtn'), pb=$('doBotPopoutBtn');
+      if(mb) mb.addEventListener('click', function(){ mx=!mx; panel.classList.toggle('maximized', mx); this.innerHTML=mx?'&#9635;':'&#9633;'; });
+      if(pb) pb.addEventListener('click', function(){ const u=new URL(window.location.href); u.searchParams.set('doBotPopout','1'); window.open(u.toString(),'doBotPopout','width=1000,height=900,resizable=yes,scrollbars=yes'); });
     })();
     function cfg(){
       const auto = !!$('doBotAutoStrikes').checked;
