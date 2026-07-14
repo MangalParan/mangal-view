@@ -1309,6 +1309,8 @@ def _load_delta_products():
             'contract_type':  p.get('contract_type', ''),
             'tick_size':      float(p.get('tick_size', 0) or 0),
             'state':          p.get('state', ''),
+            'strike_price':   p.get('strike_price'),                 # options: strike (str/num) or None
+            'settlement_time': p.get('settlement_time', ''),         # options: ISO expiry
             # New: contract specs for accurate P/L
             'contract_value': _cv,                                # multiplier per contract (e.g. 0.001 for BTCUSD)
             'notional_type':  (p.get('notional_type') or 'vanilla'),  # vanilla | inverse | quanto
@@ -6652,6 +6654,452 @@ def mt_aibot_reset():
 def zo_aibot_reset():
     _reset_bot_state(zo_ai_state, zo_ai_lock); _zo_log('Bot reset to initial state.')
     return jsonify({'success': True})
+
+# ============================ Delta Options AI bot ===========================
+# Trades BTC/ETH (etc.) CALL & PUT options on Delta Exchange — same leg-based engine
+# as the Zerodha Options bot (Claude decides per leg; buyer and/or seller), but data
+# + orders go through Delta. Auto strikes (Claude picks near-ATM, OTM-biased for
+# selling) or manual strike entry.
+do_ai_state = {'running': False, 'paused': False, 'config': {}, 'legs': [], 'trades': [],
+               'consec_losses': 0, 'log': [], '_decide': True, '_last_decision_ts': 0}
+do_ai_lock = _threading.Lock()
+
+def _do_log(msg):
+    ts = datetime.now(timezone(timedelta(seconds=IST_OFFSET))).strftime('%H:%M:%S')
+    buf = do_ai_state.setdefault('log', [])
+    buf.append('[' + ts + '] ' + msg)
+    if len(buf) > 200:
+        del buf[:len(buf) - 200]
+
+def _do_spot_candles(base, interval):
+    """Underlying spot candles for BTC/ETH — try USD then USDT perpetual."""
+    for suf in ('USD', 'USDT'):
+        c = fetch_delta_data(interval, (base or '').upper() + suf)
+        if c:
+            return c
+    return []
+
+def _do_load_options(base):
+    """Active CALL/PUT option products on Delta for the underlying (e.g. BTC)."""
+    base = (base or '').upper().strip()
+    out = []
+    for sym, p in (_load_delta_products() or {}).items():
+        ct = (p.get('contract_type') or '').lower()
+        if ct not in ('call_options', 'put_options'):
+            continue
+        if (p.get('underlying') or '').upper() != base:
+            continue
+        if (p.get('state') or '').lower() not in ('live', 'operational', ''):
+            continue
+        try:    strike = float(p.get('strike_price') or 0)
+        except (TypeError, ValueError): strike = 0.0
+        if strike <= 0:
+            continue
+        out.append({'symbol': p.get('symbol'), 'strike': strike,
+                    'type': 'CE' if ct == 'call_options' else 'PE',
+                    'expiry': (p.get('settlement_time') or '')[:10]})
+    return out
+
+def _do_option_meta(symbol, spot=0):
+    """optionType / strike / dte / moneyness for a Delta option leg."""
+    p = _load_delta_products().get((symbol or '').upper()) or {}
+    ct = (p.get('contract_type') or '').lower()
+    meta = {'optionType': 'CE' if ct == 'call_options' else ('PE' if ct == 'put_options' else '')}
+    try:    strike = float(p.get('strike_price') or 0)
+    except (TypeError, ValueError): strike = 0.0
+    if strike:
+        meta['strike'] = strike
+        if spot:
+            diff = round((float(spot) - strike) / float(spot) * 100.0, 2)
+            meta['underlyingVsStrikePct'] = diff
+            if meta['optionType'] == 'CE':
+                meta['moneyness'] = 'ITM' if spot > strike else ('ATM' if abs(diff) < 0.2 else 'OTM')
+            elif meta['optionType'] == 'PE':
+                meta['moneyness'] = 'ITM' if spot < strike else ('ATM' if abs(diff) < 0.2 else 'OTM')
+    exp = (p.get('settlement_time') or '')[:10]
+    if exp:
+        meta['expiry'] = exp
+        try:    meta['dte'] = max(0, (datetime.strptime(exp, '%Y-%m-%d').date() - _tg_now_ist().date()).days)
+        except Exception: pass
+    return meta
+
+def _do_resolve_strikes(base, ce_strike=None, pe_strike=None, sell_bias=False, otm_pct=0.25, model=''):
+    """Pick CE & PE Delta option symbols for `base`. If ce_strike/pe_strike given →
+    nearest available (manual). Else nearest expiry near-ATM, OTM-biased when selling.
+    Returns (ce_symbol, pe_symbol, info) — ce/pe None + reason on failure."""
+    base = (base or '').upper().strip()
+    if not base:
+        return None, None, 'pick an underlying (BTC / ETH)'
+    chain_all = _do_load_options(base)
+    if not chain_all:
+        return None, None, 'no Delta option chain for ' + base + ' (connect Delta / check underlying)'
+    today = _tg_now_ist().strftime('%Y-%m-%d')
+    expiries = sorted({o['expiry'] for o in chain_all if o['expiry'] and o['expiry'] >= today}) \
+               or sorted({o['expiry'] for o in chain_all if o['expiry']})
+    if not expiries:
+        return None, None, 'no expiries for ' + base
+    expiry = expiries[0]
+    chain  = [o for o in chain_all if o['expiry'] == expiry]
+    ces = sorted([o for o in chain if o['type'] == 'CE'], key=lambda o: o['strike'])
+    pes = sorted([o for o in chain if o['type'] == 'PE'], key=lambda o: o['strike'])
+    if not ces or not pes:
+        return None, None, 'incomplete option chain for ' + base
+    # Manual strikes → nearest available
+    if ce_strike not in (None, '', 0) or pe_strike not in (None, '', 0):
+        ce = min(ces, key=lambda o: abs(o['strike'] - float(ce_strike or 0))) if ce_strike else None
+        pe = min(pes, key=lambda o: abs(o['strike'] - float(pe_strike or 0))) if pe_strike else None
+        if not ce or not pe:
+            return None, None, 'could not map strikes for ' + base
+        return ce['symbol'], pe['symbol'], '{} manual → CE {} / PE {} (exp {})'.format(base, int(ce['strike']), int(pe['strike']), expiry)
+    spot = 0.0
+    sc = _do_spot_candles(base, '5m')
+    if sc:
+        spot = sc[-1]['close']
+    if spot <= 0:
+        # no spot — default to the middle strikes
+        ce = ces[len(ces) // 2]; pe = pes[len(pes) // 2]
+        return ce['symbol'], pe['symbol'], '{} → CE {} / PE {} (exp {}, no spot)'.format(base, int(ce['strike']), int(pe['strike']), expiry)
+    if sell_bias:
+        ce_pool = [o for o in ces if o['strike'] >= spot * (1 + otm_pct / 100.0)] or [o for o in ces if o['strike'] > spot] or ces
+        pe_pool = [o for o in pes if o['strike'] <= spot * (1 - otm_pct / 100.0)] or [o for o in pes if o['strike'] < spot] or pes
+        ce = min(ce_pool, key=lambda o: o['strike']); pe = max(pe_pool, key=lambda o: o['strike'])
+    else:
+        ce = min(ces, key=lambda o: abs(o['strike'] - spot)); pe = min(pes, key=lambda o: abs(o['strike'] - spot))
+    return ce['symbol'], pe['symbol'], '{} spot {:.0f} → CE {} / PE {} (exp {})'.format(base, spot, int(ce['strike']), int(pe['strike']), expiry)
+
+def _do_underlying_ctx(cfg):
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    if not base:
+        return {}
+    c = _do_spot_candles(base, cfg.get('tf', '5m'))
+    if not c or len(c) < 10:
+        return {'underlying': base}
+    cl = [x['close'] for x in c[-30:]]
+    ts = ((cl[-1] - cl[-10]) / cl[-10] * 100.0) if cl[-10] else 0.0
+    tm = ((cl[-1] - cl[0]) / cl[0] * 100.0) if cl[0] else 0.0
+    return {'underlying': base, 'underlyingSpot': round(cl[-1], 2),
+            'underlyingTrendPct': round(ts, 2), 'underlyingTrendMedPct': round(tm, 2)}
+
+def _do_place_live(leg, side, qty, cfg):
+    """Place a live Delta options order. True only if Delta ACCEPTED it."""
+    api_key = cfg.get('api_key') or ''
+    if not api_key or api_key not in delta_v2_sessions:
+        _do_log('[LIVE] Delta order skipped — not connected.'); _persist_log_line('[DOPT] [LIVE] order skipped: not connected'); return False
+    prod = _load_delta_products().get((leg['symbol'] or '').upper())
+    if not prod or not prod.get('id'):
+        _do_log('[LIVE] Unknown Delta option: ' + str(leg['symbol'])); return False
+    api_secret = delta_v2_sessions[api_key]['api_secret']
+    sess_base  = delta_v2_sessions[api_key].get('base_url') or _DELTA_BASES[0]
+    body = {'product_id': prod['id'], 'size': int(qty), 'side': 'buy' if side == 'BUY' else 'sell', 'order_type': 'market_order'}
+    result = _delta_request(api_key, api_secret, 'POST', '/v2/orders', body=body, base_url=sess_base)
+    if result.get('success'):
+        oid = (result.get('result') or {}).get('id', '')
+        _do_log('[LIVE] Delta accepted #' + str(oid) + ' (' + leg['symbol'] + ')')
+        _persist_log_line('[DOPT] [LIVE] Delta accepted #' + str(oid)); return True
+    err = result.get('error', 'unknown')
+    _do_log('[LIVE] Delta order failed: ' + str(err)); _persist_log_line('[DOPT] [LIVE] Delta order failed: ' + str(err)); return False
+
+def _do_open_leg(leg, open_side, price, strat, cfg, mode):
+    qty    = max(1, int(cfg.get('qty', 1) or 1))
+    sl_pct = float(strat.get('slPct') or cfg.get('slPct', 30.0))
+    tp_pct = float(strat.get('tpPct') or cfg.get('tpPct', 50.0))
+    is_long = open_side == 'BUY'
+    sl = price * (1 - sl_pct/100.0) if is_long else price * (1 + sl_pct/100.0)
+    tp = price * (1 + tp_pct/100.0) if is_long else price * (1 - tp_pct/100.0)
+    if mode == 'live':
+        if not _do_place_live(leg, open_side, qty, cfg):
+            _do_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}).'.format(leg['symbol'], open_side, qty))
+            _persist_log_line('[DOPT] [LIVE] ENTRY REJECTED — no position opened ' + str(leg['symbol']))
+            leg['last_exit_time'] = int(_zd_time.time()); return
+    _m = _do_option_meta(leg['symbol'])
+    leg['position'] = {'side': open_side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+                       'qty': qty, 'sl': round(sl, 2), 'tp': round(tp, 2),
+                       'strategy': strat['name'], 'mode': mode,
+                       'optionType': _m.get('optionType'), 'strike': _m.get('strike'), 'dte': _m.get('dte')}
+    kind = 'BUY-to-open (long)' if is_long else 'SELL-to-open (short)'
+    line = '[{}] ENTRY {} {} {} @ {} SL={} TP={} strat={} score={:.1f} — {}'.format(
+        mode.upper(), kind, qty, leg['symbol'], round(price, 2), round(sl, 2), round(tp, 2),
+        strat['name'], strat['score'], strat.get('reason', ''))
+    _do_log(line); _persist_log_line('[DOPT] ' + line)
+
+def _do_close_leg(leg, price, reason, cfg, mode):
+    pos = leg.get('position')
+    if not pos: return
+    prod = _load_delta_products().get((leg['symbol'] or '').upper())
+    pnl = _delta_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'], prod)
+    closed = dict(pos); closed.update({'symbol': leg['symbol'], 'exitPrice': round(price, 2),
+                   'exitTime': int(_zd_time.time()), 'pnl': round(pnl, 4), 'reason': reason})
+    do_ai_state['trades'].append(closed)
+    do_ai_state['consec_losses'] = do_ai_state.get('consec_losses', 0) + 1 if pnl < 0 else 0
+    close_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
+    line = '[{}] EXIT {} {} {} @ {} (entry {}) PnL={}{:.4f} reason={} strat={}'.format(
+        mode.upper(), close_side, pos['qty'], leg['symbol'], round(price, 2), pos['entryPrice'],
+        '+' if pnl >= 0 else '', pnl, reason, pos['strategy'])
+    _do_log(line); _persist_log_line('[DOPT] ' + line)
+    if mode == 'live':
+        _do_place_live(leg, close_side, pos['qty'], cfg)
+    leg['position'] = None
+    leg['last_exit_time'] = int(_zd_time.time())
+    if pnl < 0 or 'SL' in str(reason):
+        leg['last_loss'] = {'side': pos['side'], 'ts': int(_zd_time.time())}
+    elif pnl > 0:
+        leg['last_loss'] = {}
+
+def _do_apply_breakers(cfg, mode):
+    trades = do_ai_state['trades']; realized = sum(t['pnl'] for t in trades); unreal = 0.0
+    for leg in do_ai_state['legs']:
+        pos = leg.get('position'); lt = leg.get('last_tick') or {}
+        if pos and lt.get('price'):
+            prod = _load_delta_products().get((leg['symbol'] or '').upper())
+            unreal += _delta_calc_pnl(pos['entryPrice'], lt['price'], pos['qty'], pos['side'], prod)
+    trip = None
+    if do_ai_state['consec_losses'] >= int(cfg.get('maxConsec', 3)):     trip = 'Max consecutive losses'
+    elif realized < -abs(float(cfg.get('maxLoss', 50))):                  trip = 'Max daily loss'
+    elif float(cfg.get('maxProfit', 0) or 0) > 0 and (realized + unreal) >= float(cfg.get('maxProfit')): trip = 'Max daily profit'
+    if not trip: return
+    for leg in do_ai_state['legs']:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            _do_close_leg(leg, lt.get('price') or leg['position']['entryPrice'], trip, cfg, mode)
+    do_ai_state['running'] = False
+    _do_log('[STOP] ' + trip + ' — all legs closed, bot stopped.'); _persist_log_line('[DOPT] [STOP] ' + trip)
+
+def _do_bot_tick():
+    cfg = do_ai_state.get('config') or {}
+    if not cfg: return
+    mode = cfg.get('mode', 'paper'); interval = cfg.get('tf', '5m')
+    buyer = bool(cfg.get('optionBuyer')); seller = bool(cfg.get('optionSeller'))
+    decide = do_ai_state.get('_decide', True)
+    base_ctx = _do_underlying_ctx(cfg) if decide else {}
+    for leg in list(do_ai_state['legs']):
+        symbol = leg['symbol']
+        if not symbol: continue
+        try:
+            candles = fetch_delta_data(interval, symbol)
+        except Exception as e:
+            _do_log('[Tick] ' + symbol + ' data error: ' + str(e)); continue
+        if not candles:
+            with do_ai_lock:
+                leg['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
+            _do_log('[Tick] no Delta candles for ' + symbol); continue
+        price = candles[-1]['close']; regime = _bot_detect_regime(candles)
+        if decide:
+            leg_ctx = dict(base_ctx) if base_ctx else {}
+            leg_ctx.update(_do_option_meta(symbol, (base_ctx or {}).get('underlyingSpot') or 0))
+            leg_ctx['buyerEnabled'] = buyer; leg_ctx['sellerEnabled'] = seller
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), do_ai_state.get('trades'),
+                                         extra_ctx=leg_ctx, images=_chart_images_for(do_ai_state))
+        else:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
+        sig = strat['signal']
+        with do_ai_lock:
+            leg['last_candles'] = candles[-150:]
+            leg['last_tick'] = {'time': int(_zd_time.time()), 'price': price, 'strategy': strat['name'],
+                                'signal': sig, 'score': strat['score'], 'reason': strat['reason']}
+            pos = leg.get('position')
+            if pos:
+                is_long = pos['side'] == 'BUY'; reason = None; exit_px = price
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                if is_long:
+                    if lo <= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
+                    elif hi >= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
+                else:
+                    if hi >= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
+                    elif lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
+                if reason is None and (not is_long) and pos.get('strike') and (pos.get('dte') is not None and pos['dte'] <= 1):
+                    us = (base_ctx or {}).get('underlyingSpot'); k = float(pos['strike']); ot = pos.get('optionType')
+                    buf = float(cfg.get('nearExpiryStopPct', 0.15) or 0.15) / 100.0
+                    if us and ot == 'CE' and us >= k * (1 - buf):   reason, exit_px = 'underlying near short-call strike (expiry gamma)', price
+                    elif us and ot == 'PE' and us <= k * (1 + buf): reason, exit_px = 'underlying near short-put strike (expiry gamma)', price
+                if reason is None:
+                    if is_long and sig == 'SELL':        reason = 'signal reversal'
+                    elif (not is_long) and sig == 'BUY': reason = 'signal reversal'
+                if reason:
+                    _do_close_leg(leg, exit_px, reason, cfg, mode)
+                else:
+                    _do_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
+            else:
+                open_side = 'BUY' if (sig == 'BUY' and buyer) else ('SELL' if (sig == 'SELL' and seller) else None)
+                if open_side:
+                    now_t = int(_zd_time.time()); cd = int(cfg.get('cooldownSec', 60) or 0)
+                    ll = leg.get('last_loss') or {}; lcd = int(cfg.get('lossCooldownSec', 300) or 0)
+                    if cd and (now_t - (leg.get('last_exit_time') or 0)) < cd:
+                        _do_log('[Tick] {} {} skipped — cooldown {}s'.format(symbol, open_side, cd))
+                    elif lcd and ll.get('side') == open_side and (now_t - int(ll.get('ts', 0) or 0)) < lcd:
+                        _do_log('[Tick] {} {} skipped — loss cooldown {}s'.format(symbol, open_side, lcd))
+                    else:
+                        _do_open_leg(leg, open_side, price, strat, cfg, mode)
+                else:
+                    _do_log('[Tick] {} px={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 2), strat['reason'], strat['score']))
+    with do_ai_lock:
+        _do_apply_breakers(cfg, mode)
+
+def _do_bot_loop():
+    while True:
+        with do_ai_lock:
+            running = do_ai_state.get('running', False); paused = do_ai_state.get('paused', False)
+        if not running: break
+        if not paused:
+            _cfg = do_ai_state.get('config') or {}; _now = _zd_time.time()
+            _dsec = max(5, int(_cfg.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC))
+            do_ai_state['_decide'] = (_now - do_ai_state.get('_last_decision_ts', 0)) >= _dsec
+            try: _do_bot_tick()
+            except Exception as e: _do_log('[Tick] ERROR: ' + str(e))
+            if do_ai_state.get('_decide'): do_ai_state['_last_decision_ts'] = _now
+        _bot_gc_tick()
+        _zd_time.sleep(max(5, int((do_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
+
+@app.route('/api/aibot/doptions/start', methods=['POST'])
+@login_required
+def do_aibot_start():
+    data = request.json or {}
+    with do_ai_lock:
+        if do_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+        buyer  = bool(data.get('optionBuyer', True)); seller = bool(data.get('optionSeller', False))
+        if not buyer and not seller:
+            return jsonify({'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}), 400
+        auto_strikes = bool(data.get('autoStrikes', False))
+        base_symbol  = (data.get('baseSymbol') or '').upper().strip()
+        api_key      = (data.get('api_key') or '').strip()
+        info = ''; legs = []
+        ce_strike = data.get('ceStrike'); pe_strike = data.get('peStrike')
+        if auto_strikes or (base_symbol and (ce_strike not in (None, '', 0) or pe_strike not in (None, '', 0))):
+            if not base_symbol:
+                return jsonify({'success': False, 'error': 'Pick an underlying (BTC / ETH)'}), 400
+            ce_sym, pe_sym, info = _do_resolve_strikes(
+                base_symbol, None if auto_strikes else ce_strike, None if auto_strikes else pe_strike,
+                sell_bias=(seller and auto_strikes), otm_pct=float(data.get('sellOtmPct', 0.25) or 0.25),
+                model=(data.get('model') or '').strip())
+            if not ce_sym or not pe_sym:
+                return jsonify({'success': False, 'error': 'Strike selection failed: ' + str(info)}), 502
+            legs = [{'symbol': ce_sym, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
+                    {'symbol': pe_sym, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0}]
+        else:
+            for n in ('1', '2'):
+                sym = (data.get('sym' + n) or '').upper().strip()
+                if sym:
+                    legs.append({'symbol': sym, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
+            if not legs:
+                return jsonify({'success': False, 'error': 'Enter CE/PE strikes (with an underlying), option symbols, or enable Auto strikes'}), 400
+        do_ai_state['config'] = {
+            'autoStrikes': auto_strikes, 'baseSymbol': base_symbol,
+            'sym1': legs[0]['symbol'], 'sym2': legs[1]['symbol'] if len(legs) > 1 else '',
+            'capital': float(data.get('capital') or 0), 'qty': int(data.get('qty', 1) or 1),
+            'tf': data.get('tf', '5m'), 'mode': data.get('mode', 'paper'),
+            'optionBuyer': buyer, 'optionSeller': seller,
+            'slPct': float(data.get('slPct', 30.0)), 'tpPct': float(data.get('tpPct', 50.0)),
+            'maxConsec': int(data.get('maxConsec', 3) or 3), 'maxLoss': float(data.get('maxLoss', 50) or 50),
+            'maxProfit': float(data.get('maxProfit', 0) or 0),
+            'minScore': float(data.get('minScore') if data.get('minScore') is not None else 0.0),
+            'scoreBuffer': float(data.get('scoreBuffer') if data.get('scoreBuffer') is not None else 0.0),
+            'cooldownSec': int(data.get('cooldownSec', 60) or 0),
+            'lossCooldownSec': int(data.get('lossCooldownSec', 300) or 0),
+            'nearExpiryStopPct': float(data.get('nearExpiryStopPct', 0.15) or 0.15),
+            'sellOtmPct': float(data.get('sellOtmPct', 0.25) or 0.25),
+            'tickSec': max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
+            'model': (data.get('model') or '').strip(), 'api_key': api_key,
+            'strategies': 'claude',
+        }
+        do_ai_state['legs'] = legs; do_ai_state['trades'] = []; do_ai_state['consec_losses'] = 0
+        do_ai_state['running'] = True; do_ai_state['paused'] = False; do_ai_state['_last_decision_ts'] = 0
+        syms = ', '.join(l['symbol'] for l in legs)
+        if info: _do_log('[Auto] ' + info)
+        _do_log('[{}] BOT START {} qty={} TF={} (buyer={} seller={})'.format(
+            do_ai_state['config']['mode'].upper(), syms, do_ai_state['config']['qty'], do_ai_state['config']['tf'], buyer, seller))
+        _persist_log_line('[DOPT] [{}] BOT START {} qty={}'.format(do_ai_state['config']['mode'].upper(), syms, do_ai_state['config']['qty']))
+        _threading.Thread(target=_do_bot_loop, daemon=True, name='doptions-aibot').start()
+    return jsonify({'success': True, 'legs': [l['symbol'] for l in legs], 'info': info})
+
+@app.route('/api/aibot/doptions/stop', methods=['POST'])
+@login_required
+def do_aibot_stop():
+    with do_ai_lock:
+        mode = (do_ai_state.get('config') or {}).get('mode', 'paper')
+        for leg in do_ai_state.get('legs', []):
+            if leg.get('position'):
+                lt = leg.get('last_tick') or {}
+                _do_close_leg(leg, lt.get('price') or leg['position']['entryPrice'], 'bot stop', do_ai_state.get('config') or {}, mode)
+        do_ai_state['running'] = False; do_ai_state['paused'] = False
+    _do_log('[' + mode.upper() + '] BOT STOP'); _persist_log_line('[DOPT] [' + mode.upper() + '] BOT STOP')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/doptions/pause', methods=['POST'])
+@login_required
+def do_aibot_pause():
+    with do_ai_lock:
+        do_ai_state['paused'] = not do_ai_state.get('paused', False); paused = do_ai_state['paused']
+    _do_log('Bot ' + ('PAUSED' if paused else 'RESUMED'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/doptions/status', methods=['GET'])
+@login_required
+def do_aibot_status():
+    with do_ai_lock:
+        cfg = {k: v for k, v in (do_ai_state.get('config') or {}).items() if k != 'api_key'}
+        trades = list(do_ai_state.get('trades', []))
+        legs = [{'symbol': l['symbol'], 'position': l.get('position'), 'last_tick': l.get('last_tick', {})}
+                for l in do_ai_state.get('legs', [])]
+        log_buf = list(do_ai_state.get('log', []))[-200:]
+        running = do_ai_state.get('running', False); paused = do_ai_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    return jsonify({'success': True, 'running': running, 'paused': paused, 'config': cfg,
+                    'legs': legs, 'trades': trades[-40:], 'realizedPnl': round(realized, 4),
+                    'winRate': round(wins / len(trades) * 100, 1) if trades else None, 'log': log_buf})
+
+@app.route('/api/aibot/doptions/reset', methods=['POST'])
+@login_required
+def do_aibot_reset():
+    _reset_bot_state(do_ai_state, do_ai_lock); _do_log('Bot reset to initial state.')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/doptions/chat', methods=['POST'])
+@login_required
+def do_aibot_chat():
+    data = request.json or {}
+    message = (data.get('message') or '').strip()
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(do_ai_state, do_ai_lock, img_url, note=message)
+    if not message and not img_url:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded the latest chart. Use it as the primary structure read for the current setup and trades.'
+    chat_imgs = _chart_images_for(do_ai_state) if img_url else []
+    _bot_set_note(do_ai_state, do_ai_lock, message)
+    history = data.get('history') or []
+    with do_ai_lock:
+        cfg = {k: v for k, v in (do_ai_state.get('config') or {}).items() if k != 'api_key'}
+        trades = list(do_ai_state.get('trades', []))[-20:]
+    import json as _json
+    system = ("You are the strategy co-pilot for a server-side Delta Exchange OPTIONS bot (BTC/ETH calls & puts). "
+              "Claude decides each leg (buy long / sell short premium). Help the user reach a sustained high win rate "
+              "while protecting capital; prefer buying in a clear direction over naked selling. Be concise.\n\n"
+              "CURRENT BOT STATE:\n" + _json.dumps({'config': cfg, 'recentTrades': [
+                  {'sym': t.get('symbol'), 'pnl': round(t.get('pnl', 0), 2), 'reason': t.get('reason')} for t in trades]}, default=str)[:5000])
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        c = str(h.get('content', ''))[:4000]
+        if c: msgs.append({'role': role, 'content': c})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    return jsonify({'success': True, 'reply': text})
+
+@app.route('/api/aibot/doptions/resolve', methods=['POST'])
+@login_required
+def do_aibot_resolve():
+    """Preview the CE/PE symbols for the current underlying + strikes (before Start)."""
+    data = request.json or {}
+    ce, pe, info = _do_resolve_strikes((data.get('baseSymbol') or ''),
+                                       None if data.get('autoStrikes') else data.get('ceStrike'),
+                                       None if data.get('autoStrikes') else data.get('peStrike'),
+                                       sell_bias=bool(data.get('optionSeller')) and bool(data.get('autoStrikes')),
+                                       otm_pct=float(data.get('sellOtmPct', 0.25) or 0.25))
+    return jsonify({'success': bool(ce and pe), 'ce': ce, 'pe': pe, 'info': info})
 
 @app.route('/api/aibot/suggest_symbols', methods=['POST'])
 @login_required
@@ -16767,6 +17215,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="automation-item" id="btnZOptionsBot">&#127919; Zerodha Options AI Bot</button>
       <button class="automation-item" id="btnDeltaLogin">&#128272; Delta Login</button>
       <button class="automation-item" id="btnDeltaBot">&#129504; Delta AI Bot</button>
+      <button class="automation-item" id="btnDOptionsBot">&#127919; Delta Options AI Bot</button>
       <button class="automation-item" id="btnMT5Login">&#128272; MT5 Login</button>
       <button class="automation-item" id="btnMT5Bot">&#129504; MT5 AI Bot</button>
     </div>
@@ -17880,6 +18329,64 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="dbot-chat-input">
           <input type="text" id="deltaChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
           <button class="dbot-chat-send" id="deltaChatSend">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delta Options AI Bot Panel (BTC/ETH calls & puts) -->
+  <div class="zerodha-panel" id="doBotPanel" style="width:940px;display:none">
+    <div class="zd-header" id="doBotHeader">
+      <h3><span style="color:#f7a600">&#127919;</span> Delta Options AI Bot</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="doBotResetBtn" title="Reset bot (stop &amp; clear)">&#8634;</button>
+        <button class="zd-close" id="doBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="ai-input-bar">
+        <label title="Trading capital (USDT) — context for Claude.">Capital $<input type="number" id="doBotCapital" value="1000" min="0" step="100"></label>
+        <label title="Bot auto-stops when realised P/L drops below this.">Daily loss $<input type="number" id="doBotMaxLoss" value="50" min="1"></label>
+        <label title="Bot banks + stops once realised+open P/L reaches this. 0 = off.">Daily profit $<input type="number" id="doBotMaxProfit" value="0" min="0"></label>
+        <label>Model<select id="doBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+        <label title="How often the bot checks + calls Claude.">Tick<select id="doBotTickSec"><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option></select></label>
+        <label title="Paper = simulated. Live = real Delta orders.">Mode<select id="doBotMode"><option value="paper" selected>Paper</option><option value="live">Live</option></select></label>
+      </div>
+      <div class="zd-status-bar" style="margin-bottom:8px">
+        <span class="zd-status-dot" id="doBotStatusDot"></span>
+        <span id="doBotStatusText">Open <b style="color:#f7a600">Delta Login</b> for live data + orders. Paper works without it.</span>
+      </div>
+      <div class="ai-input-bar">
+        <label title="Open LONG by BUYing the option (profit if premium rises)."><input type="checkbox" id="doBotBuyer" checked> Option Buyer (buy&rarr;sell)</label>
+        <label title="Open SHORT by SELLing the option (collect decay)."><input type="checkbox" id="doBotSeller" checked> Option Seller (sell&rarr;buy)</label>
+        <label>Underlying<select id="doBotBaseSel"><option value="BTC" selected>BTC</option><option value="ETH">ETH</option><option value="SOL">SOL</option></select></label>
+        <label title="Checked: Claude picks CE/PE strikes near ATM (OTM-biased for selling). Unchecked: enter strikes below."><input type="checkbox" id="doBotAutoStrikes" checked> &#129302; Auto strikes (Claude picks)</label>
+      </div>
+      <div class="ai-input-bar">
+        <label title="CE (call) strike. Used only when Auto strikes is OFF. Snaps to the nearest listed strike."><span>CE strike</span><input type="number" id="doBotCeStrike" placeholder="e.g. 118000" style="width:120px"></label>
+        <label title="PE (put) strike."><span>PE strike</span><input type="number" id="doBotPeStrike" placeholder="e.g. 116000" style="width:120px"></label>
+        <label title="Number of CONTRACTS (Delta option lot). 1 BTC option contract = 0.001 BTC."><span>Contracts</span><input type="number" id="doBotQty" value="1" min="1" style="width:80px"></label>
+        <label>TF<select id="doBotTF"><option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option><option value="15m">15m</option></select></label>
+        <label title="Stop-loss % of premium (Claude may override).">SL%<input type="number" id="doBotSlPct" value="30" min="1" style="width:60px"></label>
+        <label title="Target % of premium (Claude may override).">TP%<input type="number" id="doBotTpPct" value="50" min="1" style="width:60px"></label>
+        <button class="zd-add-btn" id="doBotResolveBtn" type="button" title="Preview the CE/PE option symbols">&#128269; Preview strikes</button>
+      </div>
+      <div class="ai-risk-bar">
+        <label>Max consec losses <input type="number" id="doBotMaxConsec" value="3" min="1" style="width:56px"></label>
+        <span id="doBotResolveOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+      </div>
+      <div class="ai-input-bar">
+        <button class="zd-add-btn" id="doBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
+        <button class="zd-add-btn" id="doBotStopBtn" style="padding:7px 16px">&#9632; Stop</button>
+        <button class="zd-add-btn" id="doBotPauseBtn" style="padding:7px 12px">&#10073;&#10073; Pause</button>
+        <span id="doBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
+      </div>
+      <div class="dbot-chat-msgs" id="doBotLog" style="height:150px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#b7bdc9;white-space:pre-wrap"></div>
+      <div class="dbot-chat" style="margin-top:8px">
+        <div class="dbot-chat-msgs" id="doBotChatMsgs" style="height:120px;overflow:auto"></div>
+        <div class="dbot-chat-input">
+          <input type="text" id="doBotChatInput" placeholder="Ask Claude, or drop a directive (e.g. only longs, buy CE) …" autocomplete="off">
+          <button class="dbot-chat-send" id="doBotChatSend">Send</button>
         </div>
       </div>
     </div>
@@ -24524,6 +25031,95 @@ HTML_PAGE = r"""<!DOCTYPE html>
     setInterval(function() {
       fetch('/api/ping').catch(() => {});
     }, 10 * 60 * 1000);
+  })();
+
+  // ---- Delta Options AI Bot Panel (BTC/ETH calls & puts) ----
+  (function() {
+    const panel = document.getElementById('doBotPanel');
+    if (!panel) return;
+    const $ = function(id){ return document.getElementById(id); };
+    const logEl = $('doBotLog'), msgsEl = $('doBotChatMsgs'), inputEl = $('doBotChatInput'), sendEl = $('doBotChatSend');
+    let pendingChartImg = '', chartBtn = null, pollTimer = null;
+    function post(url, b){ return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(b||{})}).then(r=>r.json()); }
+    function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function deltaApiKey(){ const el = document.getElementById('deltaBotApiKey') || document.getElementById('deltaApiKey'); return el ? (el.value||'').trim() : ''; }
+    // draggable header
+    (function(){ const h=$('doBotHeader'); if(!h) return; let dx=0,dy=0,drag=false;
+      h.style.cursor='move';
+      h.addEventListener('mousedown',function(e){ if(e.target.closest('button'))return; drag=true; dx=e.clientX-panel.offsetLeft; dy=e.clientY-panel.offsetTop; e.preventDefault(); });
+      document.addEventListener('mousemove',function(e){ if(!drag)return; panel.style.left=(e.clientX-dx)+'px'; panel.style.top=(e.clientY-dy)+'px'; panel.style.transform='none'; });
+      document.addEventListener('mouseup',function(){ drag=false; });
+    })();
+    function cfg(){
+      const auto = !!$('doBotAutoStrikes').checked;
+      return { autoStrikes: auto, baseSymbol: $('doBotBaseSel').value,
+        ceStrike: parseFloat($('doBotCeStrike').value)||0, peStrike: parseFloat($('doBotPeStrike').value)||0,
+        qty: parseInt($('doBotQty').value)||1, tf: $('doBotTF').value, mode: $('doBotMode').value,
+        capital: parseFloat($('doBotCapital').value)||0, maxLoss: parseFloat($('doBotMaxLoss').value)||50,
+        maxProfit: parseFloat($('doBotMaxProfit').value)||0, maxConsec: parseInt($('doBotMaxConsec').value)||3,
+        slPct: parseFloat($('doBotSlPct').value)||30, tpPct: parseFloat($('doBotTpPct').value)||50,
+        optionBuyer: !!$('doBotBuyer').checked, optionSeller: !!$('doBotSeller').checked,
+        model: $('doBotModel').value, tickSec: parseInt($('doBotTickSec').value)||120, api_key: deltaApiKey() };
+    }
+    function addMsg(t, cls){ const d=document.createElement('div'); d.className='dbot-msg '+(cls||'bot'); d.innerHTML=esc(t); msgsEl.appendChild(d); msgsEl.scrollTop=msgsEl.scrollHeight; return d; }
+    function renderStatus(d){
+      if(!d||!d.success) return;
+      const dot=$('doBotStatusDot'); if(dot) dot.style.background = d.running ? '#26a69a' : '#787b86';
+      $('doBotStatusText').innerHTML = d.running ? ('Running '+(d.paused?'(paused) ':'')+'— '+(d.legs||[]).map(l=>esc(l.symbol)).join(' + ')) : 'Stopped.';
+      $('doBotPnl').textContent = 'P/L $'+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+(d.winRate!=null?('  ·  win '+d.winRate+'%'):'');
+      if(logEl && d.log){ logEl.textContent = d.log.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+    }
+    function poll(){ fetch('/api/aibot/doptions/status').then(r=>r.json()).then(renderStatus).catch(()=>{}); }
+    function startPolling(){ if(pollTimer) return; pollTimer=setInterval(poll, 3000); poll(); }
+    if($('doBotResolveBtn')) $('doBotResolveBtn').addEventListener('click', function(){
+      $('doBotResolveOut').textContent='Resolving…';
+      post('/api/aibot/doptions/resolve', cfg()).then(function(d){
+        $('doBotResolveOut').textContent = (d&&d.success) ? (d.info+'  →  CE '+d.ce+' / PE '+d.pe) : ('Failed: '+((d&&d.info)||'?'));
+      }).catch(e=>{ $('doBotResolveOut').textContent='Error: '+e.message; });
+    });
+    if($('doBotStartBtn')) $('doBotStartBtn').addEventListener('click', function(){
+      const c=cfg();
+      if(!c.optionBuyer && !c.optionSeller){ addMsg('Enable Option Buyer and/or Seller.','err'); return; }
+      addMsg('Starting Delta Options bot ('+c.baseSymbol+', '+c.mode+')…','user');
+      post('/api/aibot/doptions/start', c).then(function(d){
+        if(d&&d.success){ addMsg('Started: '+(d.legs||[]).join(' + ')+(d.info?('\n'+d.info):''),'bot'); startPolling(); }
+        else addMsg('Start failed: '+((d&&d.error)||'?'),'err');
+      }).catch(e=>addMsg('Error: '+e.message,'err'));
+    });
+    if($('doBotStopBtn')) $('doBotStopBtn').addEventListener('click', function(){ post('/api/aibot/doptions/stop',{}).then(poll); });
+    if($('doBotPauseBtn')) $('doBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/doptions/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
+    if($('doBotResetBtn')) $('doBotResetBtn').addEventListener('click', function(){ post('/api/aibot/doptions/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
+    if($('doBotClose')) $('doBotClose').addEventListener('click', function(){ panel.style.display='none'; if(pollTimer){clearInterval(pollTimer); pollTimer=null;} });
+    // chart attach
+    if(sendEl && inputEl){
+      chartBtn=document.createElement('button'); chartBtn.type='button'; chartBtn.className='dbot-chat-send';
+      chartBtn.title='Attach a chart / option-chain image for Claude'; chartBtn.textContent='📎'; chartBtn.style.marginRight='4px';
+      const f=document.createElement('input'); f.type='file'; f.accept='image/*'; f.style.display='none';
+      sendEl.parentNode.insertBefore(chartBtn, sendEl); sendEl.parentNode.appendChild(f);
+      chartBtn.addEventListener('click', ()=>f.click());
+      f.addEventListener('change', function(){ const file=f.files&&f.files[0]; f.value=''; if(!file) return;
+        if(file.size>5*1024*1024){ addMsg('Image too large (max 5MB).','err'); return; }
+        const rd=new FileReader(); rd.onload=function(){ pendingChartImg=String(rd.result||''); chartBtn.textContent='📎✓'; chartBtn.style.color='#26a69a';
+          addMsg('Image attached — sent to Claude and used for decisions.','bot'); }; rd.readAsDataURL(file); });
+    }
+    function takeImg(){ const i=pendingChartImg; pendingChartImg=''; if(chartBtn){chartBtn.textContent='📎'; chartBtn.style.color='';} return i; }
+    const hist=[];
+    function send(){ const msg=inputEl.value.trim(); if(!msg && !pendingChartImg) return;
+      if(msg){ addMsg(msg,'user'); hist.push({role:'user',content:msg}); }
+      inputEl.value=''; sendEl.disabled=true;
+      const think=addMsg('…','bot');
+      post('/api/aibot/doptions/chat', {message:msg, history:hist.slice(0,-1), model:$('doBotModel').value, image:takeImg()}).then(function(d){
+        think.remove(); if(!d||!d.success){ addMsg((d&&d.error)||'Claude unavailable.','err'); return; }
+        addMsg(d.reply||'(no reply)','bot'); hist.push({role:'assistant',content:d.reply||''});
+      }).catch(e=>{ think.remove(); addMsg('Error: '+e.message,'err'); }).finally(()=>{ sendEl.disabled=false; inputEl.focus(); });
+    }
+    if(sendEl) sendEl.addEventListener('click', send);
+    if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
+    const openBtn=document.getElementById('btnDOptionsBot');
+    if(openBtn) openBtn.addEventListener('click', function(){
+      panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none';
+      startPolling();
+    });
   })();
 
   // ---- Zerodha Options AI Bot Panel (two legs, buyer/seller) ----
