@@ -25532,7 +25532,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if(sendEl) sendEl.addEventListener('click', send);
     if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
     const openBtn=document.getElementById('btnTVBot');
-    if(openBtn) openBtn.addEventListener('click', function(){ panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none'; setTimeout(initTvChart, 60); startPolling(); });
+    if(openBtn) openBtn.addEventListener('click', function(){ panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.classList.remove('open'); setTimeout(initTvChart, 60); startPolling(); });
   })();
 
   // ---- Delta Options AI Bot Panel (BTC/ETH calls & puts) ----
@@ -25657,7 +25657,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
     const openBtn=document.getElementById('btnDOptionsBot');
     if(openBtn) openBtn.addEventListener('click', function(){
-      panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none';
+      panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.classList.remove('open');
       setTimeout(initDCharts, 60); startPolling();
     });
   })();
