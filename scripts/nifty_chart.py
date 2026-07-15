@@ -25505,10 +25505,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       post('/api/aibot/tvbot/start', c).then(function(d){ if(d&&d.success){ addMsg('Started on '+d.symbol,'bot'); startPolling(); } else addMsg('Start failed: '+((d&&d.error)||'?'),'err'); }).catch(e=>addMsg('Error: '+e.message,'err')); });
     if($('tvBotLogBtn')) $('tvBotLogBtn').addEventListener('click', function(){ window.open('/api/aibot/log_download', '_blank'); });
     if($('tvBotDlBtn')) $('tvBotDlBtn').addEventListener('click', function(){
-      const txt = (logEl && logEl.textContent) || '(no log yet)';
-      const blob = new Blob([txt], {type:'text/plain;charset=utf-8'}); const a=document.createElement('a');
-      a.href=URL.createObjectURL(blob); a.download='tradingview_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';
-      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); });
+      const a=document.createElement('a'); a.href='/api/aibot/log_download?download=1'; a.download='log.txt';
+      document.body.appendChild(a); a.click(); a.remove(); });
     if($('tvBotStopBtn')) $('tvBotStopBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/stop',{}).then(poll); });
     if($('tvBotPauseBtn')) $('tvBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
     if($('tvBotResetBtn')) $('tvBotResetBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
@@ -25626,10 +25624,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
     if($('doBotLogBtn')) $('doBotLogBtn').addEventListener('click', function(){ window.open('/api/aibot/log_download', '_blank'); });
     if($('doBotDlBtn')) $('doBotDlBtn').addEventListener('click', function(){
-      const txt = (logEl && logEl.textContent) || '(no log yet)';
-      const blob = new Blob([txt], {type:'text/plain;charset=utf-8'}); const a=document.createElement('a');
-      a.href=URL.createObjectURL(blob); a.download='delta_options_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';
-      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); });
+      const a=document.createElement('a'); a.href='/api/aibot/log_download?download=1'; a.download='log.txt';
+      document.body.appendChild(a); a.click(); a.remove(); });
     if($('doBotStopBtn')) $('doBotStopBtn').addEventListener('click', function(){ post('/api/aibot/doptions/stop',{}).then(poll); });
     if($('doBotPauseBtn')) $('doBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/doptions/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
     if($('doBotResetBtn')) $('doBotResetBtn').addEventListener('click', function(){ post('/api/aibot/doptions/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
