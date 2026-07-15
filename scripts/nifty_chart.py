@@ -4978,7 +4978,10 @@ def _zo_bot_tick():
     is_claude = _bot_is_claude(cfg)
     # Claude decisions only on the slow tick; price/stops still refresh every loop.
     _zo_decide = is_claude and zo_ai_state.get('_decide', True)
-    base_ctx = _zo_underlying_ctx(cfg) if (cfg.get('baseSymbol') and _zo_decide) else {}
+    base_ctx = _zo_underlying_ctx(cfg) if cfg.get('baseSymbol') else {}   # every tick — keep the underlying value live
+    _us = (base_ctx or {}).get('underlyingSpot')
+    if _us:
+        zo_ai_state['underlyingSpot'] = _us; zo_ai_state['underlyingSym'] = (cfg.get('baseSymbol') or '').upper()
     # TradingView readout for the UNDERLYING (option contracts aren't on TV TA).
     tv_ctx = _tv_context(cfg, 'kite', cfg.get('baseSymbol') or '', '') if _zo_decide else None
     for leg in list(zo_ai_state['legs']):
@@ -5264,6 +5267,7 @@ def zo_aibot_status():
     return jsonify({
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
         'legs': legs, 'log': log_buf,
+        'underlyingSpot': zo_ai_state.get('underlyingSpot'), 'underlyingSym': zo_ai_state.get('underlyingSym'),
         'stats': {
             'realized': round(realized, 2), 'unrealized': round(unreal, 2),
             'tradeCount': len(trades),
@@ -6886,7 +6890,11 @@ def _do_bot_tick():
     mode = cfg.get('mode', 'paper'); interval = cfg.get('tf', '5m')
     buyer = bool(cfg.get('optionBuyer')); seller = bool(cfg.get('optionSeller'))
     decide = do_ai_state.get('_decide', True)
-    base_ctx = _do_underlying_ctx(cfg) if decide else {}
+    base_ctx = _do_underlying_ctx(cfg)      # every tick — so the underlying value is always live
+    uspot = (base_ctx or {}).get('underlyingSpot')
+    if uspot:
+        do_ai_state['underlyingSpot'] = uspot
+        do_ai_state['underlyingSym'] = (cfg.get('baseSymbol') or '').upper()
     for leg in list(do_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -6911,7 +6919,8 @@ def _do_bot_tick():
         with do_ai_lock:
             leg['last_candles'] = candles[-150:]
             leg['last_tick'] = {'time': int(_zd_time.time()), 'price': price, 'strategy': strat['name'],
-                                'signal': sig, 'score': strat['score'], 'reason': strat['reason']}
+                                'signal': sig, 'score': strat['score'], 'reason': strat['reason'],
+                                'underlyingSpot': uspot, 'underlyingSym': (cfg.get('baseSymbol') or '').upper()}
             pos = leg.get('position')
             if pos:
                 is_long = pos['side'] == 'BUY'; reason = None; exit_px = price
@@ -6946,7 +6955,9 @@ def _do_bot_tick():
                     else:
                         _do_open_leg(leg, open_side, price, strat, cfg, mode)
                 else:
-                    _do_log('[Tick] {} px={} HOLD — {} (score {:.1f})'.format(symbol, round(price, 2), strat['reason'], strat['score']))
+                    _do_log('[Tick] {} px={} [{} {}] HOLD — {} (score {:.1f})'.format(
+                        symbol, round(price, 2), (cfg.get('baseSymbol') or '').upper(),
+                        round(uspot, 2) if uspot else '?', strat['reason'], strat['score']))
     with do_ai_lock:
         _do_apply_breakers(cfg, mode)
 
@@ -7062,6 +7073,7 @@ def do_aibot_status():
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
     return jsonify({'success': True, 'running': running, 'paused': paused, 'config': cfg,
                     'legs': legs, 'trades': trades[-40:], 'realizedPnl': round(realized, 4),
+                    'underlyingSpot': do_ai_state.get('underlyingSpot'), 'underlyingSym': do_ai_state.get('underlyingSym'),
                     'winRate': round(wins / len(trades) * 100, 1) if trades else None, 'log': log_buf})
 
 @app.route('/api/aibot/doptions/reset', methods=['POST'])
@@ -18851,6 +18863,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Underlying</span><span class="val" id="zoBotUnderlying" style="color:#f7a600">&mdash;</span></div>
         <div class="cell"><span class="lab">Option 1</span><span class="val" id="zoBotLeg1">FLAT</span></div>
         <div class="cell"><span class="lab">Option 2</span><span class="val" id="zoBotLeg2">FLAT</span></div>
         <div class="cell"><span class="lab">Market Regime</span><span class="val" id="zoBotRegime">&mdash;</span></div>
@@ -25476,8 +25489,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function renderStatus(d){
       if(!d||!d.success) return;
       const dot=$('doBotStatusDot'); if(dot) dot.style.background = d.running ? '#26a69a' : '#787b86';
-      $('doBotStatusText').innerHTML = d.running ? ('Running '+(d.paused?'(paused) ':'')+'— '+(d.legs||[]).map(l=>esc(l.symbol)).join(' + ')) : 'Stopped.';
-      $('doBotPnl').textContent = 'P/L $'+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+(d.winRate!=null?('  ·  win '+d.winRate+'%'):'');
+      const ul = (d.underlyingSym && d.underlyingSpot!=null) ? (d.underlyingSym+' '+d.underlyingSpot) : '';
+      const legTxt = (d.legs||[]).map(function(l){ const lt=l.last_tick||{}; const p=l.position;
+        return esc(l.symbol)+(lt.price!=null?(' @'+lt.price):' —')+(p?(' ['+p.side+' '+p.qty+']'):''); }).join('  ·  ');
+      $('doBotStatusText').innerHTML = (d.running?('Running'+(d.paused?' (paused)':'')):'Stopped')
+        + (ul?('  ·  Underlying <b style="color:#f7a600">'+esc(ul)+'</b>'):'') + (legTxt?('  ·  '+legTxt):'');
+      $('doBotPnl').textContent = 'P/L $'+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+'  ·  trades '+((d.trades||[]).length)+(d.winRate!=null?('  ·  win '+d.winRate+'%'):'');
       if(logEl && d.log){ logEl.textContent = d.log.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
     }
     function poll(){ fetch('/api/aibot/doptions/status').then(r=>r.json()).then(renderStatus).catch(()=>{}); }
@@ -25830,6 +25847,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         legEls[i].className = 'val ' + (leg.position ? (leg.position.side === 'BUY' ? 'bull' : 'bear') : '');
       }
       if (legs[0] && legs[0].last_tick && legs[0].last_tick.regime) regimeEl.textContent = legs[0].last_tick.regime;
+      const ulEl = document.getElementById('zoBotUnderlying');
+      if (ulEl) ulEl.textContent = (s.underlyingSym && s.underlyingSpot != null) ? (s.underlyingSym + ' ' + s.underlyingSpot) : '—';
       const st = s.stats || {};
       if (st.realized != null) {
         realPnlEl.textContent = (st.realized >= 0 ? '+₹' : '-₹') + Math.abs(st.realized).toFixed(2);
