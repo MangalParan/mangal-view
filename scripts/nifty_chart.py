@@ -6804,13 +6804,21 @@ def _do_underlying_ctx(cfg):
     if not base:
         return {}
     c = _do_spot_candles(base, cfg.get('tf', '5m'))
+    if c:
+        do_ai_state['underlyingCandles'] = c[-150:]
+        do_ai_state['underlyingChartSym'] = base.upper() + 'USD'
     if not c or len(c) < 10:
         return {'underlying': base}
     cl = [x['close'] for x in c[-30:]]
     ts = ((cl[-1] - cl[-10]) / cl[-10] * 100.0) if cl[-10] else 0.0
     tm = ((cl[-1] - cl[0]) / cl[0] * 100.0) if cl[0] else 0.0
+    reg = _bot_detect_regime(c)
+    move5 = ((cl[-1] - cl[-6]) / cl[-6] * 100.0) if len(cl) >= 6 and cl[-6] else 0.0
     return {'underlying': base, 'underlyingSpot': round(cl[-1], 2),
-            'underlyingTrendPct': round(ts, 2), 'underlyingTrendMedPct': round(tm, 2)}
+            'underlyingTrendPct': round(ts, 2), 'underlyingTrendMedPct': round(tm, 2),
+            'underlyingMove5barsPct': round(move5, 2),
+            'underlyingDirection': (reg['direction'] if reg.get('trending') else 'range'),
+            'underlyingRegime': '{} vol, {}'.format(reg['volatility'], 'trending ' + reg['direction'] if reg['trending'] else 'range')}
 
 def _do_place_live(leg, side, qty, cfg):
     """Place a live Delta options order. True only if Delta ACCEPTED it."""
@@ -7077,15 +7085,22 @@ def do_aibot_status():
     with do_ai_lock:
         cfg = {k: v for k, v in (do_ai_state.get('config') or {}).items() if k != 'api_key'}
         trades = list(do_ai_state.get('trades', []))
-        legs = [{'symbol': l['symbol'], 'position': l.get('position'), 'last_tick': l.get('last_tick', {})}
-                for l in do_ai_state.get('legs', [])]
+        legs = [{'symbol': l['symbol'], 'position': l.get('position'), 'last_tick': dict(l.get('last_tick', {})),
+                 'last_candles': list(l.get('last_candles', []))} for l in do_ai_state.get('legs', [])]
         log_buf = list(do_ai_state.get('log', []))[-200:]
         running = do_ai_state.get('running', False); paused = do_ai_state.get('paused', False)
     realized = sum(t.get('pnl', 0) for t in trades)
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unreal = 0.0
+    for l in legs:
+        p = l.get('position'); lt = l.get('last_tick') or {}
+        if p and lt.get('price'):
+            unreal += (lt['price'] - p['entryPrice']) * p['qty'] * (1 if p['side'] == 'BUY' else -1)
     return jsonify({'success': True, 'running': running, 'paused': paused, 'config': cfg,
-                    'legs': legs, 'trades': trades[-40:], 'realizedPnl': round(realized, 4),
+                    'legs': legs, 'trades': trades[-40:], 'realizedPnl': round(realized, 4), 'unrealizedPnl': round(unreal, 4),
                     'underlyingSpot': do_ai_state.get('underlyingSpot'), 'underlyingSym': do_ai_state.get('underlyingSym'),
+                    'underlyingChartSym': do_ai_state.get('underlyingChartSym'),
+                    'underlyingCandles': list(do_ai_state.get('underlyingCandles', []))[-150:],
                     'winRate': round(wins / len(trades) * 100, 1) if trades else None, 'log': log_buf})
 
 @app.route('/api/aibot/doptions/reset', methods=['POST'])
@@ -7352,13 +7367,18 @@ def tvb_aibot_status():
     with tvb_ai_lock:
         cfg = dict(tvb_ai_state.get('config') or {})
         trades = list(tvb_ai_state.get('trades', []))
-        pos = tvb_ai_state.get('position'); lt = tvb_ai_state.get('last_tick', {})
+        pos = tvb_ai_state.get('position'); lt = dict(tvb_ai_state.get('last_tick', {}))
+        candles = list(tvb_ai_state.get('last_candles', []))[-150:]
         log_buf = list(tvb_ai_state.get('log', []))[-200:]
         running = tvb_ai_state.get('running', False); paused = tvb_ai_state.get('paused', False)
     realized = sum(t.get('pnl', 0) for t in trades)
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unreal = 0.0
+    if pos and lt.get('price'):
+        unreal = (lt['price'] - pos['entryPrice']) * pos['qty'] * (1 if pos['side'] == 'BUY' else -1)
     return jsonify({'success': True, 'running': running, 'paused': paused, 'config': cfg,
-                    'position': pos, 'lastTick': lt, 'trades': trades[-40:], 'realizedPnl': round(realized, 4),
+                    'position': pos, 'lastTick': lt, 'candles': candles, 'trades': trades[-40:],
+                    'realizedPnl': round(realized, 4), 'unrealizedPnl': round(unreal, 4),
                     'winRate': round(wins / len(trades) * 100, 1) if trades else None,
                     'ccy': '₹' if (cfg.get('currency') or 'USD').upper() == 'INR' else '$', 'log': log_buf})
 
@@ -18677,10 +18697,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="tvBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
         <button class="zd-add-btn" id="tvBotStopBtn" style="padding:7px 16px">&#9632; Stop</button>
         <button class="zd-add-btn" id="tvBotPauseBtn" style="padding:7px 12px">&#10073;&#10073; Pause</button>
+        <button class="zd-add-btn" id="tvBotLoadBtn" type="button" style="padding:7px 12px">&#128202; Load Chart</button>
         <button class="bot-log-btn" id="tvBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
         <button class="bot-log-btn" id="tvBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
         <span id="tvBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
       </div>
+      <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Price</span><span class="val" id="tvBotPrice">&mdash;</span></div>
+        <div class="cell"><span class="lab">Position</span><span class="val" id="tvBotPos">FLAT</span></div>
+        <div class="cell"><span class="lab">Regime</span><span class="val" id="tvBotRegime">&mdash;</span></div>
+        <div class="cell"><span class="lab">Signal</span><span class="val" id="tvBotSignal">&mdash;</span></div>
+        <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="tvBotRealized">0.00</span></div>
+        <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="tvBotUnreal">0.00</span></div>
+        <div class="cell"><span class="lab">Trades</span><span class="val" id="tvBotTrades">0</span></div>
+        <div class="cell"><span class="lab">Win Rate</span><span class="val" id="tvBotWin">&mdash;</span></div>
+      </div>
+      <div class="bot-chart-wrap" style="margin:8px 0"><div id="tvBotChart"></div><div class="bot-price-overlay" id="tvBotPx"><div class="sym" id="tvBotPxSym">&mdash;</div><div class="px" id="tvBotPxVal">&mdash;</div></div></div>
       <div class="dbot-chat-msgs" id="tvBotLog" style="height:150px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#b7bdc9;white-space:pre-wrap"></div>
       <div class="dbot-chat" style="margin-top:8px">
         <div class="dbot-chat-msgs" id="tvBotChatMsgs" style="height:120px;overflow:auto"></div>
@@ -18739,9 +18771,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="doBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
         <button class="zd-add-btn" id="doBotStopBtn" style="padding:7px 16px">&#9632; Stop</button>
         <button class="zd-add-btn" id="doBotPauseBtn" style="padding:7px 12px">&#10073;&#10073; Pause</button>
+        <button class="zd-add-btn" id="doBotLoadBtn" type="button" style="padding:7px 12px">&#128202; Load Charts</button>
         <button class="bot-log-btn" id="doBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
         <button class="bot-log-btn" id="doBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
         <span id="doBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
+      </div>
+      <div class="ai-info-grid">
+        <div class="cell"><span class="lab">Underlying</span><span class="val" id="doBotUnderlying" style="color:#f7a600">&mdash;</span></div>
+        <div class="cell"><span class="lab">Option 1 (CE)</span><span class="val" id="doBotLeg1">FLAT</span></div>
+        <div class="cell"><span class="lab">Option 2 (PE)</span><span class="val" id="doBotLeg2">FLAT</span></div>
+        <div class="cell"><span class="lab">Regime</span><span class="val" id="doBotRegime">&mdash;</span></div>
+        <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="doBotRealized">$0.00</span></div>
+        <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="doBotUnreal">$0.00</span></div>
+        <div class="cell"><span class="lab">Trades</span><span class="val" id="doBotTrades">0</span></div>
+        <div class="cell"><span class="lab">Win Rate</span><span class="val" id="doBotWin">&mdash;</span></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0">
+        <div class="bot-chart-wrap" style="flex:1;min-width:280px"><div id="doBotChartU"></div><div class="bot-price-overlay" id="doBotPxU"><div class="sym" id="doBotPxUSym" style="color:#f7a600">Underlying</div><div class="px" id="doBotPxUVal">&mdash;</div></div></div>
+        <div class="bot-chart-wrap" style="flex:1;min-width:280px"><div id="doBotChart1"></div><div class="bot-price-overlay" id="doBotPx1"><div class="sym" id="doBotPx1Sym">CE</div><div class="px" id="doBotPx1Val">&mdash;</div></div></div>
+        <div class="bot-chart-wrap" style="flex:1;min-width:280px"><div id="doBotChart2"></div><div class="bot-price-overlay" id="doBotPx2"><div class="sym" id="doBotPx2Sym">PE</div><div class="px" id="doBotPx2Val">&mdash;</div></div></div>
       </div>
       <div class="dbot-chat-msgs" id="doBotLog" style="height:150px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#b7bdc9;white-space:pre-wrap"></div>
       <div class="dbot-chat" style="margin-top:8px">
@@ -25426,8 +25474,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxProfit:parseFloat($('tvBotMaxProfit').value)||0, maxConsec:parseInt($('tvBotMaxConsec').value)||3,
         cooldownSec:parseInt($('tvBotCooldown').value)||0, model:$('tvBotModel').value, tickSec:parseInt($('tvBotTickSec').value)||120 }; }
     function addMsg(t,cls){ const d=document.createElement('div'); d.className='dbot-msg '+(cls||'bot'); d.innerHTML=esc(t); msgsEl.appendChild(d); msgsEl.scrollTop=msgsEl.scrollHeight; return d; }
+    let tvChart=null, tvSeries=null;
+    function initTvChart(){ if(tvChart||typeof LightweightCharts==='undefined') return; const div=$('tvBotChart'); if(!div) return;
+      tvChart=LightweightCharts.createChart(div,{width:div.clientWidth||600,height:240,layout:{background:{color:'#131722'},textColor:'#d1d4dc'},grid:{vertLines:{color:'#1e222d'},horzLines:{color:'#1e222d'}},timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#2a2e39'},rightPriceScale:{borderColor:'#2a2e39'}});
+      tvSeries=tvChart.addCandlestickSeries({upColor:'#26a69a',downColor:'#ef5350',borderUpColor:'#26a69a',borderDownColor:'#ef5350',wickUpColor:'#26a69a',wickDownColor:'#ef5350'});
+      window.addEventListener('resize', function(){ if(tvChart) tvChart.applyOptions({width:div.clientWidth}); }); }
+    function setTv(candles){ if(tvSeries && candles && candles.length){ try{tvSeries.setData(candles);}catch(e){} const lc=candles[candles.length-1]; const el=$('tvBotPxVal'); if(lc&&el) el.textContent=Math.abs(lc.close)>=100?lc.close.toFixed(2):lc.close.toFixed(4); } }
+    function loadChart(){ initTvChart(); const sym=($('tvBotSymbol').value||'').trim().toUpperCase(); if(!sym) return; const tf=$('tvBotTF').value;
+      const ps=$('tvBotPxSym'); if(ps)ps.textContent=sym;
+      fetch('/api/candles?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&source=tradingview').then(r=>r.json()).then(d=>{ if(d.candles&&d.candles.length){ setTv(d.candles); if(tvChart)tvChart.timeScale().fitContent(); } }).catch(()=>{}); }
+    if($('tvBotLoadBtn')) $('tvBotLoadBtn').addEventListener('click', loadChart);
     function renderStatus(d){ if(!d||!d.success) return;
-      $('tvBotPnl').textContent='P/L '+(d.ccy||'$')+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+(d.winRate!=null?('  ·  win '+d.winRate+'%'):'')+(d.running?(d.paused?'  · paused':'  · running'):'  · stopped');
+      const lt=d.lastTick||{}, pos=d.position, cc=d.ccy||'$';
+      if($('tvBotPrice')) $('tvBotPrice').textContent = lt.price!=null?lt.price:'—';
+      if($('tvBotPos')){ $('tvBotPos').textContent = pos?(pos.side+' '+pos.qty+' @'+pos.entryPrice):'FLAT'; $('tvBotPos').className='val '+(pos?(pos.side==='BUY'?'bull':'bear'):''); }
+      if($('tvBotRegime')&&lt.regime) $('tvBotRegime').textContent=lt.regime;
+      if($('tvBotSignal')) $('tvBotSignal').textContent=(lt.signal||'—')+(lt.score!=null?(' ('+lt.score+')'):'');
+      if($('tvBotRealized')){ $('tvBotRealized').textContent=cc+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'0.00'); $('tvBotRealized').className='val '+((d.realizedPnl||0)>0?'bull':(d.realizedPnl||0)<0?'bear':''); }
+      if($('tvBotUnreal')){ $('tvBotUnreal').textContent=cc+(d.unrealizedPnl!=null?d.unrealizedPnl.toFixed(2):'0.00'); $('tvBotUnreal').className='val '+((d.unrealizedPnl||0)>0?'bull':(d.unrealizedPnl||0)<0?'bear':''); }
+      if($('tvBotTrades')) $('tvBotTrades').textContent=(d.trades||[]).length;
+      if($('tvBotWin')) $('tvBotWin').textContent=(d.winRate!=null?(d.winRate+'%'):'—');
+      setTv(d.candles);
+      $('tvBotPnl').textContent='P/L '+cc+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+(d.running?(d.paused?'  · paused':'  · running'):'  · stopped');
       if(logEl && d.log){ logEl.textContent=d.log.join('\n'); logEl.scrollTop=logEl.scrollHeight; } }
     function poll(){ fetch('/api/aibot/tvbot/status').then(r=>r.json()).then(renderStatus).catch(()=>{}); }
     function startPolling(){ if(pollTimer) return; pollTimer=setInterval(poll,3000); poll(); }
@@ -25466,7 +25534,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if(sendEl) sendEl.addEventListener('click', send);
     if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
     const openBtn=document.getElementById('btnTVBot');
-    if(openBtn) openBtn.addEventListener('click', function(){ panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none'; startPolling(); });
+    if(openBtn) openBtn.addEventListener('click', function(){ panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none'; setTimeout(initTvChart, 60); startPolling(); });
   })();
 
   // ---- Delta Options AI Bot Panel (BTC/ETH calls & puts) ----
@@ -25502,16 +25570,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
         model: $('doBotModel').value, tickSec: parseInt($('doBotTickSec').value)||120, api_key: deltaApiKey() };
     }
     function addMsg(t, cls){ const d=document.createElement('div'); d.className='dbot-msg '+(cls||'bot'); d.innerHTML=esc(t); msgsEl.appendChild(d); msgsEl.scrollTop=msgsEl.scrollHeight; return d; }
+    let dCharts=[null,null], dSeries=[null,null], uChart=null, uSeries=null;
+    function mkChart(div, up, dn){ if(!div||typeof LightweightCharts==='undefined') return [null,null];
+      const ch=LightweightCharts.createChart(div,{width:div.clientWidth||300,height:220,layout:{background:{color:'#131722'},textColor:'#d1d4dc'},grid:{vertLines:{color:'#1e222d'},horzLines:{color:'#1e222d'}},timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#2a2e39'},rightPriceScale:{borderColor:'#2a2e39'}});
+      const se=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn}); return [ch,se]; }
+    function initDCharts(){ if(uChart||typeof LightweightCharts==='undefined') return;
+      const u=mkChart($('doBotChartU'),'#f7a600','#c77800'); uChart=u[0]; uSeries=u[1];
+      const a=mkChart($('doBotChart1'),'#26a69a','#ef5350'); dCharts[0]=a[0]; dSeries[0]=a[1];
+      const b=mkChart($('doBotChart2'),'#26a69a','#ef5350'); dCharts[1]=b[0]; dSeries[1]=b[1];
+      window.addEventListener('resize', function(){ if(uChart)uChart.applyOptions({width:$('doBotChartU').clientWidth}); if(dCharts[0])dCharts[0].applyOptions({width:$('doBotChart1').clientWidth}); if(dCharts[1])dCharts[1].applyOptions({width:$('doBotChart2').clientWidth}); }); }
+    function setChart(se, ch, candles, pxId){ if(se && candles && candles.length){ try{se.setData(candles);}catch(e){} const lc=candles[candles.length-1]; const el=$(pxId); if(lc&&el) el.textContent = Math.abs(lc.close)>=100?lc.close.toFixed(2):lc.close.toFixed(4); } }
+    function loadCharts(){ initDCharts(); const c=cfg(); const tf=c.tf, ak=deltaApiKey();
+      const q=function(sym){ return '/api/candles?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&source=delta'+(ak?('&api_key='+encodeURIComponent(ak)):''); };
+      fetch(q((c.baseSymbol||'BTC')+'USD')).then(r=>r.json()).then(d=>{ if(d.candles&&d.candles.length){ setChart(uSeries,uChart,d.candles,'doBotPxUVal'); if(uChart)uChart.timeScale().fitContent(); const s=$('doBotPxUSym'); if(s)s.textContent=(c.baseSymbol||'BTC'); }}).catch(()=>{});
+      fetch('/api/aibot/doptions/status').then(r=>r.json()).then(function(d){ (d.legs||[]).forEach(function(l,i){ if(i>1) return;
+        fetch(q(l.symbol)).then(r=>r.json()).then(dd=>{ if(dd.candles&&dd.candles.length){ setChart(dSeries[i],dCharts[i],dd.candles,i===0?'doBotPx1Val':'doBotPx2Val'); if(dCharts[i])dCharts[i].timeScale().fitContent(); const sy=$(i===0?'doBotPx1Sym':'doBotPx2Sym'); if(sy)sy.textContent=l.symbol; } }).catch(()=>{}); }); }).catch(()=>{}); }
+    if($('doBotLoadBtn')) $('doBotLoadBtn').addEventListener('click', loadCharts);
     function renderStatus(d){
       if(!d||!d.success) return;
       const dot=$('doBotStatusDot'); if(dot) dot.style.background = d.running ? '#26a69a' : '#787b86';
-      const ul = (d.underlyingSym && d.underlyingSpot!=null) ? (d.underlyingSym+' '+d.underlyingSpot) : '';
-      const legTxt = (d.legs||[]).map(function(l){ const lt=l.last_tick||{}; const p=l.position;
-        return esc(l.symbol)+(lt.price!=null?(' @'+lt.price):' —')+(p?(' ['+p.side+' '+p.qty+']'):''); }).join('  ·  ');
-      $('doBotStatusText').innerHTML = (d.running?('Running'+(d.paused?' (paused)':'')):'Stopped')
-        + (ul?('  ·  Underlying <b style="color:#f7a600">'+esc(ul)+'</b>'):'') + (legTxt?('  ·  '+legTxt):'');
-      $('doBotPnl').textContent = 'P/L $'+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—')+'  ·  trades '+((d.trades||[]).length)+(d.winRate!=null?('  ·  win '+d.winRate+'%'):'');
-      if(logEl && d.log){ logEl.textContent = d.log.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+      const legs=d.legs||[];
+      const ul=(d.underlyingSym && d.underlyingSpot!=null)?(d.underlyingSym+' '+d.underlyingSpot):'—';
+      if($('doBotUnderlying')) $('doBotUnderlying').textContent=ul;
+      [['doBotLeg1',0],['doBotLeg2',1]].forEach(function(pair){ const el=$(pair[0]), l=legs[pair[1]]; if(!el) return;
+        if(!l){ el.textContent='—'; el.className='val'; return; } const p=l.position, lt=l.last_tick||{};
+        el.textContent=(p?(p.side+' '+p.qty+' @'+p.entryPrice):'FLAT')+(lt.price!=null?(' · px '+lt.price):'');
+        el.className='val '+(p?(p.side==='BUY'?'bull':'bear'):''); });
+      const rg=(legs[0]&&legs[0].last_tick&&legs[0].last_tick.regime)||''; if($('doBotRegime')&&rg) $('doBotRegime').textContent=rg;
+      if($('doBotRealized')){ $('doBotRealized').textContent='$'+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'0.00'); $('doBotRealized').className='val '+((d.realizedPnl||0)>0?'bull':(d.realizedPnl||0)<0?'bear':''); }
+      if($('doBotUnreal')){ $('doBotUnreal').textContent='$'+(d.unrealizedPnl!=null?d.unrealizedPnl.toFixed(2):'0.00'); $('doBotUnreal').className='val '+((d.unrealizedPnl||0)>0?'bull':(d.unrealizedPnl||0)<0?'bear':''); }
+      if($('doBotTrades')) $('doBotTrades').textContent=(d.trades||[]).length;
+      if($('doBotWin')) $('doBotWin').textContent=(d.winRate!=null?(d.winRate+'%'):'—');
+      setChart(uSeries,uChart,d.underlyingCandles,'doBotPxUVal');
+      legs.forEach(function(l,i){ if(i<2) setChart(dSeries[i],dCharts[i],l.last_candles,i===0?'doBotPx1Val':'doBotPx2Val'); });
+      if($('doBotStatusText')) $('doBotStatusText').innerHTML=(d.running?('Running'+(d.paused?' (paused)':'')):'Stopped')+(ul!=='—'?('  ·  Underlying <b style="color:#f7a600">'+esc(ul)+'</b>'):'');
+      $('doBotPnl').textContent='P/L $'+(d.realizedPnl!=null?d.realizedPnl.toFixed(2):'—');
+      if(logEl && d.log){ logEl.textContent=d.log.join('\n'); logEl.scrollTop=logEl.scrollHeight; }
     }
     function poll(){ fetch('/api/aibot/doptions/status').then(r=>r.json()).then(renderStatus).catch(()=>{}); }
     function startPolling(){ if(pollTimer) return; pollTimer=setInterval(poll, 3000); poll(); }
@@ -25568,7 +25662,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const openBtn=document.getElementById('btnDOptionsBot');
     if(openBtn) openBtn.addEventListener('click', function(){
       panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.style.display='none';
-      startPolling();
+      setTimeout(initDCharts, 60); startPolling();
     });
   })();
 
