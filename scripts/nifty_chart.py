@@ -4910,7 +4910,8 @@ def _zo_resolve_manual_strikes(base, ce_strike, pe_strike):
     return ce_row['symbol'], pe_row['symbol'], opt_exch, info
 
 def _zo_underlying_ctx(cfg):
-    """Recent underlying trend context for the option legs' Claude calls. {} if N/A."""
+    """Recent underlying MOVEMENT context for the option legs' Claude calls + the chart.
+    Also stashes the underlying candles on zo_ai_state for the underlying chart pane."""
     base = (cfg.get('baseSymbol') or '').upper().strip()
     if not base:
         return {}
@@ -4920,13 +4921,22 @@ def _zo_underlying_ctx(cfg):
     except Exception:
         candles = []
     cap = float(cfg.get('capital') or 0)
+    if candles:
+        zo_ai_state['underlyingCandles'] = candles[-150:]
+        zo_ai_state['underlyingChartSym'] = spot_sym
     if not candles or len(candles) < 10:
         return {'underlying': base, 'capital': cap} if cap else {'underlying': base}
     cl = [c['close'] for c in candles[-30:]]
     trend_short = ((cl[-1] - cl[-10]) / cl[-10] * 100.0) if len(cl) >= 10 and cl[-10] else 0.0
     trend_med   = ((cl[-1] - cl[0]) / cl[0] * 100.0) if cl[0] else 0.0
+    # Movement read so Claude can identify the underlying's direction (not just theta).
+    reg = _bot_detect_regime(candles)
+    move5 = ((cl[-1] - cl[-6]) / cl[-6] * 100.0) if len(cl) >= 6 and cl[-6] else 0.0
     ctx = {'underlying': base, 'underlyingSpot': round(cl[-1], 2),
-           'underlyingTrendPct': round(trend_short, 2), 'underlyingTrendMedPct': round(trend_med, 2)}
+           'underlyingTrendPct': round(trend_short, 2), 'underlyingTrendMedPct': round(trend_med, 2),
+           'underlyingMove5barsPct': round(move5, 2),
+           'underlyingDirection': (reg['direction'] if reg.get('trending') else 'range'),
+           'underlyingRegime': '{} vol, {}'.format(reg['volatility'], 'trending ' + reg['direction'] if reg['trending'] else 'range')}
     if cap:
         ctx['capital'] = cap
     return ctx
@@ -5268,6 +5278,8 @@ def zo_aibot_status():
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
         'legs': legs, 'log': log_buf,
         'underlyingSpot': zo_ai_state.get('underlyingSpot'), 'underlyingSym': zo_ai_state.get('underlyingSym'),
+        'underlyingChartSym': zo_ai_state.get('underlyingChartSym'),
+        'underlyingCandles': list(zo_ai_state.get('underlyingCandles', []))[-150:],
         'stats': {
             'realized': round(realized, 2), 'unrealized': round(unreal, 2),
             'tradeCount': len(trades),
@@ -18852,7 +18864,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <div class="bot-chart-wrap" style="flex:1;min-width:380px">
+        <div class="bot-chart-wrap" style="flex:1;min-width:300px">
+          <div id="zoBotChartU"></div>
+          <div class="bot-price-overlay" id="zoBotPxU"><div class="sym" id="zoBotPxUSym" style="color:#f7a600">Underlying</div><div class="px" id="zoBotPxUVal">&mdash;</div></div>
+        </div>
+        <div class="bot-chart-wrap" style="flex:1;min-width:300px">
           <div id="zoBotChart1"></div>
           <div class="bot-price-overlay" id="zoBotPx1" style="display:none"><div class="sym" id="zoBotPx1Sym">&mdash;</div><div class="px" id="zoBotPx1Val">&mdash;</div></div>
         </div>
@@ -25602,6 +25618,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     let botRunning = false, botPaused = false, botMaximized = false;
     const charts = [null, null], series = [null, null];
+    let uChart = null, uSeries = null; const uDiv = document.getElementById('zoBotChartU');
     let lastRenderedLogLen = 0, statusPoller = null;
 
     function logLine(msg, type) {
@@ -25736,9 +25753,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
           borderDownColor: '#ef5350', wickUpColor: '#26a69a', wickDownColor: '#ef5350'
         });
       }
+      if (uDiv && !uChart) {
+        uChart = LightweightCharts.createChart(uDiv, {
+          width: uDiv.clientWidth || 360, height: 240,
+          layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+          grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+          timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
+          rightPriceScale: { borderColor: '#2a2e39' }, crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+        });
+        uSeries = uChart.addCandlestickSeries({ upColor: '#f7a600', downColor: '#c77800', borderUpColor: '#f7a600',
+          borderDownColor: '#c77800', wickUpColor: '#f7a600', wickDownColor: '#c77800' });
+      }
       window.addEventListener('resize', resizeCharts);
     }
-    function resizeCharts() { for (let i = 0; i < 2; i++) if (charts[i]) charts[i].applyOptions({ width: chartDivs[i].clientWidth }); }
+    function resizeCharts() { for (let i = 0; i < 2; i++) if (charts[i]) charts[i].applyOptions({ width: chartDivs[i].clientWidth }); if (uChart && uDiv) uChart.applyOptions({ width: uDiv.clientWidth }); }
     function updatePx(i, price) {
       if (price == null || isNaN(price)) return;
       pxWraps[i].style.display = '';
@@ -25764,6 +25792,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
             logLine('[Chart] Loaded ' + d.candles.length + ' ' + tf + ' candles for ' + symbol, 'info');
           }).catch(() => logLine('[Chart] Fetch failed for ' + symbol, 'info'));
         })(i, sym);
+      }
+      // Underlying pane (spot index/stock)
+      const BASE_SPOT = {NIFTY:'NIFTY 50', BANKNIFTY:'NIFTY BANK', FINNIFTY:'NIFTY FIN SERVICE', MIDCPNIFTY:'NIFTY MID SELECT', SENSEX:'SENSEX', BANKEX:'BANKEX'};
+      const baseEl = document.getElementById('zoBotBaseSel');
+      let base = baseEl ? baseEl.value : '';
+      if (base === '__custom') base = ((document.getElementById('zoBotBaseCustom') || {}).value || '').toUpperCase();
+      const uSpot = BASE_SPOT[(base || '').toUpperCase()] || base;
+      if (uSpot && uSeries) {
+        fetch('/api/candles?symbol=' + encodeURIComponent(uSpot) + '&interval=' + encodeURIComponent(tf) + '&source=kite&api_key=' + encodeURIComponent(s.apiKey))
+          .then(r => r.json()).then(function(d) {
+            if (!d.candles || !d.candles.length) { logLine('[Chart] No underlying candles for ' + uSpot, 'info'); return; }
+            uSeries.setData(d.candles); if (uChart) uChart.timeScale().fitContent();
+            const lc = d.candles[d.candles.length - 1]; const uv = document.getElementById('zoBotPxUVal'), us = document.getElementById('zoBotPxUSym');
+            if (lc && uv) uv.textContent = lc.close >= 100 ? lc.close.toFixed(2) : lc.close.toFixed(4); if (us) us.textContent = base || 'Underlying';
+            logLine('[Chart] Loaded ' + d.candles.length + ' underlying candles (' + uSpot + ')', 'info');
+          }).catch(() => {});
       }
     }
     document.getElementById('zoBotLoadBtn').addEventListener('click', loadCharts);
@@ -25845,6 +25889,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
         legEls[i].textContent = fmtLeg(leg);
         legEls[i].className = 'val ' + (leg.position ? (leg.position.side === 'BUY' ? 'bull' : 'bear') : '');
+      }
+      if (uSeries && s.underlyingCandles && s.underlyingCandles.length) {
+        try { uSeries.setData(s.underlyingCandles); } catch (e) {}
+        const ulc = s.underlyingCandles[s.underlyingCandles.length - 1];
+        const uv = document.getElementById('zoBotPxUVal'), us = document.getElementById('zoBotPxUSym');
+        if (ulc && ulc.close != null && uv) uv.textContent = ulc.close >= 100 ? ulc.close.toFixed(2) : ulc.close.toFixed(4);
+        if (us) us.textContent = s.underlyingSym || 'Underlying';
       }
       if (legs[0] && legs[0].last_tick && legs[0].last_tick.regime) regimeEl.textContent = legs[0].last_tick.regime;
       const ulEl = document.getElementById('zoBotUnderlying');
