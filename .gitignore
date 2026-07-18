@@ -23,3 +23,5 @@ zerodha_session.json
 telegram_config.json
 # Third-party TradingView Pine scripts kept locally for reference (not app code)
 *.pine
+# Nifty_MV_bot Telegram message log (viewable/downloadable from the panel)
+telegram.txt

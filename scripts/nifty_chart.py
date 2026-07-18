@@ -3230,9 +3230,34 @@ def _tg_api(method, params, token=None):
         except Exception: pass
         return None, ('Telegram error: {} {}'.format(e, detail))[:300]
 
+# telegram.txt — a running log of every message the Nifty_MV_bot sends (briefs, stock
+# alerts, index analysis, forwarded events, tests). Stored on the /data volume so it
+# survives restarts (like telegram_config.json). Viewable + downloadable from the panel.
+_TG_LOG_PATH = os.path.join(os.path.dirname(_TG_CFG_PATH), 'telegram.txt')
+_TG_LOG_LOCK = _threading.Lock()
+def _tg_log_msg(text, status=''):
+    try:
+        ts = _tg_now_ist().strftime('%Y-%m-%d %H:%M:%S IST')
+        entry = '\n===== [{}]{} =====\n{}\n'.format(ts, (' ' + status) if status else '', (text or '').strip())
+        with _TG_LOG_LOCK:
+            with open(_TG_LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(entry)
+            # trim if it grows past ~2MB (keep the newest ~1MB)
+            try:
+                if os.path.getsize(_TG_LOG_PATH) > 2_000_000:
+                    with open(_TG_LOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+                        data = f.read()[-1_000_000:]
+                    with open(_TG_LOG_PATH, 'w', encoding='utf-8') as f:
+                        f.write('(…older entries trimmed…)\n' + data)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def _tg_send(text, token=None, chat_id=None):
     chat_id = (chat_id or _TG_STATE.get('chat_id') or '').strip()
     if not chat_id:
+        _tg_log_msg(text, 'NOT SENT — no chat_id')
         return False, 'No chat_id — set it (or click Detect chat id after messaging the bot).'
     ok_any, err = False, None
     for i in range(0, len(text) or 1, 3800):                       # Telegram caps at 4096 chars/msg
@@ -3240,6 +3265,7 @@ def _tg_send(text, token=None, chat_id=None):
                                          'disable_web_page_preview': 'true'}, token)
         if res and res.get('ok'): ok_any = True
         else: err = e or (res or {}).get('description') or 'send failed'
+    _tg_log_msg(text, 'SENT' if ok_any else ('FAILED: ' + str(err or '')[:120]))
     return ok_any, err
 
 def _tg_detect_chat(token=None):
@@ -3715,6 +3741,23 @@ def telegram_analysis_stop():
     ac['on'] = False; _TG_STATE['analysis_cfg'] = ac; _tg_save()
     _persist_log_line('[TELEGRAM] index-analysis STOP')
     return jsonify({'success': True, 'analysisCfg': ac})
+
+@app.route('/api/telegram/txt', methods=['GET'])
+@login_required
+def telegram_txt():
+    """Stream telegram.txt (every Nifty_MV_bot message). ?download=1 forces a download."""
+    as_dl = request.args.get('download') in ('1', 'true', 'yes')
+    if not os.path.exists(_TG_LOG_PATH):
+        return Response('(telegram.txt is empty — no Telegram messages sent yet)', content_type='text/plain; charset=utf-8')
+    try:
+        with open(_TG_LOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception as e:
+        return Response('Error reading telegram.txt: ' + str(e), content_type='text/plain; charset=utf-8', status=500)
+    headers = {}
+    if as_dl:
+        headers['Content-Disposition'] = 'attachment; filename="telegram_{}.txt"'.format(datetime.now().strftime('%Y%m%d_%H%M%S'))
+    return Response(content, content_type='text/plain; charset=utf-8', headers=headers)
 
 @app.route('/api/telegram/analysis/run', methods=['POST'])
 @login_required
@@ -17576,6 +17619,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">
       <button id="nmvSave" type="button" style="background:#26a69a;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Save</button>
       <button id="nmvTest" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Test message</button>
+      <button id="nmvTxt" type="button" title="Open telegram.txt — every message this bot sent" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">&#128196; Telegram.txt</button>
+      <button id="nmvTxtDl" type="button" title="Download telegram.txt" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">&#11015; Download</button>
     </div>
     <div id="nmvStatus" style="margin-top:12px;font-size:12px;color:#9aa0ac;white-space:pre-wrap"></div>
   </div>
@@ -17638,6 +17683,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   if($('nmvDetect')) $('nmvDetect').addEventListener('click',function(){ say('Detecting…'); fetch('/api/telegram/detect_chat?token='+encodeURIComponent($('nmvToken').value.trim())).then(function(r){return r.json();}).then(function(d){
       if(d&&d.success){ $('nmvChat').value=d.chatId; say('Chat id detected: '+d.chatId); } else say(d&&d.error||'Detect failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
   if($('nmvTest')) $('nmvTest').addEventListener('click',function(){ say('Sending test…'); post('/api/telegram/test',body()).then(function(d){ say(d&&d.success?'Test sent ✓ (check Telegram)':'Failed: '+((d&&d.error)||'?'),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvTxt')) $('nmvTxt').addEventListener('click',function(){ window.open('/api/telegram/txt','_blank'); });
+  if($('nmvTxtDl')) $('nmvTxtDl').addEventListener('click',function(){ var a=document.createElement('a'); a.href='/api/telegram/txt?download=1'; a.download='telegram.txt'; document.body.appendChild(a); a.click(); a.remove(); });
   function renderAn(d){ var ac=d.analysisCfg||{}, an=d.analysis||{};
     if(ac.start&&$('nmvAnStart')) $('nmvAnStart').value=ac.start; if(ac.end&&$('nmvAnEnd')) $('nmvAnEnd').value=ac.end; if(ac.everyMin&&$('nmvAnEvery')) $('nmvAnEvery').value=ac.everyMin;
     var st=$('nmvAnState'); if(st){ st.textContent = ac.on ? ('running · every '+(ac.everyMin||15)+'m '+(ac.start||'')+'–'+(ac.end||'')) : 'off'; st.style.color = ac.on ? '#26a69a' : '#9aa0ac'; }
