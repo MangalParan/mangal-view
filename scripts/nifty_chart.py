@@ -17535,10 +17535,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <!-- Nifty_MV_bot: Telegram morning brief + bot-event alerts -->
 <div id="nmvModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55)">
-  <div style="position:absolute;top:8%;left:50%;transform:translateX(-50%);width:min(460px,94vw);background:#1b2130;border:1px solid #2a2e39;border-radius:10px;padding:16px 18px;color:#d1d4dc;font-size:13px;max-height:84vh;overflow:auto">
+  <div id="nmvCard" style="position:absolute;top:8%;left:50%;transform:translateX(-50%);width:min(460px,94vw);background:#1b2130;border:1px solid #2a2e39;border-radius:10px;padding:16px 18px;color:#d1d4dc;font-size:13px;max-height:84vh;overflow:auto">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <b style="font-size:15px">&#128241; Nifty_MV_bot (Telegram)</b>
-      <span id="nmvClose" style="cursor:pointer;font-size:18px;color:#9aa0ac">&times;</span>
+      <span style="display:flex;gap:14px;align-items:center">
+        <span id="nmvMax" title="Maximize / restore — bigger window" style="cursor:pointer;font-size:15px;color:#9aa0ac">&#9633;</span>
+        <span id="nmvPop" title="Open in a new window" style="cursor:pointer;font-size:15px;color:#9aa0ac">&#8599;</span>
+        <span id="nmvClose" style="cursor:pointer;font-size:18px;color:#9aa0ac">&times;</span>
+      </span>
     </div>
     <label style="display:block;margin:8px 0 2px;color:#9aa0ac">Bot token</label>
     <input id="nmvToken" type="password" placeholder="123456:ABC… (blank = use server TELEGRAM_BOT_TOKEN)" style="width:100%;padding:6px;background:#131722;border:1px solid #2a2e39;border-radius:5px;color:#d1d4dc">
@@ -17610,6 +17614,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   if($('nmvBtn')) $('nmvBtn').addEventListener('click',open);
   if($('nmvClose')) $('nmvClose').addEventListener('click',function(){modal.style.display='none';});
   if(modal) modal.addEventListener('click',function(e){ if(e.target===modal) modal.style.display='none'; });
+  var nmvMaxed=false;
+  function nmvSetMax(on){ var c=$('nmvCard'); if(!c) return; nmvMaxed=on;
+    if(on){ c.style.width='96vw'; c.style.maxHeight='94vh'; c.style.top='3%'; } else { c.style.width='min(460px,94vw)'; c.style.maxHeight='84vh'; c.style.top='8%'; }
+    var b=$('nmvMax'); if(b) b.innerHTML = on ? '&#9635;' : '&#9633;'; }
+  if($('nmvMax')) $('nmvMax').addEventListener('click',function(){ nmvSetMax(!nmvMaxed); });
+  if($('nmvPop')) $('nmvPop').addEventListener('click',function(){ var u=new URL(window.location.href); u.searchParams.set('nmvPopout','1'); window.open(u.toString(),'nmvPopout','width=580,height=980,resizable=yes,scrollbars=yes'); });
+  if(new URLSearchParams(window.location.search).get('nmvPopout')==='1'){ setTimeout(function(){ open(); nmvSetMax(true); },250); }
   function body(){
     var alerts={}; var w=$('nmvAlerts');
     ORDER.forEach(function(k){
