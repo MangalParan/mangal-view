@@ -3719,10 +3719,13 @@ def telegram_analysis_stop():
 @app.route('/api/telegram/analysis/run', methods=['POST'])
 @login_required
 def telegram_analysis_run():
-    """Generate + send one Nifty + Sensex analysis now (synchronous — returns the text)."""
+    """Kick off one Nifty + Sensex analysis in the BACKGROUND and return immediately.
+    The build takes 20-40s (TA + OI + 2 Claude calls) — running it synchronously would
+    blow the gateway timeout and return an HTML error page. The panel polls /status
+    (analysis.ts changes) for the finished text."""
     _tg_ensure_threads()
-    txt = _tg_run_index_analysis(send=True)
-    return jsonify({'success': True, 'text': txt, 'analysis': dict(_TG_STATE.get('analysis') or {})})
+    _threading.Thread(target=_tg_run_index_analysis, kwargs={'send': True}, daemon=True, name='tg-analysis-run').start()
+    return jsonify({'success': True, 'started': True})
 
 def _extract_config_patch(text):
     """Pull a ```json {...}``` block carrying a configPatch out of Claude's reply.
@@ -17642,7 +17645,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   function anCfg(){ return {start:$('nmvAnStart').value, end:$('nmvAnEnd').value, everyMin:parseInt($('nmvAnEvery').value)||15}; }
   if($('nmvAnStart2')) $('nmvAnStart2').addEventListener('click',function(){ say('Starting analysis engine…'); post('/api/telegram/analysis/start',anCfg()).then(function(d){ if(d&&d.success){ var st=$('nmvAnState'); if(st){st.textContent='running · generating first read…'; st.style.color='#26a69a';} say('Analysis started — first read is being sent to Telegram.'); setTimeout(function(){ fetch('/api/telegram/status').then(function(r){return r.json();}).then(renderAn).catch(function(){}); }, 14000); } else say('Start failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
   if($('nmvAnStop')) $('nmvAnStop').addEventListener('click',function(){ post('/api/telegram/analysis/stop',{}).then(function(){ var st=$('nmvAnState'); if(st){st.textContent='off'; st.style.color='#9aa0ac';} say('Analysis engine stopped.'); }).catch(function(e){say('Error: '+e.message,true);}); });
-  if($('nmvAnRun')) $('nmvAnRun').addEventListener('click',function(){ if($('nmvAnOut')) $('nmvAnOut').textContent='Generating Nifty & Sensex analysis (TA + Open Interest + Claude)… ~10-20s'; post('/api/telegram/analysis/run',{}).then(function(d){ if(d&&d.success){ if($('nmvAnOut')) $('nmvAnOut').textContent=(d.text||'(no text)'); say('Analysis generated + sent to Telegram ✓'); } else { if($('nmvAnOut')) $('nmvAnOut').textContent='Failed: '+((d&&d.error)||'?'); say('Run failed',true);} }).catch(function(e){ if($('nmvAnOut')) $('nmvAnOut').textContent='Error: '+e.message; }); });
+  function anPoll(before){ var tries=0; var iv=setInterval(function(){ tries++;
+    fetch('/api/telegram/status').then(function(r){return r.json();}).then(function(s){ var an=(s&&s.analysis)||{};
+      if(an.ts && an.ts!==before){ clearInterval(iv); if($('nmvAnOut')) $('nmvAnOut').textContent=an.text||'(no text)'; say('Analysis generated + sent to Telegram ✓'); }
+      else if(tries>18){ clearInterval(iv); say('Still generating — it will appear here / on Telegram shortly.'); } }).catch(function(){}); }, 3000); }
+  if($('nmvAnRun')) $('nmvAnRun').addEventListener('click',function(){ if($('nmvAnOut')) $('nmvAnOut').textContent='Generating Nifty & Sensex analysis (TA + Open Interest + Claude)… ~20-40s';
+    fetch('/api/telegram/status').then(function(r){return r.json();}).then(function(s){ var before=((s&&s.analysis)||{}).ts||0;
+      post('/api/telegram/analysis/run',{}).then(function(d){ if(d&&d.success){ say('Generating… (sending to Telegram when ready)'); anPoll(before); } else { if($('nmvAnOut')) $('nmvAnOut').textContent='Failed to start: '+((d&&d.error)||'?'); say('Run failed',true);} }).catch(function(e){ if($('nmvAnOut')) $('nmvAnOut').textContent='Error: '+e.message; });
+    }).catch(function(){ post('/api/telegram/analysis/run',{}); anPoll(0); }); });
 })();
 </script>
 
