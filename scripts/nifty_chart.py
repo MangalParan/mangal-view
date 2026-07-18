@@ -3147,6 +3147,9 @@ _TG_STATE = {
     'chat_id': os.environ.get('TELEGRAM_CHAT_ID', '').strip(),
     'events': False, 'masterOn': True, 'alerts': _tg_default_alerts(),
     '_last': {}, 'started': False,
+    # Live index-analysis engine (Nifty + Sensex every 15m in market hours).
+    'analysis_cfg': {'on': False, 'start': '09:30', 'end': '15:30', 'everyMin': 15},
+    'analysis': {},
 }
 _TG_LOCK = _threading.Lock()
 _TG_QUEUE = []
@@ -3169,7 +3172,7 @@ def _tg_save():
     try:
         import json as _j
         with open(_TG_CFG_PATH, 'w', encoding='utf-8') as f:
-            _j.dump({k: _TG_STATE.get(k) for k in ('token', 'chat_id', 'events', 'masterOn', 'alerts')}, f)
+            _j.dump({k: _TG_STATE.get(k) for k in ('token', 'chat_id', 'events', 'masterOn', 'alerts', 'analysis_cfg')}, f)
     except Exception:
         pass
 
@@ -3193,6 +3196,11 @@ def _tg_load():
             if isinstance(saved.get(key), dict):
                 cfg.update({kk: vv for kk, vv in saved[key].items() if kk in ('on', 'time', 'universe')})
         _TG_STATE['alerts'] = merged
+    ac = d.get('analysis_cfg')
+    if isinstance(ac, dict):
+        cur = _TG_STATE.get('analysis_cfg') or {}
+        cur.update({k: v for k, v in ac.items() if k in ('on', 'start', 'end', 'everyMin')})
+        _TG_STATE['analysis_cfg'] = cur
 _TG_MARKETS = [
     ('NIFTY 50', 'NSE:NIFTY'), ('SENSEX', 'BSE:SENSEX'), ('Bank Nifty', 'NSE:BANKNIFTY'),
     ('Crude Oil MCX', 'MCX:CRUDEOIL1!'), ('Gold MCX', 'MCX:GOLD1!'),
@@ -3419,6 +3427,111 @@ def _tg_alert_text(kind, universe='NIFTY500'):
         txt = _tg_picks_text(kind, 'FNO' if kind == 'fno' else (universe or 'NIFTY500'))
     return (txt or '').rstrip() + '\n\n- MangalView'
 
+# ===== Live index analysis engine (Nifty + Sensex, TA + Open Interest) =======
+_TG_OI_CACHE = {}
+def _tg_nse_oi(symbol='NIFTY'):
+    """Option-chain OPEN INTEREST summary for an NSE index (NIFTY/BANKNIFTY/FINNIFTY):
+    spot, PCR, total + change-in CE/PE OI, max-pain, and OI-based support/resistance
+    (highest PUT OI = support, highest CALL OI = resistance). None on failure / non-NSE."""
+    symbol = (symbol or '').upper().strip()
+    if not symbol:
+        return None
+    ent = _TG_OI_CACHE.get(symbol); now = _zd_time.time()
+    if ent and now - ent['ts'] < 120:
+        return ent['data']
+    import urllib.request as _ur, json as _j, http.cookiejar as _cj
+    hdr = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+           'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9',
+           'Referer': 'https://www.nseindia.com/option-chain'}
+    try:
+        op = _ur.build_opener(_ur.HTTPCookieProcessor(_cj.CookieJar()))
+        op.open(_ur.Request('https://www.nseindia.com/option-chain', headers=hdr), timeout=10).read()
+        r = op.open(_ur.Request('https://www.nseindia.com/api/option-chain-indices?symbol=' + symbol, headers=hdr), timeout=12)
+        d = _j.loads(r.read().decode('utf-8'))
+    except Exception:
+        return ent['data'] if ent else None
+    rec  = (d or {}).get('records') or {}
+    rows = rec.get('data') or []
+    spot = rec.get('underlyingValue') or 0
+    exps = rec.get('expiryDates') or []
+    exp  = exps[0] if exps else None
+    ce_oi, pe_oi = {}, {}; tot_ce = tot_pe = chg_ce = chg_pe = 0
+    for row in rows:
+        if exp and row.get('expiryDate') != exp:
+            continue
+        k = row.get('strikePrice'); ce = row.get('CE') or {}; pe = row.get('PE') or {}
+        if ce: ce_oi[k] = ce.get('openInterest', 0) or 0; tot_ce += ce_oi[k]; chg_ce += ce.get('changeinOpenInterest', 0) or 0
+        if pe: pe_oi[k] = pe.get('openInterest', 0) or 0; tot_pe += pe_oi[k]; chg_pe += pe.get('changeinOpenInterest', 0) or 0
+    if not ce_oi or not pe_oi:
+        return ent['data'] if ent else None
+    strikes = sorted(set(list(ce_oi) + list(pe_oi)))
+    def _pain(K):
+        t = 0.0
+        for s in strikes:
+            if K > s: t += ce_oi.get(s, 0) * (K - s)
+            if K < s: t += pe_oi.get(s, 0) * (s - K)
+        return t
+    atm = min(strikes, key=lambda s: abs(s - spot)) if (strikes and spot) else None
+    near = [s for s in strikes if atm and abs(s - atm) <= 6 * (strikes[1] - strikes[0] if len(strikes) > 1 else 50)]
+    out = {'symbol': symbol, 'spot': round(spot, 2), 'expiry': exp,
+           'pcr': round(tot_pe / tot_ce, 2) if tot_ce else None,
+           'totalCallOI': tot_ce, 'totalPutOI': tot_pe, 'changeCallOI': chg_ce, 'changePutOI': chg_pe,
+           'maxPain': min(strikes, key=_pain) if strikes else None,
+           'oiSupport_maxPutOI': max(pe_oi, key=pe_oi.get) if pe_oi else None,
+           'oiResistance_maxCallOI': max(ce_oi, key=ce_oi.get) if ce_oi else None,
+           'nearStrikesCallOI': {s: ce_oi.get(s, 0) for s in near},
+           'nearStrikesPutOI': {s: pe_oi.get(s, 0) for s in near}}
+    _TG_OI_CACHE[symbol] = {'ts': now, 'data': out}
+    return out
+
+def _tg_index_analysis(name, tvsym, oi_symbol=None):
+    """Detailed intraday analysis for an index — multi-TF TradingView TA + option-chain
+    OI, written by Claude (bias, S/R, PCR read, trade plan, probability)."""
+    import json as _json
+    tas = {}
+    for lbl, iv in (('15m', '15'), ('1h', '60'), ('1D', '1D')):
+        ta = _tv_fetch_ta(tvsym, iv)
+        if ta:
+            tas[lbl] = {k: ta.get(k) for k in ('rating', 'ratingScore', 'rsi', 'macdHist', 'adx', 'stochK', 'close')}
+    oi = _tg_nse_oi(oi_symbol) if oi_symbol else None
+    if not tas and not oi:
+        return '⚠️ {} — no data (TradingView/NSE unreachable right now).'.format(name)
+    system = (
+        "You are a professional Indian index & derivatives analyst. Using the multi-timeframe technical readout AND "
+        "the option-chain OPEN INTEREST data, write a DETAILED, ACCURATE intraday analysis for " + name + ". Be "
+        "concrete and numeric — no vague filler. Cover, in this order:\n"
+        "1) TREND & MARKET BIAS (bullish / bearish / neutral) across 15m/1h/1D, with the reason.\n"
+        "2) KEY LEVELS from OI: highest PUT OI = strong SUPPORT, highest CALL OI = strong RESISTANCE, max-pain = the "
+        "magnet price into expiry. Give the actual strike numbers.\n"
+        "3) PCR read (>1.2 bullish/put-heavy, 0.8-1.2 neutral, <0.8 bearish/call-heavy) and OI BUILD-UP from the "
+        "change-in-OI (call writing = resistance/bearish, put writing = support/bullish, unwinding = squeeze).\n"
+        "4) INTRADAY TRADE PLAN for the favoured side: Entry, Stop-loss, Target1, Target2 (index levels).\n"
+        "5) PROBABILITY of an UP vs DOWN move over the next 1-2 hours, as two percentages summing to 100.\n"
+        "6) One-line ACTIONABLE summary.\n"
+        "If OI is missing, say so and lean on price/TA. Keep it under ~1400 characters, use short lines / bullets.")
+    payload = {'index': name, 'timeframes': tas, 'optionChainOI': oi}
+    text, err = _call_claude(system, [{'role': 'user', 'content': _json.dumps(payload, default=str)}],
+                             max_tokens=900, model='sonnet')
+    if err:
+        return '⚠️ {} analysis unavailable: {}'.format(name, err[:140])
+    return '📊 {} · {}\n{}'.format(name, _tg_now_ist().strftime('%d %b %H:%M IST'), (text or '').strip())
+
+def _tg_run_index_analysis(send=True):
+    """Build Nifty + Sensex analysis, store the latest for the panel, and send to Telegram."""
+    parts = []
+    for nm, tvsym, oisym in (('NIFTY 50', 'NSE:NIFTY', 'NIFTY'), ('SENSEX', 'BSE:SENSEX', None)):
+        try:
+            parts.append(_tg_index_analysis(nm, tvsym, oisym))
+        except Exception as e:
+            parts.append('⚠️ {} error: {}'.format(nm, str(e)[:120]))
+    combined = '\n\n━━━━━━━━━━\n\n'.join(parts)
+    _TG_STATE['analysis'] = {'text': combined, 'nifty': parts[0], 'sensex': parts[1] if len(parts) > 1 else '',
+                             'ts': int(_zd_time.time())}
+    if send:
+        ok, err = _tg_send(combined + '\n\n- MangalView')
+        _persist_log_line('[TELEGRAM] index-analysis sent={} {}'.format(ok, err or ''))
+    return combined
+
 def _tg_enqueue(line):
     if not (_TG_STATE.get('events') and _TG_STATE.get('masterOn')):
         return
@@ -3462,6 +3575,19 @@ def _tg_scheduler_loop():
                             _TG_STATE['_last'][key] = today
                             ok, err = _tg_send(_tg_alert_text(key, a.get('universe')))
                             _persist_log_line('[TELEGRAM] {} sent={} {}'.format(key, ok, err or ''))
+                    # Live index analysis: every `everyMin` from `start` to `end`, Mon-Fri.
+                    ac = _TG_STATE.get('analysis_cfg') or {}
+                    if ac.get('on'):
+                        sh, sm = _tg_parse_hhmm(ac.get('start', '09:30'))
+                        eh, em = _tg_parse_hhmm(ac.get('end', '15:30'))
+                        cur = now.hour * 60 + now.minute
+                        every = max(1, int(ac.get('everyMin', 15) or 15))
+                        if sh is not None and eh is not None and (sh * 60 + sm) <= cur <= (eh * 60 + em):
+                            slot = cur // every
+                            if _TG_STATE.get('_an_slot') != (today, slot):
+                                _TG_STATE['_an_slot'] = (today, slot)
+                                try: _tg_run_index_analysis()
+                                except Exception: pass
         except Exception:
             pass
         _zd_time.sleep(30)
@@ -3498,7 +3624,9 @@ def _tg_public_state():
             'nowIst': _tg_now_ist().strftime('%Y-%m-%d %H:%M:%S IST'),
             'schedAliveSec': _ago('_sched_tick'), 'flushAliveSec': _ago('_flush_tick'),
             'queue': len(_TG_QUEUE), 'cfgPath': _TG_CFG_PATH,
-            'lastFired': {k: v for k, v in (_TG_STATE.get('_last') or {}).items()}}
+            'lastFired': {k: v for k, v in (_TG_STATE.get('_last') or {}).items()},
+            'analysisCfg': dict(_TG_STATE.get('analysis_cfg') or {}),
+            'analysis': dict(_TG_STATE.get('analysis') or {})}
 
 @app.route('/api/telegram/status')
 @login_required
@@ -3561,6 +3689,40 @@ def telegram_send_alert():
     txt = _tg_alert_text(kind, universe)
     ok, err = _tg_send(txt)
     return jsonify({'success': ok, 'error': err, 'preview': txt[:4000]})
+
+@app.route('/api/telegram/analysis/start', methods=['POST'])
+@login_required
+def telegram_analysis_start():
+    """Turn ON the live index-analysis engine (Nifty + Sensex every N min, start..end
+    IST, Mon-Fri) and fire one immediately in the background."""
+    data = request.json or {}
+    ac = _TG_STATE.get('analysis_cfg') or {}
+    ac['on'] = True
+    if data.get('start'):    ac['start'] = str(data['start']).strip()
+    if data.get('end'):      ac['end'] = str(data['end']).strip()
+    if data.get('everyMin'): ac['everyMin'] = max(1, int(data.get('everyMin') or 15))
+    _TG_STATE['analysis_cfg'] = ac
+    _TG_STATE['_an_slot'] = None
+    _tg_save(); _tg_ensure_threads()
+    _threading.Thread(target=_tg_run_index_analysis, kwargs={'send': True}, daemon=True, name='tg-analysis-now').start()
+    _persist_log_line('[TELEGRAM] index-analysis START every {}m {}-{}'.format(ac.get('everyMin'), ac.get('start'), ac.get('end')))
+    return jsonify({'success': True, 'analysisCfg': ac})
+
+@app.route('/api/telegram/analysis/stop', methods=['POST'])
+@login_required
+def telegram_analysis_stop():
+    ac = _TG_STATE.get('analysis_cfg') or {}
+    ac['on'] = False; _TG_STATE['analysis_cfg'] = ac; _tg_save()
+    _persist_log_line('[TELEGRAM] index-analysis STOP')
+    return jsonify({'success': True, 'analysisCfg': ac})
+
+@app.route('/api/telegram/analysis/run', methods=['POST'])
+@login_required
+def telegram_analysis_run():
+    """Generate + send one Nifty + Sensex analysis now (synchronous — returns the text)."""
+    _tg_ensure_threads()
+    txt = _tg_run_index_analysis(send=True)
+    return jsonify({'success': True, 'text': txt, 'analysis': dict(_TG_STATE.get('analysis') or {})})
 
 def _extract_config_patch(text):
     """Pull a ```json {...}``` block carrying a configPatch out of Claude's reply.
@@ -17390,6 +17552,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <label style="display:flex;align-items:center;gap:8px;margin:4px 0"><input type="checkbox" id="nmvEvents"> &#128276; Forward all bot events (log.txt), realtime</label>
     <div style="margin:12px 0 4px;color:#9aa0ac;font-weight:600">Scheduled alerts (IST, Mon–Fri) — 10 stocks each</div>
     <div id="nmvAlerts"></div>
+
+    <div style="margin:16px 0 6px;border-top:1px solid #2a2e39;padding-top:12px;color:#9aa0ac;font-weight:600">&#128202; Live index analysis — Nifty &amp; Sensex (TA + Open Interest)</div>
+    <div style="font-size:11px;color:#787b86;margin-bottom:8px">Detailed intraday read: trend, bias, OI support/resistance, PCR, max-pain, entry/SL/targets &amp; up/down probability. Sends to Telegram every N min in market hours and shows below.</div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+      <label style="display:flex;align-items:center;gap:4px;font-size:12px">Start <input type="time" id="nmvAnStart" value="09:30" style="background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:2px"></label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:12px">End <input type="time" id="nmvAnEnd" value="15:30" style="background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:2px"></label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:12px">Every <input type="number" id="nmvAnEvery" value="15" min="1" style="width:56px;background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:2px"> min</label>
+      <button id="nmvAnStart2" type="button" style="background:#26a69a;color:#fff;border:none;border-radius:6px;padding:7px 14px;cursor:pointer">&#9654; Start</button>
+      <button id="nmvAnStop" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:7px 12px;cursor:pointer">&#9632; Stop</button>
+      <button id="nmvAnRun" type="button" style="background:#5b8def;color:#fff;border:none;border-radius:6px;padding:7px 12px;cursor:pointer">&#128260; Run now</button>
+      <span id="nmvAnState" style="font-size:11px;color:#9aa0ac">off</span>
+    </div>
+    <div id="nmvAnOut" style="margin-top:10px;max-height:280px;overflow:auto;background:#0e0f13;border:1px solid #2a2e39;border-radius:6px;padding:10px;font-size:12px;color:#d1d4dc;white-space:pre-wrap;line-height:1.45">Run the analysis or Start the engine to see the latest Nifty &amp; Sensex read here.</div>
+
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">
       <button id="nmvSave" type="button" style="background:#26a69a;color:#fff;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Save</button>
       <button id="nmvTest" type="button" style="background:#2a2e39;color:#d1d4dc;border:none;border-radius:6px;padding:8px 12px;cursor:pointer">Test message</button>
@@ -17427,7 +17603,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if(!d||!d.success) return;
       $('nmvChat').value=d.chatId||''; $('nmvMaster').checked=!!d.masterOn; $('nmvEvents').checked=!!d.events;
       $('nmvToken').placeholder=d.hasToken?'token set (leave blank to keep)':'123456:ABC…';
-      renderAlerts(d.alerts,d.labels);
+      renderAlerts(d.alerts,d.labels); renderAn(d);
       var diag='Server '+(d.nowIst||'?')+' · scheduler '+(d.schedAliveSec==null?'DOWN':d.schedAliveSec+'s ago')+' · forwarder '+(d.flushAliveSec==null?'DOWN':d.flushAliveSec+'s ago')+(d.queue?(' · queue '+d.queue):'');
       say((d.hasToken?'Token set. Set chat id + times, tick Master, then Save.':'No token — paste one above.')+'\n'+diag, !d.hasToken || d.schedAliveSec==null);
     }).catch(function(){}); }
@@ -17448,6 +17624,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   if($('nmvDetect')) $('nmvDetect').addEventListener('click',function(){ say('Detecting…'); fetch('/api/telegram/detect_chat?token='+encodeURIComponent($('nmvToken').value.trim())).then(function(r){return r.json();}).then(function(d){
       if(d&&d.success){ $('nmvChat').value=d.chatId; say('Chat id detected: '+d.chatId); } else say(d&&d.error||'Detect failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
   if($('nmvTest')) $('nmvTest').addEventListener('click',function(){ say('Sending test…'); post('/api/telegram/test',body()).then(function(d){ say(d&&d.success?'Test sent ✓ (check Telegram)':'Failed: '+((d&&d.error)||'?'),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);}); });
+  function renderAn(d){ var ac=d.analysisCfg||{}, an=d.analysis||{};
+    if(ac.start&&$('nmvAnStart')) $('nmvAnStart').value=ac.start; if(ac.end&&$('nmvAnEnd')) $('nmvAnEnd').value=ac.end; if(ac.everyMin&&$('nmvAnEvery')) $('nmvAnEvery').value=ac.everyMin;
+    var st=$('nmvAnState'); if(st){ st.textContent = ac.on ? ('running · every '+(ac.everyMin||15)+'m '+(ac.start||'')+'–'+(ac.end||'')) : 'off'; st.style.color = ac.on ? '#26a69a' : '#9aa0ac'; }
+    if(an.text && $('nmvAnOut')) $('nmvAnOut').textContent = an.text; }
+  function anCfg(){ return {start:$('nmvAnStart').value, end:$('nmvAnEnd').value, everyMin:parseInt($('nmvAnEvery').value)||15}; }
+  if($('nmvAnStart2')) $('nmvAnStart2').addEventListener('click',function(){ say('Starting analysis engine…'); post('/api/telegram/analysis/start',anCfg()).then(function(d){ if(d&&d.success){ var st=$('nmvAnState'); if(st){st.textContent='running · generating first read…'; st.style.color='#26a69a';} say('Analysis started — first read is being sent to Telegram.'); setTimeout(function(){ fetch('/api/telegram/status').then(function(r){return r.json();}).then(renderAn).catch(function(){}); }, 14000); } else say('Start failed',true); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvAnStop')) $('nmvAnStop').addEventListener('click',function(){ post('/api/telegram/analysis/stop',{}).then(function(){ var st=$('nmvAnState'); if(st){st.textContent='off'; st.style.color='#9aa0ac';} say('Analysis engine stopped.'); }).catch(function(e){say('Error: '+e.message,true);}); });
+  if($('nmvAnRun')) $('nmvAnRun').addEventListener('click',function(){ if($('nmvAnOut')) $('nmvAnOut').textContent='Generating Nifty & Sensex analysis (TA + Open Interest + Claude)… ~10-20s'; post('/api/telegram/analysis/run',{}).then(function(d){ if(d&&d.success){ if($('nmvAnOut')) $('nmvAnOut').textContent=(d.text||'(no text)'); say('Analysis generated + sent to Telegram ✓'); } else { if($('nmvAnOut')) $('nmvAnOut').textContent='Failed: '+((d&&d.error)||'?'); say('Run failed',true);} }).catch(function(e){ if($('nmvAnOut')) $('nmvAnOut').textContent='Error: '+e.message; }); });
 })();
 </script>
 
