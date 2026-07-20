@@ -2625,7 +2625,9 @@ def _delta_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    if _autopick is not None:
+    if cfg.get('manualOnly'):
+        strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+    elif _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and delta_ai_state.get('_decide', True):
         _tv = _tv_context(cfg, 'delta', symbol, '')
@@ -2718,9 +2720,12 @@ def _delta_bot_tick():
                     if pos:
                         _bot_log('[Manual] [delta] reverse — close {} then open {}'.format(pos['side'], _mside))
                         _delta_bot_close(price, 'manual reverse', mode)
-                    _ms = {'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
-                           'reason': 'manual open ' + _mside}
-                    _ms.update(_seed_sltp(cfg, symbol))   # SL capped — never the 5% panel default
+                    _mq = mcmd.get('qty')
+                    try:
+                        if _mq and float(_mq) > 0: cfg['qty'] = float(_mq)
+                    except (TypeError, ValueError): pass
+                    # SL/TP from the Buy/Sell panel (as % or points); else the capped seed.
+                    _ms = _manual_strat(_mside, price, mcmd.get('sltp') or {}, _seed_sltp(cfg, symbol))
                     _bot_log('[Manual] [delta] open {} {} @ {}'.format(_mside, symbol, price))
                     _delta_bot_open(_mside, price, _ms, mode)
                     if delta_ai_state.get('position'):
@@ -2889,6 +2894,7 @@ def delta_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'manualOnly': bool(data.get('manualOnly', False)),  # Manual mode: no auto-entries, only Buy/Sell buttons + SL/TP management
             'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'api_key':    (data.get('api_key') or '').strip(),
         }
@@ -2934,7 +2940,8 @@ def delta_aibot_manual():
     with delta_ai_lock:
         if not delta_ai_state.get('running'):
             return jsonify({'success': False, 'error': 'Start the bot first'}), 400
-        delta_ai_state['manualCmd'] = {'action': action, 'side': side}
+        delta_ai_state['manualCmd'] = {'action': action, 'side': side,
+            'sltp': {k: data.get(k) for k in ('slPct', 'tpPct', 'slPoints', 'tpPoints')}, 'qty': data.get('qty')}
     _bot_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
     return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
@@ -4351,7 +4358,9 @@ def _zd_bot_tick():
 
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    if _autopick is not None:
+    if cfg.get('manualOnly'):
+        strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+    elif _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and zd_ai_state.get('_decide', True):
         _tv = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
@@ -4420,9 +4429,12 @@ def _zd_bot_tick():
                     if pos:
                         _zd_log('[Manual] reverse — close {} then open {}'.format(pos['side'], _mside))
                         _zd_bot_close(price, 'manual reverse', mode)
-                    _ms = {'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
-                           'reason': 'manual open ' + _mside}
-                    _ms.update(_seed_sltp(cfg, symbol))   # SL capped — never the 5% panel default
+                    _mq = mcmd.get('qty')
+                    try:
+                        if _mq and float(_mq) > 0: cfg['qty'] = float(_mq)
+                    except (TypeError, ValueError): pass
+                    # SL/TP from the Buy/Sell panel (as % or points); else the capped seed.
+                    _ms = _manual_strat(_mside, price, mcmd.get('sltp') or {}, _seed_sltp(cfg, symbol))
                     _zd_log('[Manual] open {} {} @ {}'.format(_mside, symbol, round(price, 2)))
                     _zd_bot_open(_mside, price, _ms, mode)
                     if zd_ai_state.get('position'):
@@ -4582,6 +4594,7 @@ def zd_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'manualOnly': bool(data.get('manualOnly', False)),  # Manual mode: no auto-entries, only Buy/Sell buttons + SL/TP management
             'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'api_key':    (data.get('api_key') or '').strip(),
         }
@@ -4627,7 +4640,8 @@ def zd_aibot_manual():
     with zd_ai_lock:
         if not zd_ai_state.get('running'):
             return jsonify({'success': False, 'error': 'Start the bot first'}), 400
-        zd_ai_state['manualCmd'] = {'action': action, 'side': side}
+        zd_ai_state['manualCmd'] = {'action': action, 'side': side,
+            'sltp': {k: data.get(k) for k in ('slPct', 'tpPct', 'slPoints', 'tpPoints')}, 'qty': data.get('qty')}
     _zd_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
     return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
@@ -5406,6 +5420,7 @@ def zo_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'manualOnly': bool(data.get('manualOnly', False)),  # Manual mode: no auto-entries, only Buy/Sell buttons + SL/TP management
             'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'api_key':    (data.get('api_key') or '').strip(),
         }
@@ -5905,7 +5920,9 @@ def _mt_bot_tick():
         return
     price  = candles[-1]['close']
     regime = _bot_detect_regime(candles)
-    if _autopick is not None:
+    if cfg.get('manualOnly'):
+        strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+    elif _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and mt_ai_state.get('_decide', True):
         _tv = _tv_context(cfg, 'mt5', symbol, '')
@@ -5946,9 +5963,12 @@ def _mt_bot_tick():
                     if pos:
                         _mt_log('[Manual] reverse — close {} then open {}'.format(pos['side'], _mside))
                         _mt_bot_close(price, 'manual reverse', mode)
-                    _ms = {'name': 'manual', 'signal': _mside, 'score': 10.0, 'seed': True,
-                           'reason': 'manual open ' + _mside}
-                    _ms.update(_seed_sltp(cfg, symbol))   # SL capped — never the 5% panel default
+                    _mq = mcmd.get('qty')
+                    try:
+                        if _mq and float(_mq) > 0: cfg['qty'] = float(_mq)
+                    except (TypeError, ValueError): pass
+                    # SL/TP from the Buy/Sell panel (as % or points); else the capped seed.
+                    _ms = _manual_strat(_mside, price, mcmd.get('sltp') or {}, _seed_sltp(cfg, symbol))
                     _mt_log('[Manual] open {} {} @ {}'.format(_mside, symbol, round(price, 5)))
                     _mt_bot_open(_mside, price, _ms, mode)
                     if mt_ai_state.get('position'):
@@ -6100,6 +6120,7 @@ def mt_aibot_start():
             'allowedStrategies': [s for s in (data.get('allowedStrategies') if data.get('allowedStrategies') is not None else _BOT_DEFAULT_ALLOWED) if s in _BOT_CONFIGURABLE_ALGOS],
             'model':      (data.get('model') or '').strip(),   # Claude model: haiku|sonnet|opus (blank = env default)
             'tvEnabled':  bool(data.get('tvEnabled', False)),  # weigh TradingView TA + webhook as context
+            'manualOnly': bool(data.get('manualOnly', False)),  # Manual mode: no auto-entries, only Buy/Sell buttons + SL/TP management
             'tvSymbol':   (data.get('tvSymbol') or '').strip().upper(),
             'capital':    float(data.get('capital') or 0),   # Auto-symbol: Claude sizes lots & leverage from this
             'mt5_id':     (data.get('mt5_id') or '').strip(),
@@ -6147,7 +6168,8 @@ def mt_aibot_manual():
     with mt_ai_lock:
         if not mt_ai_state.get('running'):
             return jsonify({'success': False, 'error': 'Start the bot first'}), 400
-        mt_ai_state['manualCmd'] = {'action': action, 'side': side}
+        mt_ai_state['manualCmd'] = {'action': action, 'side': side,
+            'sltp': {k: data.get(k) for k in ('slPct', 'tpPct', 'slPoints', 'tpPoints')}, 'qty': data.get('qty')}
     _mt_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
     return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
@@ -6374,6 +6396,27 @@ def _seed_bias_norm(v):
     if s in ('BUY', 'LONG', 'BULL', 'UP'):   return 'BUY'
     if s in ('SELL', 'SHORT', 'BEAR', 'DOWN'): return 'SELL'
     return ''
+
+def _manual_strat(side, price, data, seed=None):
+    """Build the strat dict for a MANUAL Buy/Sell open. SL/TP can be given as a % or as
+    POINTS (points take precedence); if neither is given we fall back to `seed` (the
+    bot's seed SL/TP) and, failing that, the open function applies the panel default.
+    `data` is the manual endpoint payload (slPct/tpPct/slPoints/tpPoints)."""
+    try:    px = float(price or 0) or 1e-9
+    except (TypeError, ValueError): px = 1e-9
+    def _pos(v):
+        try:    v = float(v); return v if v > 0 else None
+        except (TypeError, ValueError): return None
+    slp = _pos(data.get('slPoints')); slp = (slp / px * 100.0) if slp else _pos(data.get('slPct'))
+    tpp = _pos(data.get('tpPoints')); tpp = (tpp / px * 100.0) if tpp else _pos(data.get('tpPct'))
+    base = dict(seed or {})
+    if slp is None: slp = base.get('slPct')
+    if tpp is None: tpp = base.get('tpPct')
+    strat = {'name': 'manual', 'signal': side, 'score': 10.0, 'seed': True,
+             'reason': 'manual {} open'.format(side)}
+    if slp is not None: strat['slPct'] = max(float(slp), 0.01)
+    if tpp is not None: strat['tpPct'] = max(float(tpp), 0.01)
+    return strat
 
 def _tv_recover_signal(text):
     """Last-resort: scan free text for a buy/sell word (e.g. a strategy comment)."""
@@ -18439,12 +18482,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="aiBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
       </div>
 
-      <!-- Manual override: open/close a position by hand while the bot runs (uses configured SL%/TP%) -->
-      <div class="ai-risk-bar" title="Manually open or close a position while the bot is running. Pick Long/Short and press Open to enter at market with the configured SL%/TP%; Close flattens the current position. Runs on the next bot tick.">
+      <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points (paper + live) -->
+      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable Claude/TV auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). Works in paper and live; SL/TP are managed while the bot runs. Runs on the next tick.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
-        <label><input type="radio" name="aiBotManualSide" value="BUY" checked> &#9650; Long</label>
-        <label><input type="radio" name="aiBotManualSide" value="SELL"> &#9660; Short</label>
-        <button class="zd-add-btn" id="aiBotManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
+        <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="aiBotManualOnly"> Manual mode</label>
+        <label>Qty <input type="number" id="aiBotManualQty" placeholder="cfg" style="width:64px" min="0" step="1"></label>
+        <label>SL% <input type="number" id="aiBotManualSlPct" style="width:56px" min="0" step="0.1"></label>
+        <label>SL pts <input type="number" id="aiBotManualSlPts" style="width:66px" min="0" step="0.05"></label>
+        <label>TP% <input type="number" id="aiBotManualTpPct" style="width:56px" min="0" step="0.1"></label>
+        <label>TP pts <input type="number" id="aiBotManualTpPts" style="width:66px" min="0" step="0.05"></label>
+        <button class="zd-add-btn" id="aiBotManualBuy"  type="button" style="background:#0b7d3b;color:#fff" title="Buy / go Long at market now">&#9650; Buy</button>
+        <button class="zd-add-btn" id="aiBotManualSell" type="button" style="background:#b23b3b;color:#fff" title="Sell / go Short at market now">&#9660; Sell</button>
         <button class="zd-add-btn" id="aiBotManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
         <span id="aiBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
@@ -18672,12 +18720,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="mtBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
       </div>
 
-      <!-- Manual override: open/close a position by hand while the bot runs (uses configured SL%/TP%) -->
-      <div class="ai-risk-bar" title="Manually open or close a position while the bot is running. Pick Long/Short and press Open to enter at market with the configured SL%/TP%; Close flattens the current position. Runs on the next bot tick.">
+      <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points (paper + live) -->
+      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
-        <label><input type="radio" name="mtBotManualSide" value="BUY" checked> &#9650; Long</label>
-        <label><input type="radio" name="mtBotManualSide" value="SELL"> &#9660; Short</label>
-        <button class="zd-add-btn" id="mtBotManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
+        <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="mtBotManualOnly"> Manual mode</label>
+        <label>Qty <input type="number" id="mtBotManualQty" placeholder="cfg" style="width:64px" min="0" step="0.01"></label>
+        <label>SL% <input type="number" id="mtBotManualSlPct" style="width:56px" min="0" step="0.1"></label>
+        <label>SL pts <input type="number" id="mtBotManualSlPts" style="width:66px" min="0" step="0.05"></label>
+        <label>TP% <input type="number" id="mtBotManualTpPct" style="width:56px" min="0" step="0.1"></label>
+        <label>TP pts <input type="number" id="mtBotManualTpPts" style="width:66px" min="0" step="0.05"></label>
+        <button class="zd-add-btn" id="mtBotManualBuy"  type="button" style="background:#0b7d3b;color:#fff" title="Buy / go Long at market now">&#9650; Buy</button>
+        <button class="zd-add-btn" id="mtBotManualSell" type="button" style="background:#b23b3b;color:#fff" title="Sell / go Short at market now">&#9660; Sell</button>
         <button class="zd-add-btn" id="mtBotManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
         <span id="mtBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
@@ -18861,12 +18914,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="deltaBotBiasOut" style="color:#9aa0ac;font-size:11px">No start bias &mdash; waits for SuperTrend</span>
       </div>
 
-      <!-- Manual override: open/close a position by hand while the bot runs (uses configured SL%/TP%) -->
-      <div class="ai-risk-bar" title="Manually open or close a position while the bot is running. Pick Long/Short and press Open to enter at market with the configured SL%/TP%; Close flattens the current position. Runs on the next bot tick.">
+      <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points (paper + live) -->
+      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
-        <label><input type="radio" name="deltaManualSide" value="BUY" checked> &#9650; Long</label>
-        <label><input type="radio" name="deltaManualSide" value="SELL"> &#9660; Short</label>
-        <button class="zd-add-btn" id="deltaManualOpen"  type="button" title="Open a position now in the selected direction (market, configured SL%/TP%)">&#9654; Open</button>
+        <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="deltaManualOnly"> Manual mode</label>
+        <label>Qty <input type="number" id="deltaManualQty" placeholder="cfg" style="width:64px" min="0" step="1"></label>
+        <label>SL% <input type="number" id="deltaManualSlPct" style="width:56px" min="0" step="0.1"></label>
+        <label>SL pts <input type="number" id="deltaManualSlPts" style="width:66px" min="0" step="0.05"></label>
+        <label>TP% <input type="number" id="deltaManualTpPct" style="width:56px" min="0" step="0.1"></label>
+        <label>TP pts <input type="number" id="deltaManualTpPts" style="width:66px" min="0" step="0.05"></label>
+        <button class="zd-add-btn" id="deltaManualBuy"  type="button" style="background:#0b7d3b;color:#fff" title="Buy / go Long at market now">&#9650; Buy</button>
+        <button class="zd-add-btn" id="deltaManualSell" type="button" style="background:#b23b3b;color:#fff" title="Sell / go Short at market now">&#9660; Sell</button>
         <button class="zd-add-btn" id="deltaManualClose" type="button" title="Close the current position now (market)">&#9632; Close</button>
         <span id="deltaManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
@@ -25408,14 +25466,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { zBiasDetect.disabled = false; });
     });
 
-    // ---- Manual override: Open / Close a position by hand while the bot runs ----
-    const zmOpenBtn = document.getElementById('aiBotManualOpen');
+    // ---- Manual mode: Buy / Sell / Close by hand with SL/TP as % or points ----
     const zmCloseBtn = document.getElementById('aiBotManualClose');
     const zmOut = document.getElementById('aiBotManualOut');
-    function zManualSide() { const r = document.querySelector('input[name="aiBotManualSide"]:checked'); return r ? r.value : 'BUY'; }
-    function zSendManual(action) {
-      const body = { action: action, side: (action === 'open') ? zManualSide() : '' };
-      if (zmOut) zmOut.textContent = (action === 'open' ? 'opening ' + zManualSide() : 'closing') + '…';
+    function zManualSLTP() {
+      const g = id => { const v = parseFloat((document.getElementById(id)||{}).value); return (isFinite(v) && v > 0) ? v : undefined; };
+      return { qty: g('aiBotManualQty'), slPct: g('aiBotManualSlPct'), tpPct: g('aiBotManualTpPct'), slPoints: g('aiBotManualSlPts'), tpPoints: g('aiBotManualTpPts') };
+    }
+    function zSendManual(action, side) {
+      const body = Object.assign({ action: action, side: side || '' }, action === 'open' ? zManualSLTP() : {});
+      if (zmOut) zmOut.textContent = (action === 'open' ? side + '…' : 'closing…');
       fetch('/api/aibot/zerodha/manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         .then(r => r.json()).then(function(res) {
           if (!res.success) { if (zmOut) zmOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
@@ -25423,8 +25483,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           logLine('[Manual] ' + (res.message || (action + ' queued')), 'info');
         }).catch(e => { if (zmOut) zmOut.innerHTML = '<span style="color:#ef5350">error</span>'; logLine('[Manual] error: ' + e.message, 'info'); });
     }
-    if (zmOpenBtn)  zmOpenBtn.addEventListener('click',  function() { zSendManual('open'); });
-    if (zmCloseBtn) zmCloseBtn.addEventListener('click', function() { zSendManual('close'); });
+    var zmBuy = document.getElementById('aiBotManualBuy'), zmSell = document.getElementById('aiBotManualSell');
+    if (zmBuy)  zmBuy.addEventListener('click',  function() { zSendManual('open', 'BUY'); });
+    if (zmSell) zmSell.addEventListener('click', function() { zSendManual('open', 'SELL'); });
+    if (zmCloseBtn) zmCloseBtn.addEventListener('click', function() { zSendManual('close', ''); });
 
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
@@ -25453,6 +25515,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         model:       modelEl ? modelEl.value : 'sonnet',
         tvEnabled:   !!(document.getElementById('aiBotTV') || {}).checked,
         tvSymbol:    ((document.getElementById('aiBotTVSym') || {}).value || '').trim().toUpperCase(),
+        manualOnly:  !!(document.getElementById('aiBotManualOnly') || {}).checked,
         qualityFilter: !!qualityChk.checked,
         includeMM:   !!incMMChk.checked,
         includeMMA:  !!incMMAChk.checked,
@@ -26742,14 +26805,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { mBiasDetect.disabled = false; });
     });
 
-    // ---- Manual override: Open / Close a position by hand while the bot runs ----
-    const mmOpenBtn = document.getElementById('mtBotManualOpen');
+    // ---- Manual mode: Buy / Sell / Close by hand with SL/TP as % or points ----
     const mmCloseBtn = document.getElementById('mtBotManualClose');
     const mmOut = document.getElementById('mtBotManualOut');
-    function mManualSide() { const r = document.querySelector('input[name="mtBotManualSide"]:checked'); return r ? r.value : 'BUY'; }
-    function mSendManual(action) {
-      const body = { action: action, side: (action === 'open') ? mManualSide() : '' };
-      if (mmOut) mmOut.textContent = (action === 'open' ? 'opening ' + mManualSide() : 'closing') + '…';
+    function mManualSLTP() {
+      const g = id => { const v = parseFloat((document.getElementById(id)||{}).value); return (isFinite(v) && v > 0) ? v : undefined; };
+      return { qty: g('mtBotManualQty'), slPct: g('mtBotManualSlPct'), tpPct: g('mtBotManualTpPct'), slPoints: g('mtBotManualSlPts'), tpPoints: g('mtBotManualTpPts') };
+    }
+    function mSendManual(action, side) {
+      const body = Object.assign({ action: action, side: side || '' }, action === 'open' ? mManualSLTP() : {});
+      if (mmOut) mmOut.textContent = (action === 'open' ? side + '…' : 'closing…');
       fetch('/api/aibot/mt5/manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         .then(r => r.json()).then(function(res) {
           if (!res.success) { if (mmOut) mmOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
@@ -26757,8 +26822,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           logLine('[Manual] ' + (res.message || (action + ' queued')), 'info');
         }).catch(e => { if (mmOut) mmOut.innerHTML = '<span style="color:#ef5350">error</span>'; logLine('[Manual] error: ' + e.message, 'info'); });
     }
-    if (mmOpenBtn)  mmOpenBtn.addEventListener('click',  function() { mSendManual('open'); });
-    if (mmCloseBtn) mmCloseBtn.addEventListener('click', function() { mSendManual('close'); });
+    var mmBuy = document.getElementById('mtBotManualBuy'), mmSell = document.getElementById('mtBotManualSell');
+    if (mmBuy)  mmBuy.addEventListener('click',  function() { mSendManual('open', 'BUY'); });
+    if (mmSell) mmSell.addEventListener('click', function() { mSendManual('open', 'SELL'); });
+    if (mmCloseBtn) mmCloseBtn.addEventListener('click', function() { mSendManual('close', ''); });
 
     startBtn.addEventListener('click', function() {
       if (botRunning) return;
@@ -26774,6 +26841,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         model: modelEl ? modelEl.value : 'sonnet',
         tvEnabled: !!(document.getElementById('mtBotTV') || {}).checked,
         tvSymbol: ((document.getElementById('mtBotTVSym') || {}).value || '').trim().toUpperCase(),
+        manualOnly: !!(document.getElementById('mtBotManualOnly') || {}).checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(), seedBias: mtGetSeedBias(),
         avoidRange: !!(document.getElementById('mtBotAvoidRange')||{}).checked,
@@ -27394,14 +27462,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .finally(() => { biasDetectBtn.disabled = false; });
     });
 
-    // ---- Manual override: Open / Close a position by hand while the bot runs ----
-    const mOpenBtn = document.getElementById('deltaManualOpen');
+    // ---- Manual mode: Buy / Sell / Close by hand with SL/TP as % or points ----
     const mCloseBtn = document.getElementById('deltaManualClose');
     const mOut = document.getElementById('deltaManualOut');
-    function manualSide() { const r = document.querySelector('input[name="deltaManualSide"]:checked'); return r ? r.value : 'BUY'; }
-    function sendManual(action) {
-      const body = { action: action, side: (action === 'open') ? manualSide() : '' };
-      if (mOut) mOut.textContent = (action === 'open' ? 'opening ' + manualSide() : 'closing') + '…';
+    function manualSLTP() {
+      const g = id => { const v = parseFloat((document.getElementById(id)||{}).value); return (isFinite(v) && v > 0) ? v : undefined; };
+      return { qty: g('deltaManualQty'), slPct: g('deltaManualSlPct'), tpPct: g('deltaManualTpPct'), slPoints: g('deltaManualSlPts'), tpPoints: g('deltaManualTpPts') };
+    }
+    function sendManual(action, side) {
+      const body = Object.assign({ action: action, side: side || '' }, action === 'open' ? manualSLTP() : {});
+      if (mOut) mOut.textContent = (action === 'open' ? side + '…' : 'closing…');
       fetch('/api/aibot/delta/manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         .then(r => r.json()).then(function(res) {
           if (!res.success) { if (mOut) mOut.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
@@ -27409,8 +27479,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           logLine('[Manual] ' + (res.message || (action + ' queued')), 'info');
         }).catch(e => { if (mOut) mOut.innerHTML = '<span style="color:#ef5350">error</span>'; logLine('[Manual] error: ' + e.message, 'info'); });
     }
-    if (mOpenBtn)  mOpenBtn.addEventListener('click',  function() { sendManual('open'); });
-    if (mCloseBtn) mCloseBtn.addEventListener('click', function() { sendManual('close'); });
+    var mBuyBtn = document.getElementById('deltaManualBuy'), mSellBtn = document.getElementById('deltaManualSell');
+    if (mBuyBtn)  mBuyBtn.addEventListener('click',  function() { sendManual('open', 'BUY'); });
+    if (mSellBtn) mSellBtn.addEventListener('click', function() { sendManual('open', 'SELL'); });
+    if (mCloseBtn) mCloseBtn.addEventListener('click', function() { sendManual('close', ''); });
 
     function openPosition(side, price, strategy, mode) {
       const qty   = Math.max(1, parseInt(qtyEl.value) || 1);
@@ -27700,6 +27772,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         model:      modelEl ? modelEl.value : 'sonnet',
         tvEnabled:  !!(document.getElementById('deltaBotTV') || {}).checked,
         tvSymbol:   ((document.getElementById('deltaBotTVSym') || {}).value || '').trim().toUpperCase(),
+        manualOnly: !!(document.getElementById('deltaManualOnly') || {}).checked,
         qualityFilter: !!qualityChk.checked,
         includeMM:  !!dIncMMChk.checked,
         includeMMA: !!dIncMMAChk.checked,
