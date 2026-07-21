@@ -5208,8 +5208,10 @@ def _zo_bot_tick():
     buyer    = bool(cfg.get('optionBuyer'))
     seller   = bool(cfg.get('optionSeller'))
     is_claude = _bot_is_claude(cfg)
+    manual_only = bool(cfg.get('manualOnly'))
     # Claude decisions only on the slow tick; price/stops still refresh every loop.
-    _zo_decide = is_claude and zo_ai_state.get('_decide', True)
+    # In manual mode no auto-decision runs — only Buy/Sell buttons + SL/TP management.
+    _zo_decide = is_claude and zo_ai_state.get('_decide', True) and not manual_only
     base_ctx = _zo_underlying_ctx(cfg) if cfg.get('baseSymbol') else {}   # every tick — keep the underlying value live
     _us = (base_ctx or {}).get('underlyingSpot')
     if _us:
@@ -5229,6 +5231,29 @@ def _zo_bot_tick():
             _zo_log('[Tick] no Kite candles for ' + symbol); continue
         price  = candles[-1]['close']
         regime = _bot_detect_regime(candles)
+        # --- Manual Buy/Sell/Close for THIS leg (CE/PE), before any auto-logic ---
+        _mc = zo_ai_state.get('manualCmd')
+        _leg_type = 'CE' if symbol.upper().endswith('CE') else ('PE' if symbol.upper().endswith('PE') else '')
+        if _mc and ((_mc.get('legType') or '') in ('', _leg_type)):
+            zo_ai_state['manualCmd'] = None
+            _ma = (_mc.get('action') or '').lower(); _ms_side = _seed_bias_norm(_mc.get('side'))
+            _lp = leg.get('position')
+            if _ma == 'close':
+                if _lp: _zo_close_leg(leg, price, 'manual close', cfg, mode)
+                else:   _zo_log('[Manual] close ignored — {} flat'.format(symbol))
+            elif _ma == 'open' and _ms_side in ('BUY', 'SELL'):
+                if _lp and _lp['side'] == _ms_side:
+                    _zo_log('[Manual] {} already {}'.format(symbol, _ms_side))
+                else:
+                    if _lp: _zo_close_leg(leg, price, 'manual reverse', cfg, mode)
+                    _mq = _mc.get('qty')
+                    try:
+                        if _mq and float(_mq) > 0: cfg['qty'] = int(float(_mq))
+                    except (TypeError, ValueError): pass
+                    _mstrat = _manual_strat(_ms_side, price, _mc.get('sltp') or {})
+                    _zo_log('[Manual] open {} {} @ {}'.format(_ms_side, symbol, price))
+                    _zo_open_leg(leg, _ms_side, price, _mstrat, cfg, mode)
+            continue   # manual handled this leg this tick; auto-logic resumes next tick
         leg_ctx = None
         if _zo_decide:
             leg_ctx = dict(base_ctx) if base_ctx else {}
@@ -5236,7 +5261,9 @@ def _zo_bot_tick():
             leg_ctx['buyerEnabled']  = buyer
             leg_ctx['sellerEnabled'] = seller
             if tv_ctx: leg_ctx['tradingview'] = tv_ctx
-        if _zo_decide:
+        if manual_only:
+            strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+        elif _zo_decide:
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx,
                                          images=_chart_images_for(zo_ai_state))
         elif is_claude:
@@ -5444,6 +5471,28 @@ def zo_aibot_start():
     _persist_log_line('[ZOPTIONS] [{}] BOT START {} ({}) qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), syms, modes.strip('+'), cfg['qty'], cfg['tf']))
     return jsonify({'success': True, 'message': 'Bot started server-side'})
+
+@app.route('/api/aibot/zoptions/manual', methods=['POST'])
+@login_required
+def zo_aibot_manual():
+    """Manual Buy/Sell/Close on a CE or PE leg (runs on next tick). SL/TP as % or points."""
+    data = request.json or {}
+    action = (data.get('action') or '').lower()
+    side = _seed_bias_norm(data.get('side'))
+    leg_type = (data.get('legType') or '').upper()
+    if action not in ('open', 'close'):
+        return jsonify({'success': False, 'error': 'action must be open or close'}), 400
+    if action == 'open' and side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'pick Buy or Sell'}), 400
+    if leg_type not in ('CE', 'PE', ''):
+        return jsonify({'success': False, 'error': 'legType must be CE or PE'}), 400
+    with zo_ai_lock:
+        if not zo_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Start the bot first'}), 400
+        zo_ai_state['manualCmd'] = {'action': action, 'side': side, 'legType': leg_type,
+            'sltp': {k: data.get(k) for k in ('slPct', 'tpPct', 'slPoints', 'tpPoints')}, 'qty': data.get('qty')}
+    _zo_log('[Manual] queued {} {} {}'.format(action.upper(), leg_type, side or ''))
+    return jsonify({'success': True, 'message': 'Manual {} {} {} queued — runs on next tick'.format(action, leg_type, side or '')})
 
 @app.route('/api/aibot/zoptions/pause', methods=['POST'])
 @login_required
@@ -7160,7 +7209,8 @@ def _do_bot_tick():
     if not cfg: return
     mode = cfg.get('mode', 'paper'); interval = cfg.get('tf', '5m')
     buyer = bool(cfg.get('optionBuyer')); seller = bool(cfg.get('optionSeller'))
-    decide = do_ai_state.get('_decide', True)
+    manual_only = bool(cfg.get('manualOnly'))
+    decide = do_ai_state.get('_decide', True) and not manual_only
     base_ctx = _do_underlying_ctx(cfg)      # every tick — so the underlying value is always live
     uspot = (base_ctx or {}).get('underlyingSpot')
     if uspot:
@@ -7178,7 +7228,32 @@ def _do_bot_tick():
                 leg['last_tick'] = {'time': int(_zd_time.time()), 'error': 'no candles'}
             _do_log('[Tick] no Delta candles for ' + symbol); continue
         price = candles[-1]['close']; regime = _bot_detect_regime(candles)
-        if decide:
+        # --- Manual Buy/Sell/Close for THIS leg (CE/PE), before any auto-logic ---
+        _mc = do_ai_state.get('manualCmd')
+        _leg_type = 'CE' if symbol.upper().endswith('CE') else ('PE' if symbol.upper().endswith('PE') else '')
+        if _mc and ((_mc.get('legType') or '') in ('', _leg_type)):
+            do_ai_state['manualCmd'] = None
+            _ma = (_mc.get('action') or '').lower(); _ms_side = _seed_bias_norm(_mc.get('side'))
+            _lp = leg.get('position')
+            if _ma == 'close':
+                if _lp: _do_close_leg(leg, price, 'manual close', cfg, mode)
+                else:   _do_log('[Manual] close ignored — {} flat'.format(symbol))
+            elif _ma == 'open' and _ms_side in ('BUY', 'SELL'):
+                if _lp and _lp['side'] == _ms_side:
+                    _do_log('[Manual] {} already {}'.format(symbol, _ms_side))
+                else:
+                    if _lp: _do_close_leg(leg, price, 'manual reverse', cfg, mode)
+                    _mq = _mc.get('qty')
+                    try:
+                        if _mq and float(_mq) > 0: cfg['qty'] = int(float(_mq))
+                    except (TypeError, ValueError): pass
+                    _mstrat = _manual_strat(_ms_side, price, _mc.get('sltp') or {})
+                    _do_log('[Manual] open {} {} @ {}'.format(_ms_side, symbol, price))
+                    _do_open_leg(leg, _ms_side, price, _mstrat, cfg, mode)
+            continue   # manual handled this leg this tick; auto-logic resumes next tick
+        if manual_only:
+            strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+        elif decide:
             leg_ctx = dict(base_ctx) if base_ctx else {}
             leg_ctx.update(_do_option_meta(symbol, (base_ctx or {}).get('underlyingSpot') or 0))
             leg_ctx['buyerEnabled'] = buyer; leg_ctx['sellerEnabled'] = seller
@@ -7297,7 +7372,7 @@ def do_aibot_start():
             'sellOtmPct': float(data.get('sellOtmPct', 0.25) or 0.25),
             'tickSec': max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'model': (data.get('model') or '').strip(), 'api_key': api_key,
-            'strategies': 'claude',
+            'strategies': 'claude', 'manualOnly': bool(data.get('manualOnly', False)),
         }
         do_ai_state['legs'] = legs; do_ai_state['trades'] = []; do_ai_state['consec_losses'] = 0
         do_ai_state['running'] = True; do_ai_state['paused'] = False; do_ai_state['_last_decision_ts'] = 0
@@ -7308,6 +7383,28 @@ def do_aibot_start():
         _persist_log_line('[DOPT] [{}] BOT START {} qty={}'.format(do_ai_state['config']['mode'].upper(), syms, do_ai_state['config']['qty']))
         _threading.Thread(target=_do_bot_loop, daemon=True, name='doptions-aibot').start()
     return jsonify({'success': True, 'legs': [l['symbol'] for l in legs], 'info': info})
+
+@app.route('/api/aibot/doptions/manual', methods=['POST'])
+@login_required
+def do_aibot_manual():
+    """Manual Buy/Sell/Close on a CE or PE leg (runs on next tick). SL/TP as % or points."""
+    data = request.json or {}
+    action = (data.get('action') or '').lower()
+    side = _seed_bias_norm(data.get('side'))
+    leg_type = (data.get('legType') or '').upper()
+    if action not in ('open', 'close'):
+        return jsonify({'success': False, 'error': 'action must be open or close'}), 400
+    if action == 'open' and side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'pick Buy or Sell'}), 400
+    if leg_type not in ('CE', 'PE', ''):
+        return jsonify({'success': False, 'error': 'legType must be CE or PE'}), 400
+    with do_ai_lock:
+        if not do_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Start the bot first'}), 400
+        do_ai_state['manualCmd'] = {'action': action, 'side': side, 'legType': leg_type,
+            'sltp': {k: data.get(k) for k in ('slPct', 'tpPct', 'slPoints', 'tpPoints')}, 'qty': data.get('qty')}
+    _do_log('[Manual] queued {} {} {}'.format(action.upper(), leg_type, side or ''))
+    return jsonify({'success': True, 'message': 'Manual {} {} {} queued — runs on next tick'.format(action, leg_type, side or '')})
 
 @app.route('/api/aibot/doptions/stop', methods=['POST'])
 @login_required
@@ -7478,7 +7575,8 @@ def _tvb_bot_tick():
         _tvb_log('[Tick] no TradingView candles for ' + symbol + ' — check the symbol (e.g. XAUUSD, OANDA:XAUUSD, MCX:GOLD1!)')
         return
     price = candles[-1]['close']; regime = _bot_detect_regime(candles)
-    decide = tvb_ai_state.get('_decide', True)
+    manual_only = bool(cfg.get('manualOnly'))
+    decide = tvb_ai_state.get('_decide', True) and not manual_only
     if _bot_is_claude(cfg) and decide:
         _tv = _tv_context(cfg, 'tradingview', symbol, '') if cfg.get('tvEnabled') else None
         strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
@@ -7494,6 +7592,27 @@ def _tvb_bot_tick():
         tvb_ai_state['last_tick'] = {'time': int(_zd_time.time()), 'price': price, 'strategy': strat['name'],
                                      'signal': sig, 'score': strat['score'], 'reason': strat['reason'],
                                      'regime': '{} vol, {}'.format(regime['volatility'], 'trending ' + regime['direction'] if regime['trending'] else 'range')}
+        # --- Manual Buy/Sell/Close, before auto-logic ---
+        _mc = tvb_ai_state.get('manualCmd')
+        if _mc:
+            tvb_ai_state['manualCmd'] = None
+            _ma = (_mc.get('action') or '').lower(); _ms_side = _seed_bias_norm(_mc.get('side'))
+            _p = tvb_ai_state.get('position')
+            if _ma == 'close':
+                if _p: _tvb_bot_close(price, 'manual close', cfg)
+                else:  _tvb_log('[Manual] close ignored — flat')
+            elif _ma == 'open' and _ms_side in ('BUY', 'SELL'):
+                if _p and _p['side'] == _ms_side:
+                    _tvb_log('[Manual] already ' + _ms_side)
+                else:
+                    if _p: _tvb_bot_close(price, 'manual reverse', cfg)
+                    _mq = _mc.get('qty')
+                    try:
+                        if _mq and float(_mq) > 0: cfg['qty'] = float(_mq)
+                    except (TypeError, ValueError): pass
+                    _tvb_log('[Manual] open {} {} @ {}'.format(_ms_side, symbol, round(price, 5)))
+                    _tvb_bot_open(_ms_side, price, _manual_strat(_ms_side, price, _mc.get('sltp') or {}), cfg)
+            sig = 'HOLD'   # don't let auto-logic act on top of the manual order this tick
         pos = tvb_ai_state.get('position')
         if pos:
             is_long = pos['side'] == 'BUY'; reason = None; exit_px = price
@@ -7567,6 +7686,7 @@ def tvb_aibot_start():
         tvb_ai_state['config'] = {
             'symbol': symbol, 'currency': (data.get('currency') or 'USD').upper(),
             'strategies': 'claude' if claude else 'tv', 'tvEnabled': bool(data.get('tvEnabled', True)),
+            'manualOnly': bool(data.get('manualOnly', False)),
             'tvSymbol': symbol, 'emaMode': bool(data.get('emaMode', False)),
             'trendGate': bool(data.get('trendGate', False)), 'avoidRange': bool(data.get('avoidRange', False)),
             'minER': float(data.get('minER', 0.0) or 0.0), 'maxCont': int(data.get('maxCont', 0) or 0),
@@ -7591,6 +7711,25 @@ def tvb_aibot_start():
         _persist_log_line('[TVBOT] [PAPER] BOT START {} strat={}'.format(symbol, 'claude' if claude else 'tv'))
         _threading.Thread(target=_tvb_bot_loop, daemon=True, name='tvbot-aibot').start()
     return jsonify({'success': True, 'symbol': symbol})
+
+@app.route('/api/aibot/tvbot/manual', methods=['POST'])
+@login_required
+def tvb_aibot_manual():
+    """Manual Buy/Sell/Close for the TradingView bot (runs on next tick). SL/TP as % or points."""
+    data = request.json or {}
+    action = (data.get('action') or '').lower()
+    side = _seed_bias_norm(data.get('side'))
+    if action not in ('open', 'close'):
+        return jsonify({'success': False, 'error': 'action must be open or close'}), 400
+    if action == 'open' and side not in ('BUY', 'SELL'):
+        return jsonify({'success': False, 'error': 'pick Buy or Sell'}), 400
+    with tvb_ai_lock:
+        if not tvb_ai_state.get('running'):
+            return jsonify({'success': False, 'error': 'Start the bot first'}), 400
+        tvb_ai_state['manualCmd'] = {'action': action, 'side': side,
+            'sltp': {k: data.get(k) for k in ('slPct', 'tpPct', 'slPoints', 'tpPoints')}, 'qty': data.get('qty')}
+    _tvb_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
+    return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
 @app.route('/api/aibot/tvbot/stop', methods=['POST'])
 @login_required
@@ -19012,6 +19151,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="bot-log-btn" id="tvBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
         <span id="tvBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
       </div>
+      <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points -->
+      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
+        <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
+        <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="tvBotManualOnly"> Manual mode</label>
+        <label>Qty <input type="number" id="tvBotManualQty" placeholder="cfg" style="width:64px" min="0" step="0.01"></label>
+        <label>SL% <input type="number" id="tvBotManualSlPct" style="width:56px" min="0" step="0.1"></label>
+        <label>SL pts <input type="number" id="tvBotManualSlPts" style="width:66px" min="0" step="0.05"></label>
+        <label>TP% <input type="number" id="tvBotManualTpPct" style="width:56px" min="0" step="0.1"></label>
+        <label>TP pts <input type="number" id="tvBotManualTpPts" style="width:66px" min="0" step="0.05"></label>
+        <button class="zd-add-btn" id="tvBotManualBuy"  type="button" style="background:#0b7d3b;color:#fff" title="Buy / go Long at market now">&#9650; Buy</button>
+        <button class="zd-add-btn" id="tvBotManualSell" type="button" style="background:#b23b3b;color:#fff" title="Sell / go Short at market now">&#9660; Sell</button>
+        <button class="zd-add-btn" id="tvBotManualClose" type="button" title="Close the current position now">&#9632; Close</button>
+        <span id="tvBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+      </div>
       <div class="ai-info-grid">
         <div class="cell"><span class="lab">Price</span><span class="val" id="tvBotPrice">&mdash;</span></div>
         <div class="cell"><span class="lab">Position</span><span class="val" id="tvBotPos">FLAT</span></div>
@@ -19085,6 +19238,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="bot-log-btn" id="doBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
         <button class="bot-log-btn" id="doBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
         <span id="doBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
+      </div>
+      <!-- Manual mode: Buy/Sell a CE or PE leg by hand with SL/TP as % or points -->
+      <div class="ai-risk-bar" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = contracts.">
+        <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
+        <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="doBotManualOnly"> Manual mode</label>
+        <label>Leg <select id="doBotManualLeg" style="background:#1e222d;color:#d1d4dc;border:1px solid #2a2e39;border-radius:4px;padding:3px"><option value="CE">CE</option><option value="PE">PE</option></select></label>
+        <label>Qty <input type="number" id="doBotManualQty" placeholder="cfg" style="width:58px" min="0" step="1"></label>
+        <label>SL% <input type="number" id="doBotManualSlPct" style="width:54px" min="0" step="1"></label>
+        <label>SL pts <input type="number" id="doBotManualSlPts" style="width:62px" min="0" step="0.05"></label>
+        <label>TP% <input type="number" id="doBotManualTpPct" style="width:54px" min="0" step="1"></label>
+        <label>TP pts <input type="number" id="doBotManualTpPts" style="width:62px" min="0" step="0.05"></label>
+        <button class="zd-add-btn" id="doBotManualBuy"  type="button" style="background:#0b7d3b;color:#fff" title="Buy the selected leg at market now">&#9650; Buy</button>
+        <button class="zd-add-btn" id="doBotManualSell" type="button" style="background:#b23b3b;color:#fff" title="Sell/short the selected leg at market now">&#9660; Sell</button>
+        <button class="zd-add-btn" id="doBotManualClose" type="button" title="Close the selected leg now">&#9632; Close</button>
+        <span id="doBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
       <div class="ai-info-grid">
         <div class="cell"><span class="lab">Underlying</span><span class="val" id="doBotUnderlying" style="color:#f7a600">&mdash;</span></div>
@@ -19265,6 +19433,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="zoBotTVTest" type="button" title="Send a sample BUY alert to the webhook and confirm it is received">&#129514; Test</button>
         <span id="zoBotTVBox" style="font-size:11px;color:#787b86">off</span>
         <div id="zoBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
+      </div>
+
+      <!-- Manual mode: Buy/Sell a CE or PE leg by hand with SL/TP as % or points -->
+      <div class="ai-risk-bar" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = lots.">
+        <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
+        <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="zoBotManualOnly"> Manual mode</label>
+        <label>Leg <select id="zoBotManualLeg" style="background:#1e222d;color:#d1d4dc;border:1px solid #2a2e39;border-radius:4px;padding:3px"><option value="CE">CE</option><option value="PE">PE</option></select></label>
+        <label>Lots <input type="number" id="zoBotManualQty" placeholder="cfg" style="width:58px" min="0" step="1"></label>
+        <label>SL% <input type="number" id="zoBotManualSlPct" style="width:54px" min="0" step="1"></label>
+        <label>SL pts <input type="number" id="zoBotManualSlPts" style="width:62px" min="0" step="0.05"></label>
+        <label>TP% <input type="number" id="zoBotManualTpPct" style="width:54px" min="0" step="1"></label>
+        <label>TP pts <input type="number" id="zoBotManualTpPts" style="width:62px" min="0" step="0.05"></label>
+        <button class="zd-add-btn" id="zoBotManualBuy"  type="button" style="background:#0b7d3b;color:#fff" title="Buy the selected leg at market now">&#9650; Buy</button>
+        <button class="zd-add-btn" id="zoBotManualSell" type="button" style="background:#b23b3b;color:#fff" title="Sell/short the selected leg at market now">&#9660; Sell</button>
+        <button class="zd-add-btn" id="zoBotManualClose" type="button" title="Close the selected leg now">&#9632; Close</button>
+        <span id="zoBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
 
       <div class="ai-risk-bar">
@@ -25787,7 +25971,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         qty:parseFloat($('tvBotQty').value)||1, tf:$('tvBotTF').value, slPct:parseFloat($('tvBotSlPct').value)||1,
         tpPct:parseFloat($('tvBotTpPct').value)||2, maxLoss:parseFloat($('tvBotMaxLoss').value)||50,
         maxProfit:parseFloat($('tvBotMaxProfit').value)||0, maxConsec:parseInt($('tvBotMaxConsec').value)||3,
-        cooldownSec:parseInt($('tvBotCooldown').value)||0, model:$('tvBotModel').value, tickSec:parseInt($('tvBotTickSec').value)||120 }; }
+        cooldownSec:parseInt($('tvBotCooldown').value)||0, model:$('tvBotModel').value, tickSec:parseInt($('tvBotTickSec').value)||120,
+        manualOnly:!!($('tvBotManualOnly')||{}).checked }; }
+    function tvbManualSLTP(){ const g=id=>{ const v=parseFloat(($(id)||{}).value); return (isFinite(v)&&v>0)?v:undefined; };
+      return { qty:g('tvBotManualQty'), slPct:g('tvBotManualSlPct'), tpPct:g('tvBotManualTpPct'), slPoints:g('tvBotManualSlPts'), tpPoints:g('tvBotManualTpPts') }; }
+    function tvbSendManual(action, side){ const body=Object.assign({action:action, side:side||''}, action==='open'?tvbManualSLTP():{});
+      const o=$('tvBotManualOut'); if(o) o.textContent=(action==='open'?side+'…':'closing…');
+      post('/api/aibot/tvbot/manual', body).then(function(res){ if(!res||!res.success){ if(o) o.innerHTML='<span style="color:#ef5350">'+((res&&res.error)||'failed')+'</span>'; return; } if(o) o.textContent=res.message||'queued'; }).catch(e=>{ if(o) o.innerHTML='<span style="color:#ef5350">error</span>'; }); }
+    if($('tvBotManualBuy'))  $('tvBotManualBuy').addEventListener('click', function(){ tvbSendManual('open','BUY'); });
+    if($('tvBotManualSell')) $('tvBotManualSell').addEventListener('click', function(){ tvbSendManual('open','SELL'); });
+    if($('tvBotManualClose'))$('tvBotManualClose').addEventListener('click', function(){ tvbSendManual('close',''); });
     function addMsg(t,cls){ const d=document.createElement('div'); d.className='dbot-msg '+(cls||'bot'); d.innerHTML=esc(t); msgsEl.appendChild(d); msgsEl.scrollTop=msgsEl.scrollHeight; return d; }
     let tvChart=null, tvSeries=null;
     function initTvChart(){ if(tvChart||typeof LightweightCharts==='undefined') return; const div=$('tvBotChart'); if(!div) return;
@@ -25880,8 +26073,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxProfit: parseFloat($('doBotMaxProfit').value)||0, maxConsec: parseInt($('doBotMaxConsec').value)||3,
         slPct: parseFloat($('doBotSlPct').value)||30, tpPct: parseFloat($('doBotTpPct').value)||50,
         optionBuyer: !!$('doBotBuyer').checked, optionSeller: !!$('doBotSeller').checked,
+        manualOnly: !!($('doBotManualOnly')||{}).checked,
         model: $('doBotModel').value, tickSec: parseInt($('doBotTickSec').value)||120, api_key: deltaApiKey() };
     }
+    function doManualSLTP(){ const g=id=>{ const v=parseFloat(($(id)||{}).value); return (isFinite(v)&&v>0)?v:undefined; };
+      return { legType:($('doBotManualLeg')||{}).value||'CE', qty:g('doBotManualQty'), slPct:g('doBotManualSlPct'), tpPct:g('doBotManualTpPct'), slPoints:g('doBotManualSlPts'), tpPoints:g('doBotManualTpPts') }; }
+    function doSendManual(action, side){ const body=Object.assign({action:action, side:side||''}, action==='open'?doManualSLTP():{legType:($('doBotManualLeg')||{}).value||'CE'});
+      const o=$('doBotManualOut'); if(o) o.textContent=(action==='open'?(body.legType+' '+side+'…'):'closing '+body.legType+'…');
+      post('/api/aibot/doptions/manual', body).then(function(res){ if(!res||!res.success){ if(o) o.innerHTML='<span style="color:#ef5350">'+((res&&res.error)||'failed')+'</span>'; return; } if(o) o.textContent=res.message||'queued'; }).catch(e=>{ if(o) o.innerHTML='<span style="color:#ef5350">error</span>'; }); }
+    if($('doBotManualBuy'))  $('doBotManualBuy').addEventListener('click', function(){ doSendManual('open','BUY'); });
+    if($('doBotManualSell')) $('doBotManualSell').addEventListener('click', function(){ doSendManual('open','SELL'); });
+    if($('doBotManualClose'))$('doBotManualClose').addEventListener('click', function(){ doSendManual('close',''); });
     function addMsg(t, cls){ const d=document.createElement('div'); d.className='dbot-msg '+(cls||'bot'); d.innerHTML=esc(t); msgsEl.appendChild(d); msgsEl.scrollTop=msgsEl.scrollHeight; return d; }
     let dCharts=[null,null], dSeries=[null,null], uChart=null, uSeries=null;
     function mkChart(div, up, dn){ if(!div||typeof LightweightCharts==='undefined') return [null,null];
@@ -26359,6 +26561,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         model: modelEl ? modelEl.value : 'sonnet',
         tvEnabled: !!(document.getElementById('zoBotTV') || {}).checked,
         tvSymbol: ((document.getElementById('zoBotTVSym') || {}).value || '').trim().toUpperCase(),
+        manualOnly: !!(document.getElementById('zoBotManualOnly') || {}).checked,
         qualityFilter: !!qualityChk.checked,
         includeMM: !!incMMChk.checked, includeMMA: !!incMMAChk.checked,
         allowedStrategies: _collectStrategies(),
@@ -26384,6 +26587,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
     stopBtn.addEventListener('click', function() {
       fetch('/api/aibot/zoptions/stop', { method: 'POST' }).then(r => r.json()).then(() => { _serverStopped(); logLine('Bot stopped on server.', 'info'); });
     });
+    // ---- Manual mode: Buy / Sell / Close a CE or PE leg with SL/TP as % or points ----
+    function zoManualSLTP() {
+      const g = id => { const v = parseFloat((document.getElementById(id)||{}).value); return (isFinite(v) && v > 0) ? v : undefined; };
+      return { legType: (document.getElementById('zoBotManualLeg')||{}).value || 'CE', qty: g('zoBotManualQty'),
+               slPct: g('zoBotManualSlPct'), tpPct: g('zoBotManualTpPct'), slPoints: g('zoBotManualSlPts'), tpPoints: g('zoBotManualTpPts') };
+    }
+    function zoSendManual(action, side) {
+      const lt = (document.getElementById('zoBotManualLeg')||{}).value || 'CE';
+      const body = Object.assign({ action: action, side: side || '' }, action === 'open' ? zoManualSLTP() : { legType: lt });
+      const o = document.getElementById('zoBotManualOut'); if (o) o.textContent = (action === 'open' ? (lt + ' ' + side + '…') : ('closing ' + lt + '…'));
+      fetch('/api/aibot/zoptions/manual', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { if (o) o.innerHTML = '<span style="color:#ef5350">' + (res.error || 'failed') + '</span>'; logLine('[Manual] ' + (res.error || 'failed'), 'info'); return; }
+          if (o) o.textContent = res.message || 'queued'; logLine('[Manual] ' + (res.message || 'queued'), 'info');
+        }).catch(e => { if (o) o.innerHTML = '<span style="color:#ef5350">error</span>'; });
+    }
+    var zoMBuy = document.getElementById('zoBotManualBuy'), zoMSell = document.getElementById('zoBotManualSell'), zoMClose = document.getElementById('zoBotManualClose');
+    if (zoMBuy)  zoMBuy.addEventListener('click',  function() { zoSendManual('open', 'BUY'); });
+    if (zoMSell) zoMSell.addEventListener('click', function() { zoSendManual('open', 'SELL'); });
+    if (zoMClose) zoMClose.addEventListener('click', function() { zoSendManual('close', ''); });
     function syncOnOpen() {
       fetch('/api/aibot/zoptions/status').then(r => r.json()).then(s => {
         if (s && s.success && s.running) {
