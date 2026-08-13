@@ -3454,90 +3454,67 @@ def _tg_picks_text(kind, universe):
         return title + ' — ' + _now_ist_str() + '\n\n(AI unavailable: ' + err + ')\n\n' + snap
     return title + ' — ' + _now_ist_str() + '\n\n' + (text or '').strip()
 
-# ===== Positional Options Buy/Sell (F&O stocks -> real CE/PE leg, never writing) ==
-def _tg_optpicks_candidates(kind, universe, shortlist_n=10, max_candidates=8):
-    """Rank the universe for a bullish (optbuy) or bearish (optsell) positional
-    options setup, keep only F&O-eligible names, and resolve each shortlisted
-    stock's live ATM option leg (CE for optbuy, PE for optsell). Returns a list
-    of merged TA+leg dicts (possibly empty — the caller degrades gracefully)."""
-    bullish = (kind == 'optbuy')
+# ===== Positional Options Buy/Sell (F&O stocks -> buy CE/PE, never writing) ======
+def _tg_optpicks_snapshot(universe):
+    """Ranked F&O-eligible TA rows for the universe. Pure technical screen — no
+    live strike/premium/option-chain dependency (that path hit NSE's per-stock
+    chain, which turned out unreliable in production — see git history). Falls
+    back to the unfiltered universe if the F&O-eligibility source is itself
+    unreachable, so this alert doesn't go empty just because ONE extra data
+    source (Kite's instrument dump) is briefly down."""
     rows = _tg_scan(universe)
     if not rows:
         return []
     # _tg_scan's 'sym' is TradingView's mangled ticker (every non-alnum -> '_'),
     # e.g. 'M&M' -> 'M_M', 'BAJAJ-AUTO' -> 'BAJAJ_AUTO'. Recover the ORIGINAL NSE
-    # symbol before matching F&O eligibility / hitting the NSE per-stock API —
-    # otherwise those names silently drop out or fetch the wrong symbol.
+    # symbol before matching F&O eligibility, or those names get silently dropped.
     tv_map = {_tv_nse_ticker(s).split(':')[-1]: s for s in _nse_constituents(universe)}
-    nfo_rows = _load_nfo_instruments()
-    fno_names = {r['name'] for r in nfo_rows}
-    lot_by_name = {}
-    for r in nfo_rows:
-        lot_by_name.setdefault(r['name'], r.get('lot_size'))
+    try:
+        fno_names = {r['name'] for r in _load_nfo_instruments()}
+    except Exception:
+        fno_names = None
     resolved = []
     for r in rows:
         orig = tv_map.get(r['sym'], r['sym'])
-        if orig not in fno_names:
+        if fno_names and orig not in fno_names:
             continue
         r = dict(r); r['sym'] = orig
         resolved.append(r)
-    if not resolved:
-        return []
-    resolved.sort(key=lambda r: r['score'], reverse=bullish)
-    shortlist = resolved[:shortlist_n]
-    session = _tg_nse_session()
-    out = []
-    for r in shortlist:
-        leg_data = _tg_stock_option_leg(r['sym'], session)
-        if not leg_data:
-            continue
-        leg = leg_data.get('ce' if bullish else 'pe')
-        if not leg or not leg.get('ltp'):
-            continue
-        out.append({
-            'symbol': r['sym'], 'type': 'CE' if bullish else 'PE',
-            'rating': r['rating'], 'rsi': r['rsi'], 'adx': r['adx'],
-            'sma50': r['sma50'], 'sma200': r['sma200'], 'perf1m': r['perf1m'],
-            'spot': leg_data['spot'], 'strike': leg_data['strike'], 'expiry': leg_data['expiry'],
-            'dte': leg_data['dte'], 'lotSize': lot_by_name.get(r['sym']),
-            'ltp': leg.get('ltp'), 'oi': leg.get('oi'), 'chgOi': leg.get('chgOi'), 'iv': leg.get('iv'),
-        })
-        if len(out) >= max_candidates:
-            break
-    return out
+    return resolved or rows
 
 def _tg_optpicks_text(kind, universe):
-    """Positional options BUY (bullish -> buy CE) / SELL (bearish -> buy PE) picks.
-    Every number Claude sees is real (live NSE premium + resolved strike/expiry),
-    so the prompt only asks it to WRITE the trade-plan around given data, never
-    invent strikes/prices."""
-    import json as _json
-    candidates = _tg_optpicks_candidates(kind, universe)
+    """Positional options BUY (bullish -> buy CE) / SELL (bearish -> buy PE) picks —
+    pure technical read (rating/RSI/ADX/SMA/1M perf), same reliable pattern as the
+    other 4 alert kinds. Deliberately no strike price, premium, or option-chain
+    data (that live-data path is unreliable — NSE blocks scripted access to its
+    per-stock chain from most server hosts)."""
+    bullish = (kind == 'optbuy')
+    rows = _tg_optpicks_snapshot(universe)
     title = ('📈 Nifty_MV — Positional Options BUY (Call options)' if kind == 'optbuy'
              else '📉 Nifty_MV — Positional Options SELL (Put options)')
     disclaimer = '⚠️ For informational purposes only. Not financial advice.'
-    if not candidates:
-        _persist_log_line('[TELEGRAM] {} candidates=0 (no F&O setups / NSE chain unavailable)'.format(kind))
-        return (title + ' — ' + _now_ist_str() +
-                '\n\n(No liquid F&O setups with a usable option chain right now.)\n\n' + disclaimer)
-    side = 'BULLISH — buying CALL (CE) options' if kind == 'optbuy' else 'BEARISH — buying PUT (PE) options'
+    if not rows:
+        _persist_log_line('[TELEGRAM] {} rows=0 (no data)'.format(kind))
+        return title + ' — ' + _now_ist_str() + '\n\n(No data available right now.)\n\n' + disclaimer
+    rows.sort(key=lambda r: r['score'], reverse=bullish)
+    top = rows[:20]
+    snap = '\n'.join('{}: close={} rating={} RSI={} ADX={} SMA50={} SMA200={} Perf1M={}%'.format(
+        r['sym'], r['close'], r['rating'], r['rsi'], r['adx'], r['sma50'], r['sma200'], r['perf1m']) for r in top)
+    side = 'BULLISH — recommend BUYING CALL (CE) options' if bullish else 'BEARISH — recommend BUYING PUT (PE) options'
+    opt = 'CE' if bullish else 'PE'
     system = (
-        "You are an Indian-markets derivatives analyst picking POSITIONAL (multi-day hold) option-BUYING setups — "
-        "never option-writing/selling. Bias: " + side + ". You are given REAL candidate stocks with their technical "
-        "read (rating/RSI/ADX/SMA50/SMA200/1M perf) AND their live resolved option leg (strike, expiry, days-to-"
-        "expiry 'dte', live premium 'ltp', OI, change-in-OI, IV). Use ONLY these numbers — do not invent strikes "
-        "or prices. Pick the best 5. For EACH give, on one line: TICKER CE/PE STRIKE (expiry) | 1-line trend "
-        "rationale | Entry ~premium | SL (as % of premium, e.g. 'SL 30% of premium') | Target (% of premium and/or "
-        "underlying level) | Hold: N trading days (STRICT: N must be at most dte-3, never suggest holding through "
-        "expiry) | 1-line liquidity/IV caution. End with a 1-line overall market-tone note. Exactly 5 setups. "
-        "<420 words, plain text, minimal emojis.")
-    user = "{} candidates ({}):\n{}\n\nGive the 5 best positional option-buy setups.".format(
-        universe, _now_ist_str(), _json.dumps(candidates, default=str))
+        "You are an Indian-markets derivatives analyst. From this F&O-stocks daily technical snapshot (rating, "
+        "RSI, ADX, SMA50, SMA200, 1-month perf), pick the 10 BEST POSITIONAL (multi-day to multi-week hold) " +
+        side + " — never option-writing/shorting. Use price vs SMA50/SMA200 for trend and ADX for strength. Do "
+        "NOT give a strike price, option premium, or reference any option chain data — none was provided. For "
+        "EACH give, on one line: TICKER — Buy " + opt + " | trend rationale (vs SMA50/200, RSI, ADX) | underlying "
+        "entry zone | underlying stop | underlying target | suggested holding period in TRADING DAYS | one other "
+        "practical note (e.g. avoid expiry week, check liquidity, size for theta decay). Exactly 10 setups. End "
+        "with a 1-line overall market-tone summary. <480 words, plain text, minimal emojis.")
+    user = "{} snapshot ({}):\n{}\n\nGive the 10 best positional {} setups.".format(universe, _now_ist_str(), snap, opt)
     text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=1800, model='sonnet')
-    _persist_log_line('[TELEGRAM] {} candidates={} aiErr={}'.format(kind, len(candidates), err or ''))
+    _persist_log_line('[TELEGRAM] {} rows={} aiErr={}'.format(kind, len(rows), err or ''))
     if err:
-        snap = '\n'.join('{} {} {} strike={} exp={} ltp={} dte={}'.format(
-            c['symbol'], c['type'], c['rating'], c['strike'], c['expiry'], c['ltp'], c['dte']) for c in candidates)
         return title + ' — ' + _now_ist_str() + '\n\n(AI unavailable: ' + err + ')\n\n' + snap + '\n\n' + disclaimer
     return title + ' — ' + _now_ist_str() + '\n\n' + (text or '').strip() + '\n\n' + disclaimer
 
@@ -3607,82 +3584,6 @@ def _tg_nse_oi(symbol='NIFTY'):
            'nearStrikesCallOI': {s: ce_oi.get(s, 0) for s in near},
            'nearStrikesPutOI': {s: pe_oi.get(s, 0) for s in near}}
     _TG_OI_CACHE[symbol] = {'ts': now, 'data': out}
-    return out
-
-# ===== Per-stock option leg (live premium) for Positional Options Buy/Sell ====
-_TG_STOCK_OPT_CACHE = {}
-_TG_STOCK_OPT_TTL = 120   # seconds — short cache so "Send now" + the 09:30 scheduled
-                          # fire don't double-hit NSE for the same symbol back-to-back
-
-def _tg_nse_session():
-    """One curl_cffi session with Chrome TLS impersonation, cookies bootstrapped
-    against the NSE homepage. Reuse across every symbol in a batch — NSE's bot
-    detection is documented elsewhere in this repo (fetch_nse_data, :9088) as
-    requiring TLS impersonation, and a fresh urllib call per symbol (like
-    _tg_nse_oi uses for the single index call) is too light for ~5-10 calls/run."""
-    session = cffi_requests.Session(impersonate='chrome')
-    try:
-        session.get('https://www.nseindia.com', timeout=10)
-    except Exception:
-        pass
-    return session
-
-def _tg_stock_option_leg(symbol, session=None):
-    """Live ATM option leg for an F&O STOCK (not index) via NSE's per-stock chain.
-    Picks the nearest expiry with >=7 calendar days left (positional runway), then
-    the strike closest to spot. Returns a dict with BOTH ce/pe legs (so the same
-    fetch/cache serves optbuy and optsell for the same symbol) or None on any
-    failure — never raises, matching every other NSE/Kite fetcher in this file."""
-    symbol = (symbol or '').upper().strip()
-    if not symbol:
-        return None
-    ent = _TG_STOCK_OPT_CACHE.get(symbol); now = _zd_time.time()
-    if ent and now - ent['ts'] < _TG_STOCK_OPT_TTL:
-        return ent['data']
-    try:
-        sess = session or _tg_nse_session()
-        r = sess.get('https://www.nseindia.com/api/option-chain-equities', params={'symbol': symbol},
-                     timeout=12, headers={'Referer': 'https://www.nseindia.com/option-chain'})
-        d = r.json()
-    except Exception:
-        return ent['data'] if ent else None
-    rec = (d or {}).get('records') or {}
-    rows = rec.get('data') or []
-    spot = rec.get('underlyingValue') or 0
-    exps = rec.get('expiryDates') or []
-    if not rows or not exps or not spot:
-        return ent['data'] if ent else None
-    today = _tg_now_ist().date()
-    exp = None
-    for e in exps:
-        try:
-            if (datetime.strptime(e, '%d-%b-%Y').date() - today).days >= 7:
-                exp = e
-                break
-        except Exception:
-            continue
-    if exp is None:
-        exp = exps[-1]
-    try:
-        dte = (datetime.strptime(exp, '%d-%b-%Y').date() - today).days
-    except Exception:
-        dte = None
-    chain = [row for row in rows if row.get('expiryDate') == exp and row.get('strikePrice') is not None]
-    if not chain:
-        return ent['data'] if ent else None
-    strike = min({row['strikePrice'] for row in chain}, key=lambda s: abs(s - spot))
-    row = next((r for r in chain if r.get('strikePrice') == strike), None)
-    if not row:
-        return ent['data'] if ent else None
-    def _leg(opt_type):
-        o = row.get(opt_type) or {}
-        if not o:
-            return None
-        return {'ltp': o.get('lastPrice'), 'oi': o.get('openInterest'),
-                'chgOi': o.get('changeinOpenInterest'), 'iv': o.get('impliedVolatility')}
-    out = {'symbol': symbol, 'spot': round(spot, 2), 'strike': strike, 'expiry': exp, 'dte': dte,
-           'ce': _leg('CE'), 'pe': _leg('PE')}
-    _TG_STOCK_OPT_CACHE[symbol] = {'ts': now, 'data': out}
     return out
 
 def _tg_index_analysis(name, tvsym, oi_symbol=None):
@@ -3827,8 +3728,7 @@ def _tg_public_state():
             'queue': len(_TG_QUEUE), 'cfgPath': _TG_CFG_PATH,
             'lastFired': {k: v for k, v in (_TG_STATE.get('_last') or {}).items()},
             'analysisCfg': dict(_TG_STATE.get('analysis_cfg') or {}),
-            'analysis': dict(_TG_STATE.get('analysis') or {}),
-            'optpicks': dict(_TG_STATE.get('optpicks') or {})}
+            'analysis': dict(_TG_STATE.get('analysis') or {})}
 
 @app.route('/api/telegram/status')
 @login_required
@@ -3881,25 +3781,13 @@ def telegram_test():
 @login_required
 def telegram_send_alert():
     """Generate + send one alert now. body {kind: brief|intraday|fno|positional|momentum|
-    optbuy|optsell, universe?}. Universe falls back to the saved per-alert universe.
-    optbuy/optsell scan+resolve live NSE option legs for several candidates before the
-    Claude call (~15-30s) — too slow for a synchronous Flask response (same class of
-    gateway-timeout bug fixed for index-analysis, see telegram_analysis_run below), so
-    those two run in a background thread and the panel polls /status for optpicks[kind]."""
+    optbuy|optsell, universe?}. Universe falls back to the saved per-alert universe."""
     data = request.json or {}
     kind = (data.get('kind') or 'brief').strip()
     if kind not in _TG_ALERT_LABELS:
         return jsonify({'success': False, 'error': 'unknown kind'}), 400
     universe = (data.get('universe') or (_TG_STATE.get('alerts', {}).get(kind, {}) or {}).get('universe') or 'NIFTY500')
     _tg_ensure_threads()
-    if kind in ('optbuy', 'optsell'):
-        def _bg():
-            txt = _tg_alert_text(kind, universe)
-            ok, err = _tg_send(txt)
-            _TG_STATE.setdefault('optpicks', {})[kind] = {'text': txt, 'ts': int(_zd_time.time())}
-            _persist_log_line('[TELEGRAM] {} sent={} {}'.format(kind, ok, err or ''))
-        _threading.Thread(target=_bg, daemon=True, name='tg-' + kind).start()
-        return jsonify({'success': True, 'started': True})
     txt = _tg_alert_text(kind, universe)
     ok, err = _tg_send(txt)
     return jsonify({'success': ok, 'error': err, 'preview': txt[:4000]})
@@ -17963,7 +17851,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div style="font-size:11px;color:#787b86;margin-top:3px">Detect: send any message to your bot in Telegram first, then click Detect.</div>
     <label style="display:flex;align-items:center;gap:8px;margin:12px 0 6px;font-weight:600"><input type="checkbox" id="nmvMaster"> &#128304; Master switch — enable ALL alerts &amp; events</label>
     <label style="display:flex;align-items:center;gap:8px;margin:4px 0"><input type="checkbox" id="nmvEvents"> &#128276; Forward all bot events (log.txt), realtime</label>
-    <div style="margin:12px 0 4px;color:#9aa0ac;font-weight:600">Scheduled alerts (IST, Mon–Fri) — 10 stocks each (5 for options picks)</div>
+    <div style="margin:12px 0 4px;color:#9aa0ac;font-weight:600">Scheduled alerts (IST, Mon–Fri) — 10 stocks each</div>
     <div id="nmvAlerts"></div>
 
     <div style="margin:16px 0 6px;border-top:1px solid #2a2e39;padding-top:12px;color:#9aa0ac;font-weight:600">&#128202; Live index analysis — Nifty &amp; Sensex (TA + Open Interest)</div>
@@ -18009,25 +17897,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       w.appendChild(row);
     });
     Array.prototype.forEach.call(w.querySelectorAll('[data-now]'),function(b){
-      b.addEventListener('click',function(){ var k=b.getAttribute('data-now');
-        if(k==='optbuy'||k==='optsell'){
-          say('Generating '+k+' — scanning F&O + live option chain + Claude… ~15-30s');
-          fetch('/api/telegram/status').then(function(r){return r.json();}).then(function(s){
-            var before=(((s&&s.optpicks)||{})[k]||{}).ts||0;
-            post('/api/telegram/send_alert',{kind:k}).then(function(d){
-              if(!d||!d.success){ say('Failed to start: '+((d&&d.error)||'?'),true); return; }
-              var tries=0; var iv=setInterval(function(){ tries++;
-                fetch('/api/telegram/status').then(function(r){return r.json();}).then(function(s2){
-                  var op=(((s2&&s2.optpicks)||{})[k])||{};
-                  if(op.ts && op.ts!==before){ clearInterval(iv); say('Sent ✓\n\n'+(op.text||''),false); }
-                  else if(tries>18){ clearInterval(iv); say('Still generating — check Telegram / telegram.txt shortly.'); }
-                }).catch(function(){});
-              },3000);
-            }).catch(function(e){say('Error: '+e.message,true);});
-          }).catch(function(e){say('Error: '+e.message,true);});
-          return;
-        }
-        say('Generating '+k+' (Claude + TradingView)…');
+      b.addEventListener('click',function(){ var k=b.getAttribute('data-now'); say('Generating '+k+' (Claude + TradingView)…');
         post('/api/telegram/send_alert',{kind:k}).then(function(d){ say((d&&d.success?'Sent ✓\n\n':'Failed: '+((d&&d.error)||'?')+'\n\n')+((d&&d.preview)||''),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);});
       });
     });
