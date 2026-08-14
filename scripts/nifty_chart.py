@@ -3146,11 +3146,13 @@ def _tg_default_alerts():
         'momentum':   {'on': False, 'time': '09:30', 'universe': 'NIFTY500'},
         'optbuy':     {'on': False, 'time': '09:30', 'universe': 'FNO'},
         'optsell':    {'on': False, 'time': '09:30', 'universe': 'FNO'},
+        'pricebands': {'on': False, 'time': '09:30', 'universe': 'NIFTY1000'},
     }
 _TG_ALERT_LABELS = {'brief': 'Nifty morning brief', 'intraday': 'Intraday stocks',
                     'fno': 'Intraday F&O stocks', 'positional': 'Positional stocks',
                     'momentum': 'Momentum (3-month)', 'optbuy': 'Positional Options BUY (Calls)',
-                    'optsell': 'Positional Options SELL (Puts)'}
+                    'optsell': 'Positional Options SELL (Puts)',
+                    'pricebands': 'Positional BUY by Price Band (9 x 10)'}
 
 _TG_STATE = {
     'token':   os.environ.get('TELEGRAM_BOT_TOKEN', '').strip(),
@@ -3518,6 +3520,70 @@ def _tg_optpicks_text(kind, universe):
         return title + ' — ' + _now_ist_str() + '\n\n(AI unavailable: ' + err + ')\n\n' + snap + '\n\n' + disclaimer
     return title + ' — ' + _now_ist_str() + '\n\n' + (text or '').strip() + '\n\n' + disclaimer
 
+# ===== Positional BUY by price band (9 tiers, ~10 picks each) ===================
+# Non-overlapping price tiers spanning Rs.0-2000, so results don't repeat the same
+# stock across bands (a literal "less than X" reading for every threshold would
+# have every band from <50 up include every stock also in <10, etc.).
+_TG_PRICE_BANDS = [(0, 10), (10, 50), (50, 100), (100, 200), (200, 500),
+                   (500, 700), (700, 1000), (1000, 1500), (1500, 2000)]
+
+def _tg_priceband_label(lo, hi):
+    return '< Rs.{}'.format(hi) if lo == 0 else 'Rs.{}-{}'.format(lo, hi)
+
+def _tg_priceband_one(rows, universe, lo, hi):
+    """Best-effort positional BUY picks for one price tier. Never raises — any
+    failure (Claude error, no candidates) degrades to a text note so one bad tier
+    doesn't blank out the whole message."""
+    label = _tg_priceband_label(lo, hi)
+    cand = [r for r in rows if r.get('close') is not None and lo <= r['close'] < hi]
+    if not cand:
+        return '*{}*\n(no qualifying stocks in this price band right now)'.format(label)
+    cand.sort(key=lambda r: r['score'], reverse=True)
+    top = cand[:20]
+    n = min(10, len(cand))
+    snap = '\n'.join('{}: close={} rating={} RSI={} ADX={} SMA50={} SMA200={} Perf1M={}%'.format(
+        r['sym'], r['close'], r['rating'], r['rsi'], r['adx'], r['sma50'], r['sma200'], r['perf1m']) for r in top)
+    system = (
+        "You are an Indian-markets swing analyst. From this daily technical snapshot of stocks priced " + label +
+        " (rating, RSI, ADX, SMA50, SMA200, 1-month perf), pick the " + str(n) + " BEST POSITIONAL (multi-day to "
+        "multi-week hold) LONG setups with genuine profit potential — favour strong trend (price above SMA50/200, "
+        "ADX>20) that is not already overextended (avoid RSI>78); skip weak/marginal names even if it means fewer "
+        "than " + str(n) + " picks. For EACH give, on ONE line: TICKER — Entry zone | SL | TP (target) | Days to "
+        "hold | 1-line reason citing the actual numbers (trend/RSI/ADX). Plain text, no markdown headers, minimal "
+        "emojis, concise — this is one of 9 price-band sections in a longer message so keep it tight.")
+    user = "{} stocks priced {} ({}):\n{}\n\nGive up to {} best positional buys.".format(
+        universe, label, _now_ist_str(), snap, n)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=1000, model='sonnet')
+    if err:
+        return '*{}*\n(AI unavailable: {})\n{}'.format(label, err, snap)
+    return '*{}*\n{}'.format(label, (text or '').strip())
+
+def _tg_pricebands_text(universe):
+    """Positional BUY picks segmented into 9 non-overlapping price bands (Rs.0-2000),
+    ~10 picks each, so results span every capital/lot-size preference. The 9 per-band
+    Claude calls run CONCURRENTLY (threads) — sequential would be ~9x a single
+    alert's latency, safely inside gunicorn's 120s timeout only if parallelized."""
+    import concurrent.futures as _cf
+    rows = _tg_scan(universe)
+    title = '💰 Nifty_MV — Positional BUY by Price Band'
+    disclaimer = '⚠️ For informational purposes only. Not financial advice.'
+    if not rows:
+        _persist_log_line('[TELEGRAM] pricebands rows=0 (no data)')
+        return title + ' — ' + _now_ist_str() + '\n\n(No data available right now.)\n\n' + disclaimer
+    results = [None] * len(_TG_PRICE_BANDS)
+    with _cf.ThreadPoolExecutor(max_workers=len(_TG_PRICE_BANDS)) as ex:
+        futs = {ex.submit(_tg_priceband_one, rows, universe, lo, hi): i
+                for i, (lo, hi) in enumerate(_TG_PRICE_BANDS)}
+        for fut in _cf.as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                lo, hi = _TG_PRICE_BANDS[i]
+                results[i] = '*{}* — error: {}'.format(_tg_priceband_label(lo, hi), str(e)[:120])
+    _persist_log_line('[TELEGRAM] pricebands rows={} bands={}'.format(len(rows), len(_TG_PRICE_BANDS)))
+    return title + ' — ' + _now_ist_str() + '\n\n' + '\n\n'.join(results) + '\n\n' + disclaimer
+
 # alert kind -> text builder. Scheduled alerts get the "- MangalView" sign-off;
 # log.txt event forwarding goes through _tg_flush_loop and is NOT signed.
 def _tg_alert_text(kind, universe='NIFTY500'):
@@ -3525,6 +3591,8 @@ def _tg_alert_text(kind, universe='NIFTY500'):
         txt = _tg_morning_text()
     elif kind in ('optbuy', 'optsell'):
         txt = _tg_optpicks_text(kind, universe or 'FNO')
+    elif kind == 'pricebands':
+        txt = _tg_pricebands_text(universe or 'NIFTY1000')
     else:
         txt = _tg_picks_text(kind, 'FNO' if kind == 'fno' else (universe or 'NIFTY500'))
     return (txt or '').rstrip() + '\n\n- MangalView'
@@ -17851,7 +17919,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div style="font-size:11px;color:#787b86;margin-top:3px">Detect: send any message to your bot in Telegram first, then click Detect.</div>
     <label style="display:flex;align-items:center;gap:8px;margin:12px 0 6px;font-weight:600"><input type="checkbox" id="nmvMaster"> &#128304; Master switch — enable ALL alerts &amp; events</label>
     <label style="display:flex;align-items:center;gap:8px;margin:4px 0"><input type="checkbox" id="nmvEvents"> &#128276; Forward all bot events (log.txt), realtime</label>
-    <div style="margin:12px 0 4px;color:#9aa0ac;font-weight:600">Scheduled alerts (IST, Mon–Fri) — 10 stocks each</div>
+    <div style="margin:12px 0 4px;color:#9aa0ac;font-weight:600">Scheduled alerts (IST, Mon–Fri) — 10 stocks each (Price Band: 10 per tier x9 tiers)</div>
     <div id="nmvAlerts"></div>
 
     <div style="margin:16px 0 6px;border-top:1px solid #2a2e39;padding-top:12px;color:#9aa0ac;font-weight:600">&#128202; Live index analysis — Nifty &amp; Sensex (TA + Open Interest)</div>
@@ -17880,7 +17948,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 (function(){
   var $=function(id){return document.getElementById(id);};
   var modal=$('nmvModal'), st=$('nmvStatus');
-  var ORDER=['brief','intraday','fno','positional','momentum','optbuy','optsell'];
+  var ORDER=['brief','intraday','fno','positional','momentum','optbuy','optsell','pricebands'];
   var UNIV=['NIFTY50','NIFTY500','NIFTY1000','FNO'];
   function say(msg,bad){ if(st){ st.textContent=msg; st.style.color=bad?'#ef5350':'#26a69a'; } }
   function post(url,b){ return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(function(r){return r.json();}); }
