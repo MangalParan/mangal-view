@@ -3089,11 +3089,14 @@ def _attach_images(messages, images):
         msgs[idx]['content'] = list(blocks) + [{'type': 'text', 'text': str(c)}]
     return msgs
 
-def _call_claude(system, messages, max_tokens=1024, model=None, images=None):
+def _call_claude(system, messages, max_tokens=1024, model=None, images=None, timeout=45):
     """Call the Anthropic Messages API via stdlib only (no SDK dependency).
     Reads ANTHROPIC_API_KEY from the environment. `model` is a panel choice
     (haiku/sonnet/opus) or full id; None uses the env default. `images` is an
-    optional list of {'media','data'} base64 chart blocks (vision). Returns (text, error)."""
+    optional list of {'media','data'} base64 chart blocks (vision). `timeout` defaults
+    to 45s (fine for every existing caller); pass a larger value for callers already
+    running in a background thread that ask for enough max_tokens to plausibly need
+    longer (e.g. many detailed picks in one call). Returns (text, error)."""
     api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
     if not api_key:
         return None, 'ANTHROPIC_API_KEY is not set on the server. Add it in your environment (Render → Environment) and redeploy.'
@@ -3110,7 +3113,7 @@ def _call_claude(system, messages, max_tokens=1024, model=None, images=None):
                                'x-api-key': api_key,
                                'anthropic-version': '2023-06-01'})
     try:
-        with _ur.urlopen(req, timeout=45) as resp:
+        with _ur.urlopen(req, timeout=timeout) as resp:
             data = _json.loads(resp.read().decode('utf-8'))
     except Exception as e:
         detail = ''
@@ -3162,6 +3165,9 @@ _TG_STATE = {
     # Live index-analysis engine (Nifty + Sensex every 15m in market hours).
     'analysis_cfg': {'on': False, 'start': '09:30', 'end': '15:30', 'everyMin': 15},
     'analysis': {},
+    # Stocks Bot panel: kind -> {picks, ts} — populated by the background thread
+    # kicked off in /api/telegram/picks_table, polled by the panel.
+    'picksTable': {},
 }
 _TG_LOCK = _threading.Lock()
 _TG_QUEUE = []
@@ -3368,25 +3374,26 @@ def _tv_nse_ticker(sym):
 _TG_SCAN_COLS = ['Recommend.All', 'RSI', 'MACD.macd', 'MACD.signal', 'ADX', 'close',
                  'Perf.3M', 'Perf.1M', 'SMA50', 'SMA200']
 
-def _tv_scan_many(tickers, interval=''):
+def _tv_scan_many(tickers, interval='', cols=None):
     """Batch TradingView TA for many NSE tickers in one request (chunked). Returns a
-    list of dicts keyed by _TG_SCAN_COLS plus 'sym'."""
+    list of dicts keyed by `cols` (default _TG_SCAN_COLS) plus 'sym'."""
     if not tickers:
         return []
+    base_cols = cols or _TG_SCAN_COLS
     suffix = '' if interval in ('', '1D') else '|' + interval
-    cols = [c + suffix for c in _TG_SCAN_COLS]
+    req_cols = [c + suffix for c in base_cols]
     import urllib.request as _ur, json as _j
     out = []
     for i in range(0, len(tickers), 280):
         chunk = tickers[i:i + 280]
-        body = _j.dumps({'symbols': {'tickers': chunk, 'query': {'types': []}}, 'columns': cols}).encode('utf-8')
+        body = _j.dumps({'symbols': {'tickers': chunk, 'query': {'types': []}}, 'columns': req_cols}).encode('utf-8')
         try:
             req = _ur.Request('https://scanner.tradingview.com/india/scan', data=body, method='POST',
                               headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
             with _ur.urlopen(req, timeout=15) as r:
                 data = _j.loads(r.read().decode('utf-8'))
             for row in (data.get('data') or []):
-                d = dict(zip(_TG_SCAN_COLS, row.get('d') or []))
+                d = dict(zip(base_cols, row.get('d') or []))
                 d['sym'] = (row.get('s') or '').split(':')[-1]
                 out.append(d)
         except Exception:
@@ -3583,6 +3590,140 @@ def _tg_pricebands_text(universe):
                 results[i] = '*{}* — error: {}'.format(_tg_priceband_label(lo, hi), str(e)[:120])
     _persist_log_line('[TELEGRAM] pricebands rows={} bands={}'.format(len(rows), len(_TG_PRICE_BANDS)))
     return title + ' — ' + _now_ist_str() + '\n\n' + '\n\n'.join(results) + '\n\n' + disclaimer
+
+# ===== Structured picks TABLE (for the "Stocks Bot" panel -> editable rows -> real =
+# orders). Separate from _tg_picks_text on purpose: that path returns prose for
+# Telegram; this one returns validated JSON with real Entry/SL/TP/Size fields a
+# table can render as editable inputs and fire straight at /api/zerodha/order.
+_TG_BOT_KINDS = ('intraday', 'fno', 'positional', 'momentum', 'pricebands')
+_TG_BOT_EXTRA_COLS = ['description', 'sector', 'market_cap_basic', 'price_earnings_ttm',
+                      'earnings_per_share_basic_ttm', 'dividend_yield_recent',
+                      'debt_to_equity', 'return_on_equity_fq', 'total_revenue_yoy_growth_ttm']
+
+def _tg_bot_shortlist(kind, universe):
+    """Ranked ~20-row shortlist, same universe scan as the prose alerts (kept as a
+    separate function so extending it never touches _tg_picks_text's behavior)."""
+    rows = _tg_scan(universe)
+    if not rows:
+        return []
+    if kind == 'momentum':
+        rows = [r for r in rows if r['perf3m'] is not None]
+        rows.sort(key=lambda r: r['perf3m'], reverse=True)
+        return rows[:20]
+    rows.sort(key=lambda r: r['score'], reverse=True)
+    return rows[:15] + rows[-5:]
+
+def _tg_bot_fundamentals(symbols):
+    """Fundamentals + name/sector for a small shortlist. Deliberately NOT requested
+    for the full universe scan (hundreds of stocks) — only cheap at shortlist size."""
+    out = {}
+    for d in _tv_scan_many([_tv_nse_ticker(s) for s in symbols], cols=_TG_BOT_EXTRA_COLS):
+        out[d.get('sym')] = d
+    return out
+
+def _tg_bot_supertrend_one(symbol):
+    try:
+        candles = fetch_tradingview_data('1d', 'NSE:' + symbol)
+        st = compute_supertrend(candles) if candles else []
+        if not st or st[-1].get('value') is None:
+            return None
+        last = st[-1]
+        return {'value': round(last['value'], 2), 'direction': 'bullish' if last['direction'] == 1 else 'bearish'}
+    except Exception:
+        return None
+
+def _tg_bot_supertrend_batch(symbols):
+    """Supertrend for a shortlist, fetched CONCURRENTLY — each call opens its own
+    TradingView WebSocket session (fetch_tradingview_data), so this does not scale
+    to the full universe, only to a small (~20 symbol) shortlist."""
+    import concurrent.futures as _cf
+    out = {}
+    if not symbols:
+        return out
+    with _cf.ThreadPoolExecutor(max_workers=min(10, len(symbols))) as ex:
+        futs = {ex.submit(_tg_bot_supertrend_one, s): s for s in symbols}
+        for fut in _cf.as_completed(futs):
+            sym = futs[fut]
+            try:
+                out[sym] = fut.result()
+            except Exception:
+                out[sym] = None
+    return out
+
+def _tg_picks_table(kind, universe):
+    """Structured positional picks for the Stocks Bot panel. Feeds Claude REAL
+    technicals + fundamentals + Supertrend and requires STRICT JSON back (same
+    validated pattern as /api/aibot/suggest_symbols) — every number in the result
+    traces back to real data, nothing here is Claude inventing a price."""
+    import json as _json, re as _re
+    rows = _tg_bot_shortlist(kind, universe)
+    if not rows:
+        return []
+    syms = [r['sym'] for r in rows]
+    fund = _tg_bot_fundamentals(syms)
+    st = _tg_bot_supertrend_batch(syms)
+    candidates = []
+    for r in rows:
+        f = fund.get(r['sym']) or {}
+        candidates.append({
+            'symbol': r['sym'], 'name': f.get('description') or r['sym'], 'sector': f.get('sector'),
+            'close': r['close'], 'rating': r['rating'], 'rsi': r['rsi'], 'adx': r['adx'],
+            'sma50': r['sma50'], 'sma200': r['sma200'], 'perf1m': r['perf1m'],
+            'supertrend': st.get(r['sym']), 'marketCap': f.get('market_cap_basic'),
+            'peRatio': f.get('price_earnings_ttm'), 'eps': f.get('earnings_per_share_basic_ttm'),
+            'dividendYield': f.get('dividend_yield_recent'), 'debtToEquity': f.get('debt_to_equity'),
+            'roe': f.get('return_on_equity_fq'), 'revenueGrowthYoy': f.get('total_revenue_yoy_growth_ttm'),
+        })
+    allow_short = kind in ('intraday', 'fno', 'positional')
+    side_note = 'a mix of BUY and SHORT' if allow_short else 'BUY ONLY (do not suggest SHORT for this alert type)'
+    hold_note = {'intraday': 'SAME DAY (intraday)', 'fno': 'SAME DAY (intraday)',
+                'positional': 'multi-day to multi-week', 'momentum': '~3 months',
+                'pricebands': 'multi-day to multi-week'}.get(kind, 'multi-day')
+    system = (
+        "You are an Indian-markets analyst picking trade setups for a LIVE order-execution table — every field "
+        "you return will be shown to the trader as an editable, orderable row, so use ONLY the real numbers given "
+        "(technicals, fundamentals, Supertrend) and never invent data. Holding style: " + hold_note + ". Side: " +
+        side_note + ". From the candidates, pick the best UP TO 10 — fewer is fine if most are weak, do not pad "
+        "with marginal setups. For EACH return: symbol, side ('BUY' or 'SHORT'), a DETAILED reason (2-4 sentences, "
+        "cite the actual technical AND fundamental numbers given, explain why this setup and why now), "
+        "fundamentalScore (0-100 judgement of valuation/quality from the given ratios, 50=average — if fundamentals "
+        "are mostly missing say so in the reason and score conservatively), technicalScore (0-100, trend/momentum "
+        "strength from rating/RSI/ADX/SMA/Supertrend agreement), entry (price), exit (a short plan string, e.g. "
+        "'at TP or after 12 trading days, whichever first'), sl (stop-loss price), tp (target price), size "
+        "(suggested share quantity sized for a moderate ~Rs.15,000-30,000 position at the given entry). Respond "
+        "STRICT JSON ONLY, no prose outside the JSON: {\"picks\":[{\"symbol\":\"\",\"side\":\"\",\"reason\":\"\","
+        "\"fundamentalScore\":0,\"technicalScore\":0,\"entry\":0,\"exit\":\"\",\"sl\":0,\"tp\":0,\"size\":0}]}")
+    user = _json.dumps({'universe': universe, 'asOf': _now_ist_str(), 'candidates': candidates}, default=str)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=3000, model='sonnet', timeout=100)
+    if err:
+        _persist_log_line('[TELEGRAM] picks_table {} aiErr={}'.format(kind, err))
+        return []
+    try:
+        obj = _json.loads(_re.search(r'\{.*\}', text or '', _re.DOTALL).group(0))
+    except Exception as e:
+        _persist_log_line('[TELEGRAM] picks_table {} parseErr={}'.format(kind, str(e)[:120]))
+        return []
+    by_sym = {c['symbol']: c for c in candidates}
+    out = []
+    for p in (obj.get('picks') or []):
+        c = by_sym.get(p.get('symbol'))
+        if not c:
+            continue
+        side = 'SHORT' if str(p.get('side', 'BUY')).upper() == 'SHORT' else 'BUY'
+        if not allow_short and side == 'SHORT':
+            continue
+        out.append({
+            'symbol': c['symbol'], 'name': c['name'], 'sector': c['sector'], 'side': side,
+            'reason': str(p.get('reason', ''))[:1000],
+            'fundamentalScore': max(0, min(100, int(p.get('fundamentalScore', 0) or 0))),
+            'technicalScore': max(0, min(100, int(p.get('technicalScore', 0) or 0))),
+            'rsi': c['rsi'], 'adx': c['adx'], 'sma50': c['sma50'], 'sma200': c['sma200'],
+            'supertrend': c['supertrend'],
+            'entry': p.get('entry'), 'exit': p.get('exit'), 'sl': p.get('sl'), 'tp': p.get('tp'),
+            'size': max(1, int(p.get('size', 1) or 1)),
+        })
+    _persist_log_line('[TELEGRAM] picks_table {} candidates={} picks={}'.format(kind, len(candidates), len(out)))
+    return out[:10]
 
 # alert kind -> text builder. Scheduled alerts get the "- MangalView" sign-off;
 # log.txt event forwarding goes through _tg_flush_loop and is NOT signed.
@@ -3859,6 +4000,37 @@ def telegram_send_alert():
     txt = _tg_alert_text(kind, universe)
     ok, err = _tg_send(txt)
     return jsonify({'success': ok, 'error': err, 'preview': txt[:4000]})
+
+@app.route('/api/telegram/picks_table', methods=['POST'])
+@login_required
+def telegram_picks_table():
+    """Kick off the Stocks Bot's structured picks build in the BACKGROUND and return
+    immediately — batch scan + a shortlist-sized fundamentals fetch + ~20 concurrent
+    Supertrend WebSocket calls + one Claude JSON call is too slow for a synchronous
+    response (same class of gateway-timeout risk fixed for index-analysis). The panel
+    polls /api/telegram/picks_table/status for the result."""
+    data = request.json or {}
+    kind = (data.get('kind') or '').strip()
+    if kind not in _TG_BOT_KINDS:
+        return jsonify({'success': False, 'error': 'unknown kind'}), 400
+    universe = (data.get('universe') or (_TG_STATE.get('alerts', {}).get(kind, {}) or {}).get('universe') or 'NIFTY500')
+
+    def _bg():
+        try:
+            picks = _tg_picks_table(kind, universe)
+        except Exception as e:
+            picks = []
+            _persist_log_line('[TELEGRAM] picks_table {} error={}'.format(kind, str(e)[:160]))
+        _TG_STATE.setdefault('picksTable', {})[kind] = {'picks': picks, 'ts': int(_zd_time.time())}
+    _threading.Thread(target=_bg, daemon=True, name='tg-picks-table-' + kind).start()
+    return jsonify({'success': True, 'started': True})
+
+@app.route('/api/telegram/picks_table/status')
+@login_required
+def telegram_picks_table_status():
+    kind = (request.args.get('kind') or '').strip()
+    entry = (_TG_STATE.get('picksTable') or {}).get(kind) or {}
+    return jsonify({'success': True, 'picks': entry.get('picks') or [], 'ts': entry.get('ts') or 0})
 
 @app.route('/api/telegram/analysis/start', methods=['POST'])
 @login_required
@@ -17950,6 +18122,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   var modal=$('nmvModal'), st=$('nmvStatus');
   var ORDER=['brief','intraday','fno','positional','momentum','optbuy','optsell','pricebands'];
   var UNIV=['NIFTY50','NIFTY500','NIFTY1000','FNO'];
+  var BOT_KINDS=['intraday','fno','positional','momentum','pricebands'];
   function say(msg,bad){ if(st){ st.textContent=msg; st.style.color=bad?'#ef5350':'#26a69a'; } }
   function post(url,b){ return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(function(r){return r.json();}); }
   function esc(v){return String(v==null?'':v);}
@@ -17959,14 +18132,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       var a=alerts[k]||{}; var row=document.createElement('div');
       row.style.cssText='display:flex;align-items:center;gap:6px;margin:5px 0;flex-wrap:wrap';
       var uni=(k==='brief'||k==='fno')?'':'<select data-uni="'+k+'" style="background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:2px">'+UNIV.map(function(u){return '<option'+(a.universe===u?' selected':'')+'>'+u+'</option>';}).join('')+'</select>';
+      var botBtn=(BOT_KINDS.indexOf(k)>=0)?'<button type="button" data-bot="'+k+'" title="Open editable picks table + Zerodha order execution" style="background:#26a69a;color:#fff;border:none;border-radius:4px;padding:3px 9px;font-size:11px;cursor:pointer">Bot</button>':'';
       row.innerHTML='<label style="flex:1;min-width:140px;display:flex;align-items:center;gap:6px;font-size:12px"><input type="checkbox" data-on="'+k+'"'+(a.on?' checked':'')+'> '+esc(labels[k]||k)+'</label>'+
         '<input type="time" data-time="'+k+'" value="'+esc(a.time||'09:30')+'" style="background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:2px">'+uni+
-        '<button type="button" data-now="'+k+'" style="background:#5b8def;color:#fff;border:none;border-radius:4px;padding:3px 9px;font-size:11px;cursor:pointer">Send</button>';
+        '<button type="button" data-now="'+k+'" style="background:#5b8def;color:#fff;border:none;border-radius:4px;padding:3px 9px;font-size:11px;cursor:pointer">Send</button>'+botBtn;
       w.appendChild(row);
     });
     Array.prototype.forEach.call(w.querySelectorAll('[data-now]'),function(b){
       b.addEventListener('click',function(){ var k=b.getAttribute('data-now'); say('Generating '+k+' (Claude + TradingView)…');
         post('/api/telegram/send_alert',{kind:k}).then(function(d){ say((d&&d.success?'Sent ✓\n\n':'Failed: '+((d&&d.error)||'?')+'\n\n')+((d&&d.preview)||''),!(d&&d.success)); }).catch(function(e){say('Error: '+e.message,true);});
+      });
+    });
+    Array.prototype.forEach.call(w.querySelectorAll('[data-bot]'),function(b){
+      b.addEventListener('click',function(){
+        var k=b.getAttribute('data-bot'); var uniSel=w.querySelector('[data-uni="'+k+'"]');
+        if(window.openStocksBot) window.openStocksBot(k, uniSel?uniSel.value:'NIFTY500');
       });
     });
   }
@@ -19618,6 +19798,44 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <input type="text" id="zoChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
           <button class="dbot-chat-send" id="zoChatSend">Send</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stocks Bot Panel: editable picks table -> Zerodha order execution -->
+  <div class="zerodha-panel" id="stocksBotPanel" style="width:1180px;display:none">
+    <div class="zd-header" id="stocksBotHeader">
+      <h3><span style="color:#26a69a">&#128202;</span> Stocks Bot &mdash; <span id="stocksBotKindLabel">Picks</span></h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="stocksBotMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="stocksBotPopoutBtn"   title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="stocksBotClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div class="zd-status-bar" id="stocksBotStatusBar" style="margin-bottom:10px">
+        <span class="zd-status-dot" id="stocksBotStatusDot"></span>
+        <span id="stocksBotStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live orders (Paper mode works without a connection)</span>
+      </div>
+      <div class="ai-disclaimer">
+        <b>&#9888; Reality check:</b> picks are Claude's read of technical + fundamental data, not investment advice.
+        Review and edit every field before placing an order. SHORT rows are display-only &mdash; short-selling
+        equity isn't supported from this panel. Always paper trade first.
+      </div>
+      <div class="ai-mode-bar">
+        <label><input type="radio" name="stocksBotMode" value="paper" checked> &#128221; Paper Trading <span style="color:#787b86;font-size:11px">(simulated, no Kite orders)</span></label>
+        <label class="live"><input type="radio" name="stocksBotMode" value="live"> &#9888; Live Trading <span style="color:#787b86;font-size:11px">(real Kite orders)</span></label>
+      </div>
+      <div id="stocksBotSummary" style="font-size:12px;color:#9aa0aa;margin:6px 0"></div>
+      <div class="zd-table-wrap">
+        <table class="zd-table">
+          <thead><tr>
+            <th>Name</th><th>Symbol</th><th>Sector</th><th>Side</th><th>Reason</th>
+            <th>Fund.</th><th>Tech.</th><th>Supertrend</th><th>RSI</th><th>ADX</th>
+            <th>SMA50</th><th>SMA200</th><th>Entry</th><th>Exit</th><th>SL</th><th>TP</th><th>Size</th><th>Order</th>
+          </tr></thead>
+          <tbody id="stocksBotBody"><tr><td colspan="18" style="text-align:center;padding:20px;color:#787b86">Click Bot on an alert row to load picks.</td></tr></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -26833,6 +27051,150 @@ HTML_PAGE = r"""<!DOCTYPE html>
     })();
 
     refreshStatus();
+  })();
+
+  // ---- Stocks Bot Panel: editable picks table -> Zerodha order execution ----
+  (function() {
+    const panel = document.getElementById('stocksBotPanel');
+    if (!panel) return;
+    const closeBtn   = document.getElementById('stocksBotClose');
+    const maxBtn     = document.getElementById('stocksBotMaximizeBtn');
+    const popBtn     = document.getElementById('stocksBotPopoutBtn');
+    const statusDot  = document.getElementById('stocksBotStatusDot');
+    const statusText = document.getElementById('stocksBotStatusText');
+    const kindLabel  = document.getElementById('stocksBotKindLabel');
+    const summaryEl  = document.getElementById('stocksBotSummary');
+    const bodyEl     = document.getElementById('stocksBotBody');
+    const MIS_KINDS  = ['intraday', 'fno'];
+    let botMaximized = false;
+    let rows = [];              // current picks — mutated in place by cell edits
+    let curKind = '', curUniverse = '';
+
+    function esc(v) { return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function fmtSt(s) { return s ? ((s.direction === 'bullish' ? '&#9650; ' : '&#9660; ') + esc(s.value)) : '—'; }
+    function currentMode() { const el = panel.querySelector('input[name=stocksBotMode]:checked'); return el ? el.value : 'paper'; }
+
+    function refreshConn() {
+      const s = ZerodhaStore.getSession();
+      _liveConn({ url: '/api/zerodha/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
+        connectedHTML: 'Connected &mdash; ' + esc(s.apiKey || '') + ' (live orders enabled)',
+        disconnectedHTML: 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live orders (Paper mode works without a connection)' });
+    }
+
+    function bindRowEvents() {
+      bodyEl.querySelectorAll('.zd-cell').forEach(function(el) {
+        el.addEventListener('change', function() {
+          const i = parseInt(el.getAttribute('data-row-idx'), 10);
+          const f = el.getAttribute('data-field');
+          if (!rows[i]) return;
+          rows[i][f] = (f === 'exit' || f === 'reason') ? el.value : (parseFloat(el.value) || 0);
+        });
+      });
+      bodyEl.querySelectorAll('[data-place]').forEach(function(btn) {
+        btn.addEventListener('click', function() { placeOrder(parseInt(btn.getAttribute('data-row-idx'), 10)); });
+      });
+    }
+
+    function render() {
+      if (!rows.length) {
+        bodyEl.innerHTML = '<tr><td colspan="18" style="text-align:center;padding:20px;color:#787b86">No picks — try again, or a different alert/universe.</td></tr>';
+        return;
+      }
+      bodyEl.innerHTML = rows.map(function(r, i) {
+        const sideCol = r.side === 'SHORT' ? '#ef5350' : '#26a69a';
+        const disabled = r.side === 'SHORT';
+        return '<tr>'
+          + '<td>' + esc(r.name) + '</td>'
+          + '<td class="zd-cell-sym">' + esc(r.symbol) + '</td>'
+          + '<td>' + esc(r.sector || '—') + '</td>'
+          + '<td><span style="color:' + sideCol + ';font-weight:700">' + esc(r.side) + '</span></td>'
+          + '<td style="max-width:260px"><textarea class="zd-cell" data-row-idx="' + i + '" data-field="reason" rows="2" '
+          + 'style="width:100%;min-width:220px;resize:vertical;background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:4px">' + esc(r.reason) + '</textarea></td>'
+          + '<td><input class="zd-cell zd-cell-score" data-row-idx="' + i + '" data-field="fundamentalScore" type="number" min="0" max="100" value="' + esc(r.fundamentalScore) + '"></td>'
+          + '<td><input class="zd-cell zd-cell-score" data-row-idx="' + i + '" data-field="technicalScore" type="number" min="0" max="100" value="' + esc(r.technicalScore) + '"></td>'
+          + '<td>' + fmtSt(r.supertrend) + '</td>'
+          + '<td>' + esc(r.rsi) + '</td>'
+          + '<td>' + esc(r.adx) + '</td>'
+          + '<td>' + esc(r.sma50) + '</td>'
+          + '<td>' + esc(r.sma200) + '</td>'
+          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="entry" type="number" step="0.05" value="' + esc(r.entry) + '"></td>'
+          + '<td><input class="zd-cell" data-row-idx="' + i + '" data-field="exit" type="text" style="width:150px" value="' + esc(r.exit) + '"></td>'
+          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="sl" type="number" step="0.05" value="' + esc(r.sl) + '"></td>'
+          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="tp" type="number" step="0.05" value="' + esc(r.tp) + '"></td>'
+          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="size" type="number" min="1" step="1" value="' + esc(r.size) + '"></td>'
+          + '<td><button type="button" class="zd-row-upd" data-row-idx="' + i + '" data-place' + (disabled ? ' disabled title="Short-selling not supported here"' : '') + '>' + (disabled ? '—' : 'Place') + '</button>'
+          + '<div style="font-size:10px;color:#787b86;margin-top:3px" id="stocksBotMsg' + i + '"></div></td>'
+          + '</tr>';
+      }).join('');
+      bindRowEvents();
+    }
+
+    function placeOrder(i) {
+      const r = rows[i];
+      if (!r || r.side === 'SHORT') return;
+      const s = ZerodhaStore.getSession();
+      const isLive = currentMode() === 'live';
+      if (isLive && !s.connected) { alert('Connect Zerodha first (see the status bar above) before placing a live order.'); return; }
+      const qty = Math.max(1, parseInt(r.size, 10) || 1);
+      const product = MIS_KINDS.indexOf(curKind) >= 0 ? 'MIS' : 'CNC';
+      if (isLive && !confirm('Place LIVE BUY order: ' + qty + ' ' + r.symbol + ' @ ' + r.entry + ' (' + product + ')?')) return;
+      const msgEl = document.getElementById('stocksBotMsg' + i);
+      if (msgEl) msgEl.textContent = 'Placing…';
+      fetch('/api/zerodha/order', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: s.apiKey, symbol: r.symbol, exchange: 'NSE', side: 'BUY', qty: qty,
+          product: product, order_type: 'LIMIT', price: r.entry, dry_run: !isLive,
+          algo: 'stocksBot:' + curKind, score: r.technicalScore }) })
+        .then(function(resp) { return resp.json(); })
+        .then(function(d) {
+          if (msgEl) msgEl.textContent = (d && d.success)
+            ? ((d.dry_run ? 'Paper ' : 'Live ') + 'order ' + (d.orderId || '?'))
+            : ('Failed: ' + ((d && d.error) || '?'));
+        })
+        .catch(function(e) { if (msgEl) msgEl.textContent = 'Error: ' + e.message; });
+    }
+
+    function poll(kind, before, tries) {
+      fetch('/api/telegram/picks_table/status?kind=' + encodeURIComponent(kind)).then(function(r) { return r.json(); }).then(function(d) {
+        if (d && d.ts && d.ts !== before) {
+          rows = (d.picks || []).map(function(p) { const o = {}; for (const k in p) o[k] = p[k]; return o; });
+          summaryEl.textContent = rows.length ? (rows.length + ' picks generated — every field is editable before you place an order.') : 'No strong setups came back — try again later or a different universe.';
+          render();
+          return;
+        }
+        if (tries > 30) { summaryEl.textContent = 'Still generating — this can take up to a minute (fundamentals + Supertrend + Claude). Leave this open.'; return; }
+        setTimeout(function() { poll(kind, before, tries + 1); }, 3000);
+      }).catch(function() { if (tries < 30) setTimeout(function() { poll(kind, before, tries + 1); }, 3000); });
+    }
+
+    window.openStocksBot = function(kind, universe) {
+      curKind = kind; curUniverse = universe || 'NIFTY500';
+      kindLabel.textContent = kind.charAt(0).toUpperCase() + kind.slice(1);
+      panel.style.display = 'block'; panel.classList.add('open');
+      rows = []; render();
+      summaryEl.textContent = 'Generating picks — scanning market, fundamentals, Supertrend + Claude… ~30-60s.';
+      refreshConn();
+      fetch('/api/telegram/picks_table/status?kind=' + encodeURIComponent(kind)).then(function(r) { return r.json(); }).then(function(s0) {
+        const before = (s0 && s0.ts) || 0;
+        fetch('/api/telegram/picks_table', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: kind, universe: curUniverse }) })
+          .then(function(r) { return r.json(); })
+          .then(function(d) { if (!d || !d.success) { summaryEl.textContent = 'Failed to start: ' + ((d && d.error) || '?'); return; } poll(kind, before, 0); })
+          .catch(function(e) { summaryEl.textContent = 'Error: ' + e.message; });
+      }).catch(function() { poll(kind, 0, 0); });
+    };
+
+    closeBtn.addEventListener('click', function() { panel.style.display = 'none'; panel.classList.remove('open'); });
+    maxBtn.addEventListener('click', function() {
+      botMaximized = !botMaximized; panel.classList.toggle('maximized', botMaximized);
+      this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
+    });
+    popBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href); url.searchParams.set('stocksBotPopout', '1');
+      window.open(url.toString(), 'stocksBotPopout', 'width=1300,height=900,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('stocksBotPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window'); panel.classList.add('open'); panel.style.display = 'block';
+    }
   })();
 
   // ---- MT5 shared store (mirrors ZerodhaStore) ----
