@@ -3527,6 +3527,120 @@ def _tg_optpicks_text(kind, universe):
         return title + ' — ' + _now_ist_str() + '\n\n(AI unavailable: ' + err + ')\n\n' + snap + '\n\n' + disclaimer
     return title + ' — ' + _now_ist_str() + '\n\n' + (text or '').strip() + '\n\n' + disclaimer
 
+# ===== Options Bot: structured optbuy/optsell picks with REAL strike/expiry/lot/
+# premium (for the Stocks Bot panel's options table -> real Zerodha F&O orders).
+# Unlike _tg_optpicks_text (deliberately strike-less prose, since NSE's anonymous
+# per-stock chain proved unreliable), this uses the SAME reliable Kite-instrument
+# infra the Zerodha Options bot already trades on (_zo_load_opt_instruments /
+# _zo_lot_size / _bot_fetch_candles) — which needs an authenticated session, so
+# this path requires a connected api_key (the equity picks table does not).
+def _tg_opt_resolve_leg(symbol, spot, opt_type, api_key):
+    """ATM option leg (tradingsymbol/strike/expiry/lotSize/premium) for a stock's
+    nearest F&O expiry. None on any failure — never raises."""
+    if not api_key or spot is None or spot <= 0:
+        return None
+    try:
+        chain_all = [i for i in _zo_load_opt_instruments('NFO') if (i.get('name') or '').upper() == symbol]
+        if not chain_all:
+            return None
+        today = datetime.now().strftime('%Y-%m-%d')
+        expiries = sorted({i['expiry'] for i in chain_all if i.get('expiry') and i['expiry'] >= today})
+        if not expiries:
+            return None
+        expiry = expiries[0]
+        chain = [i for i in chain_all if i.get('expiry') == expiry and i.get('type') == opt_type]
+        strikes = sorted({i['strike'] for i in chain if i.get('strike', 0) > 0})
+        if not strikes:
+            return None
+        atm = min(strikes, key=lambda s: abs(s - spot))
+        row = next((i for i in chain if abs(i['strike'] - atm) < 1e-6), None)
+        if not row or not row.get('symbol'):
+            return None
+        lot_size = int(float(row.get('lot_size') or 0)) or _zo_lot_size(row['symbol'], 'NFO', symbol)
+        premium = None
+        try:
+            candles = _bot_fetch_candles(row['symbol'], '5m', 'kite', api_key=api_key)
+            if candles:
+                premium = round(float(candles[-1]['close']), 2)
+        except Exception:
+            pass
+        dte = (datetime.strptime(expiry, '%Y-%m-%d').date() - datetime.now().date()).days
+        return {'tradingsymbol': row['symbol'], 'strike': atm, 'expiry': expiry, 'dte': dte,
+                'lotSize': lot_size, 'premium': premium}
+    except Exception:
+        return None
+
+def _tg_optpicks_table(kind, universe, api_key):
+    """Structured optbuy (bullish->CE) / optsell (bearish->PE) picks with real
+    resolved strike/expiry/lot/premium. Returns {'picks': [...], 'error': str|None}
+    — error is set (picks empty) when there's no connected Kite session, since
+    strike/premium resolution needs one; the caller surfaces it in the panel."""
+    import json as _json, re as _re
+    if not api_key or api_key not in zerodha_sessions:
+        return {'picks': [], 'error': 'Connect Zerodha first — options picks need a live Kite session for strike/premium data.'}
+    bullish = (kind == 'optbuy')
+    opt_type = 'CE' if bullish else 'PE'
+    rows = _tg_optpicks_snapshot(universe)
+    if not rows:
+        return {'picks': [], 'error': 'No data available right now.'}
+    rows.sort(key=lambda r: r['score'], reverse=bullish)
+    candidates = []
+    for r in rows[:20]:
+        leg = _tg_opt_resolve_leg(r['sym'], r.get('close'), opt_type, api_key)
+        if not leg:
+            continue
+        candidates.append({
+            'symbol': r['sym'], 'tradingsymbol': leg['tradingsymbol'], 'type': opt_type,
+            'spot': r['close'], 'rating': r['rating'], 'rsi': r['rsi'], 'adx': r['adx'],
+            'sma50': r['sma50'], 'sma200': r['sma200'], 'perf1m': r['perf1m'],
+            'strike': leg['strike'], 'expiry': leg['expiry'], 'dte': leg['dte'],
+            'lotSize': leg['lotSize'], 'premium': leg['premium'],
+        })
+        if len(candidates) >= 10:
+            break
+    if not candidates:
+        return {'picks': [], 'error': 'No F&O stocks with a resolvable option leg right now (check the Kite connection / IP whitelist).'}
+    side_note = 'BULLISH — buying CALL (CE) options' if bullish else 'BEARISH — buying PUT (PE) options'
+    system = (
+        "You are an Indian-markets derivatives analyst picking POSITIONAL (multi-day hold) option-BUYING setups "
+        "for a live order-execution table — never option-writing/selling. Bias: " + side_note + ". You are given "
+        "REAL resolved option legs (strike, expiry, days-to-expiry 'dte', lot size, live premium — may be null if "
+        "unavailable) plus the underlying's technicals. Use ONLY these numbers, never invent a strike or premium. "
+        "Pick the best up to 10 (fewer if most are weak — do not pad). For EACH return: symbol, a DETAILED reason "
+        "(2-4 sentences, cite the actual numbers, explain why this setup and why now), technicalScore (0-100, "
+        "trend/momentum strength), entry (near the given live premium — if premium is null, estimate conservatively "
+        "and say so in the reason), exit (a short plan string, e.g. 'at TP or after 10 trading days, whichever "
+        "first' — must stay clear of dte), sl (stop-loss PREMIUM), tp (target PREMIUM), lots (suggested integer "
+        "lot count, usually 1-2 for a moderate position). Respond STRICT JSON ONLY: {\"picks\":[{\"symbol\":\"\","
+        "\"reason\":\"\",\"technicalScore\":0,\"entry\":0,\"exit\":\"\",\"sl\":0,\"tp\":0,\"lots\":1}]}")
+    user = _json.dumps({'universe': universe, 'asOf': _now_ist_str(), 'candidates': candidates}, default=str)
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=2500, model='sonnet', timeout=100)
+    if err:
+        _persist_log_line('[TELEGRAM] optpicks_table {} aiErr={}'.format(kind, err))
+        return {'picks': [], 'error': 'AI unavailable: ' + err}
+    try:
+        obj = _json.loads(_re.search(r'\{.*\}', text or '', _re.DOTALL).group(0))
+    except Exception as e:
+        _persist_log_line('[TELEGRAM] optpicks_table {} parseErr={}'.format(kind, str(e)[:120]))
+        return {'picks': [], 'error': 'Could not parse the AI reply.'}
+    by_sym = {c['symbol']: c for c in candidates}
+    out = []
+    for p in (obj.get('picks') or []):
+        c = by_sym.get(p.get('symbol'))
+        if not c:
+            continue
+        out.append({
+            'symbol': c['symbol'], 'tradingsymbol': c['tradingsymbol'], 'type': c['type'],
+            'reason': str(p.get('reason', ''))[:1000],
+            'technicalScore': max(0, min(100, int(p.get('technicalScore', 0) or 0))),
+            'rsi': c['rsi'], 'adx': c['adx'], 'sma50': c['sma50'], 'sma200': c['sma200'],
+            'strike': c['strike'], 'expiry': c['expiry'], 'dte': c['dte'], 'lotSize': c['lotSize'],
+            'entry': p.get('entry'), 'exit': p.get('exit'), 'sl': p.get('sl'), 'tp': p.get('tp'),
+            'lots': max(1, int(p.get('lots', 1) or 1)),
+        })
+    _persist_log_line('[TELEGRAM] optpicks_table {} candidates={} picks={}'.format(kind, len(candidates), len(out)))
+    return {'picks': out[:10], 'error': None}
+
 # ===== Positional BUY by price band (9 tiers, ~10 picks each) ===================
 # Non-overlapping price tiers spanning Rs.0-2000, so results don't repeat the same
 # stock across bands (a literal "less than X" reading for every threshold would
@@ -3595,7 +3709,8 @@ def _tg_pricebands_text(universe):
 # orders). Separate from _tg_picks_text on purpose: that path returns prose for
 # Telegram; this one returns validated JSON with real Entry/SL/TP/Size fields a
 # table can render as editable inputs and fire straight at /api/zerodha/order.
-_TG_BOT_KINDS = ('intraday', 'fno', 'positional', 'momentum', 'pricebands')
+_TG_BOT_KINDS = ('intraday', 'fno', 'positional', 'momentum', 'pricebands', 'optbuy', 'optsell')
+_TG_OPT_BOT_KINDS = ('optbuy', 'optsell')
 _TG_BOT_EXTRA_COLS = ['description', 'sector', 'market_cap_basic', 'price_earnings_ttm',
                       'earnings_per_share_basic_ttm', 'dividend_yield_recent',
                       'debt_to_equity', 'return_on_equity_fq', 'total_revenue_yoy_growth_ttm']
@@ -4006,22 +4121,33 @@ def telegram_send_alert():
 def telegram_picks_table():
     """Kick off the Stocks Bot's structured picks build in the BACKGROUND and return
     immediately — batch scan + a shortlist-sized fundamentals fetch + ~20 concurrent
-    Supertrend WebSocket calls + one Claude JSON call is too slow for a synchronous
-    response (same class of gateway-timeout risk fixed for index-analysis). The panel
-    polls /api/telegram/picks_table/status for the result."""
+    Supertrend WebSocket calls (equity) or strike/expiry/premium resolution (options)
+    + one Claude JSON call is too slow for a synchronous response (same class of
+    gateway-timeout risk fixed for index-analysis). The panel polls
+    /api/telegram/picks_table/status for the result. optbuy/optsell need `api_key`
+    (a connected Kite session) since strike/premium resolution requires one —
+    checked synchronously here so a "not connected" error is immediate, not after
+    a poll cycle."""
     data = request.json or {}
     kind = (data.get('kind') or '').strip()
     if kind not in _TG_BOT_KINDS:
         return jsonify({'success': False, 'error': 'unknown kind'}), 400
     universe = (data.get('universe') or (_TG_STATE.get('alerts', {}).get(kind, {}) or {}).get('universe') or 'NIFTY500')
+    api_key = (data.get('api_key') or '').strip()
+    if kind in _TG_OPT_BOT_KINDS and (not api_key or api_key not in zerodha_sessions):
+        return jsonify({'success': False, 'error': 'Connect Zerodha first — options picks need a live Kite session.'}), 400
 
     def _bg():
         try:
-            picks = _tg_picks_table(kind, universe)
+            if kind in _TG_OPT_BOT_KINDS:
+                result = _tg_optpicks_table(kind, universe, api_key)
+                picks, err = result.get('picks') or [], result.get('error')
+            else:
+                picks, err = _tg_picks_table(kind, universe), None
         except Exception as e:
-            picks = []
+            picks, err = [], str(e)[:200]
             _persist_log_line('[TELEGRAM] picks_table {} error={}'.format(kind, str(e)[:160]))
-        _TG_STATE.setdefault('picksTable', {})[kind] = {'picks': picks, 'ts': int(_zd_time.time())}
+        _TG_STATE.setdefault('picksTable', {})[kind] = {'picks': picks, 'error': err, 'ts': int(_zd_time.time())}
     _threading.Thread(target=_bg, daemon=True, name='tg-picks-table-' + kind).start()
     return jsonify({'success': True, 'started': True})
 
@@ -4030,7 +4156,38 @@ def telegram_picks_table():
 def telegram_picks_table_status():
     kind = (request.args.get('kind') or '').strip()
     entry = (_TG_STATE.get('picksTable') or {}).get(kind) or {}
-    return jsonify({'success': True, 'picks': entry.get('picks') or [], 'ts': entry.get('ts') or 0})
+    return jsonify({'success': True, 'picks': entry.get('picks') or [], 'error': entry.get('error'), 'ts': entry.get('ts') or 0})
+
+@app.route('/api/telegram/quote')
+@login_required
+def telegram_quote():
+    """Single-symbol current-price lookup for the Stocks Bot panel's P&L column
+    (polled periodically for rows where an order was placed). kind=equity uses the
+    no-auth TradingView single-symbol fetch (same source the picks screen already
+    uses); kind=option needs a connected Kite session since it's a live option
+    premium, read the same way the Options Bot panel already does."""
+    symbol = (request.args.get('symbol') or '').strip().upper()
+    kind = (request.args.get('kind') or 'equity').strip()
+    if not symbol:
+        return jsonify({'success': False, 'error': 'symbol required'}), 400
+    price = None
+    if kind == 'option':
+        api_key = (request.args.get('api_key') or '').strip()
+        if not api_key or api_key not in zerodha_sessions:
+            return jsonify({'success': False, 'error': 'not connected'}), 400
+        try:
+            candles = _bot_fetch_candles(symbol, '5m', 'kite', api_key=api_key)
+            if candles:
+                price = round(float(candles[-1]['close']), 2)
+        except Exception:
+            price = None
+    else:
+        ta = _tv_fetch_ta(_tv_nse_ticker(symbol), '1D') or _tv_fetch_ta(_tv_nse_ticker(symbol), '')
+        if ta and ta.get('close') is not None:
+            price = ta.get('close')
+    if price is None:
+        return jsonify({'success': False, 'error': 'no price available'}), 502
+    return jsonify({'success': True, 'price': price})
 
 @app.route('/api/telegram/analysis/start', methods=['POST'])
 @login_required
@@ -18122,7 +18279,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   var modal=$('nmvModal'), st=$('nmvStatus');
   var ORDER=['brief','intraday','fno','positional','momentum','optbuy','optsell','pricebands'];
   var UNIV=['NIFTY50','NIFTY500','NIFTY1000','FNO'];
-  var BOT_KINDS=['intraday','fno','positional','momentum','pricebands'];
+  var BOT_KINDS=['intraday','fno','positional','momentum','pricebands','optbuy','optsell'];
   function say(msg,bad){ if(st){ st.textContent=msg; st.style.color=bad?'#ef5350':'#26a69a'; } }
   function post(url,b){ return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(function(r){return r.json();}); }
   function esc(v){return String(v==null?'':v);}
@@ -19829,7 +19986,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="stocksBotSummary" style="font-size:12px;color:#9aa0aa;margin:6px 0"></div>
       <div class="zd-table-wrap">
         <table class="zd-table">
-          <thead><tr>
+          <thead id="stocksBotHead"><tr>
             <th>Name</th><th>Symbol</th><th>Sector</th><th>Side</th><th>Reason</th>
             <th>Fund.</th><th>Tech.</th><th>Supertrend</th><th>RSI</th><th>ADX</th>
             <th>SMA50</th><th>SMA200</th><th>Entry</th><th>Exit</th><th>SL</th><th>TP</th><th>Size</th><th>Order</th>
@@ -27054,6 +27211,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   })();
 
   // ---- Stocks Bot Panel: editable picks table -> Zerodha order execution ----
+  // Handles BOTH the 5 equity kinds (intraday/fno/positional/momentum/pricebands,
+  // BUY+SHORT stock rows) and the 2 options kinds (optbuy/optsell, always-BUY
+  // CE/PE rows with strike/lots/lotSize) — table columns + order body differ per
+  // kind, everything else (poll/open/close/chrome/P&L) is shared. Rows come from
+  // TWO arrays: `rows` (AI picks, keys 'p0'..) and `manualRows` (4 always-present
+  // blank editable rows, keys 'm0'..'m3', so any symbol can be traded even
+  // without/beyond the AI screen).
   (function() {
     const panel = document.getElementById('stocksBotPanel');
     if (!panel) return;
@@ -27064,104 +27228,279 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const statusText = document.getElementById('stocksBotStatusText');
     const kindLabel  = document.getElementById('stocksBotKindLabel');
     const summaryEl  = document.getElementById('stocksBotSummary');
+    const headEl     = document.getElementById('stocksBotHead');
     const bodyEl     = document.getElementById('stocksBotBody');
     const MIS_KINDS  = ['intraday', 'fno'];
+    const OPT_KINDS  = ['optbuy', 'optsell'];
+    const MANUAL_ROWS = 4;
+    const EQUITY_HEAD = '<tr><th>Name</th><th>Symbol</th><th>Sector</th><th>Side</th><th>Reason</th>'
+      + '<th>Fund.</th><th>Tech.</th><th>Supertrend</th><th>RSI</th><th>ADX</th><th>SMA50</th><th>SMA200</th>'
+      + '<th>Entry</th><th>Exit</th><th>SL</th><th>TP</th><th>Size</th><th>Order</th><th>P&amp;L</th></tr>';
+    const OPT_HEAD = '<tr><th>Symbol</th><th>Type</th><th>Reason</th><th>Tech.</th><th>RSI</th><th>ADX</th>'
+      + '<th>SMA50</th><th>SMA200</th><th>Strike</th><th>Lots</th><th>Lot Size</th>'
+      + '<th>Entry</th><th>Exit</th><th>SL</th><th>TP</th><th>Order</th><th>P&amp;L</th></tr>';
     let botMaximized = false;
-    let rows = [];              // current picks — mutated in place by cell edits
+    let rows = [];              // AI picks — mutated in place by cell edits
+    let manualRows = [];        // 4 blank editable rows — see resetManualRows()
     let curKind = '', curUniverse = '';
+    let pnlTimer = null;
 
     function esc(v) { return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
     function fmtSt(s) { return s ? ((s.direction === 'bullish' ? '&#9650; ' : '&#9660; ') + esc(s.value)) : '—'; }
     function currentMode() { const el = panel.querySelector('input[name=stocksBotMode]:checked'); return el ? el.value : 'paper'; }
+    function isOptKind() { return OPT_KINDS.indexOf(curKind) >= 0; }
+    function getRow(key) { return key.charAt(0) === 'm' ? manualRows[parseInt(key.slice(1), 10)] : rows[parseInt(key.slice(1), 10)]; }
+
+    function blankEquityRow() {
+      return { symbol: '', name: '', sector: '', side: 'BUY', reason: '', fundamentalScore: '', technicalScore: '',
+        supertrend: null, rsi: '', adx: '', sma50: '', sma200: '', entry: '', exit: '', sl: '', tp: '', size: 1,
+        placed: false, placedEntry: null, placedQty: null, lastPnl: null };
+    }
+    function blankOptRow() {
+      return { symbol: '', tradingsymbol: '', type: curKind === 'optsell' ? 'PE' : 'CE', reason: '', technicalScore: '',
+        rsi: '', adx: '', sma50: '', sma200: '', strike: '', expiry: '', dte: '', lotSize: 1, lots: 1,
+        entry: '', exit: '', sl: '', tp: '', placed: false, placedEntry: null, placedQty: null, lastPnl: null };
+    }
+    function resetManualRows() {
+      manualRows = []; for (let n = 0; n < MANUAL_ROWS; n++) manualRows.push(isOptKind() ? blankOptRow() : blankEquityRow());
+    }
 
     function refreshConn() {
       const s = ZerodhaStore.getSession();
       _liveConn({ url: '/api/zerodha/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
         connectedHTML: 'Connected &mdash; ' + esc(s.apiKey || '') + ' (live orders enabled)',
-        disconnectedHTML: 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live orders (Paper mode works without a connection)' });
+        disconnectedHTML: isOptKind()
+          ? 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> first: options picks need a live Kite session for strike/premium data (Paper mode still needs the connection to GENERATE picks, only order placement itself can stay paper)'
+          : 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live orders (Paper mode works without a connection)' });
     }
 
     function bindRowEvents() {
       bodyEl.querySelectorAll('.zd-cell').forEach(function(el) {
         el.addEventListener('change', function() {
-          const i = parseInt(el.getAttribute('data-row-idx'), 10);
+          const key = el.getAttribute('data-row-key');
           const f = el.getAttribute('data-field');
-          if (!rows[i]) return;
-          rows[i][f] = (f === 'exit' || f === 'reason') ? el.value : (parseFloat(el.value) || 0);
+          const r = getRow(key);
+          if (!r) return;
+          if (f === 'symbol') {
+            r.symbol = el.value.trim().toUpperCase(); el.value = r.symbol;
+            if (isOptKind()) r.tradingsymbol = r.symbol;
+          } else {
+            r[f] = (f === 'exit' || f === 'reason') ? el.value : (parseFloat(el.value) || 0);
+            if (f === 'reason') el.title = el.value;
+          }
         });
       });
       bodyEl.querySelectorAll('[data-place]').forEach(function(btn) {
-        btn.addEventListener('click', function() { placeOrder(parseInt(btn.getAttribute('data-row-idx'), 10)); });
+        btn.addEventListener('click', function() { placeOrder(btn.getAttribute('data-row-key')); });
       });
     }
 
+    // Reason column: a small textarea (still editable, per spec) PLUS a native
+    // title tooltip carrying the full text — the cell itself is too narrow to
+    // read a 2-4 sentence reason comfortably, hovering shows it in full.
+    function reasonCell(key, text) {
+      return '<td style="max-width:260px"><textarea class="zd-cell" data-row-key="' + key + '" data-field="reason" rows="2" title="' + esc(text) + '" '
+        + 'style="width:100%;min-width:220px;resize:vertical;background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:4px">' + esc(text) + '</textarea></td>';
+    }
+
+    // P&L cell: '—' until an order's been placed for the row, then a live span
+    // (id'd so refreshPnl() can update it in place without a full re-render,
+    // which would otherwise blow away in-progress edits elsewhere in the table).
+    function pnlInner(r, key) {
+      if (!r.placed) return '—';
+      const v = r.lastPnl;
+      const txt = (v == null) ? 'Loading…' : ((v >= 0 ? '+' : '') + v.toFixed(2));
+      const col = (v == null) ? '#787b86' : (v >= 0 ? '#26a69a' : '#ef5350');
+      return '<span id="stocksBotPnl' + key + '" style="color:' + col + ';font-weight:700">' + txt + '</span>';
+    }
+    function pnlCell(r, key) { return '<td id="stocksBotPnlCell' + key + '">' + pnlInner(r, key) + '</td>'; }
+
+    function renderEquityRow(r, key) {
+      const sideCol = r.side === 'SHORT' ? '#ef5350' : '#26a69a';
+      const disabled = r.side === 'SHORT';
+      return '<tr>'
+        + '<td>' + esc(r.name) + '</td>'
+        + '<td class="zd-cell-sym">' + esc(r.symbol) + '</td>'
+        + '<td>' + esc(r.sector || '—') + '</td>'
+        + '<td><span style="color:' + sideCol + ';font-weight:700">' + esc(r.side) + '</span></td>'
+        + reasonCell(key, r.reason)
+        + '<td><input class="zd-cell zd-cell-score" data-row-key="' + key + '" data-field="fundamentalScore" type="number" min="0" max="100" value="' + esc(r.fundamentalScore) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-score" data-row-key="' + key + '" data-field="technicalScore" type="number" min="0" max="100" value="' + esc(r.technicalScore) + '"></td>'
+        + '<td>' + fmtSt(r.supertrend) + '</td>'
+        + '<td>' + esc(r.rsi) + '</td>'
+        + '<td>' + esc(r.adx) + '</td>'
+        + '<td>' + esc(r.sma50) + '</td>'
+        + '<td>' + esc(r.sma200) + '</td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="entry" type="number" step="0.05" value="' + esc(r.entry) + '"></td>'
+        + '<td><input class="zd-cell" data-row-key="' + key + '" data-field="exit" type="text" style="width:150px" value="' + esc(r.exit) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="sl" type="number" step="0.05" value="' + esc(r.sl) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="tp" type="number" step="0.05" value="' + esc(r.tp) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="size" type="number" min="1" step="1" value="' + esc(r.size) + '"></td>'
+        + '<td><button type="button" class="zd-row-upd" data-row-key="' + key + '" data-place' + (disabled ? ' disabled title="Short-selling not supported here"' : '') + '>' + (disabled ? '—' : 'Place') + '</button>'
+        + '<div style="font-size:10px;color:#787b86;margin-top:3px" id="stocksBotMsg' + key + '"></div></td>'
+        + pnlCell(r, key)
+        + '</tr>';
+    }
+
+    function renderManualEquityRow(r, key) {
+      return '<tr>'
+        + '<td>—</td>'
+        + '<td><input class="zd-cell zd-cell-sym" data-row-key="' + key + '" data-field="symbol" type="text" placeholder="SYMBOL" style="width:100px;text-transform:uppercase" value="' + esc(r.symbol) + '"></td>'
+        + '<td>—</td>'
+        + '<td><span style="color:#26a69a;font-weight:700">BUY</span></td>'
+        + reasonCell(key, r.reason)
+        + '<td><input class="zd-cell zd-cell-score" data-row-key="' + key + '" data-field="fundamentalScore" type="number" min="0" max="100" value="' + esc(r.fundamentalScore) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-score" data-row-key="' + key + '" data-field="technicalScore" type="number" min="0" max="100" value="' + esc(r.technicalScore) + '"></td>'
+        + '<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="entry" type="number" step="0.05" value="' + esc(r.entry) + '"></td>'
+        + '<td><input class="zd-cell" data-row-key="' + key + '" data-field="exit" type="text" style="width:150px" value="' + esc(r.exit) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="sl" type="number" step="0.05" value="' + esc(r.sl) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="tp" type="number" step="0.05" value="' + esc(r.tp) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="size" type="number" min="1" step="1" value="' + esc(r.size) + '"></td>'
+        + '<td><button type="button" class="zd-row-upd" data-row-key="' + key + '" data-place>Place</button>'
+        + '<div style="font-size:10px;color:#787b86;margin-top:3px" id="stocksBotMsg' + key + '"></div></td>'
+        + pnlCell(r, key)
+        + '</tr>';
+    }
+
+    function renderOptRow(r, key) {
+      const typeCol = r.type === 'PE' ? '#ef5350' : '#26a69a';
+      return '<tr>'
+        + '<td class="zd-cell-sym">' + esc(r.symbol) + '<div style="font-size:10px;color:#787b86">' + esc(r.tradingsymbol) + '</div></td>'
+        + '<td><span style="color:' + typeCol + ';font-weight:700">' + esc(r.type) + '</span></td>'
+        + reasonCell(key, r.reason)
+        + '<td><input class="zd-cell zd-cell-score" data-row-key="' + key + '" data-field="technicalScore" type="number" min="0" max="100" value="' + esc(r.technicalScore) + '"></td>'
+        + '<td>' + esc(r.rsi) + '</td>'
+        + '<td>' + esc(r.adx) + '</td>'
+        + '<td>' + esc(r.sma50) + '</td>'
+        + '<td>' + esc(r.sma200) + '</td>'
+        + '<td>' + esc(r.strike) + '<div style="font-size:10px;color:#787b86">exp ' + esc(r.expiry) + ' (' + esc(r.dte) + 'd)</div></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="lots" type="number" min="1" step="1" value="' + esc(r.lots) + '"></td>'
+        + '<td>' + esc(r.lotSize) + '</td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="entry" type="number" step="0.05" value="' + esc(r.entry) + '"></td>'
+        + '<td><input class="zd-cell" data-row-key="' + key + '" data-field="exit" type="text" style="width:150px" value="' + esc(r.exit) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="sl" type="number" step="0.05" value="' + esc(r.sl) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="tp" type="number" step="0.05" value="' + esc(r.tp) + '"></td>'
+        + '<td><button type="button" class="zd-row-upd" data-row-key="' + key + '" data-place>Place</button>'
+        + '<div style="font-size:10px;color:#787b86;margin-top:3px" id="stocksBotMsg' + key + '"></div></td>'
+        + pnlCell(r, key)
+        + '</tr>';
+    }
+
+    function renderManualOptRow(r, key) {
+      return '<tr>'
+        + '<td><input class="zd-cell zd-cell-sym" data-row-key="' + key + '" data-field="symbol" type="text" placeholder="Tradingsymbol e.g. RELIANCE26AUG1310CE" style="width:190px;text-transform:uppercase" value="' + esc(r.symbol) + '"></td>'
+        + '<td>—</td>'
+        + reasonCell(key, r.reason)
+        + '<td><input class="zd-cell zd-cell-score" data-row-key="' + key + '" data-field="technicalScore" type="number" min="0" max="100" value="' + esc(r.technicalScore) + '"></td>'
+        + '<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="lots" type="number" min="1" step="1" value="' + esc(r.lots) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="lotSize" type="number" min="1" step="1" value="' + esc(r.lotSize) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="entry" type="number" step="0.05" value="' + esc(r.entry) + '"></td>'
+        + '<td><input class="zd-cell" data-row-key="' + key + '" data-field="exit" type="text" style="width:150px" value="' + esc(r.exit) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="sl" type="number" step="0.05" value="' + esc(r.sl) + '"></td>'
+        + '<td><input class="zd-cell zd-cell-qty" data-row-key="' + key + '" data-field="tp" type="number" step="0.05" value="' + esc(r.tp) + '"></td>'
+        + '<td><button type="button" class="zd-row-upd" data-row-key="' + key + '" data-place>Place</button>'
+        + '<div style="font-size:10px;color:#787b86;margin-top:3px" id="stocksBotMsg' + key + '"></div></td>'
+        + pnlCell(r, key)
+        + '</tr>';
+    }
+
     function render() {
+      headEl.innerHTML = isOptKind() ? OPT_HEAD : EQUITY_HEAD;
+      const colspan = isOptKind() ? 17 : 19;
+      let html = '';
       if (!rows.length) {
-        bodyEl.innerHTML = '<tr><td colspan="18" style="text-align:center;padding:20px;color:#787b86">No picks — try again, or a different alert/universe.</td></tr>';
-        return;
+        html += '<tr><td colspan="' + colspan + '" style="text-align:center;padding:14px;color:#787b86">No AI picks yet — try again, or add a symbol manually below.</td></tr>';
+      } else {
+        html += rows.map(function(r, i) { const key = 'p' + i; return isOptKind() ? renderOptRow(r, key) : renderEquityRow(r, key); }).join('');
       }
-      bodyEl.innerHTML = rows.map(function(r, i) {
-        const sideCol = r.side === 'SHORT' ? '#ef5350' : '#26a69a';
-        const disabled = r.side === 'SHORT';
-        return '<tr>'
-          + '<td>' + esc(r.name) + '</td>'
-          + '<td class="zd-cell-sym">' + esc(r.symbol) + '</td>'
-          + '<td>' + esc(r.sector || '—') + '</td>'
-          + '<td><span style="color:' + sideCol + ';font-weight:700">' + esc(r.side) + '</span></td>'
-          + '<td style="max-width:260px"><textarea class="zd-cell" data-row-idx="' + i + '" data-field="reason" rows="2" '
-          + 'style="width:100%;min-width:220px;resize:vertical;background:#131722;border:1px solid #2a2e39;border-radius:4px;color:#d1d4dc;font-size:11px;padding:4px">' + esc(r.reason) + '</textarea></td>'
-          + '<td><input class="zd-cell zd-cell-score" data-row-idx="' + i + '" data-field="fundamentalScore" type="number" min="0" max="100" value="' + esc(r.fundamentalScore) + '"></td>'
-          + '<td><input class="zd-cell zd-cell-score" data-row-idx="' + i + '" data-field="technicalScore" type="number" min="0" max="100" value="' + esc(r.technicalScore) + '"></td>'
-          + '<td>' + fmtSt(r.supertrend) + '</td>'
-          + '<td>' + esc(r.rsi) + '</td>'
-          + '<td>' + esc(r.adx) + '</td>'
-          + '<td>' + esc(r.sma50) + '</td>'
-          + '<td>' + esc(r.sma200) + '</td>'
-          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="entry" type="number" step="0.05" value="' + esc(r.entry) + '"></td>'
-          + '<td><input class="zd-cell" data-row-idx="' + i + '" data-field="exit" type="text" style="width:150px" value="' + esc(r.exit) + '"></td>'
-          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="sl" type="number" step="0.05" value="' + esc(r.sl) + '"></td>'
-          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="tp" type="number" step="0.05" value="' + esc(r.tp) + '"></td>'
-          + '<td><input class="zd-cell zd-cell-qty" data-row-idx="' + i + '" data-field="size" type="number" min="1" step="1" value="' + esc(r.size) + '"></td>'
-          + '<td><button type="button" class="zd-row-upd" data-row-idx="' + i + '" data-place' + (disabled ? ' disabled title="Short-selling not supported here"' : '') + '>' + (disabled ? '—' : 'Place') + '</button>'
-          + '<div style="font-size:10px;color:#787b86;margin-top:3px" id="stocksBotMsg' + i + '"></div></td>'
-          + '</tr>';
-      }).join('');
+      html += '<tr><td colspan="' + colspan + '" style="padding:6px 4px;color:#787b86;font-size:11px;border-top:2px solid #2a2e39">Manual entry — add any symbol yourself:</td></tr>';
+      html += manualRows.map(function(r, i) { const key = 'm' + i; return isOptKind() ? renderManualOptRow(r, key) : renderManualEquityRow(r, key); }).join('');
+      bodyEl.innerHTML = html;
       bindRowEvents();
     }
 
-    function placeOrder(i) {
-      const r = rows[i];
-      if (!r || r.side === 'SHORT') return;
+    function placeOrder(key) {
+      const r = getRow(key);
+      if (!r) return;
+      if (!isOptKind() && r.side === 'SHORT') return;
+      if (!r.symbol && !r.tradingsymbol) { alert('Enter a symbol first.'); return; }
       const s = ZerodhaStore.getSession();
       const isLive = currentMode() === 'live';
       if (isLive && !s.connected) { alert('Connect Zerodha first (see the status bar above) before placing a live order.'); return; }
-      const qty = Math.max(1, parseInt(r.size, 10) || 1);
-      const product = MIS_KINDS.indexOf(curKind) >= 0 ? 'MIS' : 'CNC';
-      if (isLive && !confirm('Place LIVE BUY order: ' + qty + ' ' + r.symbol + ' @ ' + r.entry + ' (' + product + ')?')) return;
-      const msgEl = document.getElementById('stocksBotMsg' + i);
-      if (msgEl) msgEl.textContent = 'Placing…';
-      fetch('/api/zerodha/order', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: s.apiKey, symbol: r.symbol, exchange: 'NSE', side: 'BUY', qty: qty,
+      const msgEl = document.getElementById('stocksBotMsg' + key);
+      let body, orderQty;
+      if (isOptKind()) {
+        const lots = Math.max(1, parseInt(r.lots, 10) || 1);
+        const lotSize = Math.max(1, parseInt(r.lotSize, 10) || 1);
+        orderQty = lots * lotSize;
+        const tsym = (r.tradingsymbol || r.symbol || '').toUpperCase();
+        if (isLive && !confirm('Place LIVE BUY order: ' + orderQty + ' (' + lots + ' lot(s)) ' + tsym + ' @ ' + r.entry + ' (NRML)?')) return;
+        body = { api_key: s.apiKey, symbol: tsym, exchange: 'NFO', side: 'BUY', qty: orderQty,
+          product: 'NRML', order_type: 'LIMIT', price: r.entry, dry_run: !isLive,
+          algo: 'stocksBot:' + curKind, score: r.technicalScore };
+      } else {
+        orderQty = Math.max(1, parseInt(r.size, 10) || 1);
+        const product = MIS_KINDS.indexOf(curKind) >= 0 ? 'MIS' : 'CNC';
+        if (isLive && !confirm('Place LIVE BUY order: ' + orderQty + ' ' + r.symbol + ' @ ' + r.entry + ' (' + product + ')?')) return;
+        body = { api_key: s.apiKey, symbol: r.symbol, exchange: 'NSE', side: 'BUY', qty: orderQty,
           product: product, order_type: 'LIMIT', price: r.entry, dry_run: !isLive,
-          algo: 'stocksBot:' + curKind, score: r.technicalScore }) })
+          algo: 'stocksBot:' + curKind, score: r.technicalScore };
+      }
+      if (msgEl) msgEl.textContent = 'Placing…';
+      fetch('/api/zerodha/order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         .then(function(resp) { return resp.json(); })
         .then(function(d) {
           if (msgEl) msgEl.textContent = (d && d.success)
             ? ((d.dry_run ? 'Paper ' : 'Live ') + 'order ' + (d.orderId || '?'))
             : ('Failed: ' + ((d && d.error) || '?'));
+          if (d && d.success) {
+            r.placed = true; r.placedEntry = parseFloat(r.entry) || 0; r.placedQty = orderQty; r.lastPnl = null;
+            const cell = document.getElementById('stocksBotPnlCell' + key);
+            if (cell) cell.innerHTML = pnlInner(r, key);
+            refreshPnl();
+          }
         })
         .catch(function(e) { if (msgEl) msgEl.textContent = 'Error: ' + e.message; });
     }
 
+    // Periodic P&L refresh for every row an order's been placed on (both AI picks
+    // and manual rows) — updates each span in place, no full table re-render.
+    function refreshPnl() {
+      const s = ZerodhaStore.getSession();
+      function doOne(r, key) {
+        if (!r.placed) return;
+        const qsym = isOptKind() ? (r.tradingsymbol || r.symbol) : r.symbol;
+        if (!qsym) return;
+        let url = '/api/telegram/quote?symbol=' + encodeURIComponent(qsym) + '&kind=' + (isOptKind() ? 'option' : 'equity');
+        if (isOptKind()) url += '&api_key=' + encodeURIComponent(s.apiKey || '');
+        fetch(url).then(function(resp) { return resp.json(); }).then(function(d) {
+          const span = document.getElementById('stocksBotPnl' + key);
+          if (!span) return;
+          if (!d || !d.success || d.price == null) { span.textContent = 'n/a'; span.style.color = '#787b86'; return; }
+          const pnl = (d.price - r.placedEntry) * r.placedQty;
+          r.lastPnl = pnl;
+          span.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
+          span.style.color = pnl >= 0 ? '#26a69a' : '#ef5350';
+        }).catch(function() {});
+      }
+      rows.forEach(function(r, i) { doOne(r, 'p' + i); });
+      manualRows.forEach(function(r, i) { doOne(r, 'm' + i); });
+    }
+    function startPnlPolling() { if (pnlTimer) clearInterval(pnlTimer); pnlTimer = setInterval(refreshPnl, 15000); }
+    function stopPnlPolling() { if (pnlTimer) { clearInterval(pnlTimer); pnlTimer = null; } }
+
     function poll(kind, before, tries) {
       fetch('/api/telegram/picks_table/status?kind=' + encodeURIComponent(kind)).then(function(r) { return r.json(); }).then(function(d) {
         if (d && d.ts && d.ts !== before) {
-          rows = (d.picks || []).map(function(p) { const o = {}; for (const k in p) o[k] = p[k]; return o; });
-          summaryEl.textContent = rows.length ? (rows.length + ' picks generated — every field is editable before you place an order.') : 'No strong setups came back — try again later or a different universe.';
+          rows = (d.picks || []).map(function(p) { const o = {}; for (const k in p) o[k] = p[k]; o.placed = false; o.placedEntry = null; o.placedQty = null; o.lastPnl = null; return o; });
+          if (d.error) summaryEl.textContent = d.error;
+          else summaryEl.textContent = rows.length ? (rows.length + ' picks generated — every field is editable before you place an order.') : 'No strong setups came back — try again later or a different universe.';
           render();
           return;
         }
-        if (tries > 30) { summaryEl.textContent = 'Still generating — this can take up to a minute (fundamentals + Supertrend + Claude). Leave this open.'; return; }
+        if (tries > 30) { summaryEl.textContent = 'Still generating — this can take up to a minute (fundamentals/strikes/premiums + Claude). Leave this open.'; return; }
         setTimeout(function() { poll(kind, before, tries + 1); }, 3000);
       }).catch(function() { if (tries < 30) setTimeout(function() { poll(kind, before, tries + 1); }, 3000); });
     }
@@ -27170,20 +27509,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
       curKind = kind; curUniverse = universe || 'NIFTY500';
       kindLabel.textContent = kind.charAt(0).toUpperCase() + kind.slice(1);
       panel.style.display = 'block'; panel.classList.add('open');
-      rows = []; render();
-      summaryEl.textContent = 'Generating picks — scanning market, fundamentals, Supertrend + Claude… ~30-60s.';
+      rows = []; resetManualRows(); render();
+      startPnlPolling();
       refreshConn();
+      const s = ZerodhaStore.getSession();
+      if (isOptKind() && !s.connected) {
+        summaryEl.textContent = 'Connect Zerodha first — options picks need a live Kite session to resolve strike/expiry/premium (see status bar above). You can still add symbols manually below once connected.';
+        return;
+      }
+      summaryEl.textContent = isOptKind()
+        ? 'Generating picks — scanning F&O stocks, resolving strikes/premiums via Kite, + Claude… ~30-60s.'
+        : 'Generating picks — scanning market, fundamentals, Supertrend + Claude… ~30-60s.';
       fetch('/api/telegram/picks_table/status?kind=' + encodeURIComponent(kind)).then(function(r) { return r.json(); }).then(function(s0) {
         const before = (s0 && s0.ts) || 0;
         fetch('/api/telegram/picks_table', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ kind: kind, universe: curUniverse }) })
+          body: JSON.stringify({ kind: kind, universe: curUniverse, api_key: s.apiKey }) })
           .then(function(r) { return r.json(); })
           .then(function(d) { if (!d || !d.success) { summaryEl.textContent = 'Failed to start: ' + ((d && d.error) || '?'); return; } poll(kind, before, 0); })
           .catch(function(e) { summaryEl.textContent = 'Error: ' + e.message; });
       }).catch(function() { poll(kind, 0, 0); });
     };
 
-    closeBtn.addEventListener('click', function() { panel.style.display = 'none'; panel.classList.remove('open'); });
+    closeBtn.addEventListener('click', function() { panel.style.display = 'none'; panel.classList.remove('open'); stopPnlPolling(); });
     maxBtn.addEventListener('click', function() {
       botMaximized = !botMaximized; panel.classList.toggle('maximized', botMaximized);
       this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
