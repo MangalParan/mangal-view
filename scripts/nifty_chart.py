@@ -6194,24 +6194,34 @@ def _bs_iv_from_price(price, spot, strike, dte_days, option_type, risk_free_rate
     except Exception:
         return None
 
-# --- Chain/IV data source: NSE for NIFTY/BANKNIFTY/FINNIFTY, BFO+IV-inversion for SENSEX ---
-_STRAT_NSE_CACHE = {}   # {base: {'ts': float, 'data': raw NSE json}}
-_STRAT_NSE_TTL = 90     # live pricing — much shorter than zoBot's 1800s static-instrument-dump cache
+# --- Chain/IV data source: NSE first for NIFTY/BANKNIFTY/FINNIFTY (falls back to
+# Kite if NSE is unreachable — its bot-detection often blocks hosted servers even
+# with browser TLS impersonation), Kite-instrument+IV-inversion always for SENSEX. ---
+_STRAT_NSE_CACHE = {}   # {base: {'ts': float, 'data': raw NSE json, 'failed_ts': float}}
+_STRAT_NSE_TTL = 90       # live pricing — much shorter than zoBot's 1800s static-instrument-dump cache
+_STRAT_NSE_FAIL_TTL = 180 # skip retrying NSE for this long after a failure — a blocked/slow NSE
+                           # session bootstrap can take ~15-20s; without this every expiries/
+                           # claude_pick/start call would eat that latency before falling back
 
 def _strat_fetch_nse_raw(base):
     ent = _STRAT_NSE_CACHE.get(base) or {}
     now = _zd_time.time()
     if ent.get('data') and now - ent.get('ts', 0) < _STRAT_NSE_TTL:
         return ent['data']
+    if ent.get('failed_ts') and now - ent['failed_ts'] < _STRAT_NSE_FAIL_TTL:
+        return None
     try:
         session = cffi_requests.Session(impersonate='chrome')
-        session.get('https://www.nseindia.com', timeout=10)
+        session.get('https://www.nseindia.com', timeout=8)
         url = 'https://www.nseindia.com/api/option-chain-indices?symbol=' + base
-        resp = session.get(url, timeout=15, headers={'Referer': 'https://www.nseindia.com/option-chain'})
+        resp = session.get(url, timeout=10, headers={'Referer': 'https://www.nseindia.com/option-chain'})
         data = resp.json()
+        if not ((data.get('records') or {}).get('data')):
+            raise ValueError('empty NSE response (blocked or after-hours)')
     except Exception:
+        _STRAT_NSE_CACHE[base] = {'ts': ent.get('ts', 0), 'data': ent.get('data'), 'failed_ts': now}
         return ent.get('data')
-    _STRAT_NSE_CACHE[base] = {'ts': now, 'data': data}
+    _STRAT_NSE_CACHE[base] = {'ts': now, 'data': data, 'failed_ts': 0}
     return data
 
 def _strat_nse_chain(base, expiry=None):
@@ -6267,20 +6277,24 @@ def _kite_quote_batch(api_key, items):
     except Exception:
         return {}
 
-def _strat_bfo_chain(base, api_key, expiry=None):
-    """SENSEX only (not on NSE's index option-chain endpoint). Uses the Kite
-    instrument dump for strikes/expiries, a batch quote for LTPs, then inverts
-    IV from price via Black-Scholes bisection."""
-    chain_all = [i for i in _zo_load_opt_instruments('BFO') if i.get('name', '').upper() == base]
+def _strat_kite_chain(base, api_key, expiry=None):
+    """Kite-instrument-based chain: strikes/expiries from the F&O instrument dump
+    (NFO for NIFTY/BANKNIFTY/FINNIFTY, BFO for SENSEX — via _zo_base_meta), LTPs
+    via a batch quote, IV inverted from price via Black-Scholes bisection. Used
+    always for SENSEX (not on NSE's index option-chain endpoint) and as the
+    fallback for the others when NSE is unreachable. Requires an active Kite
+    connection (api_key)."""
+    _ss, _se, opt_exch = _zo_base_meta(base)
+    chain_all = [i for i in _zo_load_opt_instruments(opt_exch) if i.get('name', '').upper() == base]
     if not chain_all:
-        return 0.0, [], [], 'no BFO option chain for ' + base
+        return 0.0, [], [], 'no ' + opt_exch + ' option chain for ' + base
     today = datetime.now().strftime('%Y-%m-%d')
     expiries = sorted({i['expiry'] for i in chain_all if i.get('expiry') and i['expiry'] >= today}) \
                or sorted({i['expiry'] for i in chain_all if i.get('expiry')})
     if not expiries:
         return 0.0, [], [], 'no expiries for ' + base
     target = expiry if expiry in expiries else expiries[0]
-    spot_sym, _se, _oe = _zo_base_meta(base)
+    spot_sym, _se2, _oe = _zo_base_meta(base)
     spot = _zo_base_spot(spot_sym, api_key)
     if spot <= 0:
         return 0.0, expiries, [], 'could not read spot for ' + base + ' — check Kite connection'
@@ -6308,14 +6322,22 @@ def _strat_bfo_chain(base, api_key, expiry=None):
         row[i['type'] + '_IV'] = round(iv * 100.0, 2)
         row[i['type'] + '_LTP'] = ltp
     rows = sorted(rows_by_strike.values(), key=lambda r: r['strike'])
-    return spot, expiries, rows, ('' if rows else 'could not price ' + base + ' strikes (check Kite connection)')
+    return spot, expiries, rows, ('' if rows else 'could not price ' + base + ' strikes via Kite (check connection/market hours)')
 
 def _strat_fetch_chain(base, api_key, expiry=None):
     base = (base or '').upper().strip()
     if base in ('NIFTY', 'BANKNIFTY', 'FINNIFTY'):
-        return _strat_nse_chain(base, expiry)
+        spot, expiries, rows, err = _strat_nse_chain(base, expiry)
+        if rows:
+            return spot, expiries, rows, err
+        if not api_key:
+            return spot, expiries, rows, (err or 'NSE fetch failed and no Zerodha connection to fall back to')
+        k_spot, k_expiries, k_rows, k_err = _strat_kite_chain(base, api_key, expiry)
+        if k_rows:
+            return k_spot, k_expiries, k_rows, 'NSE unavailable, using Zerodha chain instead'
+        return (spot or k_spot), (expiries or k_expiries), [], (k_err or err or 'no chain data for ' + base)
     if base == 'SENSEX':
-        return _strat_bfo_chain(base, api_key, expiry)
+        return _strat_kite_chain(base, api_key, expiry)
     return 0.0, [], [], 'unsupported underlying ' + base
 
 # --- Strike auto-selection: deterministic delta-walk, optional Claude override ---
