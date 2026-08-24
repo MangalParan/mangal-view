@@ -6108,6 +6108,695 @@ def zo_aibot_chat():
                     'configPatch': safe_patch or None, 'summary': summary, 'rejected': rejected})
 
 # ============================================================================
+# Server-side "Strategy Menu" bot — defined multi-leg options strategies (Iron
+# Condor, Short Strangle, Jade Lizard) on NSE index options (NIFTY/BANKNIFTY/
+# FINNIFTY) or SENSEX (BFO) via Zerodha. Strikes are chosen by target DELTA
+# (Black-Scholes, computed from chain IV — no Greeks existed anywhere in this
+# file before this section) instead of zoBot's flat %-OTM. Independent from
+# zo_ai_state/zoBotPanel — does not read or mutate it.
+# ============================================================================
+strat_bot_state = {
+    'running': False, 'paused': False, 'thread': None,
+    'config': None,
+    'lastConfig': None,     # last /start or /schedule payload — used to re-resolve strikes at a scheduled entry
+    'legs': [],              # up to 4 role-tagged leg dicts, see _STRAT_TYPES
+    'trades': [],
+    'consec_losses': 0,
+    'log_buffer': [],
+    'schedule': {'entryTime': '', 'exitTime': '', 'armed': False, 'entryFiredDate': '', 'exitFiredDate': ''},
+    'underlyingSpot': None, 'underlyingSym': '',
+}
+strat_bot_lock = _threading.RLock()
+
+_STRAT_TYPES = {
+    'iron_condor':    {'label': 'Iron Condor',    'legs': ['sellCE', 'sellPE', 'hedgeCE', 'hedgePE']},
+    'short_strangle': {'label': 'Short Strangle', 'legs': ['sellCE', 'sellPE']},
+    'jade_lizard':    {'label': 'Jade Lizard',    'legs': ['sellCE', 'sellPE', 'hedgeCE']},
+}
+_STRAT_BASES = ('NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX')
+
+def _strat_log(msg):
+    ts = _bot_log_ts()
+    with strat_bot_lock:
+        buf = strat_bot_state.setdefault('log_buffer', [])
+        buf.append('[' + ts + '] ' + msg)
+        if len(buf) > 200:
+            del buf[:len(buf) - 200]
+
+# --- Black-Scholes delta (stdlib math.erf only — no scipy in requirements.txt) ---
+def _bs_price(spot, strike, sigma, t, option_type, risk_free_rate=0.07):
+    """European BS price. Degenerates to intrinsic value if sigma/t are ~0."""
+    if spot <= 0 or strike <= 0 or sigma <= 0 or t <= 0:
+        return max(0.0, (spot - strike) if option_type == 'CE' else (strike - spot))
+    d1 = (math.log(spot / strike) + (risk_free_rate + 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+    n = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    if option_type == 'CE':
+        return spot * n(d1) - strike * math.exp(-risk_free_rate * t) * n(d2)
+    return strike * math.exp(-risk_free_rate * t) * n(-d2) - spot * n(-d1)
+
+def _bs_delta(spot, strike, iv_pct, dte_days, option_type, risk_free_rate=0.07):
+    """Signed BS delta: CE in [0,1], PE in [-1,0]. iv_pct is annualized IV in
+    percent (e.g. 14.2, matching NSE's impliedVolatility field). Returns 0.0
+    on any degenerate/bad input rather than raising."""
+    try:
+        s, k = float(spot), float(strike)
+        sigma = float(iv_pct or 0) / 100.0
+        t = max(float(dte_days or 0), 0.0) / 365.0
+        if s <= 0 or k <= 0 or sigma <= 0 or t <= 0:
+            return 0.0
+        d1 = (math.log(s / k) + (risk_free_rate + 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+        n_d1 = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+        return n_d1 if option_type == 'CE' else (n_d1 - 1.0)
+    except Exception:
+        return 0.0
+
+def _bs_iv_from_price(price, spot, strike, dte_days, option_type, risk_free_rate=0.07):
+    """Invert BS price -> IV (fraction, e.g. 0.142) via bisection. Used only for
+    SENSEX (BFO), which has no NSE-style impliedVolatility field. Returns None
+    if the price is below intrinsic (can't bracket a solution)."""
+    try:
+        s, k, t = float(spot), float(strike), max(float(dte_days or 0), 0.0) / 365.0
+        price = float(price)
+        if s <= 0 or k <= 0 or t <= 0 or price <= 0:
+            return None
+        intrinsic = max(0.0, (s - k) if option_type == 'CE' else (k - s))
+        if price < intrinsic:
+            return None
+        lo, hi = 0.01, 3.0
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            if _bs_price(s, k, mid, t, option_type, risk_free_rate) > price:
+                hi = mid
+            else:
+                lo = mid
+        return (lo + hi) / 2.0
+    except Exception:
+        return None
+
+# --- Chain/IV data source: NSE for NIFTY/BANKNIFTY/FINNIFTY, BFO+IV-inversion for SENSEX ---
+_STRAT_NSE_CACHE = {}   # {base: {'ts': float, 'data': raw NSE json}}
+_STRAT_NSE_TTL = 90     # live pricing — much shorter than zoBot's 1800s static-instrument-dump cache
+
+def _strat_fetch_nse_raw(base):
+    ent = _STRAT_NSE_CACHE.get(base) or {}
+    now = _zd_time.time()
+    if ent.get('data') and now - ent.get('ts', 0) < _STRAT_NSE_TTL:
+        return ent['data']
+    try:
+        session = cffi_requests.Session(impersonate='chrome')
+        session.get('https://www.nseindia.com', timeout=10)
+        url = 'https://www.nseindia.com/api/option-chain-indices?symbol=' + base
+        resp = session.get(url, timeout=15, headers={'Referer': 'https://www.nseindia.com/option-chain'})
+        data = resp.json()
+    except Exception:
+        return ent.get('data')
+    _STRAT_NSE_CACHE[base] = {'ts': now, 'data': data}
+    return data
+
+def _strat_nse_chain(base, expiry=None):
+    """Returns (spot, expiries[sorted 'YYYY-MM-DD'], rows[for the target expiry], error)."""
+    raw = _strat_fetch_nse_raw(base)
+    if not raw:
+        return 0.0, [], [], 'could not fetch NSE option chain for ' + base
+    records = raw.get('records') or {}
+    spot = float(records.get('underlyingValue') or 0)
+    def _norm(e):
+        try: return datetime.strptime(e, '%d-%b-%Y').strftime('%Y-%m-%d')
+        except Exception: return ''
+    expiry_map = {}   # normalized 'YYYY-MM-DD' -> NSE's raw 'DD-Mon-YYYY'
+    for e in (records.get('expiryDates') or []):
+        n = _norm(e)
+        if n: expiry_map[n] = e
+    expiries = sorted(expiry_map.keys())
+    if not expiries:
+        return spot, [], [], 'no expiries for ' + base
+    target_norm = expiry if (expiry in expiry_map) else expiries[0]
+    target_raw = expiry_map[target_norm]
+    rows = []
+    for rec in (records.get('data') or []):
+        if rec.get('expiryDate') != target_raw:
+            continue
+        strike = float(rec.get('strikePrice') or 0)
+        if strike <= 0:
+            continue
+        ce = rec.get('CE') or {}; pe = rec.get('PE') or {}
+        rows.append({'strike': strike, 'expiry': target_norm,
+                     'CE_IV': float(ce.get('impliedVolatility') or 0), 'CE_LTP': float(ce.get('lastPrice') or 0),
+                     'PE_IV': float(pe.get('impliedVolatility') or 0), 'PE_LTP': float(pe.get('lastPrice') or 0)})
+    return spot, expiries, rows, ('' if rows else 'no strikes for ' + base + ' expiry ' + target_norm)
+
+def _kite_quote_batch(api_key, items):
+    """items: [(exchange, symbol), ...] -> {'EXCH:SYMBOL': {...quote...}}. Kite
+    supports multiple i= params in one /quote call. Returns {} on any failure."""
+    import urllib.request as _ur, urllib.parse as _up, json as _json
+    if not api_key or api_key not in zerodha_sessions or not items:
+        return {}
+    access_token = zerodha_sessions[api_key].get('access_token', '')
+    if not access_token:
+        return {}
+    qs = '&'.join('i=' + _up.quote(exch + ':' + sym) for exch, sym in items)
+    req = _ur.Request('https://api.kite.trade/quote?' + qs,
+                      headers={'X-Kite-Version': '3',
+                               'Authorization': 'token {}:{}'.format(api_key, access_token),
+                               'User-Agent': 'Mozilla/5.0'})
+    try:
+        with _kite_urlopen(req, timeout=15) as resp:
+            rd = _json.loads(resp.read().decode('utf-8') or '{}')
+        return rd.get('data') or {}
+    except Exception:
+        return {}
+
+def _strat_bfo_chain(base, api_key, expiry=None):
+    """SENSEX only (not on NSE's index option-chain endpoint). Uses the Kite
+    instrument dump for strikes/expiries, a batch quote for LTPs, then inverts
+    IV from price via Black-Scholes bisection."""
+    chain_all = [i for i in _zo_load_opt_instruments('BFO') if i.get('name', '').upper() == base]
+    if not chain_all:
+        return 0.0, [], [], 'no BFO option chain for ' + base
+    today = datetime.now().strftime('%Y-%m-%d')
+    expiries = sorted({i['expiry'] for i in chain_all if i.get('expiry') and i['expiry'] >= today}) \
+               or sorted({i['expiry'] for i in chain_all if i.get('expiry')})
+    if not expiries:
+        return 0.0, [], [], 'no expiries for ' + base
+    target = expiry if expiry in expiries else expiries[0]
+    spot_sym, _se, _oe = _zo_base_meta(base)
+    spot = _zo_base_spot(spot_sym, api_key)
+    if spot <= 0:
+        return 0.0, expiries, [], 'could not read spot for ' + base + ' — check Kite connection'
+    chain = [i for i in chain_all if i.get('expiry') == target]
+    strikes = sorted({i['strike'] for i in chain if i['strike'] > 0}, key=lambda s: abs(s - spot))[:40]
+    items = [(i['exchange'], i['symbol']) for i in chain if i['strike'] in strikes]
+    quotes = _kite_quote_batch(api_key, items)
+    try:
+        dte = max(0, (datetime.strptime(target, '%Y-%m-%d').date() - _tg_now_ist().date()).days)
+    except Exception:
+        dte = 1
+    rows_by_strike = {}
+    for i in chain:
+        if i['strike'] not in strikes:
+            continue
+        key = i['exchange'] + ':' + i['symbol']
+        ltp = float((quotes.get(key) or {}).get('last_price') or 0)
+        if ltp <= 0:
+            continue
+        iv = _bs_iv_from_price(ltp, spot, i['strike'], dte, i['type'])
+        if iv is None:
+            continue
+        row = rows_by_strike.setdefault(i['strike'], {'strike': i['strike'], 'expiry': target,
+                                                        'CE_IV': 0, 'CE_LTP': 0, 'PE_IV': 0, 'PE_LTP': 0})
+        row[i['type'] + '_IV'] = round(iv * 100.0, 2)
+        row[i['type'] + '_LTP'] = ltp
+    rows = sorted(rows_by_strike.values(), key=lambda r: r['strike'])
+    return spot, expiries, rows, ('' if rows else 'could not price ' + base + ' strikes (check Kite connection)')
+
+def _strat_fetch_chain(base, api_key, expiry=None):
+    base = (base or '').upper().strip()
+    if base in ('NIFTY', 'BANKNIFTY', 'FINNIFTY'):
+        return _strat_nse_chain(base, expiry)
+    if base == 'SENSEX':
+        return _strat_bfo_chain(base, api_key, expiry)
+    return 0.0, [], [], 'unsupported underlying ' + base
+
+# --- Strike auto-selection: deterministic delta-walk, optional Claude override ---
+def _strat_resolve_strikes(cfg, use_claude=True):
+    """Resolve sold CE/PE strikes by target delta + hedge strikes by points.
+    Returns (legs, info). legs is [] only on a hard chain-data failure; a
+    Claude failure always falls back to the deterministic walk (never leaves
+    the caller with zero legs)."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    strat_type = cfg.get('strategyType') or 'iron_condor'
+    roles = (_STRAT_TYPES.get(strat_type) or _STRAT_TYPES['iron_condor'])['legs']
+    target_delta = abs(float(cfg.get('targetDelta') or 0.20))
+    hedge_pts = float(cfg.get('hedgeDistancePoints') or 500)
+    spot, expiries, rows, err = _strat_fetch_chain(base, cfg.get('api_key'), cfg.get('expiry') or None)
+    if not rows:
+        return [], (err or 'no chain data for ' + base)
+    chosen_expiry = cfg.get('expiry') if (cfg.get('expiry') in expiries) else (expiries[0] if expiries else '')
+    try:
+        dte = max(0, (datetime.strptime(chosen_expiry, '%Y-%m-%d').date() - _tg_now_ist().date()).days)
+    except Exception:
+        dte = 1
+    strikes = sorted({r['strike'] for r in rows})
+    by_strike = {r['strike']: r for r in rows}
+    def _delta_at(strike, otype):
+        r = by_strike.get(strike)
+        iv = (r.get('CE_IV') if otype == 'CE' else r.get('PE_IV')) if r else 0
+        return _bs_delta(spot, strike, iv, dte, otype)
+    ce_candidates_otm = sorted([s for s in strikes if s >= spot])
+    ce_best = next((s for s in ce_candidates_otm if _delta_at(s, 'CE') <= target_delta), None) \
+              or (ce_candidates_otm[-1] if ce_candidates_otm else strikes[-1])
+    pe_candidates_otm = sorted([s for s in strikes if s <= spot], reverse=True)
+    pe_best = next((s for s in pe_candidates_otm if abs(_delta_at(s, 'PE')) <= target_delta), None) \
+              or (pe_candidates_otm[-1] if pe_candidates_otm else strikes[0])
+    reason = 'deterministic delta walk'
+    if use_claude and _bot_is_claude(cfg):
+        try:
+            import json as _json, re as _re
+            ce_window = [s for s in ce_candidates_otm if _delta_at(s, 'CE') <= target_delta * 1.5][:12] or ce_candidates_otm[:6]
+            pe_window = [s for s in pe_candidates_otm if abs(_delta_at(s, 'PE')) <= target_delta * 1.5][:12] or pe_candidates_otm[:6]
+            ce_cand = [{'strike': s, 'delta': round(_delta_at(s, 'CE'), 3)} for s in ce_window]
+            pe_cand = [{'strike': s, 'delta': round(_delta_at(s, 'PE'), 3)} for s in pe_window]
+            label = (_STRAT_TYPES.get(strat_type) or {}).get('label', strat_type)
+            system = ("You select the SELL CE and SELL PE strikes for a {} on {} options. Choose ceSellStrike from "
+                      "ceCandidates and peSellStrike from peCandidates ONLY — each must have |delta| at or below "
+                      "targetDelta, preferring the value closest to targetDelta without exceeding it. Respond STRICT "
+                      "JSON ONLY: {{\"ceSellStrike\":<number>,\"peSellStrike\":<number>,\"reason\":\"<=160 chars\"}}."
+                      ).format(label, base)
+            user = _json.dumps({'underlying': base, 'spot': round(spot, 2), 'expiry': chosen_expiry,
+                                'targetDelta': target_delta, 'ceCandidates': ce_cand, 'peCandidates': pe_cand})
+            text, cerr = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=250, model=cfg.get('model'))
+            if not cerr and text and ce_cand and pe_cand:
+                obj = _json.loads(_re.search(r'\{.*\}', text, _re.DOTALL).group(0))
+                cs = float(obj.get('ceSellStrike')); ps = float(obj.get('peSellStrike'))
+                ce_best = min([c['strike'] for c in ce_cand], key=lambda s: abs(s - cs))
+                pe_best = min([c['strike'] for c in pe_cand], key=lambda s: abs(s - ps))
+                reason = 'Claude: ' + str(obj.get('reason', ''))[:160]
+        except Exception:
+            pass   # keep the deterministic result — never leave the user with no strikes
+    opt_exch = 'NFO' if base in ('NIFTY', 'BANKNIFTY', 'FINNIFTY') else 'BFO'
+    instr = [i for i in _zo_load_opt_instruments(opt_exch)
+             if i.get('name', '').upper() == base and i.get('expiry') == chosen_expiry]
+    def _mk(role, otype, side, strike):
+        row = next((i for i in instr if i['type'] == otype and abs(i['strike'] - strike) < 1e-6), None)
+        return {'role': role, 'symbol': (row['symbol'] if row else ''), 'exchange': opt_exch,
+                'optionType': otype, 'side': side, 'strike': strike, 'delta': round(_delta_at(strike, otype), 4),
+                'iv': (by_strike.get(strike) or {}).get(otype + '_IV', 0), 'qty': 0, 'position': None,
+                'last_tick': {}, 'last_candles': [], 'last_exit_time': 0,
+                'hedge_role': '', 'hedged_by': '', 'removed': False}
+    legs = []
+    sell_ce = sell_pe = None
+    if 'sellCE' in roles:
+        sell_ce = _mk('sellCE', 'CE', 'SELL', ce_best); legs.append(sell_ce)
+    if 'sellPE' in roles:
+        sell_pe = _mk('sellPE', 'PE', 'SELL', pe_best); legs.append(sell_pe)
+    if 'hedgeCE' in roles and sell_ce is not None:
+        hstrike = min(strikes, key=lambda s: abs(s - (ce_best + hedge_pts)))
+        hedge_ce = _mk('hedgeCE', 'CE', 'BUY', hstrike); legs.append(hedge_ce)
+        sell_ce['hedge_role'] = 'hedgeCE'; hedge_ce['hedged_by'] = 'sellCE'
+    if 'hedgePE' in roles and sell_pe is not None:
+        hstrike = min(strikes, key=lambda s: abs(s - (pe_best - hedge_pts)))
+        hedge_pe = _mk('hedgePE', 'PE', 'BUY', hstrike); legs.append(hedge_pe)
+        sell_pe['hedge_role'] = 'hedgePE'; hedge_pe['hedged_by'] = 'sellPE'
+    info = '{} {} spot {:.1f} exp {} -> sellCE {} (d{:.2f}) / sellPE {} (d{:.2f}) [{}]'.format(
+        base, strat_type, spot, chosen_expiry, int(ce_best), _delta_at(ce_best, 'CE'),
+        int(pe_best), _delta_at(pe_best, 'PE'), reason)
+    return legs, info
+
+# --- Leg lifecycle (independent from _zo_open_leg/_zo_close_leg — those stay untouched) ---
+def _strat_open_leg(leg, cfg, price):
+    mode = cfg.get('mode', 'paper')
+    lots = max(1, int(cfg.get('qty', 1) or 1))
+    lot = _zo_lot_size(leg['symbol'], leg.get('exchange') or 'NFO', cfg.get('baseSymbol'))
+    qty = lots * lot
+    side = leg['side']
+    is_sold = side == 'SELL'
+    sl = tp = None
+    if is_sold:
+        sl_pct = float(cfg.get('slPct', 50.0) or 50.0)
+        tp_pct = float(cfg.get('tpPct', 50.0) or 50.0)
+        sl = round(price * (1 + sl_pct / 100.0), 2)
+        tp = round(price * (1 - tp_pct / 100.0), 2)
+    if mode == 'live':
+        if not _zo_place_live(leg, side, qty, price, cfg):
+            _strat_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}). Fix margin/funds or reduce lots.'.format(leg['symbol'], side, qty))
+            _persist_log_line('[STRATMENU] [LIVE] ENTRY REJECTED — no position opened ' + leg['symbol'])
+            leg['last_exit_time'] = int(_zd_time.time())
+            return False
+    leg['position'] = {
+        'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+        'qty': qty, 'sl': sl, 'tp': tp,
+        'strategy': cfg.get('strategyType'), 'mode': mode,
+        'optionType': leg.get('optionType'), 'strike': leg.get('strike'), 'dte': None,
+    }
+    line = '[{}] ENTRY {} {} {} @ {} role={} SL={} TP={}'.format(
+        mode.upper(), side, qty, leg['symbol'], round(price, 2), leg['role'], sl, tp)
+    _strat_log(line); _persist_log_line('[STRATMENU] ' + line)
+    return True
+
+def _strat_close_leg(leg, price, reason, cfg, mode, cascade=True):
+    pos = leg.get('position')
+    if not pos:
+        return
+    pnl = _zd_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'])
+    closed = dict(pos)
+    closed.update({'symbol': leg['symbol'], 'role': leg['role'], 'exitPrice': round(price, 2),
+                   'exitTime': int(_zd_time.time()), 'pnl': round(pnl, 2), 'reason': reason})
+    strat_bot_state['trades'].append(closed)
+    if pnl < 0: strat_bot_state['consec_losses'] = strat_bot_state.get('consec_losses', 0) + 1
+    else:       strat_bot_state['consec_losses'] = 0
+    close_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
+    line = '[{}] EXIT {} {} {} @ {} (entry {}) PnL={}{:.2f} reason={} role={}'.format(
+        mode.upper(), close_side, pos['qty'], leg['symbol'], round(price, 2), pos['entryPrice'],
+        '+' if pnl >= 0 else '', pnl, reason, leg['role'])
+    _strat_log(line); _persist_log_line('[STRATMENU] ' + line)
+    if mode == 'live':
+        _zo_place_live(leg, close_side, pos['qty'], price, cfg)
+    leg['position'] = None
+    leg['last_exit_time'] = int(_zd_time.time())
+    if cascade and leg.get('hedge_role'):
+        hedge = next((l for l in strat_bot_state['legs'] if l['role'] == leg['hedge_role'] and not l.get('removed')), None)
+        if hedge and hedge.get('position'):
+            hp = (hedge.get('last_tick') or {}).get('price') or hedge['position']['entryPrice']
+            _strat_close_leg(hedge, hp, 'hedge closed - ' + reason, cfg, mode, cascade=False)
+
+def _strat_underlying_ctx(cfg):
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    if not base:
+        return
+    spot_sym, _se, _oe = _zo_base_meta(base)
+    spot = _zo_base_spot(spot_sym, cfg.get('api_key'), cfg.get('tf', '5m'))
+    if spot:
+        strat_bot_state['underlyingSpot'] = spot
+        strat_bot_state['underlyingSym'] = base
+
+def _strat_check_breakers(cfg, mode):
+    trades = strat_bot_state['trades']
+    realized = sum(t['pnl'] for t in trades)
+    max_consec = int(cfg.get('maxConsec', 3) or 3)
+    max_loss = float(cfg.get('maxLoss', 0) or 0)
+    trip = None
+    if strat_bot_state.get('consec_losses', 0) >= max_consec: trip = 'Max consecutive losses'
+    elif max_loss and realized < -abs(max_loss):                trip = 'Max daily loss'
+    if not trip:
+        return
+    for leg in strat_bot_state['legs']:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _strat_close_leg(leg, px, trip, cfg, mode, cascade=False)
+    strat_bot_state['running'] = False
+    _strat_log('[STOP] ' + trip + ' - all legs closed, strategy stopped.')
+    _persist_log_line('[STRATMENU] [STOP] ' + trip)
+
+def _strat_bot_tick():
+    with strat_bot_lock:
+        cfg = strat_bot_state.get('config') or {}
+    if not cfg:
+        return
+    mode = cfg.get('mode', 'paper')
+    _strat_underlying_ctx(cfg)
+    for leg in list(strat_bot_state['legs']):
+        if leg.get('removed') or not leg.get('symbol'):
+            continue
+        try:
+            candles = _bot_fetch_candles(leg['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+        except Exception as e:
+            _strat_log('[Tick] ' + leg['symbol'] + ' data error: ' + str(e)); continue
+        if not candles:
+            continue
+        price = candles[-1]['close']
+        with strat_bot_lock:
+            leg['last_candles'] = candles[-150:]
+            leg['last_tick'] = {'time': int(_zd_time.time()), 'price': price}
+            pos = leg.get('position')
+            if pos and pos['side'] == 'SELL':   # hedge (BUY) legs never carry their own SL/TP
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                reason = None; exit_px = price
+                if pos['sl'] is not None and hi >= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
+                elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
+                if reason:
+                    _strat_close_leg(leg, exit_px, reason, cfg, mode)   # cascades to close the linked hedge
+                else:
+                    _strat_log('[Tick] {} px={} SL={} TP={}'.format(leg['symbol'], round(price, 2), pos['sl'], pos['tp']))
+    with strat_bot_lock:
+        _strat_check_breakers(cfg, mode)
+
+def _strat_bot_loop():
+    while True:
+        with strat_bot_lock:
+            running = strat_bot_state.get('running', False)
+            paused = strat_bot_state.get('paused', False)
+        if not running: break
+        if not paused:
+            try: _strat_bot_tick()
+            except Exception as e:
+                _strat_log('[Tick] ERROR: ' + str(e))
+        _bot_gc_tick()
+        _zd_time.sleep(max(5, int((strat_bot_state.get('config') or {}).get('priceTickSec', 10) or 10)))
+
+def _strat_start_bot(data):
+    """data: raw payload dict (from /start, or the schedule's saved lastConfig).
+    Returns (ok, message)."""
+    with strat_bot_lock:
+        if strat_bot_state.get('running'):
+            return False, 'Strategy is already running. Stop it first.'
+        base = (data.get('baseSymbol') or '').upper().strip()
+        if base not in _STRAT_BASES:
+            return False, 'Pick a supported Underlying Base (NIFTY/BANKNIFTY/FINNIFTY/SENSEX)'
+        strat_type = data.get('strategyType') or 'iron_condor'
+        if strat_type not in _STRAT_TYPES:
+            return False, 'Unknown strategy type'
+        cfg = {
+            'strategyType': strat_type, 'baseSymbol': base,
+            'expiry': (data.get('expiry') or '').strip(),
+            'targetDelta': float(data.get('targetDelta') or 0.20),
+            'hedgeDistancePoints': float(data.get('hedgeDistancePoints') or 500),
+            'qty': max(1, int(data.get('qty', 1) or 1)),
+            'tf': data.get('tf', '5m'),
+            'mode': data.get('mode', 'paper'),
+            'optionBuyer': bool(data.get('optionBuyer', True)),
+            'optionSeller': bool(data.get('optionSeller', True)),
+            'slPct': float(data.get('slPct', 50.0) or 50.0),
+            'tpPct': float(data.get('tpPct', 50.0) or 50.0),
+            'maxConsec': int(data.get('maxConsec', 3) or 3),
+            'maxLoss': float(data.get('maxLoss', 0) or 0),
+            'priceTickSec': max(5, int(data.get('priceTickSec', 10) or 10)),
+            'model': (data.get('model') or '').strip(),
+            'api_key': (data.get('api_key') or '').strip(),
+        }
+        legs = data.get('legs')   # pre-resolved from a prior /claude_pick review step, if provided
+        if not legs:
+            legs, info = _strat_resolve_strikes(cfg, use_claude=False)
+            if not legs:
+                return False, 'Could not resolve strikes: ' + info
+        else:
+            info = 'using previously resolved legs'
+        strat_bot_state['config'] = cfg
+        strat_bot_state['legs'] = legs
+        strat_bot_state['trades'] = []
+        strat_bot_state['consec_losses'] = 0
+        strat_bot_state['log_buffer'] = []
+        strat_bot_state['lastConfig'] = dict(data)
+        strat_bot_state['running'] = True
+        strat_bot_state['paused'] = False
+        t = _threading.Thread(target=_strat_bot_loop, daemon=True, name='strategy-menu-bot')
+        strat_bot_state['thread'] = t
+        t.start()
+    for leg in legs:
+        if leg.get('removed'):
+            continue
+        try:
+            candles = _bot_fetch_candles(leg['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+            price = candles[-1]['close'] if candles else 0
+        except Exception:
+            price = 0
+        if price > 0:
+            _strat_open_leg(leg, cfg, price)
+        else:
+            _strat_log('[Entry] could not price ' + leg['symbol'] + ' - leg left flat (check Kite connection)')
+    _strat_log('Strategy started {} mode: {} on {} qty={} legs={}'.format(
+        cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
+        ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
+    _persist_log_line('[STRATMENU] [{}] START {} {} qty={}'.format(cfg['mode'].upper(), strat_type, base, cfg['qty']))
+    return True, 'Strategy started'
+
+def _strat_stop_bot():
+    with strat_bot_lock:
+        was_running = strat_bot_state.get('running')
+        strat_bot_state['running'] = False
+        strat_bot_state['paused'] = False
+        cfg = strat_bot_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        legs = list(strat_bot_state.get('legs', []))
+    for leg in legs:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _strat_close_leg(leg, px, 'bot stop', cfg, mode, cascade=True)
+    if was_running:
+        _strat_log('Strategy stopped, all legs closed.')
+        _persist_log_line('[STRATMENU] [{}] STOP'.format(mode.upper()))
+    return was_running
+
+# --- Schedule: entry/exit time-of-day, no external scheduler dependency ---
+_strat_scheduler_started = [False]
+
+def _strat_scheduled_start():
+    with strat_bot_lock:
+        cfg = dict(strat_bot_state.get('lastConfig') or {})
+    if not cfg:
+        _strat_log('[Schedule] entry time reached but no saved config - configure the strategy and arm the schedule again.')
+        return
+    ok, msg = _strat_start_bot(cfg)
+    _strat_log('[Schedule] auto-start: ' + ('started' if ok else ('failed - ' + msg)))
+
+def _strat_scheduled_stop():
+    _strat_stop_bot()
+    _strat_log('[Schedule] auto-stop: strategy stopped, all legs closed.')
+
+def _strat_scheduler_loop():
+    while True:
+        try:
+            with strat_bot_lock:
+                sched = dict(strat_bot_state.get('schedule') or {})
+                running = strat_bot_state.get('running', False)
+            if sched.get('armed'):
+                now = _tg_now_ist()
+                now_hm = now.strftime('%H:%M'); today = now.strftime('%Y-%m-%d')
+                if not running and sched.get('entryTime') and sched['entryTime'] == now_hm and sched.get('entryFiredDate') != today:
+                    _strat_scheduled_start()
+                    with strat_bot_lock: strat_bot_state['schedule']['entryFiredDate'] = today
+                elif running and sched.get('exitTime') and sched['exitTime'] == now_hm and sched.get('exitFiredDate') != today:
+                    _strat_scheduled_stop()
+                    with strat_bot_lock: strat_bot_state['schedule']['exitFiredDate'] = today
+        except Exception as e:
+            _strat_log('[Schedule] ERROR: ' + str(e))
+        _zd_time.sleep(30)
+
+def _strat_ensure_scheduler():
+    if not _strat_scheduler_started[0]:
+        _strat_scheduler_started[0] = True
+        t = _threading.Thread(target=_strat_scheduler_loop, daemon=True, name='strategy-menu-scheduler')
+        t.start()
+
+@app.route('/api/aibot/strategy/expiries', methods=['GET'])
+@login_required
+def strat_aibot_expiries():
+    base = (request.args.get('base') or '').upper().strip()
+    api_key = (request.args.get('api_key') or '').strip()
+    if base not in _STRAT_BASES:
+        return jsonify({'success': False, 'error': 'Unsupported underlying'}), 400
+    spot, expiries, rows, err = _strat_fetch_chain(base, api_key)
+    return jsonify({'success': bool(expiries), 'expiries': expiries, 'spot': spot, 'error': (err or None)})
+
+@app.route('/api/aibot/strategy/claude_pick', methods=['POST'])
+@login_required
+def strat_aibot_claude_pick():
+    data = request.json or {}
+    base = (data.get('baseSymbol') or '').upper().strip()
+    if base not in _STRAT_BASES:
+        return jsonify({'success': False, 'error': 'Pick a supported Underlying Base'}), 400
+    strat_type = data.get('strategyType') or 'iron_condor'
+    if strat_type not in _STRAT_TYPES:
+        return jsonify({'success': False, 'error': 'Unknown strategy type'}), 400
+    cfg = {
+        'strategyType': strat_type, 'baseSymbol': base,
+        'expiry': (data.get('expiry') or '').strip(),
+        'targetDelta': float(data.get('targetDelta') or 0.20),
+        'hedgeDistancePoints': float(data.get('hedgeDistancePoints') or 500),
+        'model': (data.get('model') or '').strip(),
+        'api_key': (data.get('api_key') or '').strip(),
+    }
+    legs, info = _strat_resolve_strikes(cfg, use_claude=True)
+    if not legs:
+        return jsonify({'success': False, 'error': info}), 502
+    out_legs = [{k: v for k, v in l.items() if k not in ('last_candles',)} for l in legs]
+    return jsonify({'success': True, 'legs': out_legs, 'info': info})
+
+@app.route('/api/aibot/strategy/start', methods=['POST'])
+@login_required
+def strat_aibot_start():
+    data = request.json or {}
+    ok, msg = _strat_start_bot(data)
+    if ok:
+        return jsonify({'success': True, 'message': msg})
+    return jsonify({'success': False, 'error': msg}), 400
+
+@app.route('/api/aibot/strategy/remove_leg', methods=['POST'])
+@login_required
+def strat_aibot_remove_leg():
+    data = request.json or {}
+    role = (data.get('role') or '').strip()
+    if role not in ('sellCE', 'sellPE', 'hedgeCE', 'hedgePE'):
+        return jsonify({'success': False, 'error': 'role must be sellCE/sellPE/hedgeCE/hedgePE'}), 400
+    with strat_bot_lock:
+        leg = next((l for l in strat_bot_state.get('legs', []) if l['role'] == role), None)
+        if not leg:
+            return jsonify({'success': False, 'error': 'leg not found - run Claude strategy or Start first'}), 404
+        cfg = strat_bot_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+    if leg.get('position'):
+        lt = leg.get('last_tick') or {}
+        px = lt.get('price') or leg['position']['entryPrice']
+        _strat_close_leg(leg, px, 'leg removed', cfg, mode, cascade=False)
+    leg['removed'] = True
+    _strat_log('[Leg] removed ' + role + ' (' + leg.get('symbol', '') + ')')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/strategy/pause', methods=['POST'])
+@login_required
+def strat_aibot_pause():
+    with strat_bot_lock:
+        if not strat_bot_state.get('running'):
+            return jsonify({'success': False, 'error': 'Strategy is not running'}), 400
+        strat_bot_state['paused'] = not strat_bot_state.get('paused', False)
+        paused = strat_bot_state['paused']
+    _strat_log('Strategy ' + ('paused' if paused else 'resumed'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/strategy/stop', methods=['POST'])
+@login_required
+def strat_aibot_stop():
+    _strat_stop_bot()
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/strategy/status', methods=['GET'])
+@login_required
+def strat_aibot_status():
+    with strat_bot_lock:
+        cfg = dict(strat_bot_state.get('config') or {})
+        cfg.pop('api_key', None)
+        legs = [{k: v for k, v in l.items() if k != 'last_candles'} for l in strat_bot_state.get('legs', [])]
+        trades = list(strat_bot_state.get('trades', []))
+        log_buf = list(strat_bot_state.get('log_buffer', []))[-200:]
+        running = strat_bot_state.get('running', False)
+        paused = strat_bot_state.get('paused', False)
+        schedule = dict(strat_bot_state.get('schedule') or {})
+        u_spot = strat_bot_state.get('underlyingSpot'); u_sym = strat_bot_state.get('underlyingSym')
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unreal = 0.0
+    for l in legs:
+        p = l.get('position'); lt = l.get('last_tick') or {}
+        if p and lt.get('price'):
+            unreal += _zd_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'])
+    return jsonify({
+        'success': True, 'running': running, 'paused': paused, 'config': cfg,
+        'legs': legs, 'trades': trades[-100:], 'log': log_buf, 'schedule': schedule,
+        'underlyingSpot': u_spot, 'underlyingSym': u_sym,
+        'stats': {
+            'realized': round(realized, 2), 'unrealized': round(unreal, 2),
+            'tradeCount': len(trades),
+            'winRate': round(wins / len(trades) * 100.0, 1) if trades else None,
+            'wins': wins,
+        },
+    })
+
+@app.route('/api/aibot/strategy/schedule', methods=['POST'])
+@login_required
+def strat_aibot_schedule():
+    data = request.json or {}
+    if data.get('armed') is False:
+        with strat_bot_lock:
+            strat_bot_state['schedule']['armed'] = False
+        _strat_log('[Schedule] disarmed')
+        return jsonify({'success': True, 'armed': False})
+    import re as _re3
+    entry_t = (data.get('entryTime') or '').strip()
+    exit_t = (data.get('exitTime') or '').strip()
+    if not _re3.match(r'^\d{2}:\d{2}$', entry_t) or not _re3.match(r'^\d{2}:\d{2}$', exit_t):
+        return jsonify({'success': False, 'error': 'entryTime/exitTime must be HH:MM'}), 400
+    with strat_bot_lock:
+        strat_bot_state['schedule'] = {'entryTime': entry_t, 'exitTime': exit_t, 'armed': True,
+                                        'entryFiredDate': '', 'exitFiredDate': ''}
+        cfg_snapshot = data.get('config') or strat_bot_state.get('lastConfig') or {}
+        strat_bot_state['lastConfig'] = dict(cfg_snapshot)
+    _strat_ensure_scheduler()
+    _strat_log('[Schedule] armed entry={} exit={}'.format(entry_t, exit_t))
+    return jsonify({'success': True, 'armed': True, 'entryTime': entry_t, 'exitTime': exit_t})
+
+# ============================================================================
 # MetaTrader 5 (MT5) integration — pluggable backend.
 #   MT5_BACKEND=metatrader5  -> official MetaTrader5 pip package (local Windows
 #                               terminal must run on the same host as this app)
@@ -18442,6 +19131,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="automation-item" id="btnTradingView">&#128200; TradingView</button>
       <button class="automation-item" id="btnAIBot">&#129504; Zerodha AI Bot</button>
       <button class="automation-item" id="btnZOptionsBot">&#127919; Zerodha Options AI Bot</button>
+      <button class="automation-item" id="btnStrategyMenu">&#129513; Strategy Menu</button>
       <button class="automation-item" id="btnDeltaLogin">&#128272; Delta Login</button>
       <button class="automation-item" id="btnDeltaBot">&#129504; Delta AI Bot</button>
       <button class="automation-item" id="btnDOptionsBot">&#127919; Delta Options AI Bot</button>
@@ -19955,6 +20645,131 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <input type="text" id="zoChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
           <button class="dbot-chat-send" id="zoChatSend">Send</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Strategy Menu Panel: defined multi-leg options strategies (Iron Condor,
+       Short Strangle, Jade Lizard) with delta-based strike selection -->
+  <div class="zerodha-panel" id="stratMenuPanel" style="width:1020px">
+    <div class="zd-header" id="stratMenuHeader">
+      <h3><span style="color:#b388ff">&#129513;</span> Strategy Menu</h3>
+      <div class="zd-header-actions">
+        <button class="zd-header-btn" id="stratMenuMaximizeBtn" title="Maximize">&#9633;</button>
+        <button class="zd-header-btn" id="stratMenuPopoutBtn" title="Open in new window">&#8599;</button>
+        <button class="zd-close" id="stratMenuClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="zd-body">
+      <div style="display:flex;gap:12px;margin-bottom:12px">
+        <button class="zd-add-btn" id="stratMenuPickZerodha" style="padding:14px 22px;font-size:13px">&#127919; Zerodha Options Strategy</button>
+        <button class="zd-add-btn" id="stratMenuPickDelta" disabled title="Not built yet — unrelated to the Delta Exchange bot" style="padding:14px 22px;font-size:13px;opacity:0.4;cursor:not-allowed">&#128274; Delta Options Strategy <span style="font-size:10px">(coming soon)</span></button>
+      </div>
+
+      <div id="stratZoSection" style="display:none">
+        <div class="zd-status-bar" id="stratZoStatusBar" style="margin-bottom:10px">
+          <span class="zd-status-dot" id="stratZoStatusDot"></span>
+          <span id="stratZoStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders</span>
+        </div>
+
+        <div class="ai-disclaimer">
+          <b>&#9888; Reality check:</b> multi-leg option SELLING carries large/undefined risk if the underlying
+          moves against you. Short Strangle has no hedge legs — undefined risk by design. Always paper trade first.
+        </div>
+
+        <div class="ai-mode-bar">
+          <label><input type="radio" name="stratZoMode" value="paper" checked> &#128221; Paper Trading</label>
+          <label class="live"><input type="radio" name="stratZoMode" value="live"> &#9888; Live Trading</label>
+        </div>
+
+        <div class="ai-strat-bar">
+          <span class="lbl">&#127919; Options mode:</span>
+          <label><input type="checkbox" id="stratZoBuyer" checked> Option Buyer</label>
+          <label><input type="checkbox" id="stratZoSeller" checked> Option Seller</label>
+        </div>
+
+        <div class="ai-strat-bar">
+          <span class="lbl">Strategy:</span>
+          <label><input type="radio" name="stratZoType" class="stratzo-type" value="iron_condor" checked> Iron Condor</label>
+          <label><input type="radio" name="stratZoType" class="stratzo-type" value="short_strangle"> Short Strangle</label>
+          <label><input type="radio" name="stratZoType" class="stratzo-type" value="jade_lizard"> Jade Lizard</label>
+        </div>
+
+        <div class="ai-input-bar">
+          <label><span>Underlying Base</span><select id="stratZoBaseSel">
+            <option value="NIFTY" selected>NIFTY</option>
+            <option value="SENSEX">SENSEX</option>
+            <option value="FINNIFTY">FINNIFTY</option>
+            <option value="BANKNIFTY">BANKNIFTY</option>
+          </select></label>
+          <label><span>Expiry</span><select id="stratZoExpirySel"><option value="">&mdash;</option></select></label>
+          <label title="SELL legs are picked at or below this delta (0.20 = 20 delta)"><span>Target Delta</span><input type="number" id="stratZoTargetDelta" value="0.20" min="0.01" max="0.90" step="0.01" style="width:80px"></label>
+          <label title="Hedge (BUY) strike = sold strike +/- this many points"><span>Hedge distance (pts)</span><input type="number" id="stratZoHedgeDist" value="500" min="10" step="10" style="width:100px"></label>
+          <label><span>Model</span><select id="stratZoModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+          <button class="zd-add-btn" id="stratZoClaudeBtn" type="button">&#129302; Claude strategy</button>
+          <span id="stratZoClaudeInfo" style="color:#787b86;font-size:11px"></span>
+        </div>
+
+        <div style="overflow-x:auto;margin:10px 0">
+          <table style="width:100%;border-collapse:collapse;font-size:12px" id="stratZoLegsTable">
+            <thead>
+              <tr style="color:#787b86;text-align:left;border-bottom:1px solid #2a2e39">
+                <th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Symbol</th>
+                <th style="padding:6px 8px">Side</th><th style="padding:6px 8px">Strike</th>
+                <th style="padding:6px 8px">Delta</th><th style="padding:6px 8px">Position</th>
+                <th style="padding:6px 8px"></th>
+              </tr>
+            </thead>
+            <tbody id="stratZoLegsBody">
+              <tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs yet — click &#129302; Claude strategy or Start to auto-select strikes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="ai-risk-bar">
+          <label title="Applies to SOLD legs only — hedge legs close only when their sold leg's SL/TP fires">SL % <input type="number" id="stratZoSlPct" value="50" min="1" style="width:70px"></label>
+          <label>TP % <input type="number" id="stratZoTpPct" value="50" min="1" style="width:70px"></label>
+          <label>Lots <input type="number" id="stratZoQty" value="1" min="1" style="width:70px"></label>
+          <label title="Bot auto-stops after this many consecutive losing legs">Max consec losses <input type="number" id="stratZoMaxConsec" value="3" min="1" style="width:70px"></label>
+          <label>Max daily loss &#8377; <input type="number" id="stratZoMaxLoss" value="0" min="0" style="width:90px" title="0 = disabled"></label>
+        </div>
+
+        <div class="ai-info-grid">
+          <div class="cell"><span class="lab">Underlying</span><span class="val" id="stratZoUnderlying" style="color:#f7a600">&mdash;</span></div>
+          <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="stratZoRealizedPnl">&#8377;0.00</span></div>
+          <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="stratZoUnrealPnl">&#8377;0.00</span></div>
+          <div class="cell"><span class="lab">Trades</span><span class="val" id="stratZoTradeCount">0</span></div>
+          <div class="cell"><span class="lab">Win Rate</span><span class="val" id="stratZoWinRate">&mdash;</span></div>
+        </div>
+
+        <div style="overflow-x:auto;margin:10px 0">
+          <table style="width:100%;border-collapse:collapse;font-size:12px" id="stratZoTradesTable">
+            <thead>
+              <tr style="color:#787b86;text-align:left;border-bottom:1px solid #2a2e39">
+                <th style="padding:6px 8px">Time</th><th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Symbol</th>
+                <th style="padding:6px 8px">Side</th><th style="padding:6px 8px">Entry</th><th style="padding:6px 8px">Exit</th>
+                <th style="padding:6px 8px">PnL</th><th style="padding:6px 8px">Reason</th>
+              </tr>
+            </thead>
+            <tbody id="stratZoTradesBody"><tr><td colspan="8" style="padding:10px 8px;color:#787b86">No closed trades yet.</td></tr></tbody>
+          </table>
+        </div>
+
+        <div class="zd-footer">
+          <button class="zd-start-btn start" id="stratZoStartBtn">&#9654; Start</button>
+          <button class="zd-start-btn pause" id="stratZoPauseBtn" disabled>&#9208; Pause</button>
+          <button class="zd-start-btn stop" id="stratZoStopBtn" disabled>&#9632; Stop</button>
+          <button class="zd-add-btn" id="stratZoScheduleBtn" type="button">&#128337; Schedule</button>
+        </div>
+        <div class="ai-input-bar" id="stratZoScheduleBar" style="display:none">
+          <label>Entry time <input type="time" id="stratZoEntryTime"></label>
+          <label>Exit time <input type="time" id="stratZoExitTime"></label>
+          <button class="zd-add-btn" id="stratZoScheduleArmBtn" type="button">Arm schedule</button>
+          <button class="zd-add-btn" id="stratZoScheduleDisarmBtn" type="button">Disarm</button>
+          <span id="stratZoScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
+        </div>
+
+        <div class="zd-log" id="stratZoLog" style="max-height:180px"><span class="log-info">Strategy Menu ready. Paper Trading default. Pick an underlying + strategy, click Claude strategy (or Start) to resolve legs.</span></div>
       </div>
     </div>
   </div>
@@ -27613,6 +28428,291 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }).catch(e => { statusDot.classList.remove('connected'); statusText.innerHTML = '<span style="color:#ef5350">' + e.message + '</span>'; });
     });
     refresh();
+  })();
+
+  // ---- Strategy Menu Panel: multi-leg options strategies (Iron Condor, Short
+  //      Strangle, Jade Lizard) with delta-based strike selection. Independent
+  //      of the Zerodha Options AI Bot panel above — does not touch its code. ----
+  (function() {
+    const panel = document.getElementById('stratMenuPanel');
+    if (!panel) return;
+    const header    = document.getElementById('stratMenuHeader');
+    const maxBtn    = document.getElementById('stratMenuMaximizeBtn');
+    const popBtn    = document.getElementById('stratMenuPopoutBtn');
+    const closeBtn  = document.getElementById('stratMenuClose');
+    const statusDot = document.getElementById('stratZoStatusDot');
+    const statusText= document.getElementById('stratZoStatusText');
+    const logEl     = document.getElementById('stratZoLog');
+    const startBtn  = document.getElementById('stratZoStartBtn');
+    const pauseBtn  = document.getElementById('stratZoPauseBtn');
+    const stopBtn   = document.getElementById('stratZoStopBtn');
+    const legsBody  = document.getElementById('stratZoLegsBody');
+    const tradesBody= document.getElementById('stratZoTradesBody');
+    const baseSel   = document.getElementById('stratZoBaseSel');
+    const expirySel = document.getElementById('stratZoExpirySel');
+    const claudeBtn = document.getElementById('stratZoClaudeBtn');
+    const claudeInfo= document.getElementById('stratZoClaudeInfo');
+    let botRunning = false, botPaused = false, botMaximized = false;
+    let pendingLegs = [];   // legs from a Claude-strategy preview, before Start
+    let statusTimer = null;
+
+    function logLine(msg) {
+      const span = document.createElement('span');
+      span.className = 'log-info'; span.textContent = msg;
+      logEl.appendChild(span); logEl.appendChild(document.createElement('br'));
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function currentMode() { const r = document.querySelector('input[name="stratZoMode"]:checked'); return r ? r.value : 'paper'; }
+    function currentStrategyType() { const r = document.querySelector('input[name="stratZoType"]:checked'); return r ? r.value : 'iron_condor'; }
+
+    document.getElementById('stratMenuPickZerodha').addEventListener('click', function() {
+      document.getElementById('stratZoSection').style.display = '';
+      loadExpiries();
+    });
+
+    const btnOpen = document.getElementById('btnStrategyMenu');
+    if (btnOpen) btnOpen.addEventListener('click', function() {
+      automationDropdown.classList.remove('open');
+      panel.classList.add('open');
+      refreshStatus(); pollStatus();
+      if (!statusTimer) statusTimer = setInterval(pollStatus, 5000);
+    });
+    closeBtn.addEventListener('click', function() {
+      panel.classList.remove('open');
+      if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+    });
+    (function() {
+      let dr=false,sx,sy,ol,ot;
+      header.addEventListener('mousedown', function(e) {
+        if (e.target.closest('button, select, input, label')) return;
+        if (panel.classList.contains('maximized')) return;
+        dr=true; panel.style.transform='none';
+        const r = panel.getBoundingClientRect();
+        ol=r.left; ot=r.top; sx=e.clientX; sy=e.clientY;
+        panel.style.left=ol+'px'; panel.style.top=ot+'px'; e.preventDefault();
+      });
+      document.addEventListener('mousemove', e => { if (dr) { panel.style.left=(ol+e.clientX-sx)+'px'; panel.style.top=(ot+e.clientY-sy)+'px'; }});
+      document.addEventListener('mouseup', () => { dr=false; });
+    })();
+    maxBtn.addEventListener('click', function() {
+      botMaximized = !botMaximized;
+      panel.classList.toggle('maximized', botMaximized);
+      this.innerHTML = botMaximized ? '&#9635;' : '&#9633;';
+    });
+    popBtn.addEventListener('click', function() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('stratMenuPopout', '1');
+      window.open(url.toString(), 'stratMenuPopout', 'width=1100,height=950,resizable=yes,scrollbars=yes');
+    });
+    if (new URLSearchParams(window.location.search).get('stratMenuPopout') === '1') {
+      document.body.classList.add('zerodha-popout-window');
+      panel.classList.add('open');
+      maxBtn.style.display='none'; popBtn.style.display='none'; closeBtn.style.display='none';
+      document.title = '🧩 Strategy Menu — Mangal View';
+    }
+
+    function refreshStatus() {
+      const s = ZerodhaStore.getSession();
+      const dis = 'Not connected &mdash; open <b style="color:#1e6ec8">Zerodha Login</b> to enable live Kite data + live orders';
+      if (!s.apiKey) { statusDot.classList.remove('connected'); statusText.innerHTML = dis; return; }
+      _liveConn({ url: '/api/zerodha/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
+        connectedHTML: 'Connected to Zerodha <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>',
+        disconnectedHTML: dis });
+    }
+    window.addEventListener('zerodha-session-change', refreshStatus);
+
+    function loadExpiries() {
+      const s = ZerodhaStore.getSession();
+      const base = baseSel.value;
+      expirySel.innerHTML = '<option value="">Loading&hellip;</option>';
+      fetch('/api/aibot/strategy/expiries?base=' + encodeURIComponent(base) + '&api_key=' + encodeURIComponent(s.apiKey || ''))
+        .then(r => r.json()).then(function(d) {
+          expirySel.innerHTML = '';
+          if (d.expiries && d.expiries.length) {
+            d.expiries.forEach(function(e) {
+              const o = document.createElement('option'); o.value = e; o.textContent = e; expirySel.appendChild(o);
+            });
+          } else {
+            expirySel.innerHTML = '<option value="">' + (d.error || 'no expiries') + '</option>';
+          }
+        }).catch(function() { expirySel.innerHTML = '<option value="">error loading expiries</option>'; });
+    }
+    baseSel.addEventListener('change', loadExpiries);
+
+    function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
+    function fmtPos(p) {
+      if (!p) return '<span style="color:#787b86">flat</span>';
+      return '<span class="' + (p.side === 'BUY' ? 'bull' : 'bear') + '">' + p.side + ' @ ' + p.entryPrice +
+             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>';
+    }
+    function renderLegs(legs, live) {
+      legsBody.innerHTML = '';
+      const visible = (legs || []).filter(l => !l.removed);
+      if (!visible.length) {
+        legsBody.innerHTML = '<tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs — click Claude strategy or Start.</td></tr>';
+        return;
+      }
+      visible.forEach(function(leg) {
+        const tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #1e222d';
+        tr.innerHTML =
+          '<td style="padding:6px 8px">' + leg.role + '</td>' +
+          '<td style="padding:6px 8px">' + (leg.symbol || '—') + '</td>' +
+          '<td style="padding:6px 8px">' + leg.side + '</td>' +
+          '<td style="padding:6px 8px">' + (leg.strike != null ? Math.round(leg.strike) : '—') + '</td>' +
+          '<td style="padding:6px 8px">' + fmtDelta(leg.delta) + '</td>' +
+          '<td style="padding:6px 8px">' + fmtPos(leg.position) + '</td>' +
+          '<td style="padding:6px 8px"></td>';
+        const rmBtn = document.createElement('button');
+        rmBtn.className = 'zd-add-btn'; rmBtn.type = 'button'; rmBtn.textContent = 'Remove';
+        rmBtn.style.padding = '2px 8px'; rmBtn.style.fontSize = '11px';
+        rmBtn.addEventListener('click', function() {
+          if (live) {
+            fetch('/api/aibot/strategy/remove_leg', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ role: leg.role }) })
+              .then(r => r.json()).then(function(res) {
+                if (res.success) { logLine('Removed ' + leg.role); pollStatus(); }
+                else logLine('Remove failed: ' + (res.error || 'unknown'));
+              });
+          } else {
+            pendingLegs = pendingLegs.filter(l => l.role !== leg.role);
+            renderLegs(pendingLegs, false);
+          }
+        });
+        tr.lastElementChild.appendChild(rmBtn);
+        legsBody.appendChild(tr);
+      });
+    }
+
+    claudeBtn.addEventListener('click', function() {
+      const s = ZerodhaStore.getSession();
+      claudeInfo.textContent = 'Asking Claude…';
+      fetch('/api/aibot/strategy/claude_pick', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          baseSymbol: baseSel.value, strategyType: currentStrategyType(), expiry: expirySel.value,
+          targetDelta: parseFloat(document.getElementById('stratZoTargetDelta').value) || 0.20,
+          hedgeDistancePoints: parseFloat(document.getElementById('stratZoHedgeDist').value) || 500,
+          model: document.getElementById('stratZoModel').value, api_key: s.apiKey || ''
+        }) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { claudeInfo.textContent = res.error || 'failed'; logLine('Claude strategy failed: ' + (res.error || 'unknown')); return; }
+          pendingLegs = res.legs || [];
+          renderLegs(pendingLegs, false);
+          claudeInfo.textContent = res.info || '';
+          logLine('Claude strategy: ' + (res.info || ''));
+        }).catch(function(e) { claudeInfo.textContent = 'error'; logLine('Claude strategy error: ' + e.message); });
+    });
+
+    function buildCfg() {
+      const s = ZerodhaStore.getSession();
+      const cfg = {
+        baseSymbol: baseSel.value, strategyType: currentStrategyType(), expiry: expirySel.value,
+        targetDelta: parseFloat(document.getElementById('stratZoTargetDelta').value) || 0.20,
+        hedgeDistancePoints: parseFloat(document.getElementById('stratZoHedgeDist').value) || 500,
+        qty: parseInt(document.getElementById('stratZoQty').value) || 1,
+        mode: currentMode(),
+        optionBuyer: !!document.getElementById('stratZoBuyer').checked,
+        optionSeller: !!document.getElementById('stratZoSeller').checked,
+        slPct: parseFloat(document.getElementById('stratZoSlPct').value) || 50,
+        tpPct: parseFloat(document.getElementById('stratZoTpPct').value) || 50,
+        maxConsec: parseInt(document.getElementById('stratZoMaxConsec').value) || 3,
+        maxLoss: parseFloat(document.getElementById('stratZoMaxLoss').value) || 0,
+        model: document.getElementById('stratZoModel').value,
+        api_key: s.apiKey || ''
+      };
+      if (pendingLegs.length) cfg.legs = pendingLegs;
+      return cfg;
+    }
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const s = ZerodhaStore.getSession();
+      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first.'); return; }
+      const cfg = buildCfg();
+      if (!cfg.optionBuyer && !cfg.optionSeller) { logLine('Enable Option Buyer and/or Option Seller.'); return; }
+      logLine('Starting strategy ' + cfg.mode.toUpperCase() + ' ' + cfg.strategyType + ' on ' + cfg.baseSymbol + '…');
+      fetch('/api/aibot/strategy/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown')); return; }
+          logLine('Strategy running on the server.'); pollStatus();
+        }).catch(function(e) { logLine('Start request error: ' + e.message); });
+    });
+    pauseBtn.addEventListener('click', function() {
+      if (!botRunning) return;
+      fetch('/api/aibot/strategy/pause', { method: 'POST' }).then(r => r.json()).then(function(res) {
+        if (res.success) { botPaused = !!res.paused; pauseBtn.textContent = botPaused ? '▶ Resume' : '⏸ Pause'; logLine(botPaused ? 'Paused.' : 'Resumed.'); }
+      });
+    });
+    stopBtn.addEventListener('click', function() {
+      fetch('/api/aibot/strategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pollStatus(); });
+    });
+
+    const schedBar = document.getElementById('stratZoScheduleBar');
+    document.getElementById('stratZoScheduleBtn').addEventListener('click', function() {
+      schedBar.style.display = (schedBar.style.display === 'none') ? '' : 'none';
+    });
+    document.getElementById('stratZoScheduleArmBtn').addEventListener('click', function() {
+      const entryTime = document.getElementById('stratZoEntryTime').value;
+      const exitTime = document.getElementById('stratZoExitTime').value;
+      if (!entryTime || !exitTime) { logLine('Set both Entry time and Exit time.'); return; }
+      fetch('/api/aibot/strategy/schedule', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ entryTime: entryTime, exitTime: exitTime, config: buildCfg() }) })
+        .then(r => r.json()).then(function(res) {
+          if (res.success) { document.getElementById('stratZoScheduleStatus').textContent = 'armed ' + res.entryTime + ' → ' + res.exitTime; logLine('Schedule armed.'); }
+          else logLine('Schedule failed: ' + (res.error || 'unknown'));
+        });
+    });
+    document.getElementById('stratZoScheduleDisarmBtn').addEventListener('click', function() {
+      fetch('/api/aibot/strategy/schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ armed: false }) })
+        .then(r => r.json()).then(function() { document.getElementById('stratZoScheduleStatus').textContent = 'not armed'; logLine('Schedule disarmed.'); });
+    });
+
+    function pollStatus() { fetch('/api/aibot/strategy/status').then(r => r.json()).then(applyStratStatus).catch(function() {}); }
+    function applyStratStatus(s) {
+      if (!s || !s.success) return;
+      botRunning = !!s.running; botPaused = !!s.paused;
+      startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
+      pauseBtn.textContent = botPaused ? '▶ Resume' : '⏸ Pause';
+      const log = s.log || [];
+      const sig = log.join('\n');
+      if (logEl.__logsig !== sig) {
+        logEl.innerHTML = log.map(l => '<span class="log-info">' + l.replace(/</g,'&lt;') + '</span>').join('<br>');
+        logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = sig;
+      }
+      if (s.legs && s.legs.length) { pendingLegs = s.legs; renderLegs(s.legs, botRunning); }
+      const trades = s.trades || [];
+      if (trades.length) {
+        tradesBody.innerHTML = trades.slice().reverse().map(function(t) {
+          const ts = t.exitTime ? new Date(t.exitTime * 1000).toLocaleTimeString() : '—';
+          const pnlCls = (t.pnl >= 0) ? 'bull' : 'bear';
+          return '<tr style="border-bottom:1px solid #1e222d">' +
+            '<td style="padding:6px 8px">' + ts + '</td>' +
+            '<td style="padding:6px 8px">' + (t.role || '') + '</td>' +
+            '<td style="padding:6px 8px">' + (t.symbol || '') + '</td>' +
+            '<td style="padding:6px 8px">' + (t.side || '') + '</td>' +
+            '<td style="padding:6px 8px">' + t.entryPrice + '</td>' +
+            '<td style="padding:6px 8px">' + t.exitPrice + '</td>' +
+            '<td class="' + pnlCls + '" style="padding:6px 8px">' + (t.pnl >= 0 ? '+' : '') + t.pnl + '</td>' +
+            '<td style="padding:6px 8px">' + (t.reason || '') + '</td></tr>';
+        }).join('');
+      }
+      const st = s.stats || {};
+      const realEl = document.getElementById('stratZoRealizedPnl');
+      const unrEl  = document.getElementById('stratZoUnrealPnl');
+      if (st.realized != null) {
+        realEl.textContent = (st.realized >= 0 ? '+₹' : '-₹') + Math.abs(st.realized).toFixed(2);
+        realEl.className = 'val ' + (st.realized > 0 ? 'bull' : st.realized < 0 ? 'bear' : '');
+      }
+      if (st.unrealized != null) {
+        unrEl.textContent = (st.unrealized >= 0 ? '+₹' : '-₹') + Math.abs(st.unrealized).toFixed(2);
+        unrEl.className = 'val ' + (st.unrealized > 0 ? 'bull' : st.unrealized < 0 ? 'bear' : '');
+      }
+      document.getElementById('stratZoTradeCount').textContent = (st.tradeCount != null) ? st.tradeCount : '—';
+      document.getElementById('stratZoWinRate').textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
+      const ulEl = document.getElementById('stratZoUnderlying');
+      if (ulEl) ulEl.textContent = (s.underlyingSym && s.underlyingSpot != null) ? (s.underlyingSym + ' ' + s.underlyingSpot) : '—';
+      const sc = s.schedule || {};
+      document.getElementById('stratZoScheduleStatus').textContent = sc.armed ? ('armed ' + sc.entryTime + ' → ' + sc.exitTime) : 'not armed';
+    }
   })();
 
   // ---- MT5 AI Bot Panel (server-side, mirrors Delta/Zerodha) ----

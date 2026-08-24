@@ -56,3 +56,5 @@ Trendline , patterns, fibonacci , short long positions
 13. default all strategies unselected
 14. When AI bot panel opened, just check whether its really connected. if not connected say not connected. 
 15. In login Panel, check whether its really conencted, if its connected then turn button green and say connected. if not say not connected 
+
+16. For options add multiple of 65 as quantity
