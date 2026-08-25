@@ -6143,6 +6143,20 @@ def _strat_log(msg):
         if len(buf) > 200:
             del buf[:len(buf) - 200]
 
+def _strat_persist_log_line(line):
+    """Append a trade-meaningful Strategy Menu line to its own log_options.txt
+    (separate from the shared log.txt every other bot writes to), so strategy
+    trade history can be reviewed/downloaded independently. Shared by both the
+    Zerodha and Delta sides of the Strategy Menu. Timestamped in IST."""
+    from datetime import datetime as _dt, timezone as _tzc, timedelta as _tdc
+    ts = _dt.now(_tzc(_tdc(seconds=IST_OFFSET))).isoformat()
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log_options.txt')
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write('[' + ts + '] ' + line + '\n')
+    except Exception:
+        pass
+
 # --- Black-Scholes delta (stdlib math.erf only — no scipy in requirements.txt) ---
 def _bs_price(spot, strike, sigma, t, option_type, risk_free_rate=0.07):
     """European BS price. Degenerates to intrinsic value if sigma/t are ~0."""
@@ -6442,7 +6456,7 @@ def _strat_open_leg(leg, cfg, price):
     if mode == 'live':
         if not _zo_place_live(leg, side, qty, price, cfg):
             _strat_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}). Fix margin/funds or reduce lots.'.format(leg['symbol'], side, qty))
-            _persist_log_line('[STRATMENU] [LIVE] ENTRY REJECTED — no position opened ' + leg['symbol'])
+            _strat_persist_log_line('[LIVE] ENTRY REJECTED — no position opened ' + leg['symbol'])
             leg['last_exit_time'] = int(_zd_time.time())
             return False
     leg['position'] = {
@@ -6453,7 +6467,7 @@ def _strat_open_leg(leg, cfg, price):
     }
     line = '[{}] ENTRY {} {} {} @ {} role={} SL={} TP={}'.format(
         mode.upper(), side, qty, leg['symbol'], round(price, 2), leg['role'], sl, tp)
-    _strat_log(line); _persist_log_line('[STRATMENU] ' + line)
+    _strat_log(line); _strat_persist_log_line(line)
     return True
 
 def _strat_close_leg(leg, price, reason, cfg, mode, cascade=True):
@@ -6471,7 +6485,7 @@ def _strat_close_leg(leg, price, reason, cfg, mode, cascade=True):
     line = '[{}] EXIT {} {} {} @ {} (entry {}) PnL={}{:.2f} reason={} role={}'.format(
         mode.upper(), close_side, pos['qty'], leg['symbol'], round(price, 2), pos['entryPrice'],
         '+' if pnl >= 0 else '', pnl, reason, leg['role'])
-    _strat_log(line); _persist_log_line('[STRATMENU] ' + line)
+    _strat_log(line); _strat_persist_log_line(line)
     if mode == 'live':
         _zo_place_live(leg, close_side, pos['qty'], price, cfg)
     leg['position'] = None
@@ -6509,7 +6523,7 @@ def _strat_check_breakers(cfg, mode):
             _strat_close_leg(leg, px, trip, cfg, mode, cascade=False)
     strat_bot_state['running'] = False
     _strat_log('[STOP] ' + trip + ' - all legs closed, strategy stopped.')
-    _persist_log_line('[STRATMENU] [STOP] ' + trip)
+    _strat_persist_log_line('[STOP] ' + trip)
 
 def _strat_bot_tick():
     with strat_bot_lock:
@@ -6620,7 +6634,7 @@ def _strat_start_bot(data):
     _strat_log('Strategy started {} mode: {} on {} qty={} legs={}'.format(
         cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
         ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
-    _persist_log_line('[STRATMENU] [{}] START {} {} qty={}'.format(cfg['mode'].upper(), strat_type, base, cfg['qty']))
+    _strat_persist_log_line('[{}] START {} {} qty={}'.format(cfg['mode'].upper(), strat_type, base, cfg['qty']))
     return True, 'Strategy started'
 
 def _strat_stop_bot():
@@ -6638,7 +6652,7 @@ def _strat_stop_bot():
             _strat_close_leg(leg, px, 'bot stop', cfg, mode, cascade=True)
     if was_running:
         _strat_log('Strategy stopped, all legs closed.')
-        _persist_log_line('[STRATMENU] [{}] STOP'.format(mode.upper()))
+        _strat_persist_log_line('[{}] STOP'.format(mode.upper()))
     return was_running
 
 # --- Schedule: entry/exit time-of-day, no external scheduler dependency ---
@@ -6782,7 +6796,9 @@ def strat_aibot_status():
     for l in legs:
         p = l.get('position'); lt = l.get('last_tick') or {}
         if p and lt.get('price'):
-            unreal += _zd_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'])
+            leg_pnl = _zd_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'])
+            p['unrealizedPnl'] = round(leg_pnl, 2)   # live P/L shown in the leg's Position cell
+            unreal += leg_pnl
     return jsonify({
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
         'legs': legs, 'trades': trades[-100:], 'log': log_buf, 'schedule': schedule,
@@ -6816,6 +6832,593 @@ def strat_aibot_schedule():
         strat_bot_state['lastConfig'] = dict(cfg_snapshot)
     _strat_ensure_scheduler()
     _strat_log('[Schedule] armed entry={} exit={}'.format(entry_t, exit_t))
+    return jsonify({'success': True, 'armed': True, 'entryTime': entry_t, 'exitTime': exit_t})
+
+@app.route('/api/aibot/strategy/log_download', methods=['GET'])
+@login_required
+def strat_aibot_log_download():
+    """Stream log_options.txt (Strategy Menu trade log, separate from the shared
+    log.txt every other bot writes to — shared by the Zerodha and Delta sides of
+    the Strategy Menu). ?download=1 forces a file download."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log_options.txt')
+    as_download = request.args.get('download') in ('1', 'true', 'yes')
+    if not os.path.exists(path):
+        return Response('(log_options.txt is empty — no Strategy Menu trades yet)', content_type='text/plain; charset=utf-8')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        return Response('Error reading log_options.txt: ' + str(e), content_type='text/plain; charset=utf-8', status=500)
+    headers = {}
+    if as_download:
+        fname = 'log_options_{}.txt'.format(datetime.now().strftime('%Y%m%d_%H%M%S'))
+        headers['Content-Disposition'] = 'attachment; filename="{}"'.format(fname)
+    return Response(content, content_type='text/plain; charset=utf-8', headers=headers)
+
+# ============================================================================
+# "Strategy Menu" — Delta Exchange side: the SAME multi-leg engine as the
+# Zerodha side above (Iron Condor/Short Strangle/Jade Lizard, delta-based
+# strike selection with a Claude override, hedge-linked SL/TP, schedule),
+# applied to Delta Exchange crypto options. Underlyings: BTC, ETH — Delta
+# Exchange does not currently list XAUT options (checked live; only BTC/ETH
+# call_options/put_options exist), so XAUT is not offered here.
+#
+# Reuses: _STRAT_TYPES, _bs_delta (fallback only — Delta's ticker returns
+# native greeks.delta, more accurate than our own Black-Scholes for crypto
+# vol surfaces), _call_claude, and the already-existing Delta Options AI Bot
+# helpers _do_load_options / _do_place_live / _delta_calc_pnl /
+# _load_delta_products / _do_spot_candles — none of which are modified.
+# Independent of do_ai_state/doBotPanel and of strat_bot_state (Zerodha side)
+# — none of those are touched. Trade log is shared via _strat_persist_log_line
+# into log_options.txt (same file/route as the Zerodha side).
+# ============================================================================
+dstrat_bot_state = {
+    'running': False, 'paused': False, 'thread': None,
+    'config': None, 'lastConfig': None,
+    'legs': [], 'trades': [], 'consec_losses': 0, 'log_buffer': [],
+    'schedule': {'entryTime': '', 'exitTime': '', 'armed': False, 'entryFiredDate': '', 'exitFiredDate': ''},
+    'underlyingSpot': None, 'underlyingSym': '',
+}
+dstrat_bot_lock = _threading.RLock()
+_DSTRAT_BASES = ('BTC', 'ETH')
+
+def _dstrat_log(msg):
+    ts = _bot_log_ts()
+    with dstrat_bot_lock:
+        buf = dstrat_bot_state.setdefault('log_buffer', [])
+        buf.append('[' + ts + '] ' + msg)
+        if len(buf) > 200:
+            del buf[:len(buf) - 200]
+
+_DSTRAT_TICKER_CACHE = {}   # {base: {'ts': float, 'data': {'spot': float, 'by_symbol': {...}}}}
+_DSTRAT_TICKER_TTL = 30     # crypto options move fast — shorter TTL than the NSE/Kite chain cache
+
+def _dstrat_fetch_tickers(base):
+    """Live per-symbol delta/IV/mark price for BTC/ETH options via Delta's
+    ticker snapshot — includes native greeks.delta and quotes.mark_iv, so no
+    Black-Scholes call is needed on this side except as a fallback."""
+    now = _zd_time.time()
+    ent = _DSTRAT_TICKER_CACHE.get(base) or {}
+    if ent.get('data') and now - ent.get('ts', 0) < _DSTRAT_TICKER_TTL:
+        return ent['data']
+    resp = _delta_get_public('/v2/tickers', params={'contract_types': 'call_options,put_options',
+                                                      'underlying_asset_symbols': base})
+    if not resp.get('success'):
+        return ent.get('data') or {'spot': 0.0, 'by_symbol': {}}
+    by_symbol = {}
+    spot = 0.0
+    for t in (resp.get('result') or []):
+        sym = (t.get('symbol') or '').upper()
+        if not sym:
+            continue
+        greeks = t.get('greeks') or {}; quotes = t.get('quotes') or {}
+        try:    delta = float(greeks.get('delta') or 0)
+        except (TypeError, ValueError): delta = 0.0
+        try:    iv = float(quotes.get('mark_iv') or t.get('mark_vol') or 0)
+        except (TypeError, ValueError): iv = 0.0
+        try:    mark = float(t.get('mark_price') or 0)
+        except (TypeError, ValueError): mark = 0.0
+        try:    sp = float(t.get('spot_price') or 0)
+        except (TypeError, ValueError): sp = 0.0
+        if sp > 0:
+            spot = sp
+        by_symbol[sym] = {'delta': delta, 'iv': iv, 'mark': mark}
+    data = {'spot': spot, 'by_symbol': by_symbol}
+    _DSTRAT_TICKER_CACHE[base] = {'ts': now, 'data': data}
+    return data
+
+def _dstrat_resolve_strikes(cfg, use_claude=True):
+    """Resolve sold CE/PE strikes by target delta (native Delta greeks, BS
+    fallback) + hedge strikes by points. Mirrors _strat_resolve_strikes."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    strat_type = cfg.get('strategyType') or 'iron_condor'
+    roles = (_STRAT_TYPES.get(strat_type) or _STRAT_TYPES['iron_condor'])['legs']
+    target_delta = abs(float(cfg.get('targetDelta') or 0.20))
+    hedge_pts = float(cfg.get('hedgeDistancePoints') or 500)
+    chain_all = _do_load_options(base)
+    if not chain_all:
+        return [], 'no Delta option chain for ' + base
+    today = _tg_now_ist().strftime('%Y-%m-%d')
+    expiries = sorted({o['expiry'] for o in chain_all if o['expiry'] and o['expiry'] >= today}) \
+               or sorted({o['expiry'] for o in chain_all if o['expiry']})
+    if not expiries:
+        return [], 'no expiries for ' + base
+    chosen_expiry = cfg.get('expiry') if (cfg.get('expiry') in expiries) else expiries[0]
+    chain = [o for o in chain_all if o['expiry'] == chosen_expiry]
+    strikes = sorted({o['strike'] for o in chain if o['strike'] > 0})
+    if not strikes:
+        return [], 'no strikes for ' + base + ' expiry ' + chosen_expiry
+    tick = _dstrat_fetch_tickers(base)
+    by_symbol = tick.get('by_symbol') or {}
+    spot = tick.get('spot') or 0.0
+    if spot <= 0:
+        sc = _do_spot_candles(base, '5m')
+        if sc: spot = sc[-1]['close']
+    sym_by_strike_type = {(o['strike'], o['type']): o['symbol'] for o in chain}
+    try:
+        dte = max(0, (datetime.strptime(chosen_expiry, '%Y-%m-%d').date() - _tg_now_ist().date()).days)
+    except Exception:
+        dte = 0
+    def _delta_at(strike, otype):
+        sym = (sym_by_strike_type.get((strike, otype)) or '').upper()
+        info = by_symbol.get(sym) or {}
+        d = info.get('delta')
+        if d:   # native Delta Exchange greeks — signed, same convention as _bs_delta
+            return d
+        iv = info.get('iv') or 0
+        if spot > 0 and iv > 0:
+            return _bs_delta(spot, strike, iv * 100.0, dte, otype)
+        return 0.0
+    ce_candidates_otm = sorted([s for s in strikes if s >= spot]) if spot > 0 else list(strikes)
+    ce_best = next((s for s in ce_candidates_otm if _delta_at(s, 'CE') <= target_delta), None) \
+              or (ce_candidates_otm[-1] if ce_candidates_otm else strikes[-1])
+    pe_candidates_otm = sorted([s for s in strikes if s <= spot], reverse=True) if spot > 0 else list(reversed(strikes))
+    pe_best = next((s for s in pe_candidates_otm if abs(_delta_at(s, 'PE')) <= target_delta), None) \
+              or (pe_candidates_otm[-1] if pe_candidates_otm else strikes[0])
+    reason = 'deterministic delta walk (native Delta Exchange greeks)'
+    if use_claude and _bot_is_claude(cfg):
+        try:
+            import json as _json, re as _re
+            ce_window = [s for s in ce_candidates_otm if _delta_at(s, 'CE') <= target_delta * 1.5][:12] or ce_candidates_otm[:6]
+            pe_window = [s for s in pe_candidates_otm if abs(_delta_at(s, 'PE')) <= target_delta * 1.5][:12] or pe_candidates_otm[:6]
+            ce_cand = [{'strike': s, 'delta': round(_delta_at(s, 'CE'), 3)} for s in ce_window]
+            pe_cand = [{'strike': s, 'delta': round(_delta_at(s, 'PE'), 3)} for s in pe_window]
+            label = (_STRAT_TYPES.get(strat_type) or {}).get('label', strat_type)
+            system = ("You select the SELL CE and SELL PE strikes for a {} on {} crypto options (Delta Exchange). "
+                      "Choose ceSellStrike from ceCandidates and peSellStrike from peCandidates ONLY — each must "
+                      "have |delta| at or below targetDelta, preferring the value closest to targetDelta without "
+                      "exceeding it. Respond STRICT JSON ONLY: {{\"ceSellStrike\":<number>,\"peSellStrike\":<number>,"
+                      "\"reason\":\"<=160 chars\"}}.").format(label, base)
+            user = _json.dumps({'underlying': base, 'spot': round(spot, 2), 'expiry': chosen_expiry,
+                                'targetDelta': target_delta, 'ceCandidates': ce_cand, 'peCandidates': pe_cand})
+            text, cerr = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=250, model=cfg.get('model'))
+            if not cerr and text and ce_cand and pe_cand:
+                obj = _json.loads(_re.search(r'\{.*\}', text, _re.DOTALL).group(0))
+                cs = float(obj.get('ceSellStrike')); ps = float(obj.get('peSellStrike'))
+                ce_best = min([c['strike'] for c in ce_cand], key=lambda s: abs(s - cs))
+                pe_best = min([c['strike'] for c in pe_cand], key=lambda s: abs(s - ps))
+                reason = 'Claude: ' + str(obj.get('reason', ''))[:160]
+        except Exception:
+            pass   # keep the deterministic result — never leave the user with no strikes
+    def _mk(role, otype, side, strike):
+        sym = sym_by_strike_type.get((strike, otype), '') or ''
+        info = by_symbol.get(sym.upper()) or {}
+        return {'role': role, 'symbol': sym, 'exchange': 'DELTA', 'optionType': otype, 'side': side,
+                'strike': strike, 'delta': round(_delta_at(strike, otype), 4),
+                'iv': round((info.get('iv') or 0) * 100.0, 2), 'qty': 0, 'position': None,
+                'last_tick': {}, 'last_candles': [], 'last_exit_time': 0,
+                'hedge_role': '', 'hedged_by': '', 'removed': False}
+    legs = []
+    sell_ce = sell_pe = None
+    if 'sellCE' in roles:
+        sell_ce = _mk('sellCE', 'CE', 'SELL', ce_best); legs.append(sell_ce)
+    if 'sellPE' in roles:
+        sell_pe = _mk('sellPE', 'PE', 'SELL', pe_best); legs.append(sell_pe)
+    if 'hedgeCE' in roles and sell_ce is not None:
+        hstrike = min(strikes, key=lambda s: abs(s - (ce_best + hedge_pts)))
+        hedge_ce = _mk('hedgeCE', 'CE', 'BUY', hstrike); legs.append(hedge_ce)
+        sell_ce['hedge_role'] = 'hedgeCE'; hedge_ce['hedged_by'] = 'sellCE'
+    if 'hedgePE' in roles and sell_pe is not None:
+        hstrike = min(strikes, key=lambda s: abs(s - (pe_best - hedge_pts)))
+        hedge_pe = _mk('hedgePE', 'PE', 'BUY', hstrike); legs.append(hedge_pe)
+        sell_pe['hedge_role'] = 'hedgePE'; hedge_pe['hedged_by'] = 'sellPE'
+    info = '{} {} spot {:.1f} exp {} -> sellCE {} (d{:.2f}) / sellPE {} (d{:.2f}) [{}]'.format(
+        base, strat_type, spot, chosen_expiry, ce_best, _delta_at(ce_best, 'CE'),
+        pe_best, _delta_at(pe_best, 'PE'), reason)
+    return legs, info
+
+def _dstrat_open_leg(leg, cfg, price):
+    mode = cfg.get('mode', 'paper')
+    qty = max(1, int(cfg.get('qty', 1) or 1))   # Delta uses raw contract count — no lot multiplier
+    side = leg['side']
+    is_sold = side == 'SELL'
+    sl = tp = None
+    if is_sold:
+        sl_pct = float(cfg.get('slPct', 50.0) or 50.0)
+        tp_pct = float(cfg.get('tpPct', 50.0) or 50.0)
+        sl = round(price * (1 + sl_pct / 100.0), 4)
+        tp = round(price * (1 - tp_pct / 100.0), 4)
+    if mode == 'live':
+        if not _do_place_live(leg, side, qty, cfg):
+            _dstrat_log('[LIVE] ENTRY REJECTED — no position opened for {} ({} {}).'.format(leg['symbol'], side, qty))
+            _strat_persist_log_line('[DELTA][LIVE] ENTRY REJECTED — no position opened ' + leg['symbol'])
+            leg['last_exit_time'] = int(_zd_time.time())
+            return False
+    leg['position'] = {
+        'side': side, 'entryPrice': price, 'entryTime': int(_zd_time.time()),
+        'qty': qty, 'sl': sl, 'tp': tp,
+        'strategy': cfg.get('strategyType'), 'mode': mode,
+        'optionType': leg.get('optionType'), 'strike': leg.get('strike'), 'dte': None,
+    }
+    line = '[{}] ENTRY {} {} {} @ {} role={} SL={} TP={}'.format(
+        mode.upper(), side, qty, leg['symbol'], round(price, 4), leg['role'], sl, tp)
+    _dstrat_log(line); _strat_persist_log_line('[DELTA] ' + line)
+    return True
+
+def _dstrat_close_leg(leg, price, reason, cfg, mode, cascade=True):
+    pos = leg.get('position')
+    if not pos:
+        return
+    prod = _load_delta_products().get((leg['symbol'] or '').upper())
+    pnl = _delta_calc_pnl(pos['entryPrice'], price, pos['qty'], pos['side'], prod)
+    closed = dict(pos)
+    closed.update({'symbol': leg['symbol'], 'role': leg['role'], 'exitPrice': round(price, 4),
+                   'exitTime': int(_zd_time.time()), 'pnl': round(pnl, 4), 'reason': reason})
+    dstrat_bot_state['trades'].append(closed)
+    if pnl < 0: dstrat_bot_state['consec_losses'] = dstrat_bot_state.get('consec_losses', 0) + 1
+    else:       dstrat_bot_state['consec_losses'] = 0
+    close_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
+    line = '[{}] EXIT {} {} {} @ {} (entry {}) PnL={}{:.4f} reason={} role={}'.format(
+        mode.upper(), close_side, pos['qty'], leg['symbol'], round(price, 4), pos['entryPrice'],
+        '+' if pnl >= 0 else '', pnl, reason, leg['role'])
+    _dstrat_log(line); _strat_persist_log_line('[DELTA] ' + line)
+    if mode == 'live':
+        _do_place_live(leg, close_side, pos['qty'], cfg)
+    leg['position'] = None
+    leg['last_exit_time'] = int(_zd_time.time())
+    if cascade and leg.get('hedge_role'):
+        hedge = next((l for l in dstrat_bot_state['legs'] if l['role'] == leg['hedge_role'] and not l.get('removed')), None)
+        if hedge and hedge.get('position'):
+            hp = (hedge.get('last_tick') or {}).get('price') or hedge['position']['entryPrice']
+            _dstrat_close_leg(hedge, hp, 'hedge closed - ' + reason, cfg, mode, cascade=False)
+
+def _dstrat_underlying_ctx(cfg):
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    if not base:
+        return
+    c = _do_spot_candles(base, cfg.get('tf', '5m'))
+    if c:
+        dstrat_bot_state['underlyingSpot'] = c[-1]['close']
+        dstrat_bot_state['underlyingSym'] = base
+
+def _dstrat_check_breakers(cfg, mode):
+    trades = dstrat_bot_state['trades']
+    realized = sum(t['pnl'] for t in trades)
+    max_consec = int(cfg.get('maxConsec', 3) or 3)
+    max_loss = float(cfg.get('maxLoss', 0) or 0)
+    trip = None
+    if dstrat_bot_state.get('consec_losses', 0) >= max_consec: trip = 'Max consecutive losses'
+    elif max_loss and realized < -abs(max_loss):                 trip = 'Max daily loss'
+    if not trip:
+        return
+    for leg in dstrat_bot_state['legs']:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _dstrat_close_leg(leg, px, trip, cfg, mode, cascade=False)
+    dstrat_bot_state['running'] = False
+    _dstrat_log('[STOP] ' + trip + ' - all legs closed, strategy stopped.')
+    _strat_persist_log_line('[DELTA][STOP] ' + trip)
+
+def _dstrat_bot_tick():
+    with dstrat_bot_lock:
+        cfg = dstrat_bot_state.get('config') or {}
+    if not cfg:
+        return
+    mode = cfg.get('mode', 'paper')
+    _dstrat_underlying_ctx(cfg)
+    for leg in list(dstrat_bot_state['legs']):
+        if leg.get('removed') or not leg.get('symbol'):
+            continue
+        try:
+            candles = fetch_delta_data(cfg.get('tf', '5m'), leg['symbol'])
+        except Exception as e:
+            _dstrat_log('[Tick] ' + leg['symbol'] + ' data error: ' + str(e)); continue
+        if not candles:
+            continue
+        price = candles[-1]['close']
+        with dstrat_bot_lock:
+            leg['last_candles'] = candles[-150:]
+            leg['last_tick'] = {'time': int(_zd_time.time()), 'price': price}
+            pos = leg.get('position')
+            if pos and pos['side'] == 'SELL':
+                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+                reason = None; exit_px = price
+                if pos['sl'] is not None and hi >= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
+                elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
+                if reason:
+                    _dstrat_close_leg(leg, exit_px, reason, cfg, mode)
+                else:
+                    _dstrat_log('[Tick] {} px={} SL={} TP={}'.format(leg['symbol'], round(price, 4), pos['sl'], pos['tp']))
+    with dstrat_bot_lock:
+        _dstrat_check_breakers(cfg, mode)
+
+def _dstrat_bot_loop():
+    while True:
+        with dstrat_bot_lock:
+            running = dstrat_bot_state.get('running', False)
+            paused = dstrat_bot_state.get('paused', False)
+        if not running: break
+        if not paused:
+            try: _dstrat_bot_tick()
+            except Exception as e:
+                _dstrat_log('[Tick] ERROR: ' + str(e))
+        _bot_gc_tick()
+        _zd_time.sleep(max(5, int((dstrat_bot_state.get('config') or {}).get('priceTickSec', 10) or 10)))
+
+def _dstrat_start_bot(data):
+    with dstrat_bot_lock:
+        if dstrat_bot_state.get('running'):
+            return False, 'Strategy is already running. Stop it first.'
+        base = (data.get('baseSymbol') or '').upper().strip()
+        if base not in _DSTRAT_BASES:
+            return False, 'Pick a supported Underlying (BTC/ETH)'
+        strat_type = data.get('strategyType') or 'iron_condor'
+        if strat_type not in _STRAT_TYPES:
+            return False, 'Unknown strategy type'
+        cfg = {
+            'strategyType': strat_type, 'baseSymbol': base,
+            'expiry': (data.get('expiry') or '').strip(),
+            'targetDelta': float(data.get('targetDelta') or 0.20),
+            'hedgeDistancePoints': float(data.get('hedgeDistancePoints') or 500),
+            'qty': max(1, int(data.get('qty', 1) or 1)),
+            'tf': data.get('tf', '5m'),
+            'mode': data.get('mode', 'paper'),
+            'optionBuyer': bool(data.get('optionBuyer', True)),
+            'optionSeller': bool(data.get('optionSeller', True)),
+            'slPct': float(data.get('slPct', 50.0) or 50.0),
+            'tpPct': float(data.get('tpPct', 50.0) or 50.0),
+            'maxConsec': int(data.get('maxConsec', 3) or 3),
+            'maxLoss': float(data.get('maxLoss', 0) or 0),
+            'priceTickSec': max(5, int(data.get('priceTickSec', 10) or 10)),
+            'model': (data.get('model') or '').strip(),
+            'api_key': (data.get('api_key') or '').strip(),
+        }
+        legs = data.get('legs')
+        if not legs:
+            legs, info = _dstrat_resolve_strikes(cfg, use_claude=False)
+            if not legs:
+                return False, 'Could not resolve strikes: ' + info
+        else:
+            info = 'using previously resolved legs'
+        dstrat_bot_state['config'] = cfg
+        dstrat_bot_state['legs'] = legs
+        dstrat_bot_state['trades'] = []
+        dstrat_bot_state['consec_losses'] = 0
+        dstrat_bot_state['log_buffer'] = []
+        dstrat_bot_state['lastConfig'] = dict(data)
+        dstrat_bot_state['running'] = True
+        dstrat_bot_state['paused'] = False
+        t = _threading.Thread(target=_dstrat_bot_loop, daemon=True, name='delta-strategy-menu-bot')
+        dstrat_bot_state['thread'] = t
+        t.start()
+    for leg in legs:
+        if leg.get('removed'):
+            continue
+        try:
+            candles = fetch_delta_data(cfg.get('tf', '5m'), leg['symbol'])
+            price = candles[-1]['close'] if candles else 0
+        except Exception:
+            price = 0
+        if price > 0:
+            _dstrat_open_leg(leg, cfg, price)
+        else:
+            _dstrat_log('[Entry] could not price ' + leg['symbol'] + ' - leg left flat (check Delta connection)')
+    _dstrat_log('Strategy started {} mode: {} on {} qty={} legs={}'.format(
+        cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
+        ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
+    _strat_persist_log_line('[DELTA][{}] START {} {} qty={}'.format(cfg['mode'].upper(), strat_type, base, cfg['qty']))
+    return True, 'Strategy started'
+
+def _dstrat_stop_bot():
+    with dstrat_bot_lock:
+        was_running = dstrat_bot_state.get('running')
+        dstrat_bot_state['running'] = False
+        dstrat_bot_state['paused'] = False
+        cfg = dstrat_bot_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        legs = list(dstrat_bot_state.get('legs', []))
+    for leg in legs:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _dstrat_close_leg(leg, px, 'bot stop', cfg, mode, cascade=True)
+    if was_running:
+        _dstrat_log('Strategy stopped, all legs closed.')
+        _strat_persist_log_line('[DELTA][{}] STOP'.format(mode.upper()))
+    return was_running
+
+_dstrat_scheduler_started = [False]
+
+def _dstrat_scheduled_start():
+    with dstrat_bot_lock:
+        cfg = dict(dstrat_bot_state.get('lastConfig') or {})
+    if not cfg:
+        _dstrat_log('[Schedule] entry time reached but no saved config - configure the strategy and arm the schedule again.')
+        return
+    ok, msg = _dstrat_start_bot(cfg)
+    _dstrat_log('[Schedule] auto-start: ' + ('started' if ok else ('failed - ' + msg)))
+
+def _dstrat_scheduled_stop():
+    _dstrat_stop_bot()
+    _dstrat_log('[Schedule] auto-stop: strategy stopped, all legs closed.')
+
+def _dstrat_scheduler_loop():
+    while True:
+        try:
+            with dstrat_bot_lock:
+                sched = dict(dstrat_bot_state.get('schedule') or {})
+                running = dstrat_bot_state.get('running', False)
+            if sched.get('armed'):
+                now = _tg_now_ist()
+                now_hm = now.strftime('%H:%M'); today = now.strftime('%Y-%m-%d')
+                if not running and sched.get('entryTime') and sched['entryTime'] == now_hm and sched.get('entryFiredDate') != today:
+                    _dstrat_scheduled_start()
+                    with dstrat_bot_lock: dstrat_bot_state['schedule']['entryFiredDate'] = today
+                elif running and sched.get('exitTime') and sched['exitTime'] == now_hm and sched.get('exitFiredDate') != today:
+                    _dstrat_scheduled_stop()
+                    with dstrat_bot_lock: dstrat_bot_state['schedule']['exitFiredDate'] = today
+        except Exception as e:
+            _dstrat_log('[Schedule] ERROR: ' + str(e))
+        _zd_time.sleep(30)
+
+def _dstrat_ensure_scheduler():
+    if not _dstrat_scheduler_started[0]:
+        _dstrat_scheduler_started[0] = True
+        t = _threading.Thread(target=_dstrat_scheduler_loop, daemon=True, name='delta-strategy-menu-scheduler')
+        t.start()
+
+@app.route('/api/aibot/dstrategy/expiries', methods=['GET'])
+@login_required
+def dstrat_aibot_expiries():
+    base = (request.args.get('base') or '').upper().strip()
+    if base not in _DSTRAT_BASES:
+        return jsonify({'success': False, 'error': 'Unsupported underlying'}), 400
+    chain = _do_load_options(base)
+    today = _tg_now_ist().strftime('%Y-%m-%d')
+    expiries = sorted({o['expiry'] for o in chain if o['expiry'] and o['expiry'] >= today}) \
+               or sorted({o['expiry'] for o in chain if o['expiry']})
+    tick = _dstrat_fetch_tickers(base) if expiries else {}
+    return jsonify({'success': bool(expiries), 'expiries': expiries, 'spot': tick.get('spot', 0.0),
+                    'error': (None if expiries else ('no Delta option chain for ' + base))})
+
+@app.route('/api/aibot/dstrategy/claude_pick', methods=['POST'])
+@login_required
+def dstrat_aibot_claude_pick():
+    data = request.json or {}
+    base = (data.get('baseSymbol') or '').upper().strip()
+    if base not in _DSTRAT_BASES:
+        return jsonify({'success': False, 'error': 'Pick a supported Underlying (BTC/ETH)'}), 400
+    strat_type = data.get('strategyType') or 'iron_condor'
+    if strat_type not in _STRAT_TYPES:
+        return jsonify({'success': False, 'error': 'Unknown strategy type'}), 400
+    cfg = {
+        'strategyType': strat_type, 'baseSymbol': base,
+        'expiry': (data.get('expiry') or '').strip(),
+        'targetDelta': float(data.get('targetDelta') or 0.20),
+        'hedgeDistancePoints': float(data.get('hedgeDistancePoints') or 500),
+        'model': (data.get('model') or '').strip(),
+        'api_key': (data.get('api_key') or '').strip(),
+    }
+    legs, info = _dstrat_resolve_strikes(cfg, use_claude=True)
+    if not legs:
+        return jsonify({'success': False, 'error': info}), 502
+    out_legs = [{k: v for k, v in l.items() if k not in ('last_candles',)} for l in legs]
+    return jsonify({'success': True, 'legs': out_legs, 'info': info})
+
+@app.route('/api/aibot/dstrategy/start', methods=['POST'])
+@login_required
+def dstrat_aibot_start():
+    data = request.json or {}
+    ok, msg = _dstrat_start_bot(data)
+    if ok:
+        return jsonify({'success': True, 'message': msg})
+    return jsonify({'success': False, 'error': msg}), 400
+
+@app.route('/api/aibot/dstrategy/remove_leg', methods=['POST'])
+@login_required
+def dstrat_aibot_remove_leg():
+    data = request.json or {}
+    role = (data.get('role') or '').strip()
+    if role not in ('sellCE', 'sellPE', 'hedgeCE', 'hedgePE'):
+        return jsonify({'success': False, 'error': 'role must be sellCE/sellPE/hedgeCE/hedgePE'}), 400
+    with dstrat_bot_lock:
+        leg = next((l for l in dstrat_bot_state.get('legs', []) if l['role'] == role), None)
+        if not leg:
+            return jsonify({'success': False, 'error': 'leg not found - run Claude strategy or Start first'}), 404
+        cfg = dstrat_bot_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+    if leg.get('position'):
+        lt = leg.get('last_tick') or {}
+        px = lt.get('price') or leg['position']['entryPrice']
+        _dstrat_close_leg(leg, px, 'leg removed', cfg, mode, cascade=False)
+    leg['removed'] = True
+    _dstrat_log('[Leg] removed ' + role + ' (' + leg.get('symbol', '') + ')')
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/dstrategy/pause', methods=['POST'])
+@login_required
+def dstrat_aibot_pause():
+    with dstrat_bot_lock:
+        if not dstrat_bot_state.get('running'):
+            return jsonify({'success': False, 'error': 'Strategy is not running'}), 400
+        dstrat_bot_state['paused'] = not dstrat_bot_state.get('paused', False)
+        paused = dstrat_bot_state['paused']
+    _dstrat_log('Strategy ' + ('paused' if paused else 'resumed'))
+    return jsonify({'success': True, 'paused': paused})
+
+@app.route('/api/aibot/dstrategy/stop', methods=['POST'])
+@login_required
+def dstrat_aibot_stop():
+    _dstrat_stop_bot()
+    return jsonify({'success': True})
+
+@app.route('/api/aibot/dstrategy/status', methods=['GET'])
+@login_required
+def dstrat_aibot_status():
+    with dstrat_bot_lock:
+        cfg = dict(dstrat_bot_state.get('config') or {})
+        cfg.pop('api_key', None)
+        legs = [{k: v for k, v in l.items() if k != 'last_candles'} for l in dstrat_bot_state.get('legs', [])]
+        trades = list(dstrat_bot_state.get('trades', []))
+        log_buf = list(dstrat_bot_state.get('log_buffer', []))[-200:]
+        running = dstrat_bot_state.get('running', False)
+        paused = dstrat_bot_state.get('paused', False)
+        schedule = dict(dstrat_bot_state.get('schedule') or {})
+        u_spot = dstrat_bot_state.get('underlyingSpot'); u_sym = dstrat_bot_state.get('underlyingSym')
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    unreal = 0.0
+    for l in legs:
+        p = l.get('position'); lt = l.get('last_tick') or {}
+        if p and lt.get('price'):
+            prod = _load_delta_products().get((l.get('symbol') or '').upper())
+            leg_pnl = _delta_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'], prod)
+            p['unrealizedPnl'] = round(leg_pnl, 4)
+            unreal += leg_pnl
+    return jsonify({
+        'success': True, 'running': running, 'paused': paused, 'config': cfg,
+        'legs': legs, 'trades': trades[-100:], 'log': log_buf, 'schedule': schedule,
+        'underlyingSpot': u_spot, 'underlyingSym': u_sym,
+        'stats': {
+            'realized': round(realized, 4), 'unrealized': round(unreal, 4),
+            'tradeCount': len(trades),
+            'winRate': round(wins / len(trades) * 100.0, 1) if trades else None,
+            'wins': wins,
+        },
+    })
+
+@app.route('/api/aibot/dstrategy/schedule', methods=['POST'])
+@login_required
+def dstrat_aibot_schedule():
+    data = request.json or {}
+    if data.get('armed') is False:
+        with dstrat_bot_lock:
+            dstrat_bot_state['schedule']['armed'] = False
+        _dstrat_log('[Schedule] disarmed')
+        return jsonify({'success': True, 'armed': False})
+    import re as _re4
+    entry_t = (data.get('entryTime') or '').strip()
+    exit_t = (data.get('exitTime') or '').strip()
+    if not _re4.match(r'^\d{2}:\d{2}$', entry_t) or not _re4.match(r'^\d{2}:\d{2}$', exit_t):
+        return jsonify({'success': False, 'error': 'entryTime/exitTime must be HH:MM'}), 400
+    with dstrat_bot_lock:
+        dstrat_bot_state['schedule'] = {'entryTime': entry_t, 'exitTime': exit_t, 'armed': True,
+                                         'entryFiredDate': '', 'exitFiredDate': ''}
+        cfg_snapshot = data.get('config') or dstrat_bot_state.get('lastConfig') or {}
+        dstrat_bot_state['lastConfig'] = dict(cfg_snapshot)
+    _dstrat_ensure_scheduler()
+    _dstrat_log('[Schedule] armed entry={} exit={}'.format(entry_t, exit_t))
     return jsonify({'success': True, 'armed': True, 'entryTime': entry_t, 'exitTime': exit_t})
 
 # ============================================================================
@@ -20685,7 +21288,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="zd-body">
       <div style="display:flex;gap:12px;margin-bottom:12px">
         <button class="zd-add-btn" id="stratMenuPickZerodha" style="padding:14px 22px;font-size:13px">&#127919; Zerodha Options Strategy</button>
-        <button class="zd-add-btn" id="stratMenuPickDelta" disabled title="Not built yet — unrelated to the Delta Exchange bot" style="padding:14px 22px;font-size:13px;opacity:0.4;cursor:not-allowed">&#128274; Delta Options Strategy <span style="font-size:10px">(coming soon)</span></button>
+        <button class="zd-add-btn" id="stratMenuPickDelta" style="padding:14px 22px;font-size:13px">&#9889; Delta Options Strategy</button>
       </div>
 
       <div id="stratZoSection" style="display:none">
@@ -20782,6 +21385,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button class="zd-start-btn pause" id="stratZoPauseBtn" disabled>&#9208; Pause</button>
           <button class="zd-start-btn stop" id="stratZoStopBtn" disabled>&#9632; Stop</button>
           <button class="zd-add-btn" id="stratZoScheduleBtn" type="button">&#128337; Schedule</button>
+          <button class="bot-log-btn" id="stratLogBtn" type="button" title="Open log_options.txt in a new tab">&#128196; log_options.txt</button>
+          <button class="bot-log-btn" id="stratLogDownloadBtn" type="button" title="Download log_options.txt">&#11015; Download log</button>
         </div>
         <div class="ai-input-bar" id="stratZoScheduleBar" style="display:none">
           <label>Entry time <input type="time" id="stratZoEntryTime"></label>
@@ -20792,6 +21397,112 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
 
         <div class="zd-log" id="stratZoLog" style="max-height:180px"><span class="log-info">Strategy Menu ready. Paper Trading default. Pick an underlying + strategy, click Claude strategy (or Start) to resolve legs.</span></div>
+      </div>
+
+      <div id="stratDoSection" style="display:none">
+        <div class="zd-status-bar" id="stratDoStatusBar" style="margin-bottom:10px">
+          <span class="zd-status-dot" id="stratDoStatusDot"></span>
+          <span id="stratDoStatusText">Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> to enable live data + live orders</span>
+        </div>
+
+        <div class="ai-disclaimer">
+          <b>&#9888; Reality check:</b> multi-leg crypto option SELLING carries large/undefined risk if BTC/ETH
+          moves against you. Short Strangle has no hedge legs — undefined risk by design. Always paper trade first.
+        </div>
+
+        <div class="ai-mode-bar">
+          <label><input type="radio" name="stratDoMode" value="paper" checked> &#128221; Paper Trading</label>
+          <label class="live"><input type="radio" name="stratDoMode" value="live"> &#9888; Live Trading</label>
+        </div>
+
+        <div class="ai-strat-bar">
+          <span class="lbl">&#127919; Options mode:</span>
+          <label><input type="checkbox" id="stratDoBuyer" checked> Option Buyer</label>
+          <label><input type="checkbox" id="stratDoSeller" checked> Option Seller</label>
+        </div>
+
+        <div class="ai-strat-bar">
+          <span class="lbl">Strategy:</span>
+          <label><input type="radio" name="stratDoType" class="stratdo-type" value="iron_condor" checked> Iron Condor</label>
+          <label><input type="radio" name="stratDoType" class="stratdo-type" value="short_strangle"> Short Strangle</label>
+          <label><input type="radio" name="stratDoType" class="stratdo-type" value="jade_lizard"> Jade Lizard</label>
+        </div>
+
+        <div class="ai-input-bar">
+          <label><span>Underlying</span><select id="stratDoBaseSel">
+            <option value="BTC" selected>BTC</option>
+            <option value="ETH">ETH</option>
+          </select></label>
+          <label><span>Expiry</span><select id="stratDoExpirySel"><option value="">&mdash;</option></select></label>
+          <label title="SELL legs are picked at or below this delta (0.20 = 20 delta) — uses Delta Exchange's native greeks"><span>Target Delta</span><input type="number" id="stratDoTargetDelta" value="0.20" min="0.01" max="0.90" step="0.01" style="width:80px"></label>
+          <label title="Hedge (BUY) strike = sold strike +/- this many price points. BTC/ETH strikes are far apart in $ terms — 500 suits BTC, ETH usually wants ~50 (auto-suggested when you switch Underlying)."><span>Hedge distance ($)</span><input type="number" id="stratDoHedgeDist" value="500" min="1" step="1" style="width:100px"></label>
+          <label><span>Model</span><select id="stratDoModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+          <button class="zd-add-btn" id="stratDoClaudeBtn" type="button">&#129302; Claude strategy</button>
+          <span id="stratDoClaudeInfo" style="color:#787b86;font-size:11px"></span>
+        </div>
+
+        <div style="overflow-x:auto;margin:10px 0">
+          <table style="width:100%;border-collapse:collapse;font-size:12px" id="stratDoLegsTable">
+            <thead>
+              <tr style="color:#787b86;text-align:left;border-bottom:1px solid #2a2e39">
+                <th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Symbol</th>
+                <th style="padding:6px 8px">Side</th><th style="padding:6px 8px">Strike</th>
+                <th style="padding:6px 8px">Delta</th><th style="padding:6px 8px">Position</th>
+                <th style="padding:6px 8px"></th>
+              </tr>
+            </thead>
+            <tbody id="stratDoLegsBody">
+              <tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs yet — click &#129302; Claude strategy or Start to auto-select strikes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="ai-risk-bar">
+          <label title="Applies to SOLD legs only — hedge legs close only when their sold leg's SL/TP fires">SL % <input type="number" id="stratDoSlPct" value="50" min="1" style="width:70px"></label>
+          <label>TP % <input type="number" id="stratDoTpPct" value="50" min="1" style="width:70px"></label>
+          <label>Contracts <input type="number" id="stratDoQty" value="1" min="1" style="width:70px"></label>
+          <label title="Bot auto-stops after this many consecutive losing legs">Max consec losses <input type="number" id="stratDoMaxConsec" value="3" min="1" style="width:70px"></label>
+          <label>Max daily loss $ <input type="number" id="stratDoMaxLoss" value="0" min="0" style="width:90px" title="0 = disabled"></label>
+        </div>
+
+        <div class="ai-info-grid">
+          <div class="cell"><span class="lab">Underlying</span><span class="val" id="stratDoUnderlying" style="color:#f7a600">&mdash;</span></div>
+          <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="stratDoRealizedPnl">$0.00</span></div>
+          <div class="cell"><span class="lab">Unrealized P/L</span><span class="val" id="stratDoUnrealPnl">$0.00</span></div>
+          <div class="cell"><span class="lab">Trades</span><span class="val" id="stratDoTradeCount">0</span></div>
+          <div class="cell"><span class="lab">Win Rate</span><span class="val" id="stratDoWinRate">&mdash;</span></div>
+        </div>
+
+        <div style="overflow-x:auto;margin:10px 0">
+          <table style="width:100%;border-collapse:collapse;font-size:12px" id="stratDoTradesTable">
+            <thead>
+              <tr style="color:#787b86;text-align:left;border-bottom:1px solid #2a2e39">
+                <th style="padding:6px 8px">Time</th><th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Symbol</th>
+                <th style="padding:6px 8px">Side</th><th style="padding:6px 8px">Entry</th><th style="padding:6px 8px">Exit</th>
+                <th style="padding:6px 8px">PnL</th><th style="padding:6px 8px">Reason</th>
+              </tr>
+            </thead>
+            <tbody id="stratDoTradesBody"><tr><td colspan="8" style="padding:10px 8px;color:#787b86">No closed trades yet.</td></tr></tbody>
+          </table>
+        </div>
+
+        <div class="zd-footer">
+          <button class="zd-start-btn start" id="stratDoStartBtn">&#9654; Start</button>
+          <button class="zd-start-btn pause" id="stratDoPauseBtn" disabled>&#9208; Pause</button>
+          <button class="zd-start-btn stop" id="stratDoStopBtn" disabled>&#9632; Stop</button>
+          <button class="zd-add-btn" id="stratDoScheduleBtn" type="button">&#128337; Schedule</button>
+          <button class="bot-log-btn" id="stratDoLogBtn" type="button" title="Open log_options.txt in a new tab">&#128196; log_options.txt</button>
+          <button class="bot-log-btn" id="stratDoLogDownloadBtn" type="button" title="Download log_options.txt">&#11015; Download log</button>
+        </div>
+        <div class="ai-input-bar" id="stratDoScheduleBar" style="display:none">
+          <label>Entry time <input type="time" id="stratDoEntryTime"></label>
+          <label>Exit time <input type="time" id="stratDoExitTime"></label>
+          <button class="zd-add-btn" id="stratDoScheduleArmBtn" type="button">Arm schedule</button>
+          <button class="zd-add-btn" id="stratDoScheduleDisarmBtn" type="button">Disarm</button>
+          <span id="stratDoScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
+        </div>
+
+        <div class="zd-log" id="stratDoLog" style="max-height:180px"><span class="log-info">Delta Options Strategy ready. Paper Trading default. BTC/ETH only — Delta Exchange does not list XAUT options. Pick a strategy, click Claude strategy (or Start) to resolve legs.</span></div>
       </div>
     </div>
   </div>
@@ -28489,8 +29200,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     document.getElementById('stratMenuPickZerodha').addEventListener('click', function() {
       document.getElementById('stratZoSection').style.display = '';
+      const doSec = document.getElementById('stratDoSection'); if (doSec) doSec.style.display = 'none';
       loadExpiries();
     });
+
+    function fmtExpiryLabel(dateStr) {
+      try {
+        const d = new Date(dateStr + 'T00:00:00Z');
+        const wd = d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
+        return dateStr + ' (' + wd + ')';
+      } catch (e) { return dateStr; }
+    }
 
     const btnOpen = document.getElementById('btnStrategyMenu');
     if (btnOpen) btnOpen.addEventListener('click', function() {
@@ -28552,7 +29272,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           expirySel.innerHTML = '';
           if (d.expiries && d.expiries.length) {
             d.expiries.forEach(function(e) {
-              const o = document.createElement('option'); o.value = e; o.textContent = e; expirySel.appendChild(o);
+              const o = document.createElement('option'); o.value = e; o.textContent = fmtExpiryLabel(e); expirySel.appendChild(o);
             });
           } else {
             expirySel.innerHTML = '<option value="">' + (d.error || 'no expiries') + '</option>';
@@ -28562,10 +29282,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     baseSel.addEventListener('change', loadExpiries);
 
     function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
-    function fmtPos(p) {
+    function fmtPos(p, ccy) {
       if (!p) return '<span style="color:#787b86">flat</span>';
+      ccy = ccy || '₹';
+      let pnlHtml = '';
+      if (p.unrealizedPnl != null) {
+        const cls = p.unrealizedPnl >= 0 ? 'bull' : 'bear';
+        pnlHtml = ' <span class="' + cls + '">(' + (p.unrealizedPnl >= 0 ? '+' : '') + ccy + p.unrealizedPnl.toFixed(2) + ')</span>';
+      }
       return '<span class="' + (p.side === 'BUY' ? 'bull' : 'bear') + '">' + p.side + ' @ ' + p.entryPrice +
-             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>';
+             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>' + pnlHtml;
     }
     function renderLegs(legs, live) {
       legsBody.innerHTML = '';
@@ -28668,6 +29394,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fetch('/api/aibot/strategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pollStatus(); });
     });
 
+    document.getElementById('stratLogBtn').addEventListener('click', function() { window.open('/api/aibot/strategy/log_download', '_blank'); });
+    document.getElementById('stratLogDownloadBtn').addEventListener('click', function() {
+      const a = document.createElement('a'); a.href = '/api/aibot/strategy/log_download?download=1'; a.download = 'log_options.txt';
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+
     const schedBar = document.getElementById('stratZoScheduleBar');
     document.getElementById('stratZoScheduleBtn').addEventListener('click', function() {
       schedBar.style.display = (schedBar.style.display === 'none') ? '' : 'none';
@@ -28734,6 +29466,272 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (ulEl) ulEl.textContent = (s.underlyingSym && s.underlyingSpot != null) ? (s.underlyingSym + ' ' + s.underlyingSpot) : '—';
       const sc = s.schedule || {};
       document.getElementById('stratZoScheduleStatus').textContent = sc.armed ? ('armed ' + sc.entryTime + ' → ' + sc.exitTime) : 'not armed';
+    }
+  })();
+
+  // ---- Strategy Menu Panel: Delta Exchange side — same multi-leg engine as
+  //      the Zerodha side above (Iron Condor/Short Strangle/Jade Lizard,
+  //      delta-based strikes, hedge-linked SL/TP, schedule), for BTC/ETH
+  //      crypto options. Independent IIFE — does not touch the Zerodha side. ----
+  (function() {
+    const doSection = document.getElementById('stratDoSection');
+    if (!doSection) return;
+    const statusDot = document.getElementById('stratDoStatusDot');
+    const statusText= document.getElementById('stratDoStatusText');
+    const logEl     = document.getElementById('stratDoLog');
+    const startBtn  = document.getElementById('stratDoStartBtn');
+    const pauseBtn  = document.getElementById('stratDoPauseBtn');
+    const stopBtn   = document.getElementById('stratDoStopBtn');
+    const legsBody  = document.getElementById('stratDoLegsBody');
+    const tradesBody= document.getElementById('stratDoTradesBody');
+    const baseSel   = document.getElementById('stratDoBaseSel');
+    const expirySel = document.getElementById('stratDoExpirySel');
+    const claudeBtn = document.getElementById('stratDoClaudeBtn');
+    const claudeInfo= document.getElementById('stratDoClaudeInfo');
+    const hedgeDistEl = document.getElementById('stratDoHedgeDist');
+    let botRunning = false, botPaused = false;
+    let pendingLegs = [];
+    let statusTimer = null;
+    const _HEDGE_DEFAULTS = { BTC: 500, ETH: 50 };
+    let _hedgeUserEdited = false;
+    hedgeDistEl.addEventListener('input', function() { _hedgeUserEdited = true; });
+
+    function logLine(msg) {
+      const span = document.createElement('span');
+      span.className = 'log-info'; span.textContent = msg;
+      logEl.appendChild(span); logEl.appendChild(document.createElement('br'));
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function currentMode() { const r = document.querySelector('input[name="stratDoMode"]:checked'); return r ? r.value : 'paper'; }
+    function currentStrategyType() { const r = document.querySelector('input[name="stratDoType"]:checked'); return r ? r.value : 'iron_condor'; }
+    function fmtExpiryLabel(dateStr) {
+      try {
+        const d = new Date(dateStr + 'T00:00:00Z');
+        const wd = d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
+        return dateStr + ' (' + wd + ')';
+      } catch (e) { return dateStr; }
+    }
+
+    document.getElementById('stratMenuPickDelta').addEventListener('click', function() {
+      doSection.style.display = '';
+      const zoSec = document.getElementById('stratZoSection'); if (zoSec) zoSec.style.display = 'none';
+      loadExpiries();
+      refreshStatus(); pollStatus();
+      if (!statusTimer) statusTimer = setInterval(pollStatus, 5000);
+    });
+
+    function refreshStatus() {
+      const s = DeltaStore.getSession();
+      const dis = 'Not connected &mdash; open <b style="color:#1e6ec8">Delta Login</b> to enable live data + live orders';
+      if (!s.apiKey) { statusDot.classList.remove('connected'); statusText.innerHTML = dis; return; }
+      _liveConn({ url: '/api/delta/verify', apiKey: s.apiKey, dot: statusDot, text: statusText,
+        connectedHTML: 'Connected to Delta Exchange <span style="color:#787b86;font-size:11px">(' + s.apiKey + ')</span>',
+        disconnectedHTML: dis });
+    }
+    window.addEventListener('delta-session-change', refreshStatus);
+
+    function loadExpiries() {
+      const base = baseSel.value;
+      expirySel.innerHTML = '<option value="">Loading&hellip;</option>';
+      fetch('/api/aibot/dstrategy/expiries?base=' + encodeURIComponent(base))
+        .then(r => r.json()).then(function(d) {
+          expirySel.innerHTML = '';
+          if (d.expiries && d.expiries.length) {
+            d.expiries.forEach(function(e) {
+              const o = document.createElement('option'); o.value = e; o.textContent = fmtExpiryLabel(e); expirySel.appendChild(o);
+            });
+          } else {
+            expirySel.innerHTML = '<option value="">' + (d.error || 'no expiries') + '</option>';
+          }
+        }).catch(function() { expirySel.innerHTML = '<option value="">error loading expiries</option>'; });
+      if (!_hedgeUserEdited && _HEDGE_DEFAULTS[base] != null) hedgeDistEl.value = _HEDGE_DEFAULTS[base];
+    }
+    baseSel.addEventListener('change', loadExpiries);
+
+    function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
+    function fmtPosDo(p) {
+      if (!p) return '<span style="color:#787b86">flat</span>';
+      let pnlHtml = '';
+      if (p.unrealizedPnl != null) {
+        const cls = p.unrealizedPnl >= 0 ? 'bull' : 'bear';
+        pnlHtml = ' <span class="' + cls + '">(' + (p.unrealizedPnl >= 0 ? '+' : '') + '$' + p.unrealizedPnl.toFixed(4) + ')</span>';
+      }
+      return '<span class="' + (p.side === 'BUY' ? 'bull' : 'bear') + '">' + p.side + ' @ ' + p.entryPrice +
+             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>' + pnlHtml;
+    }
+    function renderLegs(legs, live) {
+      legsBody.innerHTML = '';
+      const visible = (legs || []).filter(l => !l.removed);
+      if (!visible.length) {
+        legsBody.innerHTML = '<tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs — click Claude strategy or Start.</td></tr>';
+        return;
+      }
+      visible.forEach(function(leg) {
+        const tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #1e222d';
+        tr.innerHTML =
+          '<td style="padding:6px 8px">' + leg.role + '</td>' +
+          '<td style="padding:6px 8px">' + (leg.symbol || '—') + '</td>' +
+          '<td style="padding:6px 8px">' + leg.side + '</td>' +
+          '<td style="padding:6px 8px">' + (leg.strike != null ? Math.round(leg.strike) : '—') + '</td>' +
+          '<td style="padding:6px 8px">' + fmtDelta(leg.delta) + '</td>' +
+          '<td style="padding:6px 8px">' + fmtPosDo(leg.position) + '</td>' +
+          '<td style="padding:6px 8px"></td>';
+        const rmBtn = document.createElement('button');
+        rmBtn.className = 'zd-add-btn'; rmBtn.type = 'button'; rmBtn.textContent = 'Remove';
+        rmBtn.style.padding = '2px 8px'; rmBtn.style.fontSize = '11px';
+        rmBtn.addEventListener('click', function() {
+          if (live) {
+            fetch('/api/aibot/dstrategy/remove_leg', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ role: leg.role }) })
+              .then(r => r.json()).then(function(res) {
+                if (res.success) { logLine('Removed ' + leg.role); pollStatus(); }
+                else logLine('Remove failed: ' + (res.error || 'unknown'));
+              });
+          } else {
+            pendingLegs = pendingLegs.filter(l => l.role !== leg.role);
+            renderLegs(pendingLegs, false);
+          }
+        });
+        tr.lastElementChild.appendChild(rmBtn);
+        legsBody.appendChild(tr);
+      });
+    }
+
+    claudeBtn.addEventListener('click', function() {
+      const s = DeltaStore.getSession();
+      claudeInfo.textContent = 'Asking Claude…';
+      fetch('/api/aibot/dstrategy/claude_pick', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          baseSymbol: baseSel.value, strategyType: currentStrategyType(), expiry: expirySel.value,
+          targetDelta: parseFloat(document.getElementById('stratDoTargetDelta').value) || 0.20,
+          hedgeDistancePoints: parseFloat(hedgeDistEl.value) || 500,
+          model: document.getElementById('stratDoModel').value, api_key: s.apiKey || ''
+        }) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { claudeInfo.textContent = res.error || 'failed'; logLine('Claude strategy failed: ' + (res.error || 'unknown')); return; }
+          pendingLegs = res.legs || [];
+          renderLegs(pendingLegs, false);
+          claudeInfo.textContent = res.info || '';
+          logLine('Claude strategy: ' + (res.info || ''));
+        }).catch(function(e) { claudeInfo.textContent = 'error'; logLine('Claude strategy error: ' + e.message); });
+    });
+
+    function buildCfg() {
+      const s = DeltaStore.getSession();
+      const cfg = {
+        baseSymbol: baseSel.value, strategyType: currentStrategyType(), expiry: expirySel.value,
+        targetDelta: parseFloat(document.getElementById('stratDoTargetDelta').value) || 0.20,
+        hedgeDistancePoints: parseFloat(hedgeDistEl.value) || 500,
+        qty: parseInt(document.getElementById('stratDoQty').value) || 1,
+        mode: currentMode(),
+        optionBuyer: !!document.getElementById('stratDoBuyer').checked,
+        optionSeller: !!document.getElementById('stratDoSeller').checked,
+        slPct: parseFloat(document.getElementById('stratDoSlPct').value) || 50,
+        tpPct: parseFloat(document.getElementById('stratDoTpPct').value) || 50,
+        maxConsec: parseInt(document.getElementById('stratDoMaxConsec').value) || 3,
+        maxLoss: parseFloat(document.getElementById('stratDoMaxLoss').value) || 0,
+        model: document.getElementById('stratDoModel').value,
+        api_key: s.apiKey || ''
+      };
+      if (pendingLegs.length) cfg.legs = pendingLegs;
+      return cfg;
+    }
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const s = DeltaStore.getSession();
+      if (!s.connected || !s.apiKey) { logLine('Connect Delta Exchange first.'); return; }
+      const cfg = buildCfg();
+      if (!cfg.optionBuyer && !cfg.optionSeller) { logLine('Enable Option Buyer and/or Option Seller.'); return; }
+      logLine('Starting strategy ' + cfg.mode.toUpperCase() + ' ' + cfg.strategyType + ' on ' + cfg.baseSymbol + '…');
+      fetch('/api/aibot/dstrategy/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) })
+        .then(r => r.json()).then(function(res) {
+          if (!res.success) { logLine('Start failed: ' + (res.error || 'unknown')); return; }
+          logLine('Strategy running on the server.'); pollStatus();
+        }).catch(function(e) { logLine('Start request error: ' + e.message); });
+    });
+    pauseBtn.addEventListener('click', function() {
+      if (!botRunning) return;
+      fetch('/api/aibot/dstrategy/pause', { method: 'POST' }).then(r => r.json()).then(function(res) {
+        if (res.success) { botPaused = !!res.paused; pauseBtn.textContent = botPaused ? '▶ Resume' : '⏸ Pause'; logLine(botPaused ? 'Paused.' : 'Resumed.'); }
+      });
+    });
+    stopBtn.addEventListener('click', function() {
+      fetch('/api/aibot/dstrategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pollStatus(); });
+    });
+
+    document.getElementById('stratDoLogBtn').addEventListener('click', function() { window.open('/api/aibot/strategy/log_download', '_blank'); });
+    document.getElementById('stratDoLogDownloadBtn').addEventListener('click', function() {
+      const a = document.createElement('a'); a.href = '/api/aibot/strategy/log_download?download=1'; a.download = 'log_options.txt';
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+
+    const schedBar = document.getElementById('stratDoScheduleBar');
+    document.getElementById('stratDoScheduleBtn').addEventListener('click', function() {
+      schedBar.style.display = (schedBar.style.display === 'none') ? '' : 'none';
+    });
+    document.getElementById('stratDoScheduleArmBtn').addEventListener('click', function() {
+      const entryTime = document.getElementById('stratDoEntryTime').value;
+      const exitTime = document.getElementById('stratDoExitTime').value;
+      if (!entryTime || !exitTime) { logLine('Set both Entry time and Exit time.'); return; }
+      fetch('/api/aibot/dstrategy/schedule', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ entryTime: entryTime, exitTime: exitTime, config: buildCfg() }) })
+        .then(r => r.json()).then(function(res) {
+          if (res.success) { document.getElementById('stratDoScheduleStatus').textContent = 'armed ' + res.entryTime + ' → ' + res.exitTime; logLine('Schedule armed.'); }
+          else logLine('Schedule failed: ' + (res.error || 'unknown'));
+        });
+    });
+    document.getElementById('stratDoScheduleDisarmBtn').addEventListener('click', function() {
+      fetch('/api/aibot/dstrategy/schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ armed: false }) })
+        .then(r => r.json()).then(function() { document.getElementById('stratDoScheduleStatus').textContent = 'not armed'; logLine('Schedule disarmed.'); });
+    });
+
+    function pollStatus() { fetch('/api/aibot/dstrategy/status').then(r => r.json()).then(applyStratStatus).catch(function() {}); }
+    function applyStratStatus(s) {
+      if (!s || !s.success) return;
+      botRunning = !!s.running; botPaused = !!s.paused;
+      startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
+      pauseBtn.textContent = botPaused ? '▶ Resume' : '⏸ Pause';
+      const log = s.log || [];
+      const sig = log.join('\n');
+      if (logEl.__logsig !== sig) {
+        logEl.innerHTML = log.map(l => '<span class="log-info">' + l.replace(/</g,'&lt;') + '</span>').join('<br>');
+        logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = sig;
+      }
+      if (s.legs && s.legs.length) { pendingLegs = s.legs; renderLegs(s.legs, botRunning); }
+      const trades = s.trades || [];
+      if (trades.length) {
+        tradesBody.innerHTML = trades.slice().reverse().map(function(t) {
+          const ts = t.exitTime ? new Date(t.exitTime * 1000).toLocaleTimeString() : '—';
+          const pnlCls = (t.pnl >= 0) ? 'bull' : 'bear';
+          return '<tr style="border-bottom:1px solid #1e222d">' +
+            '<td style="padding:6px 8px">' + ts + '</td>' +
+            '<td style="padding:6px 8px">' + (t.role || '') + '</td>' +
+            '<td style="padding:6px 8px">' + (t.symbol || '') + '</td>' +
+            '<td style="padding:6px 8px">' + (t.side || '') + '</td>' +
+            '<td style="padding:6px 8px">' + t.entryPrice + '</td>' +
+            '<td style="padding:6px 8px">' + t.exitPrice + '</td>' +
+            '<td class="' + pnlCls + '" style="padding:6px 8px">' + (t.pnl >= 0 ? '+' : '') + t.pnl + '</td>' +
+            '<td style="padding:6px 8px">' + (t.reason || '') + '</td></tr>';
+        }).join('');
+      }
+      const st = s.stats || {};
+      const realEl = document.getElementById('stratDoRealizedPnl');
+      const unrEl  = document.getElementById('stratDoUnrealPnl');
+      if (st.realized != null) {
+        realEl.textContent = (st.realized >= 0 ? '+$' : '-$') + Math.abs(st.realized).toFixed(4);
+        realEl.className = 'val ' + (st.realized > 0 ? 'bull' : st.realized < 0 ? 'bear' : '');
+      }
+      if (st.unrealized != null) {
+        unrEl.textContent = (st.unrealized >= 0 ? '+$' : '-$') + Math.abs(st.unrealized).toFixed(4);
+        unrEl.className = 'val ' + (st.unrealized > 0 ? 'bull' : st.unrealized < 0 ? 'bear' : '');
+      }
+      document.getElementById('stratDoTradeCount').textContent = (st.tradeCount != null) ? st.tradeCount : '—';
+      document.getElementById('stratDoWinRate').textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
+      const ulEl = document.getElementById('stratDoUnderlying');
+      if (ulEl) ulEl.textContent = (s.underlyingSym && s.underlyingSpot != null) ? (s.underlyingSym + ' ' + s.underlyingSpot) : '—';
+      const sc = s.schedule || {};
+      document.getElementById('stratDoScheduleStatus').textContent = sc.armed ? ('armed ' + sc.entryTime + ' → ' + sc.exitTime) : 'not armed';
     }
   })();
 
