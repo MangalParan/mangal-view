@@ -6859,9 +6859,11 @@ def strat_aibot_log_download():
 # "Strategy Menu" — Delta Exchange side: the SAME multi-leg engine as the
 # Zerodha side above (Iron Condor/Short Strangle/Jade Lizard, delta-based
 # strike selection with a Claude override, hedge-linked SL/TP, schedule),
-# applied to Delta Exchange crypto options. Underlyings: BTC, ETH — Delta
-# Exchange does not currently list XAUT options (checked live; only BTC/ETH
-# call_options/put_options exist), so XAUT is not offered here.
+# applied to Delta Exchange crypto options. Underlyings: BTC, ETH, XAUT
+# (Tether Gold). XAUT options only exist on Delta's INDIA host
+# (api.india.delta.exchange), not the global host — _load_delta_products()/
+# _delta_get_public() already try India first (_DELTA_BASES[0]), so this
+# works automatically as long as the India host is reachable.
 #
 # Reuses: _STRAT_TYPES, _bs_delta (fallback only — Delta's ticker returns
 # native greeks.delta, more accurate than our own Black-Scholes for crypto
@@ -6880,7 +6882,7 @@ dstrat_bot_state = {
     'underlyingSpot': None, 'underlyingSym': '',
 }
 dstrat_bot_lock = _threading.RLock()
-_DSTRAT_BASES = ('BTC', 'ETH')
+_DSTRAT_BASES = ('BTC', 'ETH', 'XAUT')
 
 def _dstrat_log(msg):
     ts = _bot_log_ts()
@@ -21432,6 +21434,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label><span>Underlying</span><select id="stratDoBaseSel">
             <option value="BTC" selected>BTC</option>
             <option value="ETH">ETH</option>
+            <option value="XAUT">XAUT</option>
           </select></label>
           <label><span>Expiry</span><select id="stratDoExpirySel"><option value="">&mdash;</option></select></label>
           <label title="SELL legs are picked at or below this delta (0.20 = 20 delta) — uses Delta Exchange's native greeks"><span>Target Delta</span><input type="number" id="stratDoTargetDelta" value="0.20" min="0.01" max="0.90" step="0.01" style="width:80px"></label>
@@ -21502,7 +21505,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <span id="stratDoScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
         </div>
 
-        <div class="zd-log" id="stratDoLog" style="max-height:180px"><span class="log-info">Delta Options Strategy ready. Paper Trading default. BTC/ETH only — Delta Exchange does not list XAUT options. Pick a strategy, click Claude strategy (or Start) to resolve legs.</span></div>
+        <div class="zd-log" id="stratDoLog" style="max-height:180px"><span class="log-info">Delta Options Strategy ready. Paper Trading default. BTC / ETH / XAUT (Tether Gold). Pick a strategy, click Claude strategy (or Start) to resolve legs.</span></div>
       </div>
     </div>
   </div>
@@ -29492,7 +29495,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let botRunning = false, botPaused = false;
     let pendingLegs = [];
     let statusTimer = null;
-    const _HEDGE_DEFAULTS = { BTC: 500, ETH: 50 };
+    const _HEDGE_DEFAULTS = { BTC: 500, ETH: 50, XAUT: 100 };
     let _hedgeUserEdited = false;
     hedgeDistEl.addEventListener('input', function() { _hedgeUserEdited = true; });
 
