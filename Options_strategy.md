@@ -15,3 +15,8 @@ Entry criteria - STart button clicked, it should place orders
 Exit critera - SL and TP for Sell position should be configurable in Percentage SL - 50%, TP -50% as default but cobnfigurable. When closing SL and TP close hedge buy CE or PE 
 It shoudl show Realised P&L Trades, Winrate etc .
 Schedule Button should be added , Entry and Exit time can eb configured for strategy should run autoimatically. 
+Add 2 clear button to clear all open positions before order placed and closed positions. It should clear all positions after trade is closed or stopped. it should be clean 
+ Strike entry should be editable , even after claude suggests, it should be editable
+ Add Chatbox below and + icon to attatch image and files like other AIbot 
+ Default Hedge distance for Nifty -500, BTC -500, XAUT-50
+Once order placed, it should show live PNL for all positions in PNL column

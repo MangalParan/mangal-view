@@ -6650,10 +6650,41 @@ def _strat_stop_bot():
             lt = leg.get('last_tick') or {}
             px = lt.get('price') or leg['position']['entryPrice']
             _strat_close_leg(leg, px, 'bot stop', cfg, mode, cascade=True)
+    with strat_bot_lock:
+        strat_bot_state['legs'] = []   # clean slate — no stale flat rows left in the panel after a stop
     if was_running:
         _strat_log('Strategy stopped, all legs closed.')
         _strat_persist_log_line('[{}] STOP'.format(mode.upper()))
     return was_running
+
+def _strat_clear_positions():
+    """Force-close every leg that currently has an open position (manual panic-
+    flatten), without stopping the bot or clearing the leg list — for 'Clear
+    Positions' before placing a fresh set of orders."""
+    with strat_bot_lock:
+        cfg = strat_bot_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        legs = list(strat_bot_state.get('legs', []))
+    closed_any = False
+    for leg in legs:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _strat_close_leg(leg, px, 'manual clear positions', cfg, mode, cascade=True)
+            closed_any = True
+    if closed_any:
+        _strat_log('[Clear] all open positions closed.')
+        _strat_persist_log_line('[Clear] all open positions closed.')
+    return closed_any
+
+def _strat_clear_trades():
+    """Wipe the closed-trades history/stats for a clean start, without touching
+    open legs or the running bot."""
+    with strat_bot_lock:
+        strat_bot_state['trades'] = []
+        strat_bot_state['consec_losses'] = 0
+    _strat_log('[Clear] trade history cleared.')
+    _strat_persist_log_line('[Clear] trade history cleared.')
 
 # --- Schedule: entry/exit time-of-day, no external scheduler dependency ---
 _strat_scheduler_started = [False]
@@ -6854,6 +6885,129 @@ def strat_aibot_log_download():
         fname = 'log_options_{}.txt'.format(datetime.now().strftime('%Y%m%d_%H%M%S'))
         headers['Content-Disposition'] = 'attachment; filename="{}"'.format(fname)
     return Response(content, content_type='text/plain; charset=utf-8', headers=headers)
+
+@app.route('/api/aibot/strategy/clear_positions', methods=['POST'])
+@login_required
+def strat_aibot_clear_positions():
+    closed = _strat_clear_positions()
+    return jsonify({'success': True, 'closed': closed})
+
+@app.route('/api/aibot/strategy/clear_trades', methods=['POST'])
+@login_required
+def strat_aibot_clear_trades():
+    _strat_clear_trades()
+    return jsonify({'success': True})
+
+def _strat_edit_leg_strike(cfg, role, otype, side, new_strike):
+    """Re-resolve ONE leg's symbol/delta/IV for a user-edited strike, snapped to
+    the nearest strike actually listed in the live chain. Returns (leg, error)."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    spot, expiries, rows, err = _strat_fetch_chain(base, cfg.get('api_key'), cfg.get('expiry') or None)
+    if not rows:
+        return None, (err or 'no chain data for ' + base)
+    chosen_expiry = cfg.get('expiry') if (cfg.get('expiry') in expiries) else (expiries[0] if expiries else '')
+    strikes = sorted({r['strike'] for r in rows})
+    if not strikes:
+        return None, 'no strikes for ' + base
+    try:
+        snapped = min(strikes, key=lambda s: abs(s - float(new_strike)))
+    except (TypeError, ValueError):
+        return None, 'invalid strike'
+    by_strike = {r['strike']: r for r in rows}
+    try:
+        dte = max(0, (datetime.strptime(chosen_expiry, '%Y-%m-%d').date() - _tg_now_ist().date()).days)
+    except Exception:
+        dte = 1
+    iv = (by_strike.get(snapped) or {}).get(otype + '_IV', 0)
+    delta = _bs_delta(spot, snapped, iv, dte, otype)
+    opt_exch = 'NFO' if base in ('NIFTY', 'BANKNIFTY', 'FINNIFTY') else 'BFO'
+    instr = [i for i in _zo_load_opt_instruments(opt_exch)
+             if i.get('name', '').upper() == base and i.get('expiry') == chosen_expiry]
+    row = next((i for i in instr if i['type'] == otype and abs(i['strike'] - snapped) < 1e-6), None)
+    leg = {'role': role, 'symbol': (row['symbol'] if row else ''), 'exchange': opt_exch,
+           'optionType': otype, 'side': side, 'strike': snapped, 'delta': round(delta, 4),
+           'iv': iv, 'qty': 0, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0,
+           'hedge_role': '', 'hedged_by': '', 'removed': False}
+    return leg, ''
+
+@app.route('/api/aibot/strategy/edit_leg', methods=['POST'])
+@login_required
+def strat_aibot_edit_leg():
+    data = request.json or {}
+    role = (data.get('role') or '').strip()
+    if role not in ('sellCE', 'sellPE', 'hedgeCE', 'hedgePE'):
+        return jsonify({'success': False, 'error': 'role must be sellCE/sellPE/hedgeCE/hedgePE'}), 400
+    strike = data.get('strike')
+    if strike in (None, ''):
+        return jsonify({'success': False, 'error': 'strike required'}), 400
+    base = (data.get('baseSymbol') or '').upper().strip()
+    if base not in _STRAT_BASES:
+        return jsonify({'success': False, 'error': 'Pick a supported Underlying Base'}), 400
+    with strat_bot_lock:
+        existing = next((l for l in strat_bot_state.get('legs', []) if l['role'] == role), None)
+        if existing and existing.get('position'):
+            return jsonify({'success': False, 'error': "This leg has an open position — can't edit its strike while live"}), 400
+    otype = 'CE' if 'CE' in role else 'PE'
+    side = 'SELL' if role.startswith('sell') else 'BUY'
+    cfg = {'baseSymbol': base, 'expiry': (data.get('expiry') or '').strip(), 'api_key': (data.get('api_key') or '').strip()}
+    leg, err = _strat_edit_leg_strike(cfg, role, otype, side, strike)
+    if not leg:
+        return jsonify({'success': False, 'error': err}), 502
+    leg['hedge_role'] = data.get('hedgeRole') or ''
+    leg['hedged_by']  = data.get('hedgedBy') or ''
+    with strat_bot_lock:
+        for i, l in enumerate(strat_bot_state.get('legs', [])):
+            if l['role'] == role:
+                strat_bot_state['legs'][i] = leg
+                break
+    _strat_log('[Leg] {} strike edited -> {} ({})'.format(role, int(leg['strike']), leg['symbol'] or 'no symbol'))
+    return jsonify({'success': True, 'leg': leg})
+
+@app.route('/api/aibot/strategy/chat', methods=['POST'])
+@login_required
+def strat_aibot_chat():
+    data = request.json or {}
+    message = (data.get('message') or '').strip()
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(strat_bot_state, strat_bot_lock, img_url, note=message)
+    if not message and not img_url:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded an image — use it as context for the current strategy setup.'
+    chat_imgs = _chart_images_for(strat_bot_state) if img_url else []
+    history = data.get('history') or []
+    with strat_bot_lock:
+        cfg = {k: v for k, v in (strat_bot_state.get('config') or {}).items() if k != 'api_key'}
+        legs = [{'role': l['role'], 'symbol': l['symbol'], 'strike': l.get('strike'),
+                 'delta': l.get('delta'), 'position': l.get('position')} for l in strat_bot_state.get('legs', [])]
+        trades = list(strat_bot_state.get('trades', []))[-20:]
+        running = strat_bot_state.get('running', False); paused = strat_bot_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    winrate = round(wins / len(trades) * 100.0, 1) if trades else None
+    import json as _json
+    system = (
+        "You are the strategy co-pilot for a server-side multi-leg options Strategy Menu bot (Iron Condor / Short "
+        "Strangle / Jade Lizard on NSE index options via Zerodha). It auto-selects SELL CE/PE strikes by target "
+        "delta and hedges with BUY legs a configurable points-distance away; SL/TP are a % of premium on SOLD legs "
+        "only — closing a sold leg's SL/TP also closes its linked hedge in the same step. Be concise and concrete. "
+        "You cannot change bot settings from this chat — just answer questions about the current setup, legs, "
+        "trades, and risk.\n\nCURRENT STATE:\n" + _json.dumps({
+            'running': running, 'paused': paused, 'config': cfg, 'legs': legs,
+            'recentTrades': trades, 'realizedPnlINR': round(realized, 2), 'winRatePct': winrate,
+        }, default=str)[:6000]
+    )
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        content = str(h.get('content', ''))[:4000]
+        if content: msgs.append({'role': role, 'content': content})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    return jsonify({'success': True, 'reply': text})
 
 # ============================================================================
 # "Strategy Menu" — Delta Exchange side: the SAME multi-leg engine as the
@@ -7235,10 +7389,39 @@ def _dstrat_stop_bot():
             lt = leg.get('last_tick') or {}
             px = lt.get('price') or leg['position']['entryPrice']
             _dstrat_close_leg(leg, px, 'bot stop', cfg, mode, cascade=True)
+    with dstrat_bot_lock:
+        dstrat_bot_state['legs'] = []   # clean slate — no stale flat rows left in the panel after a stop
     if was_running:
         _dstrat_log('Strategy stopped, all legs closed.')
         _strat_persist_log_line('[DELTA][{}] STOP'.format(mode.upper()))
     return was_running
+
+def _dstrat_clear_positions():
+    """Force-close every leg with an open position (manual panic-flatten),
+    without stopping the bot or clearing the leg list."""
+    with dstrat_bot_lock:
+        cfg = dstrat_bot_state.get('config') or {}
+        mode = cfg.get('mode', 'paper')
+        legs = list(dstrat_bot_state.get('legs', []))
+    closed_any = False
+    for leg in legs:
+        if leg.get('position'):
+            lt = leg.get('last_tick') or {}
+            px = lt.get('price') or leg['position']['entryPrice']
+            _dstrat_close_leg(leg, px, 'manual clear positions', cfg, mode, cascade=True)
+            closed_any = True
+    if closed_any:
+        _dstrat_log('[Clear] all open positions closed.')
+        _strat_persist_log_line('[DELTA][Clear] all open positions closed.')
+    return closed_any
+
+def _dstrat_clear_trades():
+    """Wipe the closed-trades history/stats for a clean start."""
+    with dstrat_bot_lock:
+        dstrat_bot_state['trades'] = []
+        dstrat_bot_state['consec_losses'] = 0
+    _dstrat_log('[Clear] trade history cleared.')
+    _strat_persist_log_line('[DELTA][Clear] trade history cleared.')
 
 _dstrat_scheduler_started = [False]
 
@@ -7422,6 +7605,128 @@ def dstrat_aibot_schedule():
     _dstrat_ensure_scheduler()
     _dstrat_log('[Schedule] armed entry={} exit={}'.format(entry_t, exit_t))
     return jsonify({'success': True, 'armed': True, 'entryTime': entry_t, 'exitTime': exit_t})
+
+@app.route('/api/aibot/dstrategy/clear_positions', methods=['POST'])
+@login_required
+def dstrat_aibot_clear_positions():
+    closed = _dstrat_clear_positions()
+    return jsonify({'success': True, 'closed': closed})
+
+@app.route('/api/aibot/dstrategy/clear_trades', methods=['POST'])
+@login_required
+def dstrat_aibot_clear_trades():
+    _dstrat_clear_trades()
+    return jsonify({'success': True})
+
+def _dstrat_edit_leg_strike(cfg, role, otype, side, new_strike):
+    """Re-resolve ONE leg's symbol/delta/IV for a user-edited strike, snapped to
+    the nearest strike actually listed in the live Delta chain."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    chain_all = _do_load_options(base)
+    if not chain_all:
+        return None, 'no Delta option chain for ' + base
+    today = _tg_now_ist().strftime('%Y-%m-%d')
+    expiries = sorted({o['expiry'] for o in chain_all if o['expiry'] and o['expiry'] >= today}) \
+               or sorted({o['expiry'] for o in chain_all if o['expiry']})
+    if not expiries:
+        return None, 'no expiries for ' + base
+    chosen_expiry = cfg.get('expiry') if (cfg.get('expiry') in expiries) else expiries[0]
+    chain = [o for o in chain_all if o['expiry'] == chosen_expiry]
+    strikes = sorted({o['strike'] for o in chain if o['strike'] > 0})
+    if not strikes:
+        return None, 'no strikes for ' + base
+    try:
+        snapped = min(strikes, key=lambda s: abs(s - float(new_strike)))
+    except (TypeError, ValueError):
+        return None, 'invalid strike'
+    sym = next((o['symbol'] for o in chain if o['type'] == otype and abs(o['strike'] - snapped) < 1e-6), '')
+    tick = _dstrat_fetch_tickers(base)
+    info = (tick.get('by_symbol') or {}).get(sym.upper()) or {}
+    delta = info.get('delta') or 0.0
+    iv = round((info.get('iv') or 0) * 100.0, 2)
+    leg = {'role': role, 'symbol': sym, 'exchange': 'DELTA', 'optionType': otype, 'side': side,
+           'strike': snapped, 'delta': round(delta, 4), 'iv': iv, 'qty': 0, 'position': None,
+           'last_tick': {}, 'last_candles': [], 'last_exit_time': 0, 'hedge_role': '', 'hedged_by': '', 'removed': False}
+    return leg, ''
+
+@app.route('/api/aibot/dstrategy/edit_leg', methods=['POST'])
+@login_required
+def dstrat_aibot_edit_leg():
+    data = request.json or {}
+    role = (data.get('role') or '').strip()
+    if role not in ('sellCE', 'sellPE', 'hedgeCE', 'hedgePE'):
+        return jsonify({'success': False, 'error': 'role must be sellCE/sellPE/hedgeCE/hedgePE'}), 400
+    strike = data.get('strike')
+    if strike in (None, ''):
+        return jsonify({'success': False, 'error': 'strike required'}), 400
+    base = (data.get('baseSymbol') or '').upper().strip()
+    if base not in _DSTRAT_BASES:
+        return jsonify({'success': False, 'error': 'Pick a supported Underlying (BTC/ETH/XAUT)'}), 400
+    with dstrat_bot_lock:
+        existing = next((l for l in dstrat_bot_state.get('legs', []) if l['role'] == role), None)
+        if existing and existing.get('position'):
+            return jsonify({'success': False, 'error': "This leg has an open position — can't edit its strike while live"}), 400
+    otype = 'CE' if 'CE' in role else 'PE'
+    side = 'SELL' if role.startswith('sell') else 'BUY'
+    cfg = {'baseSymbol': base, 'expiry': (data.get('expiry') or '').strip()}
+    leg, err = _dstrat_edit_leg_strike(cfg, role, otype, side, strike)
+    if not leg:
+        return jsonify({'success': False, 'error': err}), 502
+    leg['hedge_role'] = data.get('hedgeRole') or ''
+    leg['hedged_by']  = data.get('hedgedBy') or ''
+    with dstrat_bot_lock:
+        for i, l in enumerate(dstrat_bot_state.get('legs', [])):
+            if l['role'] == role:
+                dstrat_bot_state['legs'][i] = leg
+                break
+    _dstrat_log('[Leg] {} strike edited -> {} ({})'.format(role, leg['strike'], leg['symbol'] or 'no symbol'))
+    return jsonify({'success': True, 'leg': leg})
+
+@app.route('/api/aibot/dstrategy/chat', methods=['POST'])
+@login_required
+def dstrat_aibot_chat():
+    data = request.json or {}
+    message = (data.get('message') or '').strip()
+    img_url = data.get('image') or ''
+    if img_url:
+        _chart_store(dstrat_bot_state, dstrat_bot_lock, img_url, note=message)
+    if not message and not img_url:
+        return jsonify({'success': False, 'error': 'Empty message'}), 400
+    if not message:
+        message = 'I uploaded an image — use it as context for the current strategy setup.'
+    chat_imgs = _chart_images_for(dstrat_bot_state) if img_url else []
+    history = data.get('history') or []
+    with dstrat_bot_lock:
+        cfg = {k: v for k, v in (dstrat_bot_state.get('config') or {}).items() if k != 'api_key'}
+        legs = [{'role': l['role'], 'symbol': l['symbol'], 'strike': l.get('strike'),
+                 'delta': l.get('delta'), 'position': l.get('position')} for l in dstrat_bot_state.get('legs', [])]
+        trades = list(dstrat_bot_state.get('trades', []))[-20:]
+        running = dstrat_bot_state.get('running', False); paused = dstrat_bot_state.get('paused', False)
+    realized = sum(t.get('pnl', 0) for t in trades)
+    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+    winrate = round(wins / len(trades) * 100.0, 1) if trades else None
+    import json as _json
+    system = (
+        "You are the strategy co-pilot for a server-side multi-leg CRYPTO options Strategy Menu bot (Iron Condor / "
+        "Short Strangle / Jade Lizard on BTC/ETH/XAUT options via Delta Exchange). It auto-selects SELL CE/PE "
+        "strikes by target delta (Delta Exchange's native greeks) and hedges with BUY legs a configurable "
+        "points-distance away; SL/TP are a % of premium on SOLD legs only — closing a sold leg's SL/TP also closes "
+        "its linked hedge in the same step. Be concise and concrete. You cannot change bot settings from this "
+        "chat — just answer questions about the current setup, legs, trades, and risk.\n\nCURRENT STATE:\n" + _json.dumps({
+            'running': running, 'paused': paused, 'config': cfg, 'legs': legs,
+            'recentTrades': trades, 'realizedPnlUSD': round(realized, 4), 'winRatePct': winrate,
+        }, default=str)[:6000]
+    )
+    msgs = []
+    for h in history[-8:]:
+        role = 'assistant' if h.get('role') == 'assistant' else 'user'
+        content = str(h.get('content', ''))[:4000]
+        if content: msgs.append({'role': role, 'content': content})
+    msgs.append({'role': 'user', 'content': message})
+    text, err = _call_claude(system, msgs, model=(data.get('model') or cfg.get('model')), images=chat_imgs)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    return jsonify({'success': True, 'reply': text})
 
 # ============================================================================
 # MetaTrader 5 (MT5) integration — pluggable backend.
@@ -21344,11 +21649,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Symbol</th>
                 <th style="padding:6px 8px">Side</th><th style="padding:6px 8px">Strike</th>
                 <th style="padding:6px 8px">Delta</th><th style="padding:6px 8px">Position</th>
+                <th style="padding:6px 8px">PnL</th>
                 <th style="padding:6px 8px"></th>
               </tr>
             </thead>
             <tbody id="stratZoLegsBody">
-              <tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs yet — click &#129302; Claude strategy or Start to auto-select strikes.</td></tr>
+              <tr><td colspan="8" style="padding:10px 8px;color:#787b86">No legs yet — click &#129302; Claude strategy or Start to auto-select strikes.</td></tr>
             </tbody>
           </table>
         </div>
@@ -21387,6 +21693,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button class="zd-start-btn pause" id="stratZoPauseBtn" disabled>&#9208; Pause</button>
           <button class="zd-start-btn stop" id="stratZoStopBtn" disabled>&#9632; Stop</button>
           <button class="zd-add-btn" id="stratZoScheduleBtn" type="button">&#128337; Schedule</button>
+          <button class="zd-add-btn" id="stratZoClearPosBtn" type="button" title="Force-close every open position now (does not stop the bot)">&#129529; Clear Positions</button>
+          <button class="zd-add-btn" id="stratZoClearTradesBtn" type="button" title="Clear the closed-trades history and stats">&#128465; Clear Trades</button>
           <button class="bot-log-btn" id="stratLogBtn" type="button" title="Open log_options.txt in a new tab">&#128196; log_options.txt</button>
           <button class="bot-log-btn" id="stratLogDownloadBtn" type="button" title="Download log_options.txt">&#11015; Download log</button>
         </div>
@@ -21399,6 +21707,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
 
         <div class="zd-log" id="stratZoLog" style="max-height:180px"><span class="log-info">Strategy Menu ready. Paper Trading default. Pick an underlying + strategy, click Claude strategy (or Start) to resolve legs.</span></div>
+
+        <div class="dbot-chat">
+          <div class="dbot-chat-head">
+            <span>&#129302; Claude strategy co-pilot</span>
+            <span class="dbot-chat-hint">Ask about legs, risk, or the current setup. Attach a chart/option-chain screenshot with &#128206;.</span>
+          </div>
+          <div class="dbot-chat-msgs" id="stratZoChatMsgs">
+            <div class="dbot-msg bot">Hi! I can see your legs, trades and P/L. Ask me things like <em>"what's my current risk?"</em> or <em>"why did the sell leg get hedged?"</em>.</div>
+          </div>
+          <div class="dbot-chat-input">
+            <input type="text" id="stratZoChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
+            <button class="dbot-chat-send" id="stratZoChatSend">Send</button>
+          </div>
+        </div>
       </div>
 
       <div id="stratDoSection" style="display:none">
@@ -21451,11 +21773,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Symbol</th>
                 <th style="padding:6px 8px">Side</th><th style="padding:6px 8px">Strike</th>
                 <th style="padding:6px 8px">Delta</th><th style="padding:6px 8px">Position</th>
+                <th style="padding:6px 8px">PnL</th>
                 <th style="padding:6px 8px"></th>
               </tr>
             </thead>
             <tbody id="stratDoLegsBody">
-              <tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs yet — click &#129302; Claude strategy or Start to auto-select strikes.</td></tr>
+              <tr><td colspan="8" style="padding:10px 8px;color:#787b86">No legs yet — click &#129302; Claude strategy or Start to auto-select strikes.</td></tr>
             </tbody>
           </table>
         </div>
@@ -21494,6 +21817,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button class="zd-start-btn pause" id="stratDoPauseBtn" disabled>&#9208; Pause</button>
           <button class="zd-start-btn stop" id="stratDoStopBtn" disabled>&#9632; Stop</button>
           <button class="zd-add-btn" id="stratDoScheduleBtn" type="button">&#128337; Schedule</button>
+          <button class="zd-add-btn" id="stratDoClearPosBtn" type="button" title="Force-close every open position now (does not stop the bot)">&#129529; Clear Positions</button>
+          <button class="zd-add-btn" id="stratDoClearTradesBtn" type="button" title="Clear the closed-trades history and stats">&#128465; Clear Trades</button>
           <button class="bot-log-btn" id="stratDoLogBtn" type="button" title="Open log_options.txt in a new tab">&#128196; log_options.txt</button>
           <button class="bot-log-btn" id="stratDoLogDownloadBtn" type="button" title="Download log_options.txt">&#11015; Download log</button>
         </div>
@@ -21506,6 +21831,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
 
         <div class="zd-log" id="stratDoLog" style="max-height:180px"><span class="log-info">Delta Options Strategy ready. Paper Trading default. BTC / ETH / XAUT (Tether Gold). Pick a strategy, click Claude strategy (or Start) to resolve legs.</span></div>
+
+        <div class="dbot-chat">
+          <div class="dbot-chat-head">
+            <span>&#129302; Claude strategy co-pilot</span>
+            <span class="dbot-chat-hint">Ask about legs, risk, or the current setup. Attach a chart/option-chain screenshot with &#128206;.</span>
+          </div>
+          <div class="dbot-chat-msgs" id="stratDoChatMsgs">
+            <div class="dbot-msg bot">Hi! I can see your legs, trades and P/L. Ask me things like <em>"what's my current risk?"</em> or <em>"why did the sell leg get hedged?"</em>.</div>
+          </div>
+          <div class="dbot-chat-input">
+            <input type="text" id="stratDoChatInput" placeholder="Type a message and press Enter…" autocomplete="off">
+            <button class="dbot-chat-send" id="stratDoChatSend">Send</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -29285,35 +29624,61 @@ HTML_PAGE = r"""<!DOCTYPE html>
     baseSel.addEventListener('change', loadExpiries);
 
     function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
-    function fmtPos(p, ccy) {
+    function fmtPos(p) {
       if (!p) return '<span style="color:#787b86">flat</span>';
-      ccy = ccy || '₹';
-      let pnlHtml = '';
-      if (p.unrealizedPnl != null) {
-        const cls = p.unrealizedPnl >= 0 ? 'bull' : 'bear';
-        pnlHtml = ' <span class="' + cls + '">(' + (p.unrealizedPnl >= 0 ? '+' : '') + ccy + p.unrealizedPnl.toFixed(2) + ')</span>';
-      }
       return '<span class="' + (p.side === 'BUY' ? 'bull' : 'bear') + '">' + p.side + ' @ ' + p.entryPrice +
-             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>' + pnlHtml;
+             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>';
+    }
+    function fmtPnlCell(p, ccy) {
+      if (!p || p.unrealizedPnl == null) return '<span style="color:#787b86">—</span>';
+      ccy = ccy || '₹';
+      const cls = p.unrealizedPnl >= 0 ? 'bull' : 'bear';
+      return '<span class="' + cls + '">' + (p.unrealizedPnl >= 0 ? '+' : '') + ccy + p.unrealizedPnl.toFixed(2) + '</span>';
     }
     function renderLegs(legs, live) {
       legsBody.innerHTML = '';
       const visible = (legs || []).filter(l => !l.removed);
       if (!visible.length) {
-        legsBody.innerHTML = '<tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs — click Claude strategy or Start.</td></tr>';
+        legsBody.innerHTML = '<tr><td colspan="8" style="padding:10px 8px;color:#787b86">No legs — click Claude strategy or Start.</td></tr>';
         return;
       }
       visible.forEach(function(leg) {
         const tr = document.createElement('tr');
         tr.style.borderBottom = '1px solid #1e222d';
+        const locked = !!(live && leg.position);
         tr.innerHTML =
           '<td style="padding:6px 8px">' + leg.role + '</td>' +
           '<td style="padding:6px 8px">' + (leg.symbol || '—') + '</td>' +
           '<td style="padding:6px 8px">' + leg.side + '</td>' +
-          '<td style="padding:6px 8px">' + (leg.strike != null ? Math.round(leg.strike) : '—') + '</td>' +
+          '<td style="padding:6px 8px"></td>' +
           '<td style="padding:6px 8px">' + fmtDelta(leg.delta) + '</td>' +
           '<td style="padding:6px 8px">' + fmtPos(leg.position) + '</td>' +
+          '<td style="padding:6px 8px">' + fmtPnlCell(leg.position, '₹') + '</td>' +
           '<td style="padding:6px 8px"></td>';
+        const strikeTd = tr.children[3];
+        const strikeInp = document.createElement('input');
+        strikeInp.type = 'number'; strikeInp.value = (leg.strike != null ? Math.round(leg.strike) : '');
+        strikeInp.style.width = '80px'; strikeInp.disabled = locked;
+        strikeInp.title = locked ? 'Open position — strike is locked' : 'Edit strike, then press Enter or click away to re-resolve the symbol';
+        function commitStrike() {
+          const v = parseFloat(strikeInp.value);
+          if (!v || v === leg.strike) return;
+          const s = ZerodhaStore.getSession();
+          strikeInp.disabled = true;
+          fetch('/api/aibot/strategy/edit_leg', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ role: leg.role, strike: v, baseSymbol: baseSel.value, expiry: expirySel.value,
+                                    api_key: s.apiKey || '', hedgeRole: leg.hedge_role || '', hedgedBy: leg.hedged_by || '' }) })
+            .then(r => r.json()).then(function(res) {
+              if (!res.success) { logLine('Edit strike failed: ' + (res.error || 'unknown')); strikeInp.disabled = locked; return; }
+              const idx = pendingLegs.findIndex(l => l.role === leg.role);
+              if (idx >= 0) pendingLegs[idx] = res.leg; else pendingLegs.push(res.leg);
+              logLine('Leg ' + leg.role + ' -> strike ' + Math.round(res.leg.strike) + ' (' + (res.leg.symbol || 'no symbol') + ')');
+              renderLegs(pendingLegs, live);
+            }).catch(function(e) { logLine('Edit strike error: ' + e.message); strikeInp.disabled = locked; });
+        }
+        strikeInp.addEventListener('change', commitStrike);
+        strikeInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); strikeInp.blur(); } });
+        strikeTd.appendChild(strikeInp);
         const rmBtn = document.createElement('button');
         rmBtn.className = 'zd-add-btn'; rmBtn.type = 'button'; rmBtn.textContent = 'Remove';
         rmBtn.style.padding = '2px 8px'; rmBtn.style.fontSize = '11px';
@@ -29394,7 +29759,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       });
     });
     stopBtn.addEventListener('click', function() {
-      fetch('/api/aibot/strategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pollStatus(); });
+      fetch('/api/aibot/strategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pendingLegs = []; pollStatus(); });
+    });
+    document.getElementById('stratZoClearPosBtn').addEventListener('click', function() {
+      fetch('/api/aibot/strategy/clear_positions', { method: 'POST' }).then(r => r.json()).then(function(res) {
+        logLine(res.closed ? 'All open positions cleared.' : 'No open positions to clear.'); pollStatus();
+      });
+    });
+    document.getElementById('stratZoClearTradesBtn').addEventListener('click', function() {
+      fetch('/api/aibot/strategy/clear_trades', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Trade history cleared.'); pollStatus(); });
     });
 
     document.getElementById('stratLogBtn').addEventListener('click', function() { window.open('/api/aibot/strategy/log_download', '_blank'); });
@@ -29470,6 +29843,58 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const sc = s.schedule || {};
       document.getElementById('stratZoScheduleStatus').textContent = sc.armed ? ('armed ' + sc.entryTime + ' → ' + sc.exitTime) : 'not armed';
     }
+
+    // ---- Claude co-pilot chat (Q&A + image attach) ----
+    (function() {
+      const msgsEl = document.getElementById('stratZoChatMsgs');
+      const inputEl = document.getElementById('stratZoChatInput');
+      const sendEl = document.getElementById('stratZoChatSend');
+      if (!msgsEl || !inputEl || !sendEl) return;
+      let pendingChartImg = '', chartAttachBtn = null;
+      (function(){
+        chartAttachBtn = document.createElement('button');
+        chartAttachBtn.type = 'button'; chartAttachBtn.className = 'dbot-chat-send';
+        chartAttachBtn.title = 'Attach a chart or option-chain screenshot for Claude';
+        chartAttachBtn.textContent = '📎'; chartAttachBtn.style.marginRight = '4px';
+        const chartFile = document.createElement('input');
+        chartFile.type = 'file'; chartFile.accept = 'image/*'; chartFile.style.display = 'none';
+        sendEl.parentNode.insertBefore(chartAttachBtn, sendEl);
+        sendEl.parentNode.appendChild(chartFile);
+        chartAttachBtn.addEventListener('click', function(){ chartFile.click(); });
+        chartFile.addEventListener('change', function(){
+          const f = chartFile.files && chartFile.files[0]; chartFile.value = '';
+          if (!f) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function(){ pendingChartImg = String(rd.result || '');
+            chartAttachBtn.textContent = '📎✓'; chartAttachBtn.style.color = '#26a69a';
+            addMsg('Image attached — sent to Claude with your next message.', 'bot'); };
+          rd.readAsDataURL(f);
+        });
+      })();
+      function takeImg(){ const i = pendingChartImg; pendingChartImg = '';
+        if (chartAttachBtn){ chartAttachBtn.textContent = '📎'; chartAttachBtn.style.color = ''; } return i; }
+      const history = [];
+      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function addMsg(text, cls) { const d = document.createElement('div'); d.className = 'dbot-msg ' + (cls || 'bot'); d.innerHTML = esc(text); msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d; }
+      function send() {
+        const msg = inputEl.value.trim(); if (!msg && !pendingChartImg) return;
+        addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
+        inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
+        const thinking = addMsg('Thinking…', 'bot');
+        fetch('/api/aibot/strategy/chat', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1),
+            model: document.getElementById('stratZoModel').value, image: takeImg() }) })
+          .then(r => r.json()).then(res => {
+            thinking.remove();
+            if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
+            const reply = res.reply || '(no reply)'; addMsg(reply, 'bot'); history.push({ role: 'assistant', content: reply });
+          }).catch(e => { thinking.remove(); addMsg('Chat error: ' + e.message, 'err'); })
+          .finally(() => { sendEl.disabled = false; inputEl.disabled = false; inputEl.focus(); });
+      }
+      sendEl.addEventListener('click', send);
+      inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+    })();
   })();
 
   // ---- Strategy Menu Panel: Delta Exchange side — same multi-leg engine as
@@ -29495,7 +29920,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let botRunning = false, botPaused = false;
     let pendingLegs = [];
     let statusTimer = null;
-    const _HEDGE_DEFAULTS = { BTC: 500, ETH: 50, XAUT: 100 };
+    const _HEDGE_DEFAULTS = { BTC: 500, ETH: 50, XAUT: 50 };
     let _hedgeUserEdited = false;
     hedgeDistEl.addEventListener('input', function() { _hedgeUserEdited = true; });
 
@@ -29554,32 +29979,57 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
     function fmtPosDo(p) {
       if (!p) return '<span style="color:#787b86">flat</span>';
-      let pnlHtml = '';
-      if (p.unrealizedPnl != null) {
-        const cls = p.unrealizedPnl >= 0 ? 'bull' : 'bear';
-        pnlHtml = ' <span class="' + cls + '">(' + (p.unrealizedPnl >= 0 ? '+' : '') + '$' + p.unrealizedPnl.toFixed(4) + ')</span>';
-      }
       return '<span class="' + (p.side === 'BUY' ? 'bull' : 'bear') + '">' + p.side + ' @ ' + p.entryPrice +
-             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>' + pnlHtml;
+             (p.sl != null ? (' SL ' + p.sl) : '') + (p.tp != null ? (' TP ' + p.tp) : '') + '</span>';
+    }
+    function fmtPnlCellDo(p) {
+      if (!p || p.unrealizedPnl == null) return '<span style="color:#787b86">—</span>';
+      const cls = p.unrealizedPnl >= 0 ? 'bull' : 'bear';
+      return '<span class="' + cls + '">' + (p.unrealizedPnl >= 0 ? '+' : '') + '$' + p.unrealizedPnl.toFixed(4) + '</span>';
     }
     function renderLegs(legs, live) {
       legsBody.innerHTML = '';
       const visible = (legs || []).filter(l => !l.removed);
       if (!visible.length) {
-        legsBody.innerHTML = '<tr><td colspan="7" style="padding:10px 8px;color:#787b86">No legs — click Claude strategy or Start.</td></tr>';
+        legsBody.innerHTML = '<tr><td colspan="8" style="padding:10px 8px;color:#787b86">No legs — click Claude strategy or Start.</td></tr>';
         return;
       }
       visible.forEach(function(leg) {
         const tr = document.createElement('tr');
         tr.style.borderBottom = '1px solid #1e222d';
+        const locked = !!(live && leg.position);
         tr.innerHTML =
           '<td style="padding:6px 8px">' + leg.role + '</td>' +
           '<td style="padding:6px 8px">' + (leg.symbol || '—') + '</td>' +
           '<td style="padding:6px 8px">' + leg.side + '</td>' +
-          '<td style="padding:6px 8px">' + (leg.strike != null ? Math.round(leg.strike) : '—') + '</td>' +
+          '<td style="padding:6px 8px"></td>' +
           '<td style="padding:6px 8px">' + fmtDelta(leg.delta) + '</td>' +
           '<td style="padding:6px 8px">' + fmtPosDo(leg.position) + '</td>' +
+          '<td style="padding:6px 8px">' + fmtPnlCellDo(leg.position) + '</td>' +
           '<td style="padding:6px 8px"></td>';
+        const strikeTd = tr.children[3];
+        const strikeInp = document.createElement('input');
+        strikeInp.type = 'number'; strikeInp.value = (leg.strike != null ? Math.round(leg.strike) : '');
+        strikeInp.style.width = '80px'; strikeInp.disabled = locked;
+        strikeInp.title = locked ? 'Open position — strike is locked' : 'Edit strike, then press Enter or click away to re-resolve the symbol';
+        function commitStrike() {
+          const v = parseFloat(strikeInp.value);
+          if (!v || v === leg.strike) return;
+          strikeInp.disabled = true;
+          fetch('/api/aibot/dstrategy/edit_leg', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ role: leg.role, strike: v, baseSymbol: baseSel.value, expiry: expirySel.value,
+                                    hedgeRole: leg.hedge_role || '', hedgedBy: leg.hedged_by || '' }) })
+            .then(r => r.json()).then(function(res) {
+              if (!res.success) { logLine('Edit strike failed: ' + (res.error || 'unknown')); strikeInp.disabled = locked; return; }
+              const idx = pendingLegs.findIndex(l => l.role === leg.role);
+              if (idx >= 0) pendingLegs[idx] = res.leg; else pendingLegs.push(res.leg);
+              logLine('Leg ' + leg.role + ' -> strike ' + res.leg.strike + ' (' + (res.leg.symbol || 'no symbol') + ')');
+              renderLegs(pendingLegs, live);
+            }).catch(function(e) { logLine('Edit strike error: ' + e.message); strikeInp.disabled = locked; });
+        }
+        strikeInp.addEventListener('change', commitStrike);
+        strikeInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); strikeInp.blur(); } });
+        strikeTd.appendChild(strikeInp);
         const rmBtn = document.createElement('button');
         rmBtn.className = 'zd-add-btn'; rmBtn.type = 'button'; rmBtn.textContent = 'Remove';
         rmBtn.style.padding = '2px 8px'; rmBtn.style.fontSize = '11px';
@@ -29660,7 +30110,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       });
     });
     stopBtn.addEventListener('click', function() {
-      fetch('/api/aibot/dstrategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pollStatus(); });
+      fetch('/api/aibot/dstrategy/stop', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Stopped, legs closed.'); pendingLegs = []; pollStatus(); });
+    });
+    document.getElementById('stratDoClearPosBtn').addEventListener('click', function() {
+      fetch('/api/aibot/dstrategy/clear_positions', { method: 'POST' }).then(r => r.json()).then(function(res) {
+        logLine(res.closed ? 'All open positions cleared.' : 'No open positions to clear.'); pollStatus();
+      });
+    });
+    document.getElementById('stratDoClearTradesBtn').addEventListener('click', function() {
+      fetch('/api/aibot/dstrategy/clear_trades', { method: 'POST' }).then(r => r.json()).then(function() { logLine('Trade history cleared.'); pollStatus(); });
     });
 
     document.getElementById('stratDoLogBtn').addEventListener('click', function() { window.open('/api/aibot/strategy/log_download', '_blank'); });
@@ -29736,6 +30194,58 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const sc = s.schedule || {};
       document.getElementById('stratDoScheduleStatus').textContent = sc.armed ? ('armed ' + sc.entryTime + ' → ' + sc.exitTime) : 'not armed';
     }
+
+    // ---- Claude co-pilot chat (Q&A + image attach) ----
+    (function() {
+      const msgsEl = document.getElementById('stratDoChatMsgs');
+      const inputEl = document.getElementById('stratDoChatInput');
+      const sendEl = document.getElementById('stratDoChatSend');
+      if (!msgsEl || !inputEl || !sendEl) return;
+      let pendingChartImg = '', chartAttachBtn = null;
+      (function(){
+        chartAttachBtn = document.createElement('button');
+        chartAttachBtn.type = 'button'; chartAttachBtn.className = 'dbot-chat-send';
+        chartAttachBtn.title = 'Attach a chart or option-chain screenshot for Claude';
+        chartAttachBtn.textContent = '📎'; chartAttachBtn.style.marginRight = '4px';
+        const chartFile = document.createElement('input');
+        chartFile.type = 'file'; chartFile.accept = 'image/*'; chartFile.style.display = 'none';
+        sendEl.parentNode.insertBefore(chartAttachBtn, sendEl);
+        sendEl.parentNode.appendChild(chartFile);
+        chartAttachBtn.addEventListener('click', function(){ chartFile.click(); });
+        chartFile.addEventListener('change', function(){
+          const f = chartFile.files && chartFile.files[0]; chartFile.value = '';
+          if (!f) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function(){ pendingChartImg = String(rd.result || '');
+            chartAttachBtn.textContent = '📎✓'; chartAttachBtn.style.color = '#26a69a';
+            addMsg('Image attached — sent to Claude with your next message.', 'bot'); };
+          rd.readAsDataURL(f);
+        });
+      })();
+      function takeImg(){ const i = pendingChartImg; pendingChartImg = '';
+        if (chartAttachBtn){ chartAttachBtn.textContent = '📎'; chartAttachBtn.style.color = ''; } return i; }
+      const history = [];
+      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function addMsg(text, cls) { const d = document.createElement('div'); d.className = 'dbot-msg ' + (cls || 'bot'); d.innerHTML = esc(text); msgsEl.appendChild(d); msgsEl.scrollTop = msgsEl.scrollHeight; return d; }
+      function send() {
+        const msg = inputEl.value.trim(); if (!msg && !pendingChartImg) return;
+        addMsg(msg, 'user'); history.push({ role: 'user', content: msg });
+        inputEl.value = ''; sendEl.disabled = true; inputEl.disabled = true;
+        const thinking = addMsg('Thinking…', 'bot');
+        fetch('/api/aibot/dstrategy/chat', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1),
+            model: document.getElementById('stratDoModel').value, image: takeImg() }) })
+          .then(r => r.json()).then(res => {
+            thinking.remove();
+            if (!res.success) { addMsg(res.error || 'Claude is unavailable.', 'err'); return; }
+            const reply = res.reply || '(no reply)'; addMsg(reply, 'bot'); history.push({ role: 'assistant', content: reply });
+          }).catch(e => { thinking.remove(); addMsg('Chat error: ' + e.message, 'err'); })
+          .finally(() => { sendEl.disabled = false; inputEl.disabled = false; inputEl.focus(); });
+      }
+      sendEl.addEventListener('click', send);
+      inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+    })();
   })();
 
   // ---- MT5 AI Bot Panel (server-side, mirrors Delta/Zerodha) ----
