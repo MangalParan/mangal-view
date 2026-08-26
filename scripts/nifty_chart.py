@@ -6659,8 +6659,10 @@ def _strat_stop_bot():
 
 def _strat_clear_positions():
     """Force-close every leg that currently has an open position (manual panic-
-    flatten), without stopping the bot or clearing the leg list — for 'Clear
-    Positions' before placing a fresh set of orders."""
+    flatten), THEN wipe the leg list entirely — 'Clear Positions' resets the
+    panel back to a clean, empty legs table (no stale rows), ready either for
+    a fresh Claude strategy / Start before the bot is running, or a clean
+    restart while it is. Does not flip 'running' — use Stop for that."""
     with strat_bot_lock:
         cfg = strat_bot_state.get('config') or {}
         mode = cfg.get('mode', 'paper')
@@ -6672,9 +6674,13 @@ def _strat_clear_positions():
             px = lt.get('price') or leg['position']['entryPrice']
             _strat_close_leg(leg, px, 'manual clear positions', cfg, mode, cascade=True)
             closed_any = True
+    with strat_bot_lock:
+        strat_bot_state['legs'] = []
     if closed_any:
-        _strat_log('[Clear] all open positions closed.')
-        _strat_persist_log_line('[Clear] all open positions closed.')
+        _strat_log('[Clear] all open positions closed and legs cleared.')
+        _strat_persist_log_line('[Clear] all open positions closed and legs cleared.')
+    else:
+        _strat_log('[Clear] legs cleared (none were open).')
     return closed_any
 
 def _strat_clear_trades():
@@ -7398,7 +7404,8 @@ def _dstrat_stop_bot():
 
 def _dstrat_clear_positions():
     """Force-close every leg with an open position (manual panic-flatten),
-    without stopping the bot or clearing the leg list."""
+    THEN wipe the leg list entirely — resets the panel to a clean, empty
+    legs table. Does not flip 'running' — use Stop for that."""
     with dstrat_bot_lock:
         cfg = dstrat_bot_state.get('config') or {}
         mode = cfg.get('mode', 'paper')
@@ -7410,9 +7417,13 @@ def _dstrat_clear_positions():
             px = lt.get('price') or leg['position']['entryPrice']
             _dstrat_close_leg(leg, px, 'manual clear positions', cfg, mode, cascade=True)
             closed_any = True
+    with dstrat_bot_lock:
+        dstrat_bot_state['legs'] = []
     if closed_any:
-        _dstrat_log('[Clear] all open positions closed.')
-        _strat_persist_log_line('[DELTA][Clear] all open positions closed.')
+        _dstrat_log('[Clear] all open positions closed and legs cleared.')
+        _strat_persist_log_line('[DELTA][Clear] all open positions closed and legs cleared.')
+    else:
+        _dstrat_log('[Clear] legs cleared (none were open).')
     return closed_any
 
 def _dstrat_clear_trades():
@@ -29763,7 +29774,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
     document.getElementById('stratZoClearPosBtn').addEventListener('click', function() {
       fetch('/api/aibot/strategy/clear_positions', { method: 'POST' }).then(r => r.json()).then(function(res) {
-        logLine(res.closed ? 'All open positions cleared.' : 'No open positions to clear.'); pollStatus();
+        logLine(res.closed ? 'All open positions closed and legs cleared.' : 'Legs cleared (none were open).');
+        pendingLegs = []; renderLegs(pendingLegs, false); pollStatus();
       });
     });
     document.getElementById('stratZoClearTradesBtn').addEventListener('click', function() {
@@ -29808,7 +29820,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         logEl.innerHTML = log.map(l => '<span class="log-info">' + l.replace(/</g,'&lt;') + '</span>').join('<br>');
         logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = sig;
       }
-      if (s.legs && s.legs.length) { pendingLegs = s.legs; renderLegs(s.legs, botRunning); }
+      if (s.legs) { pendingLegs = s.legs; renderLegs(pendingLegs, botRunning); }
       const trades = s.trades || [];
       if (trades.length) {
         tradesBody.innerHTML = trades.slice().reverse().map(function(t) {
@@ -30114,7 +30126,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
     document.getElementById('stratDoClearPosBtn').addEventListener('click', function() {
       fetch('/api/aibot/dstrategy/clear_positions', { method: 'POST' }).then(r => r.json()).then(function(res) {
-        logLine(res.closed ? 'All open positions cleared.' : 'No open positions to clear.'); pollStatus();
+        logLine(res.closed ? 'All open positions closed and legs cleared.' : 'Legs cleared (none were open).');
+        pendingLegs = []; renderLegs(pendingLegs, false); pollStatus();
       });
     });
     document.getElementById('stratDoClearTradesBtn').addEventListener('click', function() {
@@ -30159,7 +30172,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         logEl.innerHTML = log.map(l => '<span class="log-info">' + l.replace(/</g,'&lt;') + '</span>').join('<br>');
         logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = sig;
       }
-      if (s.legs && s.legs.length) { pendingLegs = s.legs; renderLegs(s.legs, botRunning); }
+      if (s.legs) { pendingLegs = s.legs; renderLegs(pendingLegs, botRunning); }
       const trades = s.trades || [];
       if (trades.length) {
         tradesBody.innerHTML = trades.slice().reverse().map(function(t) {
