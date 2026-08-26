@@ -29551,11 +29551,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function currentMode() { const r = document.querySelector('input[name="stratZoMode"]:checked'); return r ? r.value : 'paper'; }
     function currentStrategyType() { const r = document.querySelector('input[name="stratZoType"]:checked'); return r ? r.value : 'iron_condor'; }
 
+    const STRAT_ROLES = { iron_condor: ['sellCE','sellPE','hedgeCE','hedgePE'], short_strangle: ['sellCE','sellPE'], jade_lizard: ['sellCE','sellPE','hedgeCE'] };
+    function placeholderLegs(stratType) {
+      const roles = STRAT_ROLES[stratType] || STRAT_ROLES.iron_condor;
+      return roles.map(function(role) {
+        const otype = role.indexOf('CE') >= 0 ? 'CE' : 'PE';
+        const side = role.indexOf('sell') === 0 ? 'SELL' : 'BUY';
+        return { role: role, symbol: '', exchange: '', optionType: otype, side: side, strike: null, delta: null, iv: 0,
+                 qty: 0, position: null, last_tick: {}, last_candles: [], last_exit_time: 0,
+                 hedge_role: (role === 'sellCE' && roles.indexOf('hedgeCE') >= 0) ? 'hedgeCE' : (role === 'sellPE' && roles.indexOf('hedgePE') >= 0) ? 'hedgePE' : '',
+                 hedged_by: role === 'hedgeCE' ? 'sellCE' : role === 'hedgePE' ? 'sellPE' : '', removed: false };
+      });
+    }
+    function resetToPlaceholders() {
+      if (botRunning) return;
+      pendingLegs = placeholderLegs(currentStrategyType());
+      renderLegs(pendingLegs, false);
+    }
+
     document.getElementById('stratMenuPickZerodha').addEventListener('click', function() {
       document.getElementById('stratZoSection').style.display = '';
       const doSec = document.getElementById('stratDoSection'); if (doSec) doSec.style.display = 'none';
       loadExpiries();
+      resetToPlaceholders();
     });
+    document.querySelectorAll('.stratzo-type').forEach(function(r) { r.addEventListener('change', resetToPlaceholders); });
 
     function fmtExpiryLabel(dateStr) {
       try {
@@ -29632,7 +29652,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           }
         }).catch(function() { expirySel.innerHTML = '<option value="">error loading expiries</option>'; });
     }
-    baseSel.addEventListener('change', loadExpiries);
+    baseSel.addEventListener('change', function() { loadExpiries(); resetToPlaceholders(); });
 
     function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
     function fmtPos(p) {
@@ -29820,7 +29840,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         logEl.innerHTML = log.map(l => '<span class="log-info">' + l.replace(/</g,'&lt;') + '</span>').join('<br>');
         logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = sig;
       }
-      if (s.legs) { pendingLegs = s.legs; renderLegs(pendingLegs, botRunning); }
+      // Only the server knows the REAL legs once the bot is running (Start, or a
+      // running bot's Clear Positions/Remove leg). Before Start, legs live only
+      // client-side (placeholders / Claude picks / manual edits) — the server's
+      // empty legs list must NOT overwrite that on every 5s poll, or the table
+      // flickers empty right after Claude Strategy resolves.
+      if (botRunning) { pendingLegs = s.legs || []; renderLegs(pendingLegs, true); }
       const trades = s.trades || [];
       if (trades.length) {
         tradesBody.innerHTML = trades.slice().reverse().map(function(t) {
@@ -29952,13 +29977,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
       } catch (e) { return dateStr; }
     }
 
+    const STRAT_ROLES = { iron_condor: ['sellCE','sellPE','hedgeCE','hedgePE'], short_strangle: ['sellCE','sellPE'], jade_lizard: ['sellCE','sellPE','hedgeCE'] };
+    function placeholderLegs(stratType) {
+      const roles = STRAT_ROLES[stratType] || STRAT_ROLES.iron_condor;
+      return roles.map(function(role) {
+        const otype = role.indexOf('CE') >= 0 ? 'CE' : 'PE';
+        const side = role.indexOf('sell') === 0 ? 'SELL' : 'BUY';
+        return { role: role, symbol: '', exchange: '', optionType: otype, side: side, strike: null, delta: null, iv: 0,
+                 qty: 0, position: null, last_tick: {}, last_candles: [], last_exit_time: 0,
+                 hedge_role: (role === 'sellCE' && roles.indexOf('hedgeCE') >= 0) ? 'hedgeCE' : (role === 'sellPE' && roles.indexOf('hedgePE') >= 0) ? 'hedgePE' : '',
+                 hedged_by: role === 'hedgeCE' ? 'sellCE' : role === 'hedgePE' ? 'sellPE' : '', removed: false };
+      });
+    }
+    function resetToPlaceholders() {
+      if (botRunning) return;
+      pendingLegs = placeholderLegs(currentStrategyType());
+      renderLegs(pendingLegs, false);
+    }
+
     document.getElementById('stratMenuPickDelta').addEventListener('click', function() {
       doSection.style.display = '';
       const zoSec = document.getElementById('stratZoSection'); if (zoSec) zoSec.style.display = 'none';
       loadExpiries();
+      resetToPlaceholders();
       refreshStatus(); pollStatus();
       if (!statusTimer) statusTimer = setInterval(pollStatus, 5000);
     });
+    document.querySelectorAll('.stratdo-type').forEach(function(r) { r.addEventListener('change', resetToPlaceholders); });
 
     function refreshStatus() {
       const s = DeltaStore.getSession();
@@ -29986,7 +30031,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }).catch(function() { expirySel.innerHTML = '<option value="">error loading expiries</option>'; });
       if (!_hedgeUserEdited && _HEDGE_DEFAULTS[base] != null) hedgeDistEl.value = _HEDGE_DEFAULTS[base];
     }
-    baseSel.addEventListener('change', loadExpiries);
+    baseSel.addEventListener('change', function() { loadExpiries(); resetToPlaceholders(); });
 
     function fmtDelta(v) { return (v == null) ? '—' : (Math.round(v * 100) / 100).toFixed(2); }
     function fmtPosDo(p) {
@@ -30172,7 +30217,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         logEl.innerHTML = log.map(l => '<span class="log-info">' + l.replace(/</g,'&lt;') + '</span>').join('<br>');
         logEl.scrollTop = logEl.scrollHeight; logEl.__logsig = sig;
       }
-      if (s.legs) { pendingLegs = s.legs; renderLegs(pendingLegs, botRunning); }
+      // Only the server knows the REAL legs once the bot is running (Start, or a
+      // running bot's Clear Positions/Remove leg). Before Start, legs live only
+      // client-side (placeholders / Claude picks / manual edits) — the server's
+      // empty legs list must NOT overwrite that on every 5s poll, or the table
+      // flickers empty right after Claude Strategy resolves.
+      if (botRunning) { pendingLegs = s.legs || []; renderLegs(pendingLegs, true); }
       const trades = s.trades || [];
       if (trades.length) {
         tradesBody.innerHTML = trades.slice().reverse().map(function(t) {
