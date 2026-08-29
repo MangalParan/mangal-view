@@ -6525,6 +6525,83 @@ def _strat_check_breakers(cfg, mode):
     _strat_log('[STOP] ' + trip + ' - all legs closed, strategy stopped.')
     _strat_persist_log_line('[STOP] ' + trip)
 
+def _strat_nonstop_session_gate(cfg, mode):
+    """Non-stop re-entry is time-boxed to NSE hours (configurable, default
+    09:25-15:00 IST) — square off everything once at/after the end time and
+    withhold new non-stop re-entries outside the window. Returns True if
+    re-entries are currently allowed (also True when nonStop is off, since
+    the gate is irrelevant then). Existing SL/TP risk management on already-
+    open legs is NOT affected by this gate — only new re-entries are."""
+    if not cfg.get('nonStop'):
+        return True
+    now_hm = _tg_now_ist().strftime('%H:%M')
+    start_t = cfg.get('nonStopStartTime') or '09:25'
+    end_t = cfg.get('nonStopEndTime') or '15:00'
+    if now_hm >= end_t:
+        with strat_bot_lock:
+            legs = list(strat_bot_state.get('legs', []))
+        any_open = any(l.get('position') for l in legs)
+        if any_open:
+            for leg in legs:
+                if leg.get('position'):
+                    lt = leg.get('last_tick') or {}
+                    px = lt.get('price') or leg['position']['entryPrice']
+                    _strat_close_leg(leg, px, 'non-stop session end square-off', cfg, mode, cascade=True)
+            _strat_log('[NonStop] session end ({}) - all positions squared off.'.format(end_t))
+        return False
+    if now_hm < start_t:
+        return False
+    return True
+
+def _strat_nonstop_reenter(closed_leg, cfg):
+    """Non-stop mode: after a SOLD leg's TP/SL close, immediately re-resolve
+    THAT leg's role at the same target delta (+ a fresh hedge for its role,
+    if the strategy uses one) and re-open it — independent of the other
+    side, which keeps trading on its own SL/TP cycle."""
+    if not strat_bot_state.get('running'):
+        return
+    if strat_bot_state.get('consec_losses', 0) >= int(cfg.get('maxConsec', 3) or 3):
+        return
+    role = closed_leg['role']
+    fresh_legs, info = _strat_resolve_strikes(cfg, use_claude=False)
+    if not fresh_legs:
+        _strat_log('[NonStop] re-entry failed for ' + role + ': ' + str(info)); return
+    new_sold = next((l for l in fresh_legs if l['role'] == role), None)
+    if not new_sold:
+        return
+    hedge_role = closed_leg.get('hedge_role') or new_sold.get('hedge_role')
+    new_hedge = next((l for l in fresh_legs if l['role'] == hedge_role), None) if hedge_role else None
+    with strat_bot_lock:
+        legs_list = strat_bot_state['legs']
+        for i, l in enumerate(legs_list):
+            if l['role'] == role:
+                legs_list[i] = new_sold; break
+        if new_hedge:
+            replaced = False
+            for i, l in enumerate(legs_list):
+                if l['role'] == hedge_role:
+                    legs_list[i] = new_hedge; replaced = True; break
+            if not replaced:
+                legs_list.append(new_hedge)
+    try:
+        candles = _bot_fetch_candles(new_sold['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+        price = candles[-1]['close'] if candles else 0
+    except Exception:
+        price = 0
+    if price > 0:
+        _strat_open_leg(new_sold, cfg, price)
+        _strat_log('[NonStop] re-entered ' + role + ' @ ' + new_sold['symbol'])
+    else:
+        _strat_log('[NonStop] could not price ' + new_sold['symbol'] + ' for re-entry - left flat')
+    if new_hedge:
+        try:
+            hc = _bot_fetch_candles(new_hedge['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+            hp = hc[-1]['close'] if hc else 0
+        except Exception:
+            hp = 0
+        if hp > 0:
+            _strat_open_leg(new_hedge, cfg, hp)
+
 def _strat_bot_tick():
     with strat_bot_lock:
         cfg = strat_bot_state.get('config') or {}
@@ -6532,6 +6609,7 @@ def _strat_bot_tick():
         return
     mode = cfg.get('mode', 'paper')
     _strat_underlying_ctx(cfg)
+    reentry_ok = _strat_nonstop_session_gate(cfg, mode)
     for leg in list(strat_bot_state['legs']):
         if leg.get('removed') or not leg.get('symbol'):
             continue
@@ -6553,6 +6631,8 @@ def _strat_bot_tick():
                 elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
                 if reason:
                     _strat_close_leg(leg, exit_px, reason, cfg, mode)   # cascades to close the linked hedge
+                    if cfg.get('nonStop') and reentry_ok:
+                        _strat_nonstop_reenter(leg, cfg)
                 else:
                     _strat_log('[Tick] {} px={} SL={} TP={}'.format(leg['symbol'], round(price, 2), pos['sl'], pos['tp']))
     with strat_bot_lock:
@@ -6600,6 +6680,9 @@ def _strat_start_bot(data):
             'priceTickSec': max(5, int(data.get('priceTickSec', 10) or 10)),
             'model': (data.get('model') or '').strip(),
             'api_key': (data.get('api_key') or '').strip(),
+            'nonStop': bool(data.get('nonStop', False)),
+            'nonStopStartTime': (data.get('nonStopStartTime') or '09:25').strip(),
+            'nonStopEndTime': (data.get('nonStopEndTime') or '15:00').strip(),
         }
         legs = data.get('legs')   # pre-resolved from a prior /claude_pick review step, if provided
         if not legs:
@@ -7272,6 +7355,56 @@ def _dstrat_check_breakers(cfg, mode):
     _dstrat_log('[STOP] ' + trip + ' - all legs closed, strategy stopped.')
     _strat_persist_log_line('[DELTA][STOP] ' + trip)
 
+def _dstrat_nonstop_reenter(closed_leg, cfg):
+    """Non-stop mode: after a SOLD leg's TP/SL close, immediately re-resolve
+    THAT leg's role at the same target delta (+ a fresh hedge for its role,
+    if the strategy uses one) and re-open it — independent of the other
+    side. Crypto trades 24/7, so no session-hours gate is needed here
+    (unlike the Zerodha side, which is time-boxed to NSE hours)."""
+    if not dstrat_bot_state.get('running'):
+        return
+    if dstrat_bot_state.get('consec_losses', 0) >= int(cfg.get('maxConsec', 3) or 3):
+        return
+    role = closed_leg['role']
+    fresh_legs, info = _dstrat_resolve_strikes(cfg, use_claude=False)
+    if not fresh_legs:
+        _dstrat_log('[NonStop] re-entry failed for ' + role + ': ' + str(info)); return
+    new_sold = next((l for l in fresh_legs if l['role'] == role), None)
+    if not new_sold:
+        return
+    hedge_role = closed_leg.get('hedge_role') or new_sold.get('hedge_role')
+    new_hedge = next((l for l in fresh_legs if l['role'] == hedge_role), None) if hedge_role else None
+    with dstrat_bot_lock:
+        legs_list = dstrat_bot_state['legs']
+        for i, l in enumerate(legs_list):
+            if l['role'] == role:
+                legs_list[i] = new_sold; break
+        if new_hedge:
+            replaced = False
+            for i, l in enumerate(legs_list):
+                if l['role'] == hedge_role:
+                    legs_list[i] = new_hedge; replaced = True; break
+            if not replaced:
+                legs_list.append(new_hedge)
+    try:
+        candles = fetch_delta_data(cfg.get('tf', '5m'), new_sold['symbol'])
+        price = candles[-1]['close'] if candles else 0
+    except Exception:
+        price = 0
+    if price > 0:
+        _dstrat_open_leg(new_sold, cfg, price)
+        _dstrat_log('[NonStop] re-entered ' + role + ' @ ' + new_sold['symbol'])
+    else:
+        _dstrat_log('[NonStop] could not price ' + new_sold['symbol'] + ' for re-entry - left flat')
+    if new_hedge:
+        try:
+            hc = fetch_delta_data(cfg.get('tf', '5m'), new_hedge['symbol'])
+            hp = hc[-1]['close'] if hc else 0
+        except Exception:
+            hp = 0
+        if hp > 0:
+            _dstrat_open_leg(new_hedge, cfg, hp)
+
 def _dstrat_bot_tick():
     with dstrat_bot_lock:
         cfg = dstrat_bot_state.get('config') or {}
@@ -7300,6 +7433,8 @@ def _dstrat_bot_tick():
                 elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
                 if reason:
                     _dstrat_close_leg(leg, exit_px, reason, cfg, mode)
+                    if cfg.get('nonStop'):
+                        _dstrat_nonstop_reenter(leg, cfg)
                 else:
                     _dstrat_log('[Tick] {} px={} SL={} TP={}'.format(leg['symbol'], round(price, 4), pos['sl'], pos['tp']))
     with dstrat_bot_lock:
@@ -7324,7 +7459,7 @@ def _dstrat_start_bot(data):
             return False, 'Strategy is already running. Stop it first.'
         base = (data.get('baseSymbol') or '').upper().strip()
         if base not in _DSTRAT_BASES:
-            return False, 'Pick a supported Underlying (BTC/ETH)'
+            return False, 'Pick a supported Underlying (BTC/ETH/XAUT)'
         strat_type = data.get('strategyType') or 'iron_condor'
         if strat_type not in _STRAT_TYPES:
             return False, 'Unknown strategy type'
@@ -7345,6 +7480,7 @@ def _dstrat_start_bot(data):
             'priceTickSec': max(5, int(data.get('priceTickSec', 10) or 10)),
             'model': (data.get('model') or '').strip(),
             'api_key': (data.get('api_key') or '').strip(),
+            'nonStop': bool(data.get('nonStop', False)),
         }
         legs = data.get('legs')
         if not legs:
@@ -21678,6 +21814,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label>Max daily loss &#8377; <input type="number" id="stratZoMaxLoss" value="0" min="0" style="width:90px" title="0 = disabled"></label>
         </div>
 
+        <div class="ai-strat-bar" title="When a sold leg hits TP or SL, immediately re-enter that same role at a fresh strike (same target delta, same SL%/TP%) and keep trading — independent of the other side. Stops itself once Max consec losses trips.">
+          <label><input type="checkbox" id="stratZoNonStop"> &#9851; Non Stop (re-enter on TP/SL, same delta)</label>
+          <span id="stratZoNonStopTimes" style="display:none;gap:10px;align-items:center">
+            <label style="margin-left:8px">Start <input type="time" id="stratZoNonStopStart" value="09:25"></label>
+            <label>Close <input type="time" id="stratZoNonStopEnd" value="15:00"></label>
+            <span style="color:#787b86;font-size:10px">(re-entries only within this window; squares off everything at Close)</span>
+          </span>
+        </div>
+
         <div class="ai-info-grid">
           <div class="cell"><span class="lab">Underlying</span><span class="val" id="stratZoUnderlying" style="color:#f7a600">&mdash;</span></div>
           <div class="cell"><span class="lab">Realized P/L</span><span class="val" id="stratZoRealizedPnl">&#8377;0.00</span></div>
@@ -21800,6 +21945,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label>Contracts <input type="number" id="stratDoQty" value="1" min="1" style="width:70px"></label>
           <label title="Bot auto-stops after this many consecutive losing legs">Max consec losses <input type="number" id="stratDoMaxConsec" value="3" min="1" style="width:70px"></label>
           <label>Max daily loss $ <input type="number" id="stratDoMaxLoss" value="0" min="0" style="width:90px" title="0 = disabled"></label>
+        </div>
+
+        <div class="ai-strat-bar" title="When a sold leg hits TP or SL, immediately re-enter that same role at a fresh strike (same target delta, same SL%/TP%) and keep trading — independent of the other side. Crypto trades 24/7, so no session-hours window. Stops itself once Max consec losses trips.">
+          <label><input type="checkbox" id="stratDoNonStop"> &#9851; Non Stop (re-enter on TP/SL, same delta)</label>
         </div>
 
         <div class="ai-info-grid">
@@ -29550,6 +29699,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function currentMode() { const r = document.querySelector('input[name="stratZoMode"]:checked'); return r ? r.value : 'paper'; }
     function currentStrategyType() { const r = document.querySelector('input[name="stratZoType"]:checked'); return r ? r.value : 'iron_condor'; }
+    (function() {
+      const chk = document.getElementById('stratZoNonStop'), times = document.getElementById('stratZoNonStopTimes');
+      chk.addEventListener('change', function() { times.style.display = chk.checked ? 'inline-flex' : 'none'; });
+    })();
 
     const STRAT_ROLES = { iron_condor: ['sellCE','sellPE','hedgeCE','hedgePE'], short_strangle: ['sellCE','sellPE'], jade_lizard: ['sellCE','sellPE','hedgeCE'] };
     function placeholderLegs(stratType) {
@@ -29765,7 +29918,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxConsec: parseInt(document.getElementById('stratZoMaxConsec').value) || 3,
         maxLoss: parseFloat(document.getElementById('stratZoMaxLoss').value) || 0,
         model: document.getElementById('stratZoModel').value,
-        api_key: s.apiKey || ''
+        api_key: s.apiKey || '',
+        nonStop: !!document.getElementById('stratZoNonStop').checked,
+        nonStopStartTime: document.getElementById('stratZoNonStopStart').value || '09:25',
+        nonStopEndTime: document.getElementById('stratZoNonStopEnd').value || '15:00'
       };
       if (pendingLegs.length) cfg.legs = pendingLegs;
       return cfg;
@@ -30142,7 +30298,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxConsec: parseInt(document.getElementById('stratDoMaxConsec').value) || 3,
         maxLoss: parseFloat(document.getElementById('stratDoMaxLoss').value) || 0,
         model: document.getElementById('stratDoModel').value,
-        api_key: s.apiKey || ''
+        api_key: s.apiKey || '',
+        nonStop: !!document.getElementById('stratDoNonStop').checked
       };
       if (pendingLegs.length) cfg.legs = pendingLegs;
       return cfg;

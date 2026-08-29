@@ -20,3 +20,5 @@ Add 2 clear button to clear all open positions before order placed and closed po
  Add Chatbox below and + icon to attatch image and files like other AIbot 
  Default Hedge distance for Nifty -500, BTC -500, XAUT-50
 Once order placed, it should show live PNL for all positions in PNL column
+In Delta strategy, add check box "Non stop", when non stop checkbox clicked. Once position is closed again  re enter on the winning leg with different strike same delta, same SL%,same TP% and start selling options. Example:  if CE, PE leg, once CE hit TP, then with same delta , different strike or same strike it should reenter and make profit. PE side should continue to trade as it is, once PE hit TP again renter and do trading with same delta and so on. Once SL hit, close the leg and continue to trade with same delta and so on. Based on consecutive losses number trade can exit, or else it shoudl trade non stop.
+Implement same non stop logic in zerodha also, but trading close at 3PM, start at 9:25 AM. it should be configurable. 
