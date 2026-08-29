@@ -29840,29 +29840,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
           '<td style="padding:6px 8px">' + fmtPnlCell(leg.position, '₹') + '</td>' +
           '<td style="padding:6px 8px"></td>';
         const strikeTd = tr.children[3];
+        strikeTd.style.whiteSpace = 'nowrap';
         const strikeInp = document.createElement('input');
         strikeInp.type = 'number'; strikeInp.value = (leg.strike != null ? Math.round(leg.strike) : '');
-        strikeInp.style.width = '80px'; strikeInp.disabled = locked;
-        strikeInp.title = locked ? 'Open position — strike is locked' : 'Edit strike, then press Enter or click away to re-resolve the symbol';
+        strikeInp.style.width = '72px'; strikeInp.disabled = locked;
+        strikeInp.title = locked ? 'Open position — strike is locked' : 'Edit the strike, then press Enter or click Go to re-resolve the symbol';
+        const strikeGoBtn = document.createElement('button');
+        strikeGoBtn.type = 'button'; strikeGoBtn.textContent = 'Go'; strikeGoBtn.disabled = locked;
+        strikeGoBtn.style.cssText = 'margin-left:4px;padding:2px 8px;font-size:11px';
+        strikeGoBtn.className = 'zd-add-btn';
+        strikeGoBtn.title = 'Apply this strike';
+        const strikeMsg = document.createElement('span');
+        strikeMsg.style.cssText = 'margin-left:6px;font-size:10px';
         function commitStrike() {
           const v = parseFloat(strikeInp.value);
-          if (!v || v === leg.strike) return;
+          if (!v) { strikeMsg.textContent = 'enter a strike'; strikeMsg.style.color = '#ef5350'; return; }
+          if (v === leg.strike) { strikeMsg.textContent = 'unchanged'; strikeMsg.style.color = '#787b86'; return; }
           const s = ZerodhaStore.getSession();
-          strikeInp.disabled = true;
+          if (!expirySel.value) { strikeMsg.textContent = 'pick an expiry first'; strikeMsg.style.color = '#ef5350'; return; }
+          strikeInp.disabled = true; strikeGoBtn.disabled = true;
+          strikeMsg.textContent = 'resolving…'; strikeMsg.style.color = '#787b86';
           fetch('/api/aibot/strategy/edit_leg', { method: 'POST', headers: {'Content-Type':'application/json'},
             body: JSON.stringify({ role: leg.role, strike: v, baseSymbol: baseSel.value, expiry: expirySel.value,
                                     api_key: s.apiKey || '', hedgeRole: leg.hedge_role || '', hedgedBy: leg.hedged_by || '' }) })
             .then(r => r.json()).then(function(res) {
-              if (!res.success) { logLine('Edit strike failed: ' + (res.error || 'unknown')); strikeInp.disabled = locked; return; }
+              if (!res.success) {
+                logLine('Edit strike failed: ' + (res.error || 'unknown'));
+                strikeMsg.textContent = res.error || 'failed'; strikeMsg.style.color = '#ef5350';
+                strikeInp.disabled = locked; strikeGoBtn.disabled = locked; return;
+              }
               const idx = pendingLegs.findIndex(l => l.role === leg.role);
               if (idx >= 0) pendingLegs[idx] = res.leg; else pendingLegs.push(res.leg);
               logLine('Leg ' + leg.role + ' -> strike ' + Math.round(res.leg.strike) + ' (' + (res.leg.symbol || 'no symbol') + ')');
               renderLegs(pendingLegs, live);
-            }).catch(function(e) { logLine('Edit strike error: ' + e.message); strikeInp.disabled = locked; });
+            }).catch(function(e) {
+              logLine('Edit strike error: ' + e.message);
+              strikeMsg.textContent = 'network error'; strikeMsg.style.color = '#ef5350';
+              strikeInp.disabled = locked; strikeGoBtn.disabled = locked;
+            });
         }
         strikeInp.addEventListener('change', commitStrike);
-        strikeInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); strikeInp.blur(); } });
-        strikeTd.appendChild(strikeInp);
+        strikeInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); commitStrike(); } });
+        strikeGoBtn.addEventListener('click', commitStrike);
+        strikeTd.appendChild(strikeInp); strikeTd.appendChild(strikeGoBtn); strikeTd.appendChild(strikeMsg);
         const rmBtn = document.createElement('button');
         rmBtn.className = 'zd-add-btn'; rmBtn.type = 'button'; rmBtn.textContent = 'Remove';
         rmBtn.style.padding = '2px 8px'; rmBtn.style.fontSize = '11px';
@@ -30221,28 +30241,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
           '<td style="padding:6px 8px">' + fmtPnlCellDo(leg.position) + '</td>' +
           '<td style="padding:6px 8px"></td>';
         const strikeTd = tr.children[3];
+        strikeTd.style.whiteSpace = 'nowrap';
         const strikeInp = document.createElement('input');
         strikeInp.type = 'number'; strikeInp.value = (leg.strike != null ? Math.round(leg.strike) : '');
-        strikeInp.style.width = '80px'; strikeInp.disabled = locked;
-        strikeInp.title = locked ? 'Open position — strike is locked' : 'Edit strike, then press Enter or click away to re-resolve the symbol';
+        strikeInp.style.width = '72px'; strikeInp.disabled = locked;
+        strikeInp.title = locked ? 'Open position — strike is locked' : 'Edit the strike, then press Enter or click Go to re-resolve the symbol';
+        const strikeGoBtn = document.createElement('button');
+        strikeGoBtn.type = 'button'; strikeGoBtn.textContent = 'Go'; strikeGoBtn.disabled = locked;
+        strikeGoBtn.style.cssText = 'margin-left:4px;padding:2px 8px;font-size:11px';
+        strikeGoBtn.className = 'zd-add-btn';
+        strikeGoBtn.title = 'Apply this strike';
+        const strikeMsg = document.createElement('span');
+        strikeMsg.style.cssText = 'margin-left:6px;font-size:10px';
         function commitStrike() {
           const v = parseFloat(strikeInp.value);
-          if (!v || v === leg.strike) return;
-          strikeInp.disabled = true;
+          if (!v) { strikeMsg.textContent = 'enter a strike'; strikeMsg.style.color = '#ef5350'; return; }
+          if (v === leg.strike) { strikeMsg.textContent = 'unchanged'; strikeMsg.style.color = '#787b86'; return; }
+          if (!expirySel.value) { strikeMsg.textContent = 'pick an expiry first'; strikeMsg.style.color = '#ef5350'; return; }
+          strikeInp.disabled = true; strikeGoBtn.disabled = true;
+          strikeMsg.textContent = 'resolving…'; strikeMsg.style.color = '#787b86';
           fetch('/api/aibot/dstrategy/edit_leg', { method: 'POST', headers: {'Content-Type':'application/json'},
             body: JSON.stringify({ role: leg.role, strike: v, baseSymbol: baseSel.value, expiry: expirySel.value,
                                     hedgeRole: leg.hedge_role || '', hedgedBy: leg.hedged_by || '' }) })
             .then(r => r.json()).then(function(res) {
-              if (!res.success) { logLine('Edit strike failed: ' + (res.error || 'unknown')); strikeInp.disabled = locked; return; }
+              if (!res.success) {
+                logLine('Edit strike failed: ' + (res.error || 'unknown'));
+                strikeMsg.textContent = res.error || 'failed'; strikeMsg.style.color = '#ef5350';
+                strikeInp.disabled = locked; strikeGoBtn.disabled = locked; return;
+              }
               const idx = pendingLegs.findIndex(l => l.role === leg.role);
               if (idx >= 0) pendingLegs[idx] = res.leg; else pendingLegs.push(res.leg);
               logLine('Leg ' + leg.role + ' -> strike ' + res.leg.strike + ' (' + (res.leg.symbol || 'no symbol') + ')');
               renderLegs(pendingLegs, live);
-            }).catch(function(e) { logLine('Edit strike error: ' + e.message); strikeInp.disabled = locked; });
+            }).catch(function(e) {
+              logLine('Edit strike error: ' + e.message);
+              strikeMsg.textContent = 'network error'; strikeMsg.style.color = '#ef5350';
+              strikeInp.disabled = locked; strikeGoBtn.disabled = locked;
+            });
         }
         strikeInp.addEventListener('change', commitStrike);
-        strikeInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); strikeInp.blur(); } });
-        strikeTd.appendChild(strikeInp);
+        strikeInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); commitStrike(); } });
+        strikeGoBtn.addEventListener('click', commitStrike);
+        strikeTd.appendChild(strikeInp); strikeTd.appendChild(strikeGoBtn); strikeTd.appendChild(strikeMsg);
         const rmBtn = document.createElement('button');
         rmBtn.className = 'zd-add-btn'; rmBtn.type = 'button'; rmBtn.textContent = 'Remove';
         rmBtn.style.padding = '2px 8px'; rmBtn.style.fontSize = '11px';
