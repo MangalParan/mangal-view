@@ -6132,6 +6132,11 @@ _STRAT_TYPES = {
     'iron_condor':    {'label': 'Iron Condor',    'legs': ['sellCE', 'sellPE', 'hedgeCE', 'hedgePE']},
     'short_strangle': {'label': 'Short Strangle', 'legs': ['sellCE', 'sellPE']},
     'jade_lizard':    {'label': 'Jade Lizard',    'legs': ['sellCE', 'sellPE', 'hedgeCE']},
+    # Signal-driven, not a fixed structure: resolves all 4 legs (so the table
+    # always shows CE+PE+both hedges), but only the side matching the current
+    # EMA regime is ever actually open — bullish -> sell PE (+hedge), bearish
+    # -> sell CE (+hedge), switching sides as the regime flips.
+    'ema_crossover':  {'label': 'EMA 5/13 Crossover', 'legs': ['sellCE', 'sellPE', 'hedgeCE', 'hedgePE']},
 }
 _STRAT_BASES = ('NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX')
 
@@ -6526,13 +6531,14 @@ def _strat_check_breakers(cfg, mode):
     _strat_persist_log_line('[STOP] ' + trip)
 
 def _strat_nonstop_session_gate(cfg, mode):
-    """Non-stop re-entry is time-boxed to NSE hours (configurable, default
-    09:25-15:00 IST) — square off everything once at/after the end time and
-    withhold new non-stop re-entries outside the window. Returns True if
-    re-entries are currently allowed (also True when nonStop is off, since
-    the gate is irrelevant then). Existing SL/TP risk management on already-
-    open legs is NOT affected by this gate — only new re-entries are."""
-    if not cfg.get('nonStop'):
+    """Non-stop re-entry (and the EMA-crossover strategy, which is inherently
+    continuous) is time-boxed to NSE hours (configurable, default 09:25-15:00
+    IST) — square off everything once at/after the end time and withhold new
+    re-entries/opens outside the window. Returns True if new entries are
+    currently allowed (also True when neither non-stop nor EMA is active,
+    since the gate is irrelevant then). Existing SL/TP risk management on
+    already-open legs is NOT affected by this gate — only new entries are."""
+    if not (cfg.get('nonStop') or cfg.get('strategyType') == 'ema_crossover'):
         return True
     now_hm = _tg_now_ist().strftime('%H:%M')
     start_t = cfg.get('nonStopStartTime') or '09:25'
@@ -6602,6 +6608,98 @@ def _strat_nonstop_reenter(closed_leg, cfg):
         if hp > 0:
             _strat_open_leg(new_hedge, cfg, hp)
 
+def _strat_ema_signal(candles, fast_period, slow_period):
+    """'bullish' | 'bearish' | None (not enough data yet), from EMA(fast) vs
+    EMA(slow) on the given candles — reuses the existing compute_ema()."""
+    if not candles or len(candles) < slow_period + 2:
+        return None
+    closes = [c['close'] for c in candles]
+    ema_f = compute_ema(closes, fast_period)
+    ema_s = compute_ema(closes, slow_period)
+    f, s = ema_f[-1], ema_s[-1]
+    if not f or not s:
+        return None
+    if f > s: return 'bullish'
+    if f < s: return 'bearish'
+    return None
+
+def _strat_ema_open_side(role, cfg):
+    """Re-resolve `role` (+ its hedge, if any) at the current target delta and
+    open a fresh position for it. Used by the EMA-crossover strategy to
+    switch sides as the signal changes, or re-enter the active side after it
+    closes on SL/TP — this is that strategy's own continuous-trading
+    behavior, independent of the generic Non Stop checkbox/re-entry path."""
+    fresh_legs, info = _strat_resolve_strikes(cfg, use_claude=False)
+    if not fresh_legs:
+        _strat_log('[EMA] resolve failed for ' + role + ': ' + str(info)); return
+    new_sold = next((l for l in fresh_legs if l['role'] == role), None)
+    if not new_sold:
+        return
+    hedge_role = new_sold.get('hedge_role')
+    new_hedge = next((l for l in fresh_legs if l['role'] == hedge_role), None) if hedge_role else None
+    with strat_bot_lock:
+        legs_list = strat_bot_state['legs']
+        replaced = False
+        for i, l in enumerate(legs_list):
+            if l['role'] == role: legs_list[i] = new_sold; replaced = True; break
+        if not replaced:
+            legs_list.append(new_sold)
+        if new_hedge:
+            replaced = False
+            for i, l in enumerate(legs_list):
+                if l['role'] == hedge_role: legs_list[i] = new_hedge; replaced = True; break
+            if not replaced:
+                legs_list.append(new_hedge)
+    try:
+        candles = _bot_fetch_candles(new_sold['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+        price = candles[-1]['close'] if candles else 0
+    except Exception:
+        price = 0
+    if price > 0:
+        _strat_open_leg(new_sold, cfg, price)
+        _strat_log('[EMA] opened ' + role + ' @ ' + new_sold['symbol'])
+    else:
+        _strat_log('[EMA] could not price ' + new_sold['symbol'] + ' - left flat')
+    if new_hedge:
+        try:
+            hc = _bot_fetch_candles(new_hedge['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+            hp = hc[-1]['close'] if hc else 0
+        except Exception:
+            hp = 0
+        if hp > 0:
+            _strat_open_leg(new_hedge, cfg, hp)
+
+def _strat_ema_tick_logic(cfg, mode, reentry_ok):
+    """EMA 5/13-crossover-driven side selection: bullish regime -> sell PE
+    (+hedge); bearish regime -> sell CE (+hedge); switches sides as the
+    regime flips, and re-opens the active side fresh whenever it's flat.
+    `reentry_ok` (the Zerodha market-hours gate) blocks only NEW opens —
+    the wrong side is always closed immediately on a signal flip."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    spot_sym, _se, _oe = _zo_base_meta(base)
+    fast = max(1, int(cfg.get('emaFast', 5) or 5))
+    slow = max(fast + 1, int(cfg.get('emaSlow', 13) or 13))
+    tf = cfg.get('emaTimeframe') or '15m'
+    try:
+        candles = _bot_fetch_candles(spot_sym, tf, 'kite', api_key=cfg.get('api_key'))
+    except Exception:
+        candles = []
+    signal = _strat_ema_signal(candles, fast, slow)
+    if not signal:
+        return
+    active_role   = 'sellPE' if signal == 'bullish' else 'sellCE'
+    inactive_role = 'sellCE' if signal == 'bullish' else 'sellPE'
+    with strat_bot_lock:
+        legs = list(strat_bot_state.get('legs', []))
+    active_leg   = next((l for l in legs if l['role'] == active_role and not l.get('removed')), None)
+    inactive_leg = next((l for l in legs if l['role'] == inactive_role and not l.get('removed')), None)
+    if inactive_leg and inactive_leg.get('position'):
+        lt = inactive_leg.get('last_tick') or {}
+        px = lt.get('price') or inactive_leg['position']['entryPrice']
+        _strat_close_leg(inactive_leg, px, 'EMA signal flip (' + signal + ')', cfg, mode, cascade=True)
+    if active_leg and not active_leg.get('position') and not active_leg.get('removed') and reentry_ok:
+        _strat_ema_open_side(active_role, cfg)
+
 def _strat_bot_tick():
     with strat_bot_lock:
         cfg = strat_bot_state.get('config') or {}
@@ -6609,7 +6707,10 @@ def _strat_bot_tick():
         return
     mode = cfg.get('mode', 'paper')
     _strat_underlying_ctx(cfg)
+    is_ema = cfg.get('strategyType') == 'ema_crossover'
     reentry_ok = _strat_nonstop_session_gate(cfg, mode)
+    if is_ema:
+        _strat_ema_tick_logic(cfg, mode, reentry_ok)
     for leg in list(strat_bot_state['legs']):
         if leg.get('removed') or not leg.get('symbol'):
             continue
@@ -6631,7 +6732,7 @@ def _strat_bot_tick():
                 elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
                 if reason:
                     _strat_close_leg(leg, exit_px, reason, cfg, mode)   # cascades to close the linked hedge
-                    if cfg.get('nonStop') and reentry_ok:
+                    if cfg.get('nonStop') and reentry_ok and not is_ema:
                         _strat_nonstop_reenter(leg, cfg)
                 else:
                     _strat_log('[Tick] {} px={} SL={} TP={}'.format(leg['symbol'], round(price, 2), pos['sl'], pos['tp']))
@@ -6663,6 +6764,7 @@ def _strat_start_bot(data):
         strat_type = data.get('strategyType') or 'iron_condor'
         if strat_type not in _STRAT_TYPES:
             return False, 'Unknown strategy type'
+        is_ema = strat_type == 'ema_crossover'
         cfg = {
             'strategyType': strat_type, 'baseSymbol': base,
             'expiry': (data.get('expiry') or '').strip(),
@@ -6683,6 +6785,9 @@ def _strat_start_bot(data):
             'nonStop': bool(data.get('nonStop', False)),
             'nonStopStartTime': (data.get('nonStopStartTime') or '09:25').strip(),
             'nonStopEndTime': (data.get('nonStopEndTime') or '15:00').strip(),
+            'emaFast': max(1, int(data.get('emaFast', 5) or 5)),
+            'emaSlow': max(2, int(data.get('emaSlow', 13) or 13)),
+            'emaTimeframe': (data.get('emaTimeframe') or '15m').strip(),
         }
         legs = data.get('legs')   # pre-resolved from a prior /claude_pick review step, if provided
         if not legs:
@@ -6702,18 +6807,24 @@ def _strat_start_bot(data):
         t = _threading.Thread(target=_strat_bot_loop, daemon=True, name='strategy-menu-bot')
         strat_bot_state['thread'] = t
         t.start()
-    for leg in legs:
-        if leg.get('removed'):
-            continue
-        try:
-            candles = _bot_fetch_candles(leg['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
-            price = candles[-1]['close'] if candles else 0
-        except Exception:
-            price = 0
-        if price > 0:
-            _strat_open_leg(leg, cfg, price)
-        else:
-            _strat_log('[Entry] could not price ' + leg['symbol'] + ' - leg left flat (check Kite connection)')
+    if is_ema:
+        # EMA-crossover only opens the side matching the CURRENT regime — the
+        # other side's legs stay resolved (visible in the table) but flat.
+        reentry_ok = _strat_nonstop_session_gate(cfg, cfg['mode'])
+        _strat_ema_tick_logic(cfg, cfg['mode'], reentry_ok)
+    else:
+        for leg in legs:
+            if leg.get('removed'):
+                continue
+            try:
+                candles = _bot_fetch_candles(leg['symbol'], cfg.get('tf', '5m'), 'kite', api_key=cfg.get('api_key'))
+                price = candles[-1]['close'] if candles else 0
+            except Exception:
+                price = 0
+            if price > 0:
+                _strat_open_leg(leg, cfg, price)
+            else:
+                _strat_log('[Entry] could not price ' + leg['symbol'] + ' - leg left flat (check Kite connection)')
     _strat_log('Strategy started {} mode: {} on {} qty={} legs={}'.format(
         cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
         ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
@@ -7405,6 +7516,78 @@ def _dstrat_nonstop_reenter(closed_leg, cfg):
         if hp > 0:
             _dstrat_open_leg(new_hedge, cfg, hp)
 
+def _dstrat_ema_open_side(role, cfg):
+    """Re-resolve `role` (+ its hedge, if any) at the current target delta and
+    open a fresh position for it. Mirrors _strat_ema_open_side for the Delta
+    side (uses fetch_delta_data / _dstrat_resolve_strikes / _dstrat_open_leg)."""
+    fresh_legs, info = _dstrat_resolve_strikes(cfg, use_claude=False)
+    if not fresh_legs:
+        _dstrat_log('[EMA] resolve failed for ' + role + ': ' + str(info)); return
+    new_sold = next((l for l in fresh_legs if l['role'] == role), None)
+    if not new_sold:
+        return
+    hedge_role = new_sold.get('hedge_role')
+    new_hedge = next((l for l in fresh_legs if l['role'] == hedge_role), None) if hedge_role else None
+    with dstrat_bot_lock:
+        legs_list = dstrat_bot_state['legs']
+        replaced = False
+        for i, l in enumerate(legs_list):
+            if l['role'] == role: legs_list[i] = new_sold; replaced = True; break
+        if not replaced:
+            legs_list.append(new_sold)
+        if new_hedge:
+            replaced = False
+            for i, l in enumerate(legs_list):
+                if l['role'] == hedge_role: legs_list[i] = new_hedge; replaced = True; break
+            if not replaced:
+                legs_list.append(new_hedge)
+    try:
+        candles = fetch_delta_data(cfg.get('tf', '5m'), new_sold['symbol'])
+        price = candles[-1]['close'] if candles else 0
+    except Exception:
+        price = 0
+    if price > 0:
+        _dstrat_open_leg(new_sold, cfg, price)
+        _dstrat_log('[EMA] opened ' + role + ' @ ' + new_sold['symbol'])
+    else:
+        _dstrat_log('[EMA] could not price ' + new_sold['symbol'] + ' - left flat')
+    if new_hedge:
+        try:
+            hc = fetch_delta_data(cfg.get('tf', '5m'), new_hedge['symbol'])
+            hp = hc[-1]['close'] if hc else 0
+        except Exception:
+            hp = 0
+        if hp > 0:
+            _dstrat_open_leg(new_hedge, cfg, hp)
+
+def _dstrat_ema_tick_logic(cfg, mode):
+    """EMA 5/13-crossover-driven side selection for Delta (BTC/ETH/XAUT) —
+    same as _strat_ema_tick_logic, but crypto trades 24/7 so there's no
+    market-hours gate on new opens."""
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    fast = max(1, int(cfg.get('emaFast', 5) or 5))
+    slow = max(fast + 1, int(cfg.get('emaSlow', 13) or 13))
+    tf = cfg.get('emaTimeframe') or '15m'
+    try:
+        candles = _do_spot_candles(base, tf)
+    except Exception:
+        candles = []
+    signal = _strat_ema_signal(candles, fast, slow)
+    if not signal:
+        return
+    active_role   = 'sellPE' if signal == 'bullish' else 'sellCE'
+    inactive_role = 'sellCE' if signal == 'bullish' else 'sellPE'
+    with dstrat_bot_lock:
+        legs = list(dstrat_bot_state.get('legs', []))
+    active_leg   = next((l for l in legs if l['role'] == active_role and not l.get('removed')), None)
+    inactive_leg = next((l for l in legs if l['role'] == inactive_role and not l.get('removed')), None)
+    if inactive_leg and inactive_leg.get('position'):
+        lt = inactive_leg.get('last_tick') or {}
+        px = lt.get('price') or inactive_leg['position']['entryPrice']
+        _dstrat_close_leg(inactive_leg, px, 'EMA signal flip (' + signal + ')', cfg, mode, cascade=True)
+    if active_leg and not active_leg.get('position') and not active_leg.get('removed'):
+        _dstrat_ema_open_side(active_role, cfg)
+
 def _dstrat_bot_tick():
     with dstrat_bot_lock:
         cfg = dstrat_bot_state.get('config') or {}
@@ -7412,6 +7595,9 @@ def _dstrat_bot_tick():
         return
     mode = cfg.get('mode', 'paper')
     _dstrat_underlying_ctx(cfg)
+    is_ema = cfg.get('strategyType') == 'ema_crossover'
+    if is_ema:
+        _dstrat_ema_tick_logic(cfg, mode)
     for leg in list(dstrat_bot_state['legs']):
         if leg.get('removed') or not leg.get('symbol'):
             continue
@@ -7433,7 +7619,7 @@ def _dstrat_bot_tick():
                 elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
                 if reason:
                     _dstrat_close_leg(leg, exit_px, reason, cfg, mode)
-                    if cfg.get('nonStop'):
+                    if cfg.get('nonStop') and not is_ema:
                         _dstrat_nonstop_reenter(leg, cfg)
                 else:
                     _dstrat_log('[Tick] {} px={} SL={} TP={}'.format(leg['symbol'], round(price, 4), pos['sl'], pos['tp']))
@@ -7463,6 +7649,7 @@ def _dstrat_start_bot(data):
         strat_type = data.get('strategyType') or 'iron_condor'
         if strat_type not in _STRAT_TYPES:
             return False, 'Unknown strategy type'
+        is_ema = strat_type == 'ema_crossover'
         cfg = {
             'strategyType': strat_type, 'baseSymbol': base,
             'expiry': (data.get('expiry') or '').strip(),
@@ -7481,6 +7668,9 @@ def _dstrat_start_bot(data):
             'model': (data.get('model') or '').strip(),
             'api_key': (data.get('api_key') or '').strip(),
             'nonStop': bool(data.get('nonStop', False)),
+            'emaFast': max(1, int(data.get('emaFast', 5) or 5)),
+            'emaSlow': max(2, int(data.get('emaSlow', 13) or 13)),
+            'emaTimeframe': (data.get('emaTimeframe') or '15m').strip(),
         }
         legs = data.get('legs')
         if not legs:
@@ -7500,18 +7690,21 @@ def _dstrat_start_bot(data):
         t = _threading.Thread(target=_dstrat_bot_loop, daemon=True, name='delta-strategy-menu-bot')
         dstrat_bot_state['thread'] = t
         t.start()
-    for leg in legs:
-        if leg.get('removed'):
-            continue
-        try:
-            candles = fetch_delta_data(cfg.get('tf', '5m'), leg['symbol'])
-            price = candles[-1]['close'] if candles else 0
-        except Exception:
-            price = 0
-        if price > 0:
-            _dstrat_open_leg(leg, cfg, price)
-        else:
-            _dstrat_log('[Entry] could not price ' + leg['symbol'] + ' - leg left flat (check Delta connection)')
+    if is_ema:
+        _dstrat_ema_tick_logic(cfg, cfg['mode'])
+    else:
+        for leg in legs:
+            if leg.get('removed'):
+                continue
+            try:
+                candles = fetch_delta_data(cfg.get('tf', '5m'), leg['symbol'])
+                price = candles[-1]['close'] if candles else 0
+            except Exception:
+                price = 0
+            if price > 0:
+                _dstrat_open_leg(leg, cfg, price)
+            else:
+                _dstrat_log('[Entry] could not price ' + leg['symbol'] + ' - leg left flat (check Delta connection)')
     _dstrat_log('Strategy started {} mode: {} on {} qty={} legs={}'.format(
         cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
         ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
@@ -21772,6 +21965,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label><input type="radio" name="stratZoType" class="stratzo-type" value="iron_condor" checked> Iron Condor</label>
           <label><input type="radio" name="stratZoType" class="stratzo-type" value="short_strangle"> Short Strangle</label>
           <label><input type="radio" name="stratZoType" class="stratzo-type" value="jade_lizard"> Jade Lizard</label>
+          <label title="Bullish EMA regime -> sell PE (+hedge); bearish -> sell CE (+hedge); switches sides as the regime flips. Trades continuously on its own."><input type="radio" name="stratZoType" class="stratzo-type" value="ema_crossover"> EMA 5/13 Crossover</label>
+        </div>
+        <div class="ai-input-bar" id="stratZoEmaBar" style="display:none">
+          <label>EMA Fast <input type="number" id="stratZoEmaFast" value="5" min="1" style="width:60px"></label>
+          <label>EMA Slow <input type="number" id="stratZoEmaSlow" value="13" min="2" style="width:60px"></label>
+          <label>Timeframe <select id="stratZoEmaTf">
+            <option value="5m">5m</option><option value="15m" selected>15m</option><option value="30m">30m</option><option value="1h">1h</option>
+          </select></label>
+          <span style="color:#787b86;font-size:10px">(bullish crossover &rarr; sell PE, bearish &rarr; sell CE; hedges follow automatically)</span>
         </div>
 
         <div class="ai-input-bar">
@@ -21906,6 +22108,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label><input type="radio" name="stratDoType" class="stratdo-type" value="iron_condor" checked> Iron Condor</label>
           <label><input type="radio" name="stratDoType" class="stratdo-type" value="short_strangle"> Short Strangle</label>
           <label><input type="radio" name="stratDoType" class="stratdo-type" value="jade_lizard"> Jade Lizard</label>
+          <label title="Bullish EMA regime -> sell PE (+hedge); bearish -> sell CE (+hedge); switches sides as the regime flips. Trades continuously on its own, 24/7."><input type="radio" name="stratDoType" class="stratdo-type" value="ema_crossover"> EMA 5/13 Crossover</label>
+        </div>
+        <div class="ai-input-bar" id="stratDoEmaBar" style="display:none">
+          <label>EMA Fast <input type="number" id="stratDoEmaFast" value="5" min="1" style="width:60px"></label>
+          <label>EMA Slow <input type="number" id="stratDoEmaSlow" value="13" min="2" style="width:60px"></label>
+          <label>Timeframe <select id="stratDoEmaTf">
+            <option value="5m">5m</option><option value="15m" selected>15m</option><option value="30m">30m</option><option value="1h">1h</option>
+          </select></label>
+          <span style="color:#787b86;font-size:10px">(bullish crossover &rarr; sell PE, bearish &rarr; sell CE; hedges follow automatically)</span>
         </div>
 
         <div class="ai-input-bar">
@@ -29721,14 +29932,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       pendingLegs = placeholderLegs(currentStrategyType());
       renderLegs(pendingLegs, false);
     }
+    function syncEmaBar() {
+      document.getElementById('stratZoEmaBar').style.display = (currentStrategyType() === 'ema_crossover') ? '' : 'none';
+    }
 
     document.getElementById('stratMenuPickZerodha').addEventListener('click', function() {
       document.getElementById('stratZoSection').style.display = '';
       const doSec = document.getElementById('stratDoSection'); if (doSec) doSec.style.display = 'none';
       loadExpiries();
       resetToPlaceholders();
+      syncEmaBar();
     });
-    document.querySelectorAll('.stratzo-type').forEach(function(r) { r.addEventListener('change', resetToPlaceholders); });
+    document.querySelectorAll('.stratzo-type').forEach(function(r) { r.addEventListener('change', function() { resetToPlaceholders(); syncEmaBar(); }); });
 
     function fmtExpiryLabel(dateStr) {
       try {
@@ -29941,7 +30156,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         api_key: s.apiKey || '',
         nonStop: !!document.getElementById('stratZoNonStop').checked,
         nonStopStartTime: document.getElementById('stratZoNonStopStart').value || '09:25',
-        nonStopEndTime: document.getElementById('stratZoNonStopEnd').value || '15:00'
+        nonStopEndTime: document.getElementById('stratZoNonStopEnd').value || '15:00',
+        emaFast: parseInt(document.getElementById('stratZoEmaFast').value) || 5,
+        emaSlow: parseInt(document.getElementById('stratZoEmaSlow').value) || 13,
+        emaTimeframe: document.getElementById('stratZoEmaTf').value || '15m'
       };
       if (pendingLegs.length) cfg.legs = pendingLegs;
       return cfg;
@@ -30170,16 +30388,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       pendingLegs = placeholderLegs(currentStrategyType());
       renderLegs(pendingLegs, false);
     }
+    function syncEmaBar() {
+      document.getElementById('stratDoEmaBar').style.display = (currentStrategyType() === 'ema_crossover') ? '' : 'none';
+    }
 
     document.getElementById('stratMenuPickDelta').addEventListener('click', function() {
       doSection.style.display = '';
       const zoSec = document.getElementById('stratZoSection'); if (zoSec) zoSec.style.display = 'none';
       loadExpiries();
       resetToPlaceholders();
+      syncEmaBar();
       refreshStatus(); pollStatus();
       if (!statusTimer) statusTimer = setInterval(pollStatus, 5000);
     });
-    document.querySelectorAll('.stratdo-type').forEach(function(r) { r.addEventListener('change', resetToPlaceholders); });
+    document.querySelectorAll('.stratdo-type').forEach(function(r) { r.addEventListener('change', function() { resetToPlaceholders(); syncEmaBar(); }); });
 
     function refreshStatus() {
       const s = DeltaStore.getSession();
@@ -30339,7 +30561,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxLoss: parseFloat(document.getElementById('stratDoMaxLoss').value) || 0,
         model: document.getElementById('stratDoModel').value,
         api_key: s.apiKey || '',
-        nonStop: !!document.getElementById('stratDoNonStop').checked
+        nonStop: !!document.getElementById('stratDoNonStop').checked,
+        emaFast: parseInt(document.getElementById('stratDoEmaFast').value) || 5,
+        emaSlow: parseInt(document.getElementById('stratDoEmaSlow').value) || 13,
+        emaTimeframe: document.getElementById('stratDoEmaTf').value || '15m'
       };
       if (pendingLegs.length) cfg.legs = pendingLegs;
       return cfg;
