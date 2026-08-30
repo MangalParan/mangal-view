@@ -6140,6 +6140,27 @@ _STRAT_TYPES = {
 }
 _STRAT_BASES = ('NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX')
 
+# Every configurable Strategy Menu parameter (Zerodha + Delta share this cfg
+# shape, minus a couple of Zerodha-only keys) — logged in full on Start so a
+# session's settings (position size, strategy type, delta/SL/TP, non-stop
+# window, EMA periods, ...) can be reproduced/audited from the log alone.
+# Mirrors _bot_cfg_summary's [CONFIG] convention used by the older bots —
+# log_to_journal.py's Config sheet already auto-discovers any key it doesn't
+# recognize, so no changes were needed there.
+_STRAT_CFG_KEYS = ['strategyType', 'baseSymbol', 'expiry', 'targetDelta', 'hedgeDistancePoints',
+                    'qty', 'tf', 'mode', 'optionBuyer', 'optionSeller', 'slPct', 'tpPct',
+                    'maxConsec', 'maxLoss', 'priceTickSec', 'model', 'nonStop',
+                    'nonStopStartTime', 'nonStopEndTime', 'emaFast', 'emaSlow', 'emaTimeframe']
+
+def _strat_cfg_summary(cfg):
+    """One-line 'key=value key=value ...' dump of every Strategy Menu setting
+    in cfg (never api_key). Keeps 0/False (meaningful), drops None/''/[]."""
+    parts = []
+    for k in _STRAT_CFG_KEYS:
+        if k in cfg and cfg.get(k) not in (None, '', []):
+            parts.append('{}={}'.format(k, cfg.get(k)))
+    return ' '.join(parts)
+
 def _strat_log(msg):
     ts = _bot_log_ts()
     with strat_bot_lock:
@@ -6832,6 +6853,9 @@ def _strat_start_bot(data):
         cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
         ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
     _strat_persist_log_line('[{}] START {} {} qty={}'.format(cfg['mode'].upper(), strat_type, base, cfg['qty']))
+    _cfg_line = _strat_cfg_summary(cfg)
+    _strat_log('[Config] ' + _cfg_line)
+    _strat_persist_log_line('[{}] [CONFIG] {}'.format(cfg['mode'].upper(), _cfg_line))
     return True, 'Strategy started'
 
 def _strat_stop_bot():
@@ -7740,6 +7764,9 @@ def _dstrat_start_bot(data):
         cfg['mode'].upper(), _STRAT_TYPES[strat_type]['label'], base, cfg['qty'],
         ', '.join(l['symbol'] for l in legs if not l.get('removed') and l.get('symbol'))))
     _strat_persist_log_line('[DELTA][{}] START {} {} qty={}'.format(cfg['mode'].upper(), strat_type, base, cfg['qty']))
+    _cfg_line = _strat_cfg_summary(cfg)
+    _dstrat_log('[Config] ' + _cfg_line)
+    _strat_persist_log_line('[DELTA] [CONFIG] {}'.format(_cfg_line))
     return True, 'Strategy started'
 
 def _dstrat_stop_bot():
