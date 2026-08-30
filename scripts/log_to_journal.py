@@ -41,6 +41,18 @@ EXIT_RE = re.compile(
     r'EXIT (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
     r'\(entry (?P<entry>[\d.]+)\) PnL=(?P<pnl>\S+) reason=(?P<reason>.+?) strat=(?P<strat>\S+)$')
 
+# Strategy Menu format (Zerodha + Delta multi-leg engine, log_options.txt):
+# 'ENTRY SELL 1000 P-BTC-77000-300826 @ 63.0 role=sellPE SL=157.5 TP=44.1'
+# 'EXIT BUY 1000 P-BTC-77000-300826 @ 60.0 (entry 63.0) PnL=+3.0000 reason=TP hit role=sellPE'
+# Hedge legs have no SL/TP: 'SL=None TP=None'.
+ENTRY2_RE = re.compile(
+    r'ENTRY (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
+    r'role=(?P<role>\S+) SL=(?P<sl>None|[\d.]+) TP=(?P<tp>None|[\d.]+)$')
+
+EXIT2_RE = re.compile(
+    r'EXIT (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
+    r'\(entry (?P<entry>[\d.]+)\) PnL=(?P<pnl>\S+) reason=(?P<reason>.+?) role=(?P<role>\S+)$')
+
 def _pnl(s):
     """Parse a PnL token tolerant of currency symbols (₹/$, or the â¹ mojibake) and
     the odd '+-0.0000' the bot prints for a flat close. Sign from any leading '-'."""
@@ -142,7 +154,7 @@ def parse_files(paths):
                         'entry_px': float(em.group('px')), 'sl': float(em.group('sl')),
                         'tp': float(em.group('tp')), 'strategy': em.group('strat'),
                         'score': float(em.group('score')), 'cap': em.group('cap') or '',
-                        'entry_note': (em.group('note') or '').strip(),
+                        'entry_note': (em.group('note') or '').strip(), 'role': '',
                         'exit_time': '', 'exit_px': '', 'pnl': '', 'exit_reason': '',
                         'entry_order': '', 'exit_order': '',
                     }
@@ -162,13 +174,58 @@ def parse_files(paths):
                                'qty': float(xm.group('qty')), 'entry_px': float(xm.group('entry')),
                                'sl': '', 'tp': '', 'strategy': xm.group('strat'), 'score': '',
                                'cap': '', 'entry_note': '', 'entry_order': '', 'exit_order': '',
-                               'continuation': ''}
+                               'continuation': '', 'role': ''}
                         trades.append(leg)
                     leg['exit_time'] = ts
                     leg['exit_px'] = float(xm.group('px'))
                     leg['pnl'] = _pnl(xm.group('pnl'))
                     leg['exit_reason'] = xm.group('reason').strip()
                     open_pos[bot] = None
+                    last_event_idx_by_bot[bot] = (leg, 'exit')
+                    continue
+
+                # --- ENTRY (Strategy Menu multi-leg format: role= identifies WHICH
+                # leg, since 2+ legs — e.g. sellCE + hedgeCE — are often open at
+                # once under the same bot tag, unlike the single-slot bots above) ---
+                em2 = ENTRY2_RE.search(msg)
+                if em2:
+                    role = em2.group('role')
+                    key = (bot, role)
+                    sl_raw, tp_raw = em2.group('sl'), em2.group('tp')
+                    leg = {
+                        'entry_time': ts, 'bot': bot, 'symbol': em2.group('sym'),
+                        'side': em2.group('side'), 'qty': float(em2.group('qty')),
+                        'entry_px': float(em2.group('px')),
+                        'sl': float(sl_raw) if sl_raw != 'None' else '',
+                        'tp': float(tp_raw) if tp_raw != 'None' else '',
+                        'strategy': '', 'score': '', 'cap': '', 'entry_note': '', 'role': role,
+                        'exit_time': '', 'exit_px': '', 'pnl': '', 'exit_reason': '',
+                        'entry_order': '', 'exit_order': '', 'continuation': '',
+                    }
+                    trades.append(leg)
+                    open_pos[key] = leg
+                    last_event_idx_by_bot[bot] = (leg, 'entry')
+                    continue
+
+                # --- EXIT (Strategy Menu multi-leg format) ---
+                xm2 = EXIT2_RE.search(msg)
+                if xm2:
+                    role = xm2.group('role')
+                    key = (bot, role)
+                    leg = open_pos.get(key)
+                    if leg is None:  # orphan exit — make a stub
+                        leg = {'entry_time': '', 'bot': bot, 'symbol': xm2.group('sym'),
+                               'side': 'BUY' if xm2.group('side') == 'SELL' else 'SELL',
+                               'qty': float(xm2.group('qty')), 'entry_px': float(xm2.group('entry')),
+                               'sl': '', 'tp': '', 'strategy': '', 'score': '',
+                               'cap': '', 'entry_note': '', 'entry_order': '', 'exit_order': '',
+                               'continuation': '', 'role': role}
+                        trades.append(leg)
+                    leg['exit_time'] = ts
+                    leg['exit_px'] = float(xm2.group('px'))
+                    leg['pnl'] = _pnl(xm2.group('pnl'))
+                    leg['exit_reason'] = xm2.group('reason').strip()
+                    open_pos[key] = None
                     last_event_idx_by_bot[bot] = (leg, 'exit')
                     continue
 
@@ -217,7 +274,7 @@ def build_workbook(events, alerts, trades, out_path):
     # ---- Trades ----
     ws = wb.active; ws.title = 'Trades'
     cols = [('Entry Time', 'entry_time'), ('Exit Time', 'exit_time'), ('Bot', 'bot'),
-            ('Symbol', 'symbol'), ('Side', 'side'), ('Qty', 'qty'),
+            ('Role', 'role'), ('Symbol', 'symbol'), ('Side', 'side'), ('Qty', 'qty'),
             ('Entry Px', 'entry_px'), ('SL', 'sl'), ('TP', 'tp'),
             ('Exit Px', 'exit_px'), ('PnL', 'pnl'), ('Move %', 'move_pct'),
             ('R', 'R'), ('Mins', 'mins'), ('Exit Reason', 'exit_reason'),

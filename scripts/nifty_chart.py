@@ -6810,8 +6810,11 @@ def _strat_start_bot(data):
     if is_ema:
         # EMA-crossover only opens the side matching the CURRENT regime — the
         # other side's legs stay resolved (visible in the table) but flat.
-        reentry_ok = _strat_nonstop_session_gate(cfg, cfg['mode'])
-        _strat_ema_tick_logic(cfg, cfg['mode'], reentry_ok)
+        # The background loop's own first tick (started above) handles this —
+        # calling _strat_ema_tick_logic here too raced against it and could
+        # double-open the same leg (confirmed: duplicate ENTRY lines with no
+        # EXIT between them in the trade log).
+        pass
     else:
         for leg in legs:
             if leg.get('removed'):
@@ -7283,6 +7286,34 @@ def _dstrat_fetch_tickers(base):
     _DSTRAT_TICKER_CACHE[base] = {'ts': now, 'data': data}
     return data
 
+def _dstrat_ticker_mark(base, symbol):
+    """The exchange's own live mark_price for one option symbol, or 0.0 if
+    unavailable. Backed by the same cached ticker snapshot _dstrat_resolve_
+    strikes already uses for delta/IV."""
+    try:
+        tick = _dstrat_fetch_tickers(base)
+        return float((tick.get('by_symbol') or {}).get((symbol or '').upper(), {}).get('mark') or 0)
+    except Exception:
+        return 0.0
+
+def _dstrat_price_for(base, symbol, tf):
+    """Live price to OPEN a Delta option leg at: prefer the exchange's own
+    ticker mark_price over the historical-candle close. Illiquid/far-OTM
+    contracts can carry a stale or carried-forward candle — confirmed
+    incident: a hedge leg's candle close read 1220 while its ticker mark was
+    ~1 at the same moment (no trade in between), producing a ~$1200 phantom
+    loss on paper when it was later closed at its real price. The ticker
+    mark is exchange-computed fair value and doesn't have that failure mode.
+    Falls back to the candle close only if the ticker has no mark yet."""
+    mark = _dstrat_ticker_mark(base, symbol)
+    if mark > 0:
+        return mark
+    try:
+        candles = fetch_delta_data(tf, symbol)
+        return candles[-1]['close'] if candles else 0
+    except Exception:
+        return 0
+
 def _dstrat_resolve_strikes(cfg, use_claude=True):
     """Resolve sold CE/PE strikes by target delta (native Delta greeks, BS
     fallback) + hedge strikes by points. Mirrors _strat_resolve_strikes."""
@@ -7497,29 +7528,22 @@ def _dstrat_nonstop_reenter(closed_leg, cfg):
                     legs_list[i] = new_hedge; replaced = True; break
             if not replaced:
                 legs_list.append(new_hedge)
-    try:
-        candles = fetch_delta_data(cfg.get('tf', '5m'), new_sold['symbol'])
-        price = candles[-1]['close'] if candles else 0
-    except Exception:
-        price = 0
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    price = _dstrat_price_for(base, new_sold['symbol'], cfg.get('tf', '5m'))
     if price > 0:
         _dstrat_open_leg(new_sold, cfg, price)
         _dstrat_log('[NonStop] re-entered ' + role + ' @ ' + new_sold['symbol'])
     else:
         _dstrat_log('[NonStop] could not price ' + new_sold['symbol'] + ' for re-entry - left flat')
     if new_hedge:
-        try:
-            hc = fetch_delta_data(cfg.get('tf', '5m'), new_hedge['symbol'])
-            hp = hc[-1]['close'] if hc else 0
-        except Exception:
-            hp = 0
+        hp = _dstrat_price_for(base, new_hedge['symbol'], cfg.get('tf', '5m'))
         if hp > 0:
             _dstrat_open_leg(new_hedge, cfg, hp)
 
 def _dstrat_ema_open_side(role, cfg):
     """Re-resolve `role` (+ its hedge, if any) at the current target delta and
-    open a fresh position for it. Mirrors _strat_ema_open_side for the Delta
-    side (uses fetch_delta_data / _dstrat_resolve_strikes / _dstrat_open_leg)."""
+    open a fresh position for it, pricing off the exchange's own ticker mark
+    (see _dstrat_price_for) rather than a possibly-stale historical candle."""
     fresh_legs, info = _dstrat_resolve_strikes(cfg, use_claude=False)
     if not fresh_legs:
         _dstrat_log('[EMA] resolve failed for ' + role + ': ' + str(info)); return
@@ -7541,22 +7565,15 @@ def _dstrat_ema_open_side(role, cfg):
                 if l['role'] == hedge_role: legs_list[i] = new_hedge; replaced = True; break
             if not replaced:
                 legs_list.append(new_hedge)
-    try:
-        candles = fetch_delta_data(cfg.get('tf', '5m'), new_sold['symbol'])
-        price = candles[-1]['close'] if candles else 0
-    except Exception:
-        price = 0
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    price = _dstrat_price_for(base, new_sold['symbol'], cfg.get('tf', '5m'))
     if price > 0:
         _dstrat_open_leg(new_sold, cfg, price)
         _dstrat_log('[EMA] opened ' + role + ' @ ' + new_sold['symbol'])
     else:
         _dstrat_log('[EMA] could not price ' + new_sold['symbol'] + ' - left flat')
     if new_hedge:
-        try:
-            hc = fetch_delta_data(cfg.get('tf', '5m'), new_hedge['symbol'])
-            hp = hc[-1]['close'] if hc else 0
-        except Exception:
-            hp = 0
+        hp = _dstrat_price_for(base, new_hedge['symbol'], cfg.get('tf', '5m'))
         if hp > 0:
             _dstrat_open_leg(new_hedge, cfg, hp)
 
@@ -7594,6 +7611,7 @@ def _dstrat_bot_tick():
     if not cfg:
         return
     mode = cfg.get('mode', 'paper')
+    base = (cfg.get('baseSymbol') or '').upper().strip()
     _dstrat_underlying_ctx(cfg)
     is_ema = cfg.get('strategyType') == 'ema_crossover'
     if is_ema:
@@ -7608,12 +7626,25 @@ def _dstrat_bot_tick():
         if not candles:
             continue
         price = candles[-1]['close']
+        bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
+        # Sanity-check the candle against the exchange's own live mark price —
+        # illiquid/far-OTM Delta options can carry a stale or carried-forward
+        # candle close (confirmed incident: candle close 1220 vs a ticker mark
+        # of ~1 for the same symbol seconds apart, with no real trade between
+        # them — a ~$1200 phantom loss when the leg later closed at its real
+        # price). If they disagree by more than 2x, distrust the candle
+        # entirely and collapse this tick to the ticker's point price so
+        # SL/TP can never fire off a phantom bar.
+        tick_mark = _dstrat_ticker_mark(base, leg['symbol'])
+        if tick_mark > 0 and price > 0 and (tick_mark / price > 2 or price / tick_mark > 2):
+            _dstrat_log('[Tick] {} candle close {} vs ticker mark {} - distrusting the candle, using mark'.format(
+                leg['symbol'], price, tick_mark))
+            price = hi = lo = tick_mark
         with dstrat_bot_lock:
             leg['last_candles'] = candles[-150:]
             leg['last_tick'] = {'time': int(_zd_time.time()), 'price': price}
             pos = leg.get('position')
             if pos and pos['side'] == 'SELL':
-                bar = candles[-1]; hi = bar.get('high', price); lo = bar.get('low', price)
                 reason = None; exit_px = price
                 if pos['sl'] is not None and hi >= pos['sl']:   reason, exit_px = 'SL hit', pos['sl']
                 elif pos['tp'] is not None and lo <= pos['tp']: reason, exit_px = 'TP hit', pos['tp']
@@ -7691,16 +7722,16 @@ def _dstrat_start_bot(data):
         dstrat_bot_state['thread'] = t
         t.start()
     if is_ema:
-        _dstrat_ema_tick_logic(cfg, cfg['mode'])
+        # The background loop's own first tick (started above) opens the
+        # regime-matching side — calling _dstrat_ema_tick_logic here too raced
+        # against it and could double-open the same leg (confirmed: duplicate
+        # ENTRY lines with no EXIT between them in the trade log).
+        pass
     else:
         for leg in legs:
             if leg.get('removed'):
                 continue
-            try:
-                candles = fetch_delta_data(cfg.get('tf', '5m'), leg['symbol'])
-                price = candles[-1]['close'] if candles else 0
-            except Exception:
-                price = 0
+            price = _dstrat_price_for(base, leg['symbol'], cfg.get('tf', '5m'))
             if price > 0:
                 _dstrat_open_leg(leg, cfg, price)
             else:
