@@ -2266,13 +2266,18 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
         + tv_block
-        + (("IMAGE ATTACHED: A screenshot is attached — it may be a PRICE CHART (SuperTrend/EMA/PSAR/"
-            "support-resistance, often multiple timeframes) and/or OPTION-CHAIN / OPEN-INTEREST (OI) / max-pain "
-            "data. Read whatever it shows and treat it as the PRIMARY read: from a chart take trend, key S/R and "
+        + (("{} CHART IMAGE(S) ATTACHED: each may be preceded by a 'Chart: <label>' text note naming its "
+            "timeframe (e.g. Daily, 1 Hour, 15 Minutes) when more than one is attached. They may be PRICE CHARTS "
+            "(SuperTrend/EMA/PSAR/support-resistance) and/or OPTION-CHAIN / OPEN-INTEREST (OI) / max-pain data. "
+            "When SEVERAL timeframes are attached, synthesize a MULTI-TIMEFRAME read: use the higher timeframes "
+            "(Daily/1H) for the dominant trend/bias, and the lower timeframes (30m/15m/5m) for entry timing — "
+            "don't let a lower-timeframe wiggle override a clear higher-timeframe trend; only take the trade if "
+            "the lower-timeframe signal agrees with (or at least doesn't fight) the higher-timeframe bias. Read "
+            "whatever each chart shows and treat it as the PRIMARY read: from a chart take trend, key S/R and "
             "indicator alignment; from OI/option-chain data infer support/resistance from high-OI strikes, PCR, OI "
             "build-up vs unwinding, and the likely pin / max-pain level — then align your decision (and, for "
-            "options, the strike & side) with it. If the image contradicts the numeric fields, trust the image. It "
-            "is the user's latest manual view — weight it heavily.\n")
+            "options, the strike & side) with it. If the image(s) contradict the numeric fields, trust the "
+            "image(s). They are the user's latest manual view — weight them heavily.\n").format(len(images))
            if images else "")
         + (("OPERATOR NOTE: 'operatorNote' is the user's latest instruction/context typed in the chat "
             "(e.g. a directional bias, a level to watch, 'only longs today', 'stay flat', 'be aggressive'). "
@@ -2633,7 +2638,7 @@ def _delta_bot_tick():
         _tv = _tv_context(cfg, 'delta', symbol, '')
         strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
                                      extra_ctx=({'tradingview': _tv} if _tv else None),
-                                     images=_chart_images_for(delta_ai_state))
+                                     images=_chart_images_for_multi(delta_ai_state))
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -3056,6 +3061,59 @@ def _chart_images_for(state, max_age_sec=_CHART_MAX_AGE):
         return []
     return [{'media': img.get('media', 'image/png'), 'data': img['data']}]
 
+# --- Multi-timeframe chart slots (Delta AI Bot: upload 1D/1H/30m/15m/5m charts,
+# click Analyse for a combined pre-flight read, then Start trades with all of
+# them as ongoing vision context). Separate from the single-slot chartImg
+# above (the plain one-off chat attach) so a bot can hold several charts at
+# once; _chart_images_for_multi falls back to the single slot if no named
+# slots are populated, so the old one-off chat attach still works unchanged. ---
+_DELTA_CHART_SLOTS = ['1d', '1h', '30m', '15m', '5m']   # coarsest timeframe first
+_DELTA_CHART_LABELS = {'1d': 'Daily (1D)', '1h': '1 Hour', '30m': '30 Minutes',
+                        '15m': '15 Minutes', '5m': '5 Minutes'}
+
+def _chart_store_slot(state, lock, slot, data_url, note=''):
+    """Save an uploaded chart into a NAMED timeframe slot. Returns True if stored."""
+    if slot not in _DELTA_CHART_SLOTS:
+        return False
+    img = _parse_data_url(data_url)
+    if not img:
+        return False
+    img['ts'] = int(_zd_time.time())
+    img['note'] = str(note or '')[:200]
+    with lock:
+        slots = state.setdefault('chartImgs', {})
+        slots[slot] = img
+    return True
+
+def _chart_slots_status(state):
+    """{'1d': True/False, ...} — which named slots currently hold a fresh chart."""
+    slots = state.get('chartImgs') or {}
+    now = int(_zd_time.time())
+    return {s: bool(slots.get(s) and slots[s].get('data') and
+                    (now - int(slots[s].get('ts', 0))) <= _CHART_MAX_AGE)
+            for s in _DELTA_CHART_SLOTS}
+
+def _chart_images_for_multi(state, max_age_sec=_CHART_MAX_AGE):
+    """[{'media','data','label'}] for every fresh named chart slot, coarsest
+    timeframe first (so Claude reads trend top-down). Falls back to the single
+    legacy chartImg slot (plain one-off chat attach) if no named slots are
+    populated, so existing single-image behavior is unaffected."""
+    slots = state.get('chartImgs') if isinstance(state, dict) else None
+    now = int(_zd_time.time())
+    out = []
+    if slots:
+        for slot in _DELTA_CHART_SLOTS:
+            img = slots.get(slot)
+            if not img or not img.get('data'):
+                continue
+            if max_age_sec and (now - int(img.get('ts', 0))) > max_age_sec:
+                continue
+            out.append({'media': img.get('media', 'image/png'), 'data': img['data'],
+                        'label': _DELTA_CHART_LABELS.get(slot, slot)})
+    if out:
+        return out
+    return _chart_images_for(state, max_age_sec)
+
 def _bot_set_note(state, lock, message):
     """Store the user's latest chat message as a steering note on the bot config so the
     LIVE Claude decision loop factors it in (a bias, a level, 'only longs', 'stay flat').
@@ -3073,8 +3131,18 @@ def _img_block(img):
             'media_type': img.get('media', 'image/png'), 'data': img.get('data', '')}}
 
 def _attach_images(messages, images):
-    """Prepend image content blocks to the LATEST user message (vision input)."""
-    blocks = [_img_block(i) for i in (images or []) if i and i.get('data')]
+    """Prepend image content blocks to the LATEST user message (vision input).
+    An item may carry an optional 'label' (e.g. '1 Hour') — a short text block
+    is inserted right before that image so Claude can tell multiple attached
+    charts apart (e.g. 5 timeframe uploads). Unlabeled items behave exactly as
+    before (image block only)."""
+    blocks = []
+    for i in (images or []):
+        if not i or not i.get('data'):
+            continue
+        if i.get('label'):
+            blocks.append({'type': 'text', 'text': 'Chart: ' + str(i['label'])})
+        blocks.append(_img_block(i))
     if not blocks:
         return messages
     msgs = [dict(m) for m in messages]
@@ -4432,6 +4500,63 @@ def delta_aibot_chat():
     return jsonify({'success': True, 'reply': clean_text or text,
                     'configPatch': safe_patch or None, 'summary': summary,
                     'rejected': rejected})
+
+@app.route('/api/aibot/delta/chart_upload', methods=['POST'])
+@login_required
+def delta_aibot_chart_upload():
+    """Save one manually-uploaded multi-timeframe chart into a named slot
+    (1d/1h/30m/15m/5m) — separate from the single-slot chat attach, so all 5
+    can be held at once for a combined /analyse read and for ongoing vision
+    context once the bot is trading."""
+    data = request.json or {}
+    slot = (data.get('slot') or '').strip().lower()
+    img_url = data.get('image') or ''
+    if slot not in _DELTA_CHART_SLOTS:
+        return jsonify({'success': False, 'error': 'slot must be one of: ' + ', '.join(_DELTA_CHART_SLOTS)}), 400
+    if not _chart_store_slot(delta_ai_state, delta_ai_lock, slot, img_url):
+        return jsonify({'success': False, 'error': 'could not read image (must be a valid image, <5MB)'}), 400
+    _bot_log('[Chart] uploaded {} ({})'.format(_DELTA_CHART_LABELS.get(slot, slot), slot))
+    return jsonify({'success': True, 'slot': slot, 'slots': _chart_slots_status(delta_ai_state)})
+
+@app.route('/api/aibot/delta/analyse', methods=['POST'])
+@login_required
+def delta_aibot_analyse():
+    """Pre-flight multi-timeframe analysis: send every currently-uploaded chart
+    slot to Claude in one call and return a combined read + a clear ready/not-
+    ready verdict, WITHOUT touching the bot's running state or placing any
+    order. Start (separately) begins trading and keeps resending the same
+    slots as ongoing vision context each decision tick."""
+    data = request.json or {}
+    imgs = _chart_images_for_multi(delta_ai_state, max_age_sec=_CHART_MAX_AGE)
+    if not imgs:
+        return jsonify({'success': False, 'error': 'Upload at least one chart (1D/1H/30m/15m/5m) before analysing.'}), 400
+    with delta_ai_lock:
+        cfg = dict(delta_ai_state.get('config') or {})
+    model = (data.get('model') or cfg.get('model') or '').strip()
+    symbol = (data.get('symbol') or cfg.get('symbol') or '').strip().upper() or 'the symbol'
+    labels = ', '.join(i.get('label', '?') for i in imgs)
+    system = (
+        "You are a professional multi-timeframe crypto technical analyst reviewing chart screenshots for "
+        + symbol + " as a pre-flight check before a trading bot goes live (or continues trading) on them. You "
+        "were given " + str(len(imgs)) + " chart(s), in this order: " + labels + ". For EACH chart, briefly note "
+        "trend/structure, key support/resistance, and any notable pattern or indicator reading visible (EMA, "
+        "SuperTrend, volume, etc.). Then give ONE combined multi-timeframe verdict: use the higher timeframes for "
+        "the dominant trend/bias and the lower ones for entry timing — don't let a lower-timeframe wiggle override "
+        "a clear higher-timeframe trend. State the overall bias (bullish/bearish/neutral/choppy) and the highest-"
+        "confidence trade idea if any (direction + rough entry/invalidation zone). End with ONE clear final line: "
+        "either 'READY FOR TRADING' with a one-sentence reason, or 'NOT READY' with what's missing or conflicting "
+        "between timeframes. Be concise — this is a pre-flight check, not a full report."
+    )
+    user = 'Analyse these charts for ' + symbol + ' and tell me if you are ready for trading.'
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700,
+                             model=model, images=imgs, timeout=60)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    with delta_ai_lock:
+        delta_ai_state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels}
+    _bot_log('[Analyse] ' + labels + ' -> ' + (text or '')[:160].replace('\n', ' '))
+    _persist_log_line('[DELTA] [ANALYSE] ' + labels)
+    return jsonify({'success': True, 'reply': text, 'charts': labels})
 
 @app.route('/api/aibot/delta/status', methods=['GET'])
 @login_required
@@ -21423,7 +21548,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="deltaBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost. Match this to your uploaded chart timeframes for longer-horizon trading.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <div class="zd-status-bar" id="deltaBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="deltaBotStatusDot"></span>
@@ -21498,10 +21623,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="deltaBotClaudeChk" checked> &#129302; Claude AI</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="deltaBotIncludeMM"><input type="checkbox" id="deltaBotIncludeMMA"></span>
+      </div>
+
+      <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
+           1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
+           Start trades with all of them as ongoing vision context each decision tick. -->
+      <div class="ai-strat-bar" id="deltaBotChartsBar">
+        <span class="lbl">&#128196; Charts:</span>
+        <span id="deltaBotChartSlots" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="zd-add-btn" type="button" data-slot="1d"  style="padding:4px 10px;font-size:11px">1D</button>
+          <button class="zd-add-btn" type="button" data-slot="1h"  style="padding:4px 10px;font-size:11px">1H</button>
+          <button class="zd-add-btn" type="button" data-slot="30m" style="padding:4px 10px;font-size:11px">30m</button>
+          <button class="zd-add-btn" type="button" data-slot="15m" style="padding:4px 10px;font-size:11px">15m</button>
+          <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
+        </span>
+        <button class="zd-add-btn" id="deltaBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
+        <span style="color:#787b86;font-size:10px">(upload each timeframe, then Analyse before Start — charts stay attached to every trade decision for ~3h)</span>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
@@ -32172,6 +32313,70 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       sendEl.addEventListener('click', send);
       inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+
+      // ---- Multi-timeframe chart upload + Analyse (Claude AI strategy only) ----
+      (function() {
+        const claudeChk = document.getElementById('deltaBotClaudeChk');
+        const chartsBar = document.getElementById('deltaBotChartsBar');
+        const slotBtns  = Array.prototype.slice.call(document.querySelectorAll('#deltaBotChartSlots button[data-slot]'));
+        const analyseBtn = document.getElementById('deltaBotAnalyseBtn');
+        if (!chartsBar || !analyseBtn) return;
+
+        function syncChartsBarVisibility() {
+          chartsBar.style.display = (claudeChk && claudeChk.checked) ? '' : 'none';
+        }
+        if (claudeChk) claudeChk.addEventListener('change', syncChartsBarVisibility);
+        syncChartsBarVisibility();
+
+        const slotFile = document.createElement('input');
+        slotFile.type = 'file'; slotFile.accept = 'image/*'; slotFile.style.display = 'none';
+        document.body.appendChild(slotFile);
+        let pendingSlot = null;
+        slotBtns.forEach(function(btn) {
+          btn.addEventListener('click', function() { pendingSlot = btn.dataset.slot; slotFile.click(); });
+        });
+        slotFile.addEventListener('change', function() {
+          const f = slotFile.files && slotFile.files[0]; slotFile.value = '';
+          const slot = pendingSlot; pendingSlot = null;
+          if (!f || !slot) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function() {
+            const dataUrl = String(rd.result || '');
+            fetch('/api/aibot/delta/chart_upload', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ slot: slot, image: dataUrl }) })
+              .then(r => r.json()).then(function(res) {
+                const btn = slotBtns.find(function(b) { return b.dataset.slot === slot; });
+                if (res.success) {
+                  if (btn) { btn.style.background = '#26a69a'; btn.style.color = '#fff'; btn.textContent = slot.toUpperCase() + ' ✓'; }
+                  addMsg(slot.toUpperCase() + ' chart uploaded (valid ~3h).', 'bot');
+                } else {
+                  addMsg('Upload failed (' + slot + '): ' + (res.error || 'unknown'), 'err');
+                }
+              }).catch(function(e) { addMsg('Upload error (' + slot + '): ' + e.message, 'err'); });
+          };
+          rd.readAsDataURL(f);
+        });
+
+        analyseBtn.addEventListener('click', function() {
+          analyseBtn.disabled = true; analyseBtn.textContent = 'Analysing…';
+          const thinking = addMsg('Analysing all uploaded charts…', 'bot');
+          fetch('/api/aibot/delta/analyse', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ model: (document.getElementById('deltaBotModel') || {}).value,
+                                    symbol: (document.getElementById('deltaBotSymbol') || {}).value }) })
+            .then(r => r.json()).then(function(res) {
+              thinking.remove();
+              if (!res.success) { addMsg('Analyse failed: ' + (res.error || 'unknown'), 'err'); return; }
+              const d = addMsg('📊 Multi-timeframe analysis (' + (res.charts || '') + '):', 'bot');
+              const body = document.createElement('div');
+              body.style.marginTop = '4px';
+              body.innerHTML = esc(res.reply || '').replace(/\n/g, '<br>');
+              d.appendChild(body);
+              msgsEl.scrollTop = msgsEl.scrollHeight;
+            }).catch(function(e) { thinking.remove(); addMsg('Analyse error: ' + e.message, 'err'); })
+            .finally(function() { analyseBtn.disabled = false; analyseBtn.textContent = '🤖 Analyse'; });
+        });
+      })();
     })();
 
     // On panel open / page load, check whether a server-side bot is already
