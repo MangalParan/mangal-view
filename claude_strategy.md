@@ -1,6 +1,11 @@
 # Claude AI Trading Strategy
 
-How the **Claude AI** strategy works in the AI bots (Zerodha, Delta, MT5, Zerodha Options).
+There are now **two distinct places** Claude makes trading decisions in this app, with very different scopes:
+
+1. **The four legacy AI bots** (Zerodha, Delta, MT5, Zerodha Options) — Claude is given full autonomy: it decides entries, exits, direction, and its own stop-loss/target every tick. This is sections 1–12 below.
+2. **The Strategy Menu** (Iron Condor / Short Strangle / Jade Lizard / EMA 5/13 Crossover, on NSE index options via Zerodha or BTC/ETH/XAUT options via Delta Exchange) — Claude's role is much narrower: it only ever picks **which strike** to sell, inside a target-delta window you set. It never sets its own SL/TP, never decides direction, and its output is validated/snapped to real strikes with a deterministic fallback if it fails. See section 13.
+
+## Part 1 — the four legacy AI bots
 
 The core lives in [`_claude_trade_signal`](scripts/nifty_chart.py#L1845) and runs **once per tick** for each bot / option leg. When the Claude AI strategy is selected (the default), Claude decides entries, exits, stop-loss and target on its own — none of the legacy algo strategies are used.
 
@@ -125,6 +130,15 @@ Each bot chat has a **📎 attach** button. Upload a TradingView chart screensho
 - The chart stays "current" for **~3 hours**, then expires so a stale picture can't keep driving trades. **Re-upload anytime** during a trade to re-steer the strategy around the newest chart.
 - Available on all four bots (Delta / Zerodha / MT5 / Options). See [`_call_claude`](scripts/nifty_chart.py) (the `images` param) and the per-bot chart store (`_chart_store` / `_chart_images_for`).
 
+### Delta AI Bot: multi-timeframe chart upload + Analyse
+
+The Delta AI Bot additionally has a **Charts bar** (shown when Claude AI strategy is ticked) with five dedicated upload buttons — **1D, 1H, 30m, 15m, 5m** — instead of the single 📎 slot above:
+
+- Each button uploads into its own **named timeframe slot** (`_chart_store_slot`), so all 5 can be held at once rather than one overwriting the last (`_chart_images_for_multi`, falling back to the single 📎 slot if none of the 5 are used).
+- **Analyse** (`/api/aibot/delta/analyse`) sends every uploaded slot to Claude in **one call**, with a dedicated pre-flight prompt: per-chart notes (trend/structure/S-R/pattern), then **one combined multi-timeframe verdict** ending in an explicit `READY FOR TRADING` or `NOT READY` line. This is purely advisory — it does not touch the running bot or place an order.
+- Once **Start** is clicked, the live decision loop (`_delta_bot_tick`) keeps resending all 5 uploaded charts to Claude as vision context on **every** decision tick (same ~3h freshness window as the single-slot version) — so Analyse is a pre-flight check, and Start is what actually trades off the same charts continuously.
+- Each image gets a `Chart: <label>` text block immediately before it (a small, backward-compatible extension to `_attach_images`) so Claude can tell the 5 timeframes apart, and the system prompt explicitly instructs it to use the **higher timeframes for bias, lower timeframes for entry timing** — a lower-timeframe wiggle should never override a clear higher-timeframe trend.
+
 ---
 
 ## 10. Data source & fallback
@@ -136,12 +150,74 @@ Candles come from the bot's broker feed — Delta, Kite (Zerodha), or MT5. For t
 ## 11. Model & cadence
 
 - The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
-- **Tick** sets how often the bot checks the market and calls Claude (15s … 10m). Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost. A slower tick (e.g. 180s) = fewer, more-considered trades and lower cost.
+- **Tick** sets how often the bot checks the market and calls Claude. Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost. A slower tick (e.g. 180s) = fewer, more-considered trades and lower cost.
+  - **Delta AI Bot**: 15s … 1d (15s/30s/1m/2m/3m/5m/10m/15m/30m/1h/1d) — extended so cadence can match a higher-timeframe, multi-chart read (see §9).
+  - **Zerodha / MT5 / Zerodha Options bots**: 15s … 10m (unchanged).
 
 ---
 
-## 12. Honest caveats
+## 12. Honest caveats (legacy bots)
 
 - This is a **discretionary, LLM-judgment** strategy, **not** a backtested quant edge. The prompt steers Claude toward selective, structure-based trades to favour win rate, but **no strategy guarantees profit** — markets gap and reverse.
 - The **circuit breakers** (max consecutive losses, max daily loss/profit) and **SL on every trade** are what cap the downside.
 - Always **paper-trade first** to see how it behaves on your symbols and timeframe before going live.
+
+---
+
+## Part 2 — the Strategy Menu (multi-leg options strategies)
+
+Opened from **Automation → Strategy Menu**: a completely different engine from Part 1, built for **defined multi-leg options strategies** rather than free-form directional trading. Two independent sides — **Zerodha Options Strategy** (NIFTY / BANKNIFTY / FINNIFTY / SENSEX, via Kite) and **Delta Options Strategy** (BTC / ETH / XAUT options, via Delta Exchange — unrelated to the Part-1 Delta AI Bot above, a naming coincidence) — sharing the same strategy engine (`_strat_*` for Zerodha, `_dstrat_*` for Delta).
+
+## 13. Strategy types
+
+| Type | Legs | Notes |
+|---|---|---|
+| **Iron Condor** | sellCE, sellPE, hedgeCE, hedgePE | Both sides sold + hedged, always. |
+| **Short Strangle** | sellCE, sellPE | No hedges — **undefined risk by design**, flagged in the UI. |
+| **Jade Lizard** | sellCE, sellPE, hedgeCE | Call side hedged, put side naked (classic Jade Lizard construction — no upside risk if credit > call-spread width). |
+| **EMA 5/13 Crossover** | sellCE, sellPE, hedgeCE, hedgePE | **Not Claude-driven at all** — see §13.3. All 4 legs are resolved/shown, but only the side matching the current EMA regime is ever actually open. |
+
+## 13.1 Claude's role: strike selection only
+
+The **"Claude strategy" button** (`/claude_pick`, or automatically on Start if never clicked) is the *only* place Claude is consulted, and its job is narrow: **pick which strike to sell**, nothing else.
+
+- **Prompt** (`_strat_resolve_strikes` / `_dstrat_resolve_strikes`): "Choose `ceSellStrike` from `ceCandidates` and `peSellStrike` from `peCandidates` ONLY — each must have `|delta|` at or below `targetDelta`, preferring the value closest to `targetDelta` without exceeding it." Candidates are pre-filtered to a plausible delta window (≤ 1.5× target) so Claude can't pick something wildly off-target, and its answer is **snapped to the nearest real candidate strike** — it can never invent a strike or symbol.
+- **Delta comes from real greeks, not a guess**: Zerodha side computes Black-Scholes delta from the NSE/Kite chain's IV (`_bs_delta`); Delta Exchange side uses the **exchange's own native `greeks.delta`** from its ticker snapshot (more accurate than Black-Scholes for crypto vol surfaces), falling back to Black-Scholes only if a symbol's native greeks are missing.
+- **Any Claude failure — bad JSON, timeout, unparseable strike — silently falls back to the deterministic delta-walk** (pick the strike with the largest `|delta|` still ≤ `targetDelta`). The user is never left with zero legs.
+- **Hedge strikes are NEVER Claude's call.** They're always deterministic: sold strike ± `hedgeDistancePoints` (default **500** for NIFTY/BTC, **50** for XAUT/ETH), snapped to the nearest strike actually listed in the chain. This is a hardcoded design decision, not a judgment call the prompt leaves open.
+- Claude is **not** asked about SL/TP, direction, or timing here — those are plain configured percentages (see §13.2), applied identically regardless of how the strike was chosen.
+
+## 13.2 Risk, sizing, and exits
+
+- **SL % / TP %** (default **50% / 50%**, user-configurable) apply to **sold legs only** — computed the same simple way as the legacy bots' manual mode: `sl = price × (1 ± slPct/100)`, `tp = price × (1 ∓ tpPct/100)`. Hedge (BUY) legs never carry their own SL/TP.
+- **Hedge-linked exit**: when a sold leg's SL or TP fires, its paired hedge leg is closed **in the same step** (`_strat_close_leg` / `_dstrat_close_leg`, `cascade=True`) — never left open alone.
+- **Position size** = `qty` (lots for Zerodha, raw contracts for Delta) — a plain manual number, not capital/leverage-sized like the legacy bots.
+- **Circuit breakers**: Max consecutive losses, Max daily loss — same concept as Part 1, checked once per tick (`_strat_check_breakers`).
+
+## 13.3 EMA 5/13 Crossover — a pure technical strategy, no LLM signal
+
+This strategy type computes `compute_ema(closes, 5)` vs `compute_ema(closes, 13)` on the underlying (configurable EMA periods and timeframe, default 15m) **every tick** (`_strat_ema_signal` / `_strat_ema_tick_logic`):
+
+- **Bullish** regime (fast EMA > slow EMA) → sell PE (+ its hedge). **Bearish** → sell CE (+ its hedge). The active side switches automatically as the regime flips, closing the wrong side (hedge cascades with it) and freshly re-resolving the correct one.
+- **Claude is only invoked, if at all, to pick the strike** for whichever side the EMA crossover says should be active — the *decision* to be bullish or bearish is a deterministic formula, not an LLM judgment call. This is the opposite of Part 1, where Claude reads structure and decides direction itself.
+
+## 13.4 Non Stop — continuous re-entry
+
+A **Non Stop** checkbox (both sides) makes the strategy trade continuously instead of stopping after one round-trip:
+
+- When a sold leg closes on TP or SL, it **immediately re-resolves that same role** at the **same target delta** (a fresh strike — same or different depending on where the market is now) and **same SL%/TP%**, and re-opens it (`_strat_nonstop_reenter` / `_dstrat_nonstop_reenter`). This is deterministic strike resolution, not another Claude call.
+- Stops itself once **Max consec losses** trips — the existing breaker already halts the bot at that point.
+- **EMA Crossover strategies are inherently continuous** regardless of the checkbox — the regime-following logic in §13.3 already reopens the active side whenever it's flat.
+- **Zerodha only**: Non Stop (and EMA Crossover) is additionally time-boxed to a configurable market-hours window, default **09:25–15:00 IST** (`_strat_nonstop_session_gate`) — squares off everything once at/after the close time and withholds new re-entries outside the window; existing SL/TP risk management on already-open legs is never gated by this. **Delta side has no such window** — crypto trades 24/7.
+
+## 13.5 What's logged
+
+`log_options.txt` (separate from the legacy bots' shared `log.txt`) gets a full `[CONFIG]` line on every Start (`_strat_cfg_summary`) — strategy type, underlying, expiry, target delta, hedge distance, position size, SL%/TP%, buyer/seller mode, non-stop + its window, EMA periods — everything needed to reproduce or audit a run, auto-picked up by `log_to_journal.py`'s existing Config sheet.
+
+## 13.6 Honest caveats (Strategy Menu)
+
+- Claude's **only** discretion here is which strike to sell within a delta band you set — it is not deciding whether to trade, which direction, or how much risk to take. Get the direction/timing wrong (manually, or via EMA Crossover) and the strike selection won't save you.
+- **Short Strangle has no hedge — undefined risk.** Iron Condor / Jade Lizard cap risk via the hedge leg(s), but only as far as `hedgeDistancePoints` actually reaches — a large enough gap can still blow through it.
+- **Non Stop compounds losing streaks fast** in a choppy market: every SL hit immediately re-enters, so a string of stop-outs (common when SL is much tighter than TP — see Part 1 §4's incident) adds up quickly. The Max consec losses breaker is the only backstop.
+- No cross-restart persistence: trades/P&L live in memory only, same as the legacy bots — a server restart loses history (the log file is the durable record).
+- Always **paper-trade first**.
