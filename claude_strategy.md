@@ -54,8 +54,10 @@ There is **no fixed Min score gate** anymore. Claude rates each setup on its **o
 
 On **every** BUY/SELL, Claude must return:
 
-- **`slPct`** — stop-loss %, placed just **beyond the invalidation level** (the swing / structure that proves the trade wrong).
-- **`tpPct`** — target %, placed at the **next opposing S/R level**, with **reward : risk ≥ 1.5**.
+- **`slPct`** — stop-loss %, **derived from a specific price level**, never a round guess: pick the real invalidation level (from `nearestSupport`/`nearestResistance`/`supports`/`resistances`, or a price/zone it names in `reason`) and compute `slPct = abs(lastPrice - level) / lastPrice * 100`, with a small buffer beyond it so ordinary noise doesn't clip it.
+- **`tpPct`** — target %, computed the same way against the **next opposing S/R level**, with **reward : risk ≥ 1.5**.
+- **Consistency check (mandatory)** — if `reason` names a price or zone, `slPct`/`tpPct` must correspond to that same price. Claude must not cite one level in the reasoning and then quietly set a tighter number just to make the trade look better on paper.
+- **In high volatility, it must not tighten the stop below the real level to compensate** — a stop tighter than the actual invalidation just gets clipped by noise. If the genuine invalidation sits far away, that means the setup risks too much right now: lower conviction / HOLD, not a faked tighter stop. *(Added after a live loss where the stated reasoning named an 80,800 demand zone ~0.5–0.7% away but the actual `slPct` set was only ~0.22% — an artificially tight, structurally-inconsistent stop that, combined with 25x leverage, turned ordinary noise into a ~5.5%-of-capital loss.)*
 
 These **override** the panel's SL/TP. The bot converts them into exact SL/TP prices on the position — see [`_delta_bot_open`](scripts/nifty_chart.py#L2089), [`_zd_bot_open`](scripts/nifty_chart.py#L2747), [`_mt_bot_open`](scripts/nifty_chart.py#L3736), [`_zo_open_leg`](scripts/nifty_chart.py#L3217).
 
