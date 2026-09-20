@@ -2101,6 +2101,27 @@ def _tv_context(cfg, broker, symbol, exchange):
                        ' — use an EXCHANGE:SYMBOL ticker (e.g. BINANCE:BTCUSDT, NSE:RELIANCE) or leave blank for auto')
     return out
 
+def _bot_quant_signal(candles):
+    """Composite statistical/mean-reversion score (Z-score, regression deviation,
+    Bollinger %B, StochRSI, Keltner Channel, Hurst exponent, variance ratio, price
+    percentile, return skew — see generate_quant_signals) computed on demand ONLY
+    when the 'Quant' checkbox is on, so pure-Claude mode keeps skipping the 14-
+    indicator bundle (_bot_signal_data) for the memory reasons noted on
+    _bot_fetch_candles. Returns the summary dict {score, verdict, indicators, rsi,
+    macd, vwap} or None if there isn't enough data / it errors."""
+    try:
+        bb        = compute_bollinger_bands(candles, 20, 2.0)
+        rsi_data  = compute_rsi(candles)
+        macd_data = compute_macd(candles)
+        vwap_data = compute_vwap(candles)
+        ema9      = compute_ema_series(candles, 9)
+        ema21     = compute_ema_series(candles, 21)
+        sr        = compute_support_resistance(candles)
+        _sigs, summ = generate_quant_signals(candles, bb, rsi_data, macd_data, vwap_data, ema9, ema21, sr)
+        return summ or None
+    except Exception:
+        return None
+
 def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=None, extra_ctx=None, images=None):
     """Autonomous Claude strategy. Sends recent OHLCV plus market context (multi-
     window trend, volume/liquidity, volatility), the CURRENT position (so it
@@ -2218,6 +2239,25 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "still make the final call; never trade against your own structure read just because TV disagrees. "
             "If webhook.test is true it is a MANUAL TEST alert — IGNORE it completely, do not let it influence the trade.\n")
 
+    # Quant block — a deterministic statistical model (context only) when the panel's
+    # Quant checkbox is on. Claude still decides; the quant score/verdict drives
+    # (nudges) conviction the same way the TradingView block does.
+    quant_block = ""
+    quant_ctx = None
+    if 'quant' in (cfg.get('allowedStrategies') or []):
+        quant_ctx = _bot_quant_signal(candles)
+        if quant_ctx:
+            quant_block = (
+                "\nQUANT (statistical model, in 'quant'): a deterministic composite score from Z-score (mean "
+                "reversion), linear-regression deviation, Bollinger %B, Stochastic RSI, Keltner Channel position, "
+                "a Hurst-exponent proxy (trending vs mean-reverting regime), variance ratio, price percentile rank "
+                "and return skew — 'score' (positive=bullish/oversold-bounce, negative=bearish/overbought-fade) "
+                "and 'verdict' (STRONG BUY..STRONG SELL/NEUTRAL), with the top contributing 'indicators'. This "
+                "should AUTOMATICALLY DRIVE your decision: when verdict/score AGREE with your structure read, "
+                "raise conviction and act on it even on a borderline setup; when they OPPOSE it, lower conviction "
+                "or HOLD; NEUTRAL is a mild vote for HOLD unless everything else is unanimous. This is a "
+                "quantitative vote alongside price action, not a replacement for it.\n")
+
     min_enter = float(cfg.get('minScore', 0) or 0) + float(cfg.get('scoreBuffer', 0) or 0)
     if min_enter <= 0:
         gate = ("Score the setup YOURSELF on a 0-10 conviction scale and ONLY take BUY/SELL when your own conviction "
@@ -2274,6 +2314,7 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "After a recent 'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
         + tv_block
+        + quant_block
         + (("{} CHART IMAGE(S) ATTACHED: each may be preceded by a 'Chart: <label>' text note naming its "
             "timeframe (e.g. Daily, 1 Hour, 15 Minutes) when more than one is attached. They may be PRICE CHARTS "
             "(SuperTrend/EMA/PSAR/support-resistance) and/or OPTION-CHAIN / OPEN-INTEREST (OI) / max-pain data. "
@@ -2311,6 +2352,8 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
     if note_txt:
         _payload['operatorNote'] = note_txt
         _payload['operatorNoteAgeSec'] = note_age
+    if quant_ctx:
+        _payload['quant'] = quant_ctx
     if extra_ctx:
         _payload.update(extra_ctx)
     user = _json.dumps(_payload, default=str)
@@ -21208,6 +21251,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="aiBotIncludeMM"><input type="checkbox" id="aiBotIncludeMMA"></span>
@@ -21448,6 +21492,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="mtBotIncludeMM"><input type="checkbox" id="mtBotIncludeMMA"></span>
@@ -21632,6 +21677,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="deltaBotClaudeChk" checked> &#129302; Claude AI</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="deltaBotIncludeMM"><input type="checkbox" id="deltaBotIncludeMMA"></span>
@@ -22062,6 +22108,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="zoBotIncludeMM"><input type="checkbox" id="zoBotIncludeMMA"></span>
