@@ -1940,11 +1940,53 @@ def _bot_fetch_candles(symbol, interval, source, api_key=None):
     NOT the 14-indicator bundle _bot_signal_data builds every tick — skipping it
     cuts per-tick memory churn massively (was OOMing Render after a couple hours)."""
     try:
-        if source == 'kite':  return fetch_kite_data(interval, symbol, api_key=api_key) or []
-        if source == 'mt5':   return fetch_mt5_data(interval, symbol, api_key) or []
+        if source == 'kite':         return fetch_kite_data(interval, symbol, api_key=api_key) or []
+        if source == 'mt5':          return fetch_mt5_data(interval, symbol, api_key) or []
+        if source == 'tradingview':  return fetch_tradingview_data(interval, symbol) or []
         return fetch_delta_data(interval, symbol) or []
     except Exception:
         return []
+
+# Timeframes auto-analysed every Claude decision tick (and for the pre-flight
+# write-up below) so every AI bot gets a top-down multi-timeframe read even
+# when the user hasn't uploaded any chart images — mirrors the Delta AI Bot's
+# manual 1D/1H/30m/15m/5m upload set, just numeric instead of a screenshot.
+_BOT_MULTI_TF = ['1d', '1h', '30m', '15m', '5m']
+_BOT_MULTI_TF_CACHE = {}   # {(source, symbol): {'ts': float, 'data': {...}}}
+
+def _bot_multi_tf_snapshot(source, symbol, api_key=None, max_age_sec=90):
+    """Auto-fetched 1D/1H/30m/15m/5m read for `symbol` — lastPrice/sma20/
+    changePct/trend/recentHigh/recentLow per timeframe. Fed to Claude every
+    decision tick as the 'multiTF' block (see _claude_trade_signal) so it
+    always has a multi-timeframe view, image or not. Cached briefly so a fast
+    decision cadence doesn't refetch 5 timeframes every single tick."""
+    key = (source, symbol)
+    now = _zd_time.time()
+    cached = _BOT_MULTI_TF_CACHE.get(key)
+    if cached and (now - cached['ts']) < max_age_sec:
+        return cached['data']
+    out = {}
+    for tf in _BOT_MULTI_TF:
+        try:
+            candles = _bot_fetch_candles(symbol, tf, source, api_key=api_key)
+        except Exception:
+            candles = None
+        if not candles or len(candles) < 10:
+            continue
+        closes = [c['close'] for c in candles[-60:]]
+        last = closes[-1]
+        n20 = min(20, len(closes))
+        sma20 = sum(closes[-n20:]) / n20
+        n10 = min(10, len(closes))
+        chg = ((closes[-1] - closes[-n10]) / closes[-n10] * 100.0) if closes[-n10] else 0.0
+        win20 = candles[-n20:]
+        hi = max(c['high'] for c in win20); lo = min(c['low'] for c in win20)
+        trend = 'up' if last > sma20 * 1.001 else ('down' if last < sma20 * 0.999 else 'flat')
+        out[tf] = {'lastPrice': round(last, 5), 'sma20': round(sma20, 5), 'changePct': round(chg, 2),
+                   'trend': trend, 'recentHigh': round(hi, 5), 'recentLow': round(lo, 5)}
+    if out:
+        _BOT_MULTI_TF_CACHE[key] = {'ts': now, 'data': out}
+    return out or None
 
 # Seconds between bot ticks. In Claude-AI mode each tick = one Anthropic API
 # call per running bot/leg, so this directly drives API credit usage:
@@ -2239,6 +2281,21 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
             "still make the final call; never trade against your own structure read just because TV disagrees. "
             "If webhook.test is true it is a MANUAL TEST alert — IGNORE it completely, do not let it influence the trade.\n")
 
+    # Multi-timeframe block — auto-fetched 1D/1H/30m/15m/5m numeric snapshot, sent
+    # EVERY decision tick regardless of whether chart images are attached, so the
+    # bot always analyses top-down instead of only reacting to the primary tf.
+    multi_tf_block = ""
+    if extra_ctx and extra_ctx.get('multiTF'):
+        multi_tf_block = (
+            "\nMULTI-TIMEFRAME (auto-fetched, in 'multiTF'): a snapshot of 1D/1H/30m/15m/5m for this symbol — "
+            "lastPrice, sma20, changePct (10-bar), trend (up/down/flat vs sma20) and the 20-bar recentHigh/"
+            "recentLow for each. ALWAYS synthesize this top-down, even when no chart image is attached: use the "
+            "higher timeframes (1D/1H) for the dominant trend/bias and the lower ones (30m/15m/5m) for entry "
+            "timing — don't let a lower-timeframe wiggle override a clear higher-timeframe trend; only take the "
+            "trade if the lower-timeframe read agrees with (or doesn't fight) the higher-timeframe bias. If a "
+            "chart IMAGE for a timeframe is ALSO attached, the image is the richer, PRIMARY read for that "
+            "timeframe — use multiTF's numbers to fill in whichever timeframes have no image.\n")
+
     # Quant block — a deterministic statistical model (context only) when the panel's
     # Quant checkbox is on. Claude still decides; the quant score/verdict drives
     # (nudges) conviction the same way the TradingView block does.
@@ -2314,6 +2371,7 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
         "After a recent 'SL hit' loss in conditions like now, RAISE your bar and be more selective (HOLD more).\n"
         + option_block
         + tv_block
+        + multi_tf_block
         + quant_block
         + (("{} CHART IMAGE(S) ATTACHED: each may be preceded by a 'Chart: <label>' text note naming its "
             "timeframe (e.g. Daily, 1 Hour, 15 Minutes) when more than one is attached. They may be PRICE CHARTS "
@@ -2686,10 +2744,16 @@ def _delta_bot_tick():
     elif _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and delta_ai_state.get('_decide', True):
-        _tv = _tv_context(cfg, 'delta', symbol, '')
+        _tv   = _tv_context(cfg, 'delta', symbol, '')
+        _imgs = _chart_images_for_multi(delta_ai_state)
+        _mtf  = _bot_multi_tf_snapshot('delta', symbol)
+        if not delta_ai_state.get('position') and _bot_preflight_stale(delta_ai_state):
+            _bot_run_preflight_analyse(delta_ai_state, delta_ai_lock, _bot_log, '[DELTA]', symbol, cfg.get('model'), _imgs, _mtf)
+        _ectx = {}
+        if _tv:  _ectx['tradingview'] = _tv
+        if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
-                                     extra_ctx=({'tradingview': _tv} if _tv else None),
-                                     images=_chart_images_for_multi(delta_ai_state))
+                                     extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -3251,6 +3315,71 @@ def _call_claude(system, messages, max_tokens=1024, model=None, images=None, tim
     parts = data.get('content') or []
     text  = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
     return text, None
+
+# --- Pre-flight multi-timeframe analysis, shared by every AI bot. Runs once
+# (per freshness window) before the bot's first entry after starting/going
+# flat: uses uploaded chart images if any are present, else the auto-fetched
+# numeric multiTF snapshot, and posts a written verdict the panel's chat
+# window shows via the 'lastAnalysis' field in /status. ---
+_ANALYSIS_MAX_AGE = 3600   # re-run the pre-flight read at most once an hour
+
+def _bot_build_analysis(images, multi_tf, symbol, model):
+    """(text, err) — a pre-flight multi-timeframe read, from chart images when
+    present, else the auto-fetched numeric multiTF snapshot."""
+    if images:
+        labels = ', '.join(i.get('label', '?') for i in images)
+        system = (
+            "You are a professional multi-timeframe technical analyst reviewing chart screenshots for " + symbol +
+            " as a pre-flight check before a trading bot goes live (or continues trading) on them. You were given "
+            + str(len(images)) + " chart(s), in this order: " + labels + ". For EACH chart, briefly note trend/"
+            "structure, key support/resistance, and any notable pattern or indicator reading visible (EMA, "
+            "SuperTrend, volume, etc.). Then give ONE combined multi-timeframe verdict: use the higher timeframes "
+            "for the dominant trend/bias and the lower ones for entry timing — don't let a lower-timeframe wiggle "
+            "override a clear higher-timeframe trend. State the overall bias (bullish/bearish/neutral/choppy) and "
+            "the highest-confidence trade idea if any (direction + rough entry/invalidation zone). End with ONE "
+            "clear final line: either 'READY FOR TRADING' with a one-sentence reason, or 'NOT READY' with what's "
+            "missing or conflicting between timeframes. Be concise — this is a pre-flight check, not a full report.")
+        user = 'Analyse these charts for ' + symbol + ' and tell me if you are ready for trading.'
+        return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700, model=model,
+                            images=images, timeout=60)
+    if multi_tf:
+        system = (
+            "You are a professional multi-timeframe technical analyst reviewing an auto-fetched numeric snapshot "
+            "for " + symbol + " as a pre-flight check before a trading bot goes live. No chart image was uploaded, "
+            "so read the numbers directly: for each timeframe in 'multiTF' you have lastPrice, sma20, changePct "
+            "(10-bar), trend (vs sma20) and the 20-bar recentHigh/recentLow. For EACH timeframe present, briefly "
+            "note the trend and where price sits vs its recent range. Then give ONE combined multi-timeframe "
+            "verdict: use the higher timeframes (1d/1h) for the dominant trend/bias and the lower ones (30m/15m/"
+            "5m) for entry timing — don't let a lower-timeframe wiggle override a clear higher-timeframe trend. "
+            "State the overall bias (bullish/bearish/neutral/choppy) and the highest-confidence trade idea if any. "
+            "End with ONE clear final line: either 'READY FOR TRADING' with a one-sentence reason, or 'NOT READY' "
+            "with why. Be concise — this is a pre-flight check, not a full report.")
+        import json as _json
+        user = _json.dumps({'symbol': symbol, 'multiTF': multi_tf})
+        return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700, model=model, timeout=60)
+    return None, 'no chart images and no auto-fetched data available yet'
+
+def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, images, multi_tf):
+    """Runs _bot_build_analysis, stores it on state['lastAnalysis'] (picked up
+    by the panel's status poll and shown in the chat window), and logs it.
+    Called from each bot's tick loop before its first entry after start/flat —
+    see the 'preflight' gate next to each _claude_trade_signal call site."""
+    text, err = _bot_build_analysis(images, multi_tf, symbol, model)
+    if err:
+        log_fn('[Analyse] auto pre-flight failed: ' + str(err)[:160])
+        return None
+    labels = ', '.join(i.get('label', '?') for i in images) if images else (', '.join(_BOT_MULTI_TF) + ' (auto, no chart uploaded)')
+    with lock:
+        state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not images}
+    log_fn('[Analyse] ' + labels + ' -> ' + (text or '')[:160].replace('\n', ' '))
+    _persist_log_line(persist_tag + ' [ANALYSE] ' + labels)
+    return text
+
+def _bot_preflight_stale(state):
+    """True when this bot has no recent pre-flight analysis — used to gate an
+    automatic re-run (once per _ANALYSIS_MAX_AGE) before the next entry."""
+    la = state.get('lastAnalysis') or {}
+    return (int(_zd_time.time()) - int(la.get('ts', 0) or 0)) > _ANALYSIS_MAX_AGE
 
 # =============================== Telegram (Nifty_MV_bot) ======================
 # Sends a daily pre-market brief (Claude + live TradingView TA) and forwards bot
@@ -4552,62 +4681,110 @@ def delta_aibot_chat():
                     'configPatch': safe_patch or None, 'summary': summary,
                     'rejected': rejected})
 
-@app.route('/api/aibot/delta/chart_upload', methods=['POST'])
-@login_required
-def delta_aibot_chart_upload():
-    """Save one manually-uploaded multi-timeframe chart into a named slot
-    (1d/1h/30m/15m/5m) — separate from the single-slot chat attach, so all 5
-    can be held at once for a combined /analyse read and for ongoing vision
-    context once the bot is trading."""
+def _bot_chart_upload_route(state, lock, log_fn):
+    """Shared handler: save one manually-uploaded multi-timeframe chart into a
+    named slot (1d/1h/30m/15m/5m) — separate from the single-slot chat attach,
+    so all 5 can be held at once for a combined /analyse read and for ongoing
+    vision context once the bot is trading. Used by every AI bot panel."""
     data = request.json or {}
     slot = (data.get('slot') or '').strip().lower()
     img_url = data.get('image') or ''
     if slot not in _DELTA_CHART_SLOTS:
         return jsonify({'success': False, 'error': 'slot must be one of: ' + ', '.join(_DELTA_CHART_SLOTS)}), 400
-    if not _chart_store_slot(delta_ai_state, delta_ai_lock, slot, img_url):
+    if not _chart_store_slot(state, lock, slot, img_url):
         return jsonify({'success': False, 'error': 'could not read image (must be a valid image, <5MB)'}), 400
-    _bot_log('[Chart] uploaded {} ({})'.format(_DELTA_CHART_LABELS.get(slot, slot), slot))
-    return jsonify({'success': True, 'slot': slot, 'slots': _chart_slots_status(delta_ai_state)})
+    log_fn('[Chart] uploaded {} ({})'.format(_DELTA_CHART_LABELS.get(slot, slot), slot))
+    return jsonify({'success': True, 'slot': slot, 'slots': _chart_slots_status(state)})
+
+def _bot_analyse_route(state, lock, log_fn, persist_tag, source, api_key_field=None, symbol_field='symbol'):
+    """Shared handler for every bot's manual 'Analyse' button: a pre-flight
+    multi-timeframe read using uploaded chart images if present, else the
+    auto-fetched numeric multiTF snapshot (so it still works with nothing
+    uploaded) — WITHOUT touching the bot's running state or placing any
+    order. Start (separately) begins trading and keeps resending the same
+    context each decision tick (see the preflight gate next to each
+    _claude_trade_signal call site)."""
+    data = request.json or {}
+    with lock:
+        cfg = dict(state.get('config') or {})
+    imgs = _chart_images_for_multi(state, max_age_sec=_CHART_MAX_AGE)
+    model = (data.get('model') or cfg.get('model') or '').strip()
+    symbol = (data.get('symbol') or cfg.get(symbol_field) or cfg.get('baseSymbol') or '').strip().upper() or 'the symbol'
+    multi_tf = None
+    if not imgs:
+        api_key = cfg.get(api_key_field) if api_key_field else None
+        multi_tf = _bot_multi_tf_snapshot(source, symbol, api_key=api_key)
+        if not multi_tf:
+            return jsonify({'success': False, 'error': 'Upload at least one chart (1D/1H/30m/15m/5m), or wait a moment for live data to be available.'}), 400
+    text, err = _bot_build_analysis(imgs, multi_tf, symbol, model)
+    if err:
+        return jsonify({'success': False, 'error': err}), 502
+    labels = ', '.join(i.get('label', '?') for i in imgs) if imgs else (', '.join(_BOT_MULTI_TF) + ' (auto, no chart uploaded)')
+    with lock:
+        state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not imgs}
+    log_fn('[Analyse] ' + labels + ' -> ' + (text or '')[:160].replace('\n', ' '))
+    _persist_log_line(persist_tag + ' [ANALYSE] ' + labels)
+    return jsonify({'success': True, 'reply': text, 'charts': labels})
+
+@app.route('/api/aibot/delta/chart_upload', methods=['POST'])
+@login_required
+def delta_aibot_chart_upload():
+    return _bot_chart_upload_route(delta_ai_state, delta_ai_lock, _bot_log)
 
 @app.route('/api/aibot/delta/analyse', methods=['POST'])
 @login_required
 def delta_aibot_analyse():
-    """Pre-flight multi-timeframe analysis: send every currently-uploaded chart
-    slot to Claude in one call and return a combined read + a clear ready/not-
-    ready verdict, WITHOUT touching the bot's running state or placing any
-    order. Start (separately) begins trading and keeps resending the same
-    slots as ongoing vision context each decision tick."""
-    data = request.json or {}
-    imgs = _chart_images_for_multi(delta_ai_state, max_age_sec=_CHART_MAX_AGE)
-    if not imgs:
-        return jsonify({'success': False, 'error': 'Upload at least one chart (1D/1H/30m/15m/5m) before analysing.'}), 400
-    with delta_ai_lock:
-        cfg = dict(delta_ai_state.get('config') or {})
-    model = (data.get('model') or cfg.get('model') or '').strip()
-    symbol = (data.get('symbol') or cfg.get('symbol') or '').strip().upper() or 'the symbol'
-    labels = ', '.join(i.get('label', '?') for i in imgs)
-    system = (
-        "You are a professional multi-timeframe crypto technical analyst reviewing chart screenshots for "
-        + symbol + " as a pre-flight check before a trading bot goes live (or continues trading) on them. You "
-        "were given " + str(len(imgs)) + " chart(s), in this order: " + labels + ". For EACH chart, briefly note "
-        "trend/structure, key support/resistance, and any notable pattern or indicator reading visible (EMA, "
-        "SuperTrend, volume, etc.). Then give ONE combined multi-timeframe verdict: use the higher timeframes for "
-        "the dominant trend/bias and the lower ones for entry timing — don't let a lower-timeframe wiggle override "
-        "a clear higher-timeframe trend. State the overall bias (bullish/bearish/neutral/choppy) and the highest-"
-        "confidence trade idea if any (direction + rough entry/invalidation zone). End with ONE clear final line: "
-        "either 'READY FOR TRADING' with a one-sentence reason, or 'NOT READY' with what's missing or conflicting "
-        "between timeframes. Be concise — this is a pre-flight check, not a full report."
-    )
-    user = 'Analyse these charts for ' + symbol + ' and tell me if you are ready for trading.'
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700,
-                             model=model, images=imgs, timeout=60)
-    if err:
-        return jsonify({'success': False, 'error': err}), 502
-    with delta_ai_lock:
-        delta_ai_state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels}
-    _bot_log('[Analyse] ' + labels + ' -> ' + (text or '')[:160].replace('\n', ' '))
-    _persist_log_line('[DELTA] [ANALYSE] ' + labels)
-    return jsonify({'success': True, 'reply': text, 'charts': labels})
+    return _bot_analyse_route(delta_ai_state, delta_ai_lock, _bot_log, '[DELTA]', 'delta')
+
+@app.route('/api/aibot/zerodha/chart_upload', methods=['POST'])
+@login_required
+def zerodha_aibot_chart_upload():
+    return _bot_chart_upload_route(zd_ai_state, zd_ai_lock, _zd_log)
+
+@app.route('/api/aibot/zerodha/analyse', methods=['POST'])
+@login_required
+def zerodha_aibot_analyse():
+    return _bot_analyse_route(zd_ai_state, zd_ai_lock, _zd_log, '[ZERODHA]', 'kite', api_key_field='api_key')
+
+@app.route('/api/aibot/mt5/chart_upload', methods=['POST'])
+@login_required
+def mt5_aibot_chart_upload():
+    return _bot_chart_upload_route(mt_ai_state, mt_ai_lock, _mt_log)
+
+@app.route('/api/aibot/mt5/analyse', methods=['POST'])
+@login_required
+def mt5_aibot_analyse():
+    return _bot_analyse_route(mt_ai_state, mt_ai_lock, _mt_log, '[MT5]', 'mt5', api_key_field='mt5_id')
+
+@app.route('/api/aibot/tvbot/chart_upload', methods=['POST'])
+@login_required
+def tvbot_aibot_chart_upload():
+    return _bot_chart_upload_route(tvb_ai_state, tvb_ai_lock, _tvb_log)
+
+@app.route('/api/aibot/tvbot/analyse', methods=['POST'])
+@login_required
+def tvbot_aibot_analyse():
+    return _bot_analyse_route(tvb_ai_state, tvb_ai_lock, _tvb_log, '[TVBOT]', 'tradingview')
+
+@app.route('/api/aibot/doptions/chart_upload', methods=['POST'])
+@login_required
+def doptions_aibot_chart_upload():
+    return _bot_chart_upload_route(do_ai_state, do_ai_lock, _do_log)
+
+@app.route('/api/aibot/doptions/analyse', methods=['POST'])
+@login_required
+def doptions_aibot_analyse():
+    return _bot_analyse_route(do_ai_state, do_ai_lock, _do_log, '[DOPT]', 'delta', symbol_field='baseSymbol')
+
+@app.route('/api/aibot/zoptions/chart_upload', methods=['POST'])
+@login_required
+def zoptions_aibot_chart_upload():
+    return _bot_chart_upload_route(zo_ai_state, zo_ai_lock, _zo_log)
+
+@app.route('/api/aibot/zoptions/analyse', methods=['POST'])
+@login_required
+def zoptions_aibot_analyse():
+    return _bot_analyse_route(zo_ai_state, zo_ai_lock, _zo_log, '[ZOPTIONS]', 'kite', api_key_field='api_key', symbol_field='baseSymbol')
 
 @app.route('/api/aibot/delta/status', methods=['GET'])
 @login_required
@@ -4623,6 +4800,7 @@ def delta_aibot_status():
         running   = delta_ai_state.get('running', False)
         paused    = delta_ai_state.get('paused', False)
         consec    = delta_ai_state.get('consec_losses', 0)
+        last_analysis = delta_ai_state.get('lastAnalysis')
     realized   = sum(t.get('pnl', 0) for t in trades)
     wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unrealized = 0.0
@@ -4651,6 +4829,7 @@ def delta_aibot_status():
         'last_tick': last_tick,
         'last_candles': candles,
         'log':      log_buf,
+        'lastAnalysis': last_analysis,
         'stats': {
             'realized':     round(realized, 4),
             'unrealized':   round(unrealized, 4),
@@ -5005,10 +5184,16 @@ def _zd_bot_tick():
     elif _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and zd_ai_state.get('_decide', True):
-        _tv = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
+        _tv   = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
+        _imgs = _chart_images_for_multi(zd_ai_state)
+        _mtf  = _bot_multi_tf_snapshot('kite', symbol, api_key=cfg.get('api_key'))
+        if not zd_ai_state.get('position') and _bot_preflight_stale(zd_ai_state):
+            _bot_run_preflight_analyse(zd_ai_state, zd_ai_lock, _zd_log, '[ZERODHA]', symbol, cfg.get('model'), _imgs, _mtf)
+        _ectx = {}
+        if _tv:  _ectx['tradingview'] = _tv
+        if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
-                                     extra_ctx=({'tradingview': _tv} if _tv else None),
-                                     images=_chart_images_for(zd_ai_state))
+                                     extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -5330,6 +5515,7 @@ def zd_aibot_status():
         running   = zd_ai_state.get('running', False)
         paused    = zd_ai_state.get('paused', False)
         consec    = zd_ai_state.get('consec_losses', 0)
+        last_analysis = zd_ai_state.get('lastAnalysis')
     realized   = sum(t.get('pnl', 0) for t in trades)
     wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unrealized = 0.0
@@ -5338,7 +5524,7 @@ def zd_aibot_status():
     return jsonify({
         'success':  True, 'running':  running, 'paused':   paused,
         'config':   cfg, 'position': pos, 'last_tick': last_tick,
-        'last_candles': candles, 'log':      log_buf,
+        'last_candles': candles, 'log':      log_buf, 'lastAnalysis': last_analysis,
         'stats': {
             'realized':     round(realized, 2),
             'unrealized':   round(unrealized, 2),
@@ -5860,6 +6046,15 @@ def _zo_bot_tick():
         zo_ai_state['underlyingSpot'] = _us; zo_ai_state['underlyingSym'] = (cfg.get('baseSymbol') or '').upper()
     # TradingView readout for the UNDERLYING (option contracts aren't on TV TA).
     tv_ctx = _tv_context(cfg, 'kite', cfg.get('baseSymbol') or '', '') if _zo_decide else None
+    # Multi-timeframe read of the UNDERLYING (direction driver for every leg) + a
+    # pre-flight written analysis (chart images if uploaded, else these numbers)
+    # once before the first entry / after going flat on every leg.
+    _mtf_ctx = (_bot_multi_tf_snapshot('kite', cfg.get('baseSymbol') or '', api_key=cfg.get('api_key'))
+                if (_zo_decide and cfg.get('baseSymbol')) else None)
+    _zo_imgs = _chart_images_for_multi(zo_ai_state) if _zo_decide else []
+    if (_zo_decide and not any(l.get('position') for l in zo_ai_state['legs']) and _bot_preflight_stale(zo_ai_state)):
+        _bot_run_preflight_analyse(zo_ai_state, zo_ai_lock, _zo_log, '[ZOPTIONS]',
+                                   cfg.get('baseSymbol') or 'options', cfg.get('model'), _zo_imgs, _mtf_ctx)
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -5903,11 +6098,12 @@ def _zo_bot_tick():
             leg_ctx['buyerEnabled']  = buyer
             leg_ctx['sellerEnabled'] = seller
             if tv_ctx: leg_ctx['tradingview'] = tv_ctx
+            if _mtf_ctx: leg_ctx['multiTF'] = _mtf_ctx
         if manual_only:
             strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
         elif _zo_decide:
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx,
-                                         images=_chart_images_for(zo_ai_state))
+                                         images=_zo_imgs)
         elif is_claude:
             strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
         else:
@@ -6181,6 +6377,7 @@ def zo_aibot_status():
         running = zo_ai_state.get('running', False)
         paused  = zo_ai_state.get('paused', False)
         consec  = zo_ai_state.get('consec_losses', 0)
+        last_analysis = zo_ai_state.get('lastAnalysis')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal   = 0.0
@@ -6190,7 +6387,7 @@ def zo_aibot_status():
             unreal += _zd_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'])
     return jsonify({
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
-        'legs': legs, 'log': log_buf,
+        'legs': legs, 'log': log_buf, 'lastAnalysis': last_analysis,
         'underlyingSpot': zo_ai_state.get('underlyingSpot'), 'underlyingSym': zo_ai_state.get('underlyingSym'),
         'underlyingChartSym': zo_ai_state.get('underlyingChartSym'),
         'underlyingCandles': list(zo_ai_state.get('underlyingCandles', []))[-150:],
@@ -8635,10 +8832,16 @@ def _mt_bot_tick():
     elif _autopick is not None:
         strat = _autopick
     elif _bot_is_claude(cfg) and mt_ai_state.get('_decide', True):
-        _tv = _tv_context(cfg, 'mt5', symbol, '')
+        _tv   = _tv_context(cfg, 'mt5', symbol, '')
+        _imgs = _chart_images_for_multi(mt_ai_state)
+        _mtf  = _bot_multi_tf_snapshot('mt5', symbol, api_key=cfg.get('mt5_id'))
+        if not mt_ai_state.get('position') and _bot_preflight_stale(mt_ai_state):
+            _bot_run_preflight_analyse(mt_ai_state, mt_ai_lock, _mt_log, '[MT5]', symbol, cfg.get('model'), _imgs, _mtf)
+        _ectx = {}
+        if _tv:  _ectx['tradingview'] = _tv
+        if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
-                                     extra_ctx=({'tradingview': _tv} if _tv else None),
-                                     images=_chart_images_for(mt_ai_state))
+                                     extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -8926,6 +9129,7 @@ def mt_aibot_status():
         running   = mt_ai_state.get('running', False)
         paused    = mt_ai_state.get('paused', False)
         consec    = mt_ai_state.get('consec_losses', 0)
+        last_analysis = mt_ai_state.get('lastAnalysis')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal   = 0.0
@@ -8934,6 +9138,7 @@ def mt_aibot_status():
     return jsonify({
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
         'position': pos, 'last_tick': last_tick, 'last_candles': candles, 'log': log_buf,
+        'lastAnalysis': last_analysis,
         'stats': {
             'realized': round(realized, 5), 'unrealized': round(unreal, 5),
             'tradeCount': len(trades),
@@ -9877,6 +10082,14 @@ def _do_bot_tick():
     if uspot:
         do_ai_state['underlyingSpot'] = uspot
         do_ai_state['underlyingSym'] = (cfg.get('baseSymbol') or '').upper()
+    # Multi-timeframe read of the UNDERLYING + a pre-flight written analysis
+    # (chart images if uploaded, else these numbers) once before the first
+    # entry / after going flat on every leg.
+    _mtf_ctx = _bot_multi_tf_snapshot('delta', cfg.get('baseSymbol') or '') if (decide and cfg.get('baseSymbol')) else None
+    _do_imgs = _chart_images_for_multi(do_ai_state) if decide else []
+    if decide and not any(l.get('position') for l in do_ai_state['legs']) and _bot_preflight_stale(do_ai_state):
+        _bot_run_preflight_analyse(do_ai_state, do_ai_lock, _do_log, '[DOPT]',
+                                   cfg.get('baseSymbol') or 'options', cfg.get('model'), _do_imgs, _mtf_ctx)
     for leg in list(do_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -9918,8 +10131,9 @@ def _do_bot_tick():
             leg_ctx = dict(base_ctx) if base_ctx else {}
             leg_ctx.update(_do_option_meta(symbol, (base_ctx or {}).get('underlyingSpot') or 0))
             leg_ctx['buyerEnabled'] = buyer; leg_ctx['sellerEnabled'] = seller
+            if _mtf_ctx: leg_ctx['multiTF'] = _mtf_ctx
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), do_ai_state.get('trades'),
-                                         extra_ctx=leg_ctx, images=_chart_images_for(do_ai_state))
+                                         extra_ctx=leg_ctx, images=_do_imgs)
         else:
             strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
         sig = strat['signal']
@@ -10098,6 +10312,7 @@ def do_aibot_status():
                  'last_candles': list(l.get('last_candles', []))} for l in do_ai_state.get('legs', [])]
         log_buf = list(do_ai_state.get('log', []))[-200:]
         running = do_ai_state.get('running', False); paused = do_ai_state.get('paused', False)
+        last_analysis = do_ai_state.get('lastAnalysis')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal = 0.0
@@ -10110,7 +10325,8 @@ def do_aibot_status():
                     'underlyingSpot': do_ai_state.get('underlyingSpot'), 'underlyingSym': do_ai_state.get('underlyingSym'),
                     'underlyingChartSym': do_ai_state.get('underlyingChartSym'),
                     'underlyingCandles': list(do_ai_state.get('underlyingCandles', []))[-150:],
-                    'winRate': round(wins / len(trades) * 100, 1) if trades else None, 'log': log_buf})
+                    'winRate': round(wins / len(trades) * 100, 1) if trades else None, 'log': log_buf,
+                    'lastAnalysis': last_analysis})
 
 @app.route('/api/aibot/doptions/reset', methods=['POST'])
 @login_required
@@ -10239,10 +10455,16 @@ def _tvb_bot_tick():
     manual_only = bool(cfg.get('manualOnly'))
     decide = tvb_ai_state.get('_decide', True) and not manual_only
     if _bot_is_claude(cfg) and decide:
-        _tv = _tv_context(cfg, 'tradingview', symbol, '') if cfg.get('tvEnabled') else None
+        _tv   = _tv_context(cfg, 'tradingview', symbol, '') if cfg.get('tvEnabled') else None
+        _imgs = _chart_images_for_multi(tvb_ai_state)
+        _mtf  = _bot_multi_tf_snapshot('tradingview', symbol)
+        if not tvb_ai_state.get('position') and _bot_preflight_stale(tvb_ai_state):
+            _bot_run_preflight_analyse(tvb_ai_state, tvb_ai_lock, _tvb_log, '[TVBOT]', symbol, cfg.get('model'), _imgs, _mtf)
+        _ectx = {}
+        if _tv:  _ectx['tradingview'] = _tv
+        if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
-                                     tvb_ai_state.get('trades'), extra_ctx=({'tradingview': _tv} if _tv else None),
-                                     images=_chart_images_for(tvb_ai_state))
+                                     tvb_ai_state.get('trades'), extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -10346,7 +10568,9 @@ def tvb_aibot_start():
         claude = bool(data.get('claude', True))
         tvb_ai_state['config'] = {
             'symbol': symbol, 'currency': (data.get('currency') or 'USD').upper(),
-            'strategies': 'claude' if claude else 'tv', 'tvEnabled': bool(data.get('tvEnabled', True)),
+            'strategies': 'claude' if claude else 'tv',
+            'allowedStrategies': ['claude'] if claude else [],   # _bot_is_claude() reads this, not 'strategies'
+            'tvEnabled': bool(data.get('tvEnabled', True)),
             'manualOnly': bool(data.get('manualOnly', False)),
             'tvSymbol': symbol, 'emaMode': bool(data.get('emaMode', False)),
             'trendGate': bool(data.get('trendGate', False)), 'avoidRange': bool(data.get('avoidRange', False)),
@@ -10422,6 +10646,7 @@ def tvb_aibot_status():
         candles = list(tvb_ai_state.get('last_candles', []))[-150:]
         log_buf = list(tvb_ai_state.get('log', []))[-200:]
         running = tvb_ai_state.get('running', False); paused = tvb_ai_state.get('paused', False)
+        last_analysis = tvb_ai_state.get('lastAnalysis')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal = 0.0
@@ -10431,7 +10656,8 @@ def tvb_aibot_status():
                     'position': pos, 'lastTick': lt, 'candles': candles, 'trades': trades[-40:],
                     'realizedPnl': round(realized, 4), 'unrealizedPnl': round(unreal, 4),
                     'winRate': round(wins / len(trades) * 100, 1) if trades else None,
-                    'ccy': '₹' if (cfg.get('currency') or 'USD').upper() == 'INR' else '$', 'log': log_buf})
+                    'ccy': '₹' if (cfg.get('currency') or 'USD').upper() == 'INR' else '$', 'log': log_buf,
+                    'lastAnalysis': last_analysis})
 
 @app.route('/api/aibot/tvbot/reset', methods=['POST'])
 @login_required
@@ -21155,7 +21381,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="aiBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <!-- Connection status -->
       <div class="zd-status-bar" id="aiBotStatusBar" style="margin-bottom:10px">
@@ -21250,11 +21476,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="aiBotClaudeChk" checked> &#129302; Claude AI</label>
           <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="aiBotIncludeMM"><input type="checkbox" id="aiBotIncludeMMA"></span>
+      </div>
+
+      <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
+           1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
+           Start trades with all of them as ongoing vision context each decision tick. -->
+      <div class="ai-strat-bar" id="aiBotChartsBar">
+        <span class="lbl">&#128196; Charts:</span>
+        <span id="aiBotChartSlots" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="zd-add-btn" type="button" data-slot="1d"  style="padding:4px 10px;font-size:11px">1D</button>
+          <button class="zd-add-btn" type="button" data-slot="1h"  style="padding:4px 10px;font-size:11px">1H</button>
+          <button class="zd-add-btn" type="button" data-slot="30m" style="padding:4px 10px;font-size:11px">30m</button>
+          <button class="zd-add-btn" type="button" data-slot="15m" style="padding:4px 10px;font-size:11px">15m</button>
+          <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
+        </span>
+        <button class="zd-add-btn" id="aiBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
+        <span style="color:#787b86;font-size:10px">(optional — charts stay attached to every trade decision for ~3h. Even with nothing uploaded, Claude auto-analyses 1D/1H/30m/15m/5m and posts its read here before its first trade)</span>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
@@ -21433,7 +21675,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="mtBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <div class="zd-status-bar" id="mtBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="mtBotStatusDot"></span>
@@ -21491,11 +21733,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="mtBotClaudeChk" checked> &#129302; Claude AI</label>
           <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="mtBotIncludeMM"><input type="checkbox" id="mtBotIncludeMMA"></span>
+      </div>
+
+      <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
+           1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
+           Start trades with all of them as ongoing vision context each decision tick. -->
+      <div class="ai-strat-bar" id="mtBotChartsBar">
+        <span class="lbl">&#128196; Charts:</span>
+        <span id="mtBotChartSlots" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="zd-add-btn" type="button" data-slot="1d"  style="padding:4px 10px;font-size:11px">1D</button>
+          <button class="zd-add-btn" type="button" data-slot="1h"  style="padding:4px 10px;font-size:11px">1H</button>
+          <button class="zd-add-btn" type="button" data-slot="30m" style="padding:4px 10px;font-size:11px">30m</button>
+          <button class="zd-add-btn" type="button" data-slot="15m" style="padding:4px 10px;font-size:11px">15m</button>
+          <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
+        </span>
+        <button class="zd-add-btn" id="mtBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
+        <span style="color:#787b86;font-size:10px">(optional — charts stay attached to every trade decision for ~3h. Even with nothing uploaded, Claude auto-analyses 1D/1H/30m/15m/5m and posts its read here before its first trade)</span>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
@@ -21696,7 +21954,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
         </span>
         <button class="zd-add-btn" id="deltaBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
-        <span style="color:#787b86;font-size:10px">(upload each timeframe, then Analyse before Start — charts stay attached to every trade decision for ~3h)</span>
+        <span style="color:#787b86;font-size:10px">(optional — charts stay attached to every trade decision for ~3h. Even with nothing uploaded, Claude auto-analyses 1D/1H/30m/15m/5m and posts its read here before its first trade)</span>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
@@ -21818,7 +22076,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>SL%<input type="number" id="tvBotSlPct" value="1.0" min="0.1" step="0.1" style="width:60px"></label>
         <label>TP%<input type="number" id="tvBotTpPct" value="2.0" min="0.1" step="0.1" style="width:60px"></label>
         <label>Model<select id="tvBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label>Tick<select id="tvBotTickSec"><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option></select></label>
+        <label>Tick<select id="tvBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+      </div>
+
+      <!-- Multi-timeframe chart upload (optional): upload 1D/1H/30m/15m/5m charts,
+           click Analyse for a combined pre-flight read, then Start trades with all
+           of them as ongoing vision context each decision tick. Even with nothing
+           uploaded, Claude auto-analyses these timeframes from live data. -->
+      <div class="ai-strat-bar" id="tvBotChartsBar">
+        <span class="lbl">&#128196; Charts:</span>
+        <span id="tvBotChartSlots" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="zd-add-btn" type="button" data-slot="1d"  style="padding:4px 10px;font-size:11px">1D</button>
+          <button class="zd-add-btn" type="button" data-slot="1h"  style="padding:4px 10px;font-size:11px">1H</button>
+          <button class="zd-add-btn" type="button" data-slot="30m" style="padding:4px 10px;font-size:11px">30m</button>
+          <button class="zd-add-btn" type="button" data-slot="15m" style="padding:4px 10px;font-size:11px">15m</button>
+          <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
+        </span>
+        <button class="zd-add-btn" id="tvBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
+        <span style="color:#787b86;font-size:10px">(optional — even with nothing uploaded, Claude auto-analyses 1D/1H/30m/15m/5m and posts its read here before its first trade)</span>
       </div>
       <div class="ai-input-bar" id="tvBotTvOpts" style="display:none">
         <label title="EMA 5/13 exit-only mode (SuperTrend = entry). Off = dual signal."><input type="checkbox" id="tvBotEmaMode"> EMA mode</label>
@@ -21893,8 +22168,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when realised P/L drops below this.">Daily loss $<input type="number" id="doBotMaxLoss" value="50" min="1"></label>
         <label title="Bot banks + stops once realised+open P/L reaches this. 0 = off.">Daily profit $<input type="number" id="doBotMaxProfit" value="0" min="0"></label>
         <label>Model<select id="doBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="How often the bot checks + calls Claude.">Tick<select id="doBotTickSec"><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option></select></label>
+        <label title="How often the bot checks + calls Claude.">Tick<select id="doBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
         <label title="Paper = simulated. Live = real Delta orders.">Mode<select id="doBotMode"><option value="paper" selected>Paper</option><option value="live">Live</option></select></label>
+      </div>
+
+      <!-- Multi-timeframe chart upload (optional): upload 1D/1H/30m/15m/5m charts,
+           click Analyse for a combined pre-flight read, then Start trades with all
+           of them as ongoing vision context each decision tick. Even with nothing
+           uploaded, Claude auto-analyses these timeframes from live data. -->
+      <div class="ai-strat-bar" id="doBotChartsBar">
+        <span class="lbl">&#128196; Charts:</span>
+        <span id="doBotChartSlots" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="zd-add-btn" type="button" data-slot="1d"  style="padding:4px 10px;font-size:11px">1D</button>
+          <button class="zd-add-btn" type="button" data-slot="1h"  style="padding:4px 10px;font-size:11px">1H</button>
+          <button class="zd-add-btn" type="button" data-slot="30m" style="padding:4px 10px;font-size:11px">30m</button>
+          <button class="zd-add-btn" type="button" data-slot="15m" style="padding:4px 10px;font-size:11px">15m</button>
+          <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
+        </span>
+        <button class="zd-add-btn" id="doBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
+        <span style="color:#787b86;font-size:10px">(optional — even with nothing uploaded, Claude auto-analyses 1D/1H/30m/15m/5m and posts its read here before its first trade)</span>
       </div>
       <div class="zd-status-bar" style="margin-bottom:8px">
         <span class="zd-status-dot" id="doBotStatusDot"></span>
@@ -21988,7 +22280,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
         <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="zoBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <div class="zd-status-bar" id="zoBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="zoBotStatusDot"></span>
@@ -22107,11 +22399,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="ai-strat-bar">
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
-          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" checked> &#129302; Claude AI</label>
+          <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="zoBotClaudeChk" checked> &#129302; Claude AI</label>
           <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="zoBotIncludeMM"><input type="checkbox" id="zoBotIncludeMMA"></span>
+      </div>
+
+      <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
+           1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
+           Start trades with all of them as ongoing vision context each decision tick. -->
+      <div class="ai-strat-bar" id="zoBotChartsBar">
+        <span class="lbl">&#128196; Charts:</span>
+        <span id="zoBotChartSlots" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="zd-add-btn" type="button" data-slot="1d"  style="padding:4px 10px;font-size:11px">1D</button>
+          <button class="zd-add-btn" type="button" data-slot="1h"  style="padding:4px 10px;font-size:11px">1H</button>
+          <button class="zd-add-btn" type="button" data-slot="30m" style="padding:4px 10px;font-size:11px">30m</button>
+          <button class="zd-add-btn" type="button" data-slot="15m" style="padding:4px 10px;font-size:11px">15m</button>
+          <button class="zd-add-btn" type="button" data-slot="5m"  style="padding:4px 10px;font-size:11px">5m</button>
+        </span>
+        <button class="zd-add-btn" id="zoBotAnalyseBtn" type="button" title="Send every uploaded chart to Claude for one combined multi-timeframe read" style="margin-left:6px">&#129302; Analyse</button>
+        <span style="color:#787b86;font-size:10px">(optional — charts stay attached to every trade decision for ~3h. Even with nothing uploaded, Claude auto-analyses 1D/1H/30m/15m/5m and posts its read here before its first trade)</span>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) on the UNDERLYING — context for Claude -->
@@ -28551,6 +28859,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // /status for display. The old client-side botTick() above is unused.
     let lastRenderedLogLen = 0;
     let statusPoller = null;
+    let _lastAnalysisTs = 0;
+    function _escAnalysis(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function _surfaceAnalysis(s) {
+      // Auto pre-flight analysis (posted by the server before the bot's first
+      // entry — with or without uploaded charts) shown in the chat window once,
+      // the same way the manual Analyse button's reply is shown.
+      const a = s && s.lastAnalysis;
+      if (!a || !a.ts || a.ts === _lastAnalysisTs) return;
+      _lastAnalysisTs = a.ts;
+      const mEl = document.getElementById('zerodhaChatMsgs');
+      if (!mEl) return;
+      const d = document.createElement('div'); d.className = 'dbot-msg bot';
+      d.innerHTML = '📊 ' + (a.auto ? 'Auto ' : '') + 'multi-timeframe analysis (' + _escAnalysis(a.charts || '') + '):';
+      mEl.appendChild(d);
+      const body = document.createElement('div'); body.style.marginTop = '4px';
+      body.innerHTML = _escAnalysis(a.text || '').replace(/\n/g, '<br>');
+      mEl.appendChild(body);
+      mEl.scrollTop = mEl.scrollHeight;
+    }
     function _renderPauseBtn() {
       if (botPaused) { pauseBtn.innerHTML = '▶ Resume'; pauseBtn.classList.remove('pause'); pauseBtn.classList.add('resume'); }
       else           { pauseBtn.innerHTML = '⏸ Pause';  pauseBtn.classList.remove('resume'); pauseBtn.classList.add('pause'); }
@@ -28570,6 +28897,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function pollStatus() { fetch('/api/aibot/zerodha/status').then(r => r.json()).then(applyStatus).catch(() => {}); }
     function applyStatus(s) {
       if (!s || !s.success) return;
+      _surfaceAnalysis(s);
       botRunning = !!s.running; botPaused = !!s.paused;
       startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
       _renderPauseBtn();
@@ -28950,6 +29278,70 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       sendEl.addEventListener('click', send);
       inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+
+      // ---- Multi-timeframe chart upload + Analyse (shown when Claude AI is on) ----
+      (function() {
+        const claudeChk = document.getElementById('aiBotClaudeChk');
+        const chartsBar = document.getElementById('aiBotChartsBar');
+        const slotBtns  = Array.prototype.slice.call(document.querySelectorAll('#aiBotChartSlots button[data-slot]'));
+        const analyseBtn = document.getElementById('aiBotAnalyseBtn');
+        if (!chartsBar || !analyseBtn) return;
+
+        function syncChartsBarVisibility() {
+          chartsBar.style.display = (claudeChk && claudeChk.checked) ? '' : 'none';
+        }
+        if (claudeChk) claudeChk.addEventListener('change', syncChartsBarVisibility);
+        syncChartsBarVisibility();
+
+        const slotFile = document.createElement('input');
+        slotFile.type = 'file'; slotFile.accept = 'image/*'; slotFile.style.display = 'none';
+        document.body.appendChild(slotFile);
+        let pendingSlot = null;
+        slotBtns.forEach(function(btn) {
+          btn.addEventListener('click', function() { pendingSlot = btn.dataset.slot; slotFile.click(); });
+        });
+        slotFile.addEventListener('change', function() {
+          const f = slotFile.files && slotFile.files[0]; slotFile.value = '';
+          const slot = pendingSlot; pendingSlot = null;
+          if (!f || !slot) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function() {
+            const dataUrl = String(rd.result || '');
+            fetch('/api/aibot/zerodha/chart_upload', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ slot: slot, image: dataUrl }) })
+              .then(r => r.json()).then(function(res) {
+                const btn = slotBtns.find(function(b) { return b.dataset.slot === slot; });
+                if (res.success) {
+                  if (btn) { btn.style.background = '#26a69a'; btn.style.color = '#fff'; btn.textContent = slot.toUpperCase() + ' ✓'; }
+                  addMsg(slot.toUpperCase() + ' chart uploaded (valid ~3h).', 'bot');
+                } else {
+                  addMsg('Upload failed (' + slot + '): ' + (res.error || 'unknown'), 'err');
+                }
+              }).catch(function(e) { addMsg('Upload error (' + slot + '): ' + e.message, 'err'); });
+          };
+          rd.readAsDataURL(f);
+        });
+
+        analyseBtn.addEventListener('click', function() {
+          analyseBtn.disabled = true; analyseBtn.textContent = 'Analysing…';
+          const thinking = addMsg('Analysing…', 'bot');
+          fetch('/api/aibot/zerodha/analyse', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''),
+                                    symbol: (document.getElementById('aiBotSymbol') || {}).value }) })
+            .then(r => r.json()).then(function(res) {
+              thinking.remove();
+              if (!res.success) { addMsg('Analyse failed: ' + (res.error || 'unknown'), 'err'); return; }
+              const d = addMsg('📊 Multi-timeframe analysis (' + (res.charts || '') + '):', 'bot');
+              const body = document.createElement('div');
+              body.style.marginTop = '4px';
+              body.innerHTML = esc(res.reply || '').replace(/\n/g, '<br>');
+              d.appendChild(body);
+              msgsEl.scrollTop = msgsEl.scrollHeight;
+            }).catch(function(e) { thinking.remove(); addMsg('Analyse error: ' + e.message, 'err'); })
+            .finally(function() { analyseBtn.disabled = false; analyseBtn.textContent = '🤖 Analyse'; });
+        });
+      })();
     })();
 
     function loadTradeHistory() {
@@ -28980,7 +29372,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (!panel) return;
     const $ = function(id){ return document.getElementById(id); };
     const logEl=$('tvBotLog'), msgsEl=$('tvBotChatMsgs'), inputEl=$('tvBotChatInput'), sendEl=$('tvBotChatSend');
-    let pendingChartImg='', chartBtn=null, pollTimer=null;
+    let pendingChartImg='', chartBtn=null, pollTimer=null, _lastAnalysisTs=0;
+    function _escAnalysis(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function _surfaceAnalysis(d){
+      const a=d&&d.lastAnalysis;
+      if(!a||!a.ts||a.ts===_lastAnalysisTs) return;
+      _lastAnalysisTs=a.ts;
+      if(!msgsEl) return;
+      const el=document.createElement('div'); el.className='dbot-msg bot';
+      el.innerHTML='📊 '+(a.auto?'Auto ':'')+'multi-timeframe analysis ('+_escAnalysis(a.charts||'')+'):';
+      msgsEl.appendChild(el);
+      const body=document.createElement('div'); body.style.marginTop='4px'; body.innerHTML=_escAnalysis(a.text||'').replace(/\n/g,'<br>');
+      msgsEl.appendChild(body); msgsEl.scrollTop=msgsEl.scrollHeight;
+    }
     function post(url,b){ return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()); }
     function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
     (function(){ const h=$('tvBotHeader'); if(!h) return; let dx=0,dy=0,drag=false; h.style.cursor='move';
@@ -29020,6 +29424,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fetch('/api/candles?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&source=tradingview').then(r=>r.json()).then(d=>{ if(d.candles&&d.candles.length){ setTv(d.candles); if(tvChart)tvChart.timeScale().fitContent(); } }).catch(()=>{}); }
     if($('tvBotLoadBtn')) $('tvBotLoadBtn').addEventListener('click', loadChart);
     function renderStatus(d){ if(!d||!d.success) return;
+      _surfaceAnalysis(d);
       const lt=d.lastTick||{}, pos=d.position, cc=d.ccy||'$';
       if($('tvBotPrice')) $('tvBotPrice').textContent = lt.price!=null?lt.price:'—';
       if($('tvBotPos')){ $('tvBotPos').textContent = pos?(pos.side+' '+pos.qty+' @'+pos.entryPrice):'FLAT'; $('tvBotPos').className='val '+(pos?(pos.side==='BUY'?'bull':'bear'):''); }
@@ -29066,6 +29471,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }).catch(e=>{ think.remove(); addMsg('Error: '+e.message,'err'); }).finally(()=>{ sendEl.disabled=false; inputEl.focus(); }); }
     if(sendEl) sendEl.addEventListener('click', send);
     if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
+    // ---- Multi-timeframe chart upload + Analyse (always available — this bot is Claude-only) ----
+    (function(){
+      const slotBtns=Array.prototype.slice.call(document.querySelectorAll('#tvBotChartSlots button[data-slot]'));
+      const analyseBtn=$('tvBotAnalyseBtn');
+      if(!analyseBtn) return;
+      const slotFile=document.createElement('input'); slotFile.type='file'; slotFile.accept='image/*'; slotFile.style.display='none';
+      document.body.appendChild(slotFile);
+      let pendingSlot=null;
+      slotBtns.forEach(function(btn){ btn.addEventListener('click', function(){ pendingSlot=btn.dataset.slot; slotFile.click(); }); });
+      slotFile.addEventListener('change', function(){
+        const f=slotFile.files&&slotFile.files[0]; slotFile.value=''; const slot=pendingSlot; pendingSlot=null;
+        if(!f||!slot) return;
+        if(f.size>5*1024*1024){ addMsg('Image too large (max 5MB).','err'); return; }
+        const rd=new FileReader();
+        rd.onload=function(){ const dataUrl=String(rd.result||'');
+          post('/api/aibot/tvbot/chart_upload', {slot:slot, image:dataUrl}).then(function(res){
+            const btn=slotBtns.find(function(b){ return b.dataset.slot===slot; });
+            if(res.success){ if(btn){ btn.style.background='#26a69a'; btn.style.color='#fff'; btn.textContent=slot.toUpperCase()+' ✓'; } addMsg(slot.toUpperCase()+' chart uploaded (valid ~3h).','bot'); }
+            else addMsg('Upload failed ('+slot+'): '+(res.error||'unknown'),'err');
+          }).catch(function(e){ addMsg('Upload error ('+slot+'): '+e.message,'err'); }); };
+        rd.readAsDataURL(f);
+      });
+      analyseBtn.addEventListener('click', function(){
+        analyseBtn.disabled=true; analyseBtn.textContent='Analysing…';
+        const thinking=addMsg('Analysing…','bot');
+        post('/api/aibot/tvbot/analyse', {model:$('tvBotModel').value, symbol:($('tvBotSymbol').value||'').trim().toUpperCase()}).then(function(res){
+          thinking.remove();
+          if(!res.success){ addMsg('Analyse failed: '+(res.error||'unknown'),'err'); return; }
+          const d=addMsg('📊 Multi-timeframe analysis ('+(res.charts||'')+'):','bot');
+          const body=document.createElement('div'); body.style.marginTop='4px'; body.innerHTML=esc(res.reply||'').replace(/\n/g,'<br>');
+          d.appendChild(body); msgsEl.scrollTop=msgsEl.scrollHeight;
+        }).catch(function(e){ thinking.remove(); addMsg('Analyse error: '+e.message,'err'); })
+          .finally(function(){ analyseBtn.disabled=false; analyseBtn.textContent='🤖 Analyse'; });
+      });
+    })();
     const openBtn=document.getElementById('btnTVBot');
     if(openBtn) openBtn.addEventListener('click', function(){ panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.classList.remove('open'); setTimeout(initTvChart, 60); startPolling(); });
   })();
@@ -29076,7 +29516,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (!panel) return;
     const $ = function(id){ return document.getElementById(id); };
     const logEl = $('doBotLog'), msgsEl = $('doBotChatMsgs'), inputEl = $('doBotChatInput'), sendEl = $('doBotChatSend');
-    let pendingChartImg = '', chartBtn = null, pollTimer = null;
+    let pendingChartImg = '', chartBtn = null, pollTimer = null, _lastAnalysisTs = 0;
+    function _escAnalysis(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function _surfaceAnalysis(d){
+      const a=d&&d.lastAnalysis;
+      if(!a||!a.ts||a.ts===_lastAnalysisTs) return;
+      _lastAnalysisTs=a.ts;
+      if(!msgsEl) return;
+      const el=document.createElement('div'); el.className='dbot-msg bot';
+      el.innerHTML='📊 '+(a.auto?'Auto ':'')+'multi-timeframe analysis ('+_escAnalysis(a.charts||'')+'):';
+      msgsEl.appendChild(el);
+      const body=document.createElement('div'); body.style.marginTop='4px'; body.innerHTML=_escAnalysis(a.text||'').replace(/\n/g,'<br>');
+      msgsEl.appendChild(body); msgsEl.scrollTop=msgsEl.scrollHeight;
+    }
     function post(url, b){ return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(b||{})}).then(r=>r.json()); }
     function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
     function deltaApiKey(){ const el = document.getElementById('deltaBotApiKey') || document.getElementById('deltaApiKey'); return el ? (el.value||'').trim() : ''; }
@@ -29130,6 +29582,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if($('doBotLoadBtn')) $('doBotLoadBtn').addEventListener('click', loadCharts);
     function renderStatus(d){
       if(!d||!d.success) return;
+      _surfaceAnalysis(d);
       const dot=$('doBotStatusDot'); if(dot) dot.style.background = d.running ? '#26a69a' : '#787b86';
       const legs=d.legs||[];
       const ul=(d.underlyingSym && d.underlyingSpot!=null)?(d.underlyingSym+' '+d.underlyingSpot):'—';
@@ -29199,6 +29652,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     if(sendEl) sendEl.addEventListener('click', send);
     if(inputEl) inputEl.addEventListener('keydown', function(e){ if(e.key==='Enter') send(); });
+    // ---- Multi-timeframe chart upload + Analyse (always available — this bot is Claude-only) ----
+    (function(){
+      const slotBtns=Array.prototype.slice.call(document.querySelectorAll('#doBotChartSlots button[data-slot]'));
+      const analyseBtn=$('doBotAnalyseBtn');
+      if(!analyseBtn) return;
+      const slotFile=document.createElement('input'); slotFile.type='file'; slotFile.accept='image/*'; slotFile.style.display='none';
+      document.body.appendChild(slotFile);
+      let pendingSlot=null;
+      slotBtns.forEach(function(btn){ btn.addEventListener('click', function(){ pendingSlot=btn.dataset.slot; slotFile.click(); }); });
+      slotFile.addEventListener('change', function(){
+        const f=slotFile.files&&slotFile.files[0]; slotFile.value=''; const slot=pendingSlot; pendingSlot=null;
+        if(!f||!slot) return;
+        if(f.size>5*1024*1024){ addMsg('Image too large (max 5MB).','err'); return; }
+        const rd=new FileReader();
+        rd.onload=function(){ const dataUrl=String(rd.result||'');
+          post('/api/aibot/doptions/chart_upload', {slot:slot, image:dataUrl}).then(function(res){
+            const btn=slotBtns.find(function(b){ return b.dataset.slot===slot; });
+            if(res.success){ if(btn){ btn.style.background='#26a69a'; btn.style.color='#fff'; btn.textContent=slot.toUpperCase()+' ✓'; } addMsg(slot.toUpperCase()+' chart uploaded (valid ~3h).','bot'); }
+            else addMsg('Upload failed ('+slot+'): '+(res.error||'unknown'),'err');
+          }).catch(function(e){ addMsg('Upload error ('+slot+'): '+e.message,'err'); }); };
+        rd.readAsDataURL(f);
+      });
+      analyseBtn.addEventListener('click', function(){
+        analyseBtn.disabled=true; analyseBtn.textContent='Analysing…';
+        const thinking=addMsg('Analysing…','bot');
+        post('/api/aibot/doptions/analyse', {model:$('doBotModel').value, symbol:$('doBotBaseSel').value}).then(function(res){
+          thinking.remove();
+          if(!res.success){ addMsg('Analyse failed: '+(res.error||'unknown'),'err'); return; }
+          const d=addMsg('📊 Multi-timeframe analysis ('+(res.charts||'')+'):','bot');
+          const body=document.createElement('div'); body.style.marginTop='4px'; body.innerHTML=esc(res.reply||'').replace(/\n/g,'<br>');
+          d.appendChild(body); msgsEl.scrollTop=msgsEl.scrollHeight;
+        }).catch(function(e){ thinking.remove(); addMsg('Analyse error: '+e.message,'err'); })
+          .finally(function(){ analyseBtn.disabled=false; analyseBtn.textContent='🤖 Analyse'; });
+      });
+    })();
     const openBtn=document.getElementById('btnDOptionsBot');
     if(openBtn) openBtn.addEventListener('click', function(){
       panel.style.display='block'; const dd=document.getElementById('automationDropdown'); if(dd) dd.classList.remove('open');
@@ -29476,8 +29964,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!p) return leg.symbol + ': FLAT';
       return leg.symbol + ': ' + (p.side === 'BUY' ? 'LONG' : 'SHORT') + ' @ ' + p.entryPrice + ' (' + p.strategy + ')';
     }
+    let _lastAnalysisTs = 0;
+    function _escAnalysis(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function _surfaceAnalysis(s) {
+      const a = s && s.lastAnalysis;
+      if (!a || !a.ts || a.ts === _lastAnalysisTs) return;
+      _lastAnalysisTs = a.ts;
+      const mEl = document.getElementById('zoChatMsgs');
+      if (!mEl) return;
+      const d = document.createElement('div'); d.className = 'dbot-msg bot';
+      d.innerHTML = '📊 ' + (a.auto ? 'Auto ' : '') + 'multi-timeframe analysis (' + _escAnalysis(a.charts || '') + '):';
+      mEl.appendChild(d);
+      const body = document.createElement('div'); body.style.marginTop = '4px';
+      body.innerHTML = _escAnalysis(a.text || '').replace(/\n/g, '<br>');
+      mEl.appendChild(body);
+      mEl.scrollTop = mEl.scrollHeight;
+    }
     function applyStatus(s) {
       if (!s || !s.success) return;
+      _surfaceAnalysis(s);
       botRunning = !!s.running; botPaused = !!s.paused;
       startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
       _renderPauseBtn();
@@ -29720,6 +30225,71 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       sendEl.addEventListener('click', send);
       inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+
+      // ---- Multi-timeframe chart upload + Analyse (shown when Claude AI is on) ----
+      (function() {
+        const claudeChk = document.getElementById('zoBotClaudeChk');
+        const chartsBar = document.getElementById('zoBotChartsBar');
+        const slotBtns  = Array.prototype.slice.call(document.querySelectorAll('#zoBotChartSlots button[data-slot]'));
+        const analyseBtn = document.getElementById('zoBotAnalyseBtn');
+        if (!chartsBar || !analyseBtn) return;
+
+        function syncChartsBarVisibility() {
+          chartsBar.style.display = (claudeChk && claudeChk.checked) ? '' : 'none';
+        }
+        if (claudeChk) claudeChk.addEventListener('change', syncChartsBarVisibility);
+        syncChartsBarVisibility();
+
+        const slotFile = document.createElement('input');
+        slotFile.type = 'file'; slotFile.accept = 'image/*'; slotFile.style.display = 'none';
+        document.body.appendChild(slotFile);
+        let pendingSlot = null;
+        slotBtns.forEach(function(btn) {
+          btn.addEventListener('click', function() { pendingSlot = btn.dataset.slot; slotFile.click(); });
+        });
+        slotFile.addEventListener('change', function() {
+          const f = slotFile.files && slotFile.files[0]; slotFile.value = '';
+          const slot = pendingSlot; pendingSlot = null;
+          if (!f || !slot) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function() {
+            const dataUrl = String(rd.result || '');
+            fetch('/api/aibot/zoptions/chart_upload', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ slot: slot, image: dataUrl }) })
+              .then(r => r.json()).then(function(res) {
+                const btn = slotBtns.find(function(b) { return b.dataset.slot === slot; });
+                if (res.success) {
+                  if (btn) { btn.style.background = '#26a69a'; btn.style.color = '#fff'; btn.textContent = slot.toUpperCase() + ' ✓'; }
+                  addMsg(slot.toUpperCase() + ' chart uploaded (valid ~3h).', 'bot');
+                } else {
+                  addMsg('Upload failed (' + slot + '): ' + (res.error || 'unknown'), 'err');
+                }
+              }).catch(function(e) { addMsg('Upload error (' + slot + '): ' + e.message, 'err'); });
+          };
+          rd.readAsDataURL(f);
+        });
+
+        analyseBtn.addEventListener('click', function() {
+          let base = (document.getElementById('zoBotBaseSel') || {}).value || '';
+          if (base === '__custom') base = ((document.getElementById('zoBotBaseCustom') || {}).value || '').toUpperCase();
+          analyseBtn.disabled = true; analyseBtn.textContent = 'Analysing…';
+          const thinking = addMsg('Analysing…', 'bot');
+          fetch('/api/aibot/zoptions/analyse', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''), symbol: base }) })
+            .then(r => r.json()).then(function(res) {
+              thinking.remove();
+              if (!res.success) { addMsg('Analyse failed: ' + (res.error || 'unknown'), 'err'); return; }
+              const d = addMsg('📊 Multi-timeframe analysis (' + (res.charts || '') + '):', 'bot');
+              const body = document.createElement('div');
+              body.style.marginTop = '4px';
+              body.innerHTML = esc(res.reply || '').replace(/\n/g, '<br>');
+              d.appendChild(body);
+              msgsEl.scrollTop = msgsEl.scrollHeight;
+            }).catch(function(e) { thinking.remove(); addMsg('Analyse error: ' + e.message, 'err'); })
+            .finally(function() { analyseBtn.disabled = false; analyseBtn.textContent = '🤖 Analyse'; });
+        });
+      })();
     })();
 
     refreshStatus();
@@ -31154,8 +31724,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function startStatusPoll() { if (statusPoller) return; pollStatus(); statusPoller = setInterval(pollStatus, 5000); }
     function stopStatusPoll() { if (statusPoller) { clearInterval(statusPoller); statusPoller = null; } }
     function pollStatus() { fetch('/api/aibot/mt5/status').then(r => r.json()).then(applyStatus).catch(() => {}); }
+    let _lastAnalysisTs = 0;
+    function _escAnalysis(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function _surfaceAnalysis(s) {
+      const a = s && s.lastAnalysis;
+      if (!a || !a.ts || a.ts === _lastAnalysisTs) return;
+      _lastAnalysisTs = a.ts;
+      const mEl = document.getElementById('mtChatMsgs');
+      if (!mEl) return;
+      const d = document.createElement('div'); d.className = 'dbot-msg bot';
+      d.innerHTML = '📊 ' + (a.auto ? 'Auto ' : '') + 'multi-timeframe analysis (' + _escAnalysis(a.charts || '') + '):';
+      mEl.appendChild(d);
+      const body = document.createElement('div'); body.style.marginTop = '4px';
+      body.innerHTML = _escAnalysis(a.text || '').replace(/\n/g, '<br>');
+      mEl.appendChild(body);
+      mEl.scrollTop = mEl.scrollHeight;
+    }
     function applyStatus(s) {
       if (!s || !s.success) return;
+      _surfaceAnalysis(s);
       botRunning = !!s.running; botPaused = !!s.paused;
       startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
       _renderPauseBtn(); if (!botRunning) stopStatusPoll();
@@ -31396,6 +31983,70 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       sendEl.addEventListener('click', send);
       inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+
+      // ---- Multi-timeframe chart upload + Analyse (shown when Claude AI is on) ----
+      (function() {
+        const claudeChk = document.getElementById('mtBotClaudeChk');
+        const chartsBar = document.getElementById('mtBotChartsBar');
+        const slotBtns  = Array.prototype.slice.call(document.querySelectorAll('#mtBotChartSlots button[data-slot]'));
+        const analyseBtn = document.getElementById('mtBotAnalyseBtn');
+        if (!chartsBar || !analyseBtn) return;
+
+        function syncChartsBarVisibility() {
+          chartsBar.style.display = (claudeChk && claudeChk.checked) ? '' : 'none';
+        }
+        if (claudeChk) claudeChk.addEventListener('change', syncChartsBarVisibility);
+        syncChartsBarVisibility();
+
+        const slotFile = document.createElement('input');
+        slotFile.type = 'file'; slotFile.accept = 'image/*'; slotFile.style.display = 'none';
+        document.body.appendChild(slotFile);
+        let pendingSlot = null;
+        slotBtns.forEach(function(btn) {
+          btn.addEventListener('click', function() { pendingSlot = btn.dataset.slot; slotFile.click(); });
+        });
+        slotFile.addEventListener('change', function() {
+          const f = slotFile.files && slotFile.files[0]; slotFile.value = '';
+          const slot = pendingSlot; pendingSlot = null;
+          if (!f || !slot) return;
+          if (f.size > 5 * 1024 * 1024) { addMsg('Image too large (max 5MB).', 'err'); return; }
+          const rd = new FileReader();
+          rd.onload = function() {
+            const dataUrl = String(rd.result || '');
+            fetch('/api/aibot/mt5/chart_upload', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ slot: slot, image: dataUrl }) })
+              .then(r => r.json()).then(function(res) {
+                const btn = slotBtns.find(function(b) { return b.dataset.slot === slot; });
+                if (res.success) {
+                  if (btn) { btn.style.background = '#26a69a'; btn.style.color = '#fff'; btn.textContent = slot.toUpperCase() + ' ✓'; }
+                  addMsg(slot.toUpperCase() + ' chart uploaded (valid ~3h).', 'bot');
+                } else {
+                  addMsg('Upload failed (' + slot + '): ' + (res.error || 'unknown'), 'err');
+                }
+              }).catch(function(e) { addMsg('Upload error (' + slot + '): ' + e.message, 'err'); });
+          };
+          rd.readAsDataURL(f);
+        });
+
+        analyseBtn.addEventListener('click', function() {
+          analyseBtn.disabled = true; analyseBtn.textContent = 'Analysing…';
+          const thinking = addMsg('Analysing…', 'bot');
+          fetch('/api/aibot/mt5/analyse', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ model: (typeof modelEl !== 'undefined' && modelEl ? modelEl.value : ''),
+                                    symbol: (document.getElementById('mtBotSymbol') || {}).value }) })
+            .then(r => r.json()).then(function(res) {
+              thinking.remove();
+              if (!res.success) { addMsg('Analyse failed: ' + (res.error || 'unknown'), 'err'); return; }
+              const d = addMsg('📊 Multi-timeframe analysis (' + (res.charts || '') + '):', 'bot');
+              const body = document.createElement('div');
+              body.style.marginTop = '4px';
+              body.innerHTML = esc(res.reply || '').replace(/\n/g, '<br>');
+              d.appendChild(body);
+              msgsEl.scrollTop = msgsEl.scrollHeight;
+            }).catch(function(e) { thinking.remove(); addMsg('Analyse error: ' + e.message, 'err'); })
+            .finally(function() { analyseBtn.disabled = false; analyseBtn.textContent = '🤖 Analyse'; });
+        });
+      })();
     })();
 
     refreshStatus();
@@ -32078,6 +32729,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // =========================================================================
     let statusPoller = null;
     let lastRenderedLogLen = 0;
+    let _lastAnalysisTs = 0;
+    function _escAnalysis(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function _surfaceAnalysis(s) {
+      const a = s && s.lastAnalysis;
+      if (!a || !a.ts || a.ts === _lastAnalysisTs) return;
+      _lastAnalysisTs = a.ts;
+      const mEl = document.getElementById('deltaChatMsgs');
+      if (!mEl) return;
+      const d = document.createElement('div'); d.className = 'dbot-msg bot';
+      d.innerHTML = '📊 ' + (a.auto ? 'Auto ' : '') + 'multi-timeframe analysis (' + _escAnalysis(a.charts || '') + '):';
+      mEl.appendChild(d);
+      const body = document.createElement('div'); body.style.marginTop = '4px';
+      body.innerHTML = _escAnalysis(a.text || '').replace(/\n/g, '<br>');
+      mEl.appendChild(body);
+      mEl.scrollTop = mEl.scrollHeight;
+    }
     function _serverStarted(resp) {
       botRunning = true; botPaused = false;
       startBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
@@ -32103,6 +32770,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function applyStatus(s) {
       if (!s || !s.success) return;
+      _surfaceAnalysis(s);
       // Reconcile running/paused state
       botRunning = !!s.running;
       botPaused  = !!s.paused;

@@ -2,12 +2,12 @@
 
 There are now **two distinct places** Claude makes trading decisions in this app, with very different scopes:
 
-1. **The four legacy AI bots** (Zerodha, Delta, MT5, Zerodha Options) — Claude is given full autonomy: it decides entries, exits, direction, and its own stop-loss/target every tick. This is sections 1–12 below.
+1. **The six legacy AI bots** (Zerodha, Delta, MT5, Zerodha Options, Delta Options, TradingView bot) — Claude is given full autonomy: it decides entries, exits, direction, and its own stop-loss/target every tick. This is sections 1–12 below.
 2. **The Strategy Menu** (Iron Condor / Short Strangle / Jade Lizard / EMA 5/13 Crossover, on NSE index options via Zerodha or BTC/ETH/XAUT options via Delta Exchange) — Claude's role is much narrower: it only ever picks **which strike** to sell, inside a target-delta window you set. It never sets its own SL/TP, never decides direction, and its output is validated/snapped to real strikes with a deterministic fallback if it fails. See section 13.
 
-## Part 1 — the four legacy AI bots
+## Part 1 — the six legacy AI bots
 
-The core lives in [`_claude_trade_signal`](scripts/nifty_chart.py#L1845) and runs **once per tick** for each bot / option leg. When the Claude AI strategy is selected (the default), Claude decides entries, exits, stop-loss and target on its own — none of the legacy algo strategies are used.
+The core lives in [`_claude_trade_signal`](scripts/nifty_chart.py#L2167) and runs **once per tick** for each bot / option leg. When the Claude AI strategy is selected (the default on four bots; the only mode on Delta Options and the TradingView bot), Claude decides entries, exits, stop-loss and target on its own — none of the legacy algo strategies are used.
 
 ---
 
@@ -121,6 +121,10 @@ Each panel has a **📊 TradingView** toggle. There's no official API for a user
 - For the **Options** bot, TradingView is read on the **underlying** (e.g. NSE:NIFTY), since option contracts aren't on TradingView TA.
 - Influence is **context only**: Claude lifts conviction when TV aligns with its own read and raises its bar when TV opposes — it never trades against its own structure read just because TV disagrees. A stale webhook (large `ageSec`) is weighted weakly.
 
+### Quant confirmation (optional)
+
+Each panel also has a **📊 Quant** checkbox next to Claude AI (`data-strat="quant"`, collected into `allowedStrategies` the same way as every other strategy checkbox). When ticked, [`_bot_quant_signal`](scripts/nifty_chart.py) runs a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner Channel, Hurst exponent, variance ratio, percentile rank, return skew — see `generate_quant_signals`) fresh each tick and adds a `quant` block to the prompt: Claude raises conviction when the quant score/verdict agrees with its own read and lowers it when it opposes, same "confirmation, not override" relationship as TradingView. Off by default; see `Quant_strategy.md` for the full model.
+
 ## 9. Chart image input (vision)
 
 Each bot chat has a **📎 attach** button. Upload a TradingView chart screenshot (SuperTrend / EMA / PSAR / support-resistance, any or multiple timeframes) and Claude uses it as **vision input** (base64 image blocks on the Anthropic Messages API):
@@ -128,16 +132,22 @@ Each bot chat has a **📎 attach** button. Upload a TradingView chart screensho
 - **In the chat** — it reads the chart to answer questions about the current setup.
 - **In the live trade loop** — the latest uploaded chart is fed to Claude on **every decision** while the bot runs, and the prompt tells it to treat the chart as the **PRIMARY structure read**: trend, key S/R and indicator alignment come from what it *sees*, and it aligns the decision with the chart. If the picture contradicts the numeric fields, it trusts the chart's structure.
 - The chart stays "current" for **~3 hours**, then expires so a stale picture can't keep driving trades. **Re-upload anytime** during a trade to re-steer the strategy around the newest chart.
-- Available on all four bots (Delta / Zerodha / MT5 / Options). See [`_call_claude`](scripts/nifty_chart.py) (the `images` param) and the per-bot chart store (`_chart_store` / `_chart_images_for`).
+- Available on all six bots (Delta / Zerodha / MT5 / Zerodha Options / Delta Options / TradingView). See [`_call_claude`](scripts/nifty_chart.py) (the `images` param) and the per-bot chart store (`_chart_store` / `_chart_images_for`).
 
-### Delta AI Bot: multi-timeframe chart upload + Analyse
+### Multi-timeframe chart upload + Analyse — every AI bot
 
-The Delta AI Bot additionally has a **Charts bar** (shown when Claude AI strategy is ticked) with five dedicated upload buttons — **1D, 1H, 30m, 15m, 5m** — instead of the single 📎 slot above:
+Every AI bot panel (Delta / Zerodha / MT5 / Zerodha Options / Delta Options / TradingView bot) has a **Charts bar** with five dedicated upload buttons — **1D, 1H, 30m, 15m, 5m** — instead of relying only on the single 📎 chat slot above. On the four bots with a Claude AI checkbox, the bar only shows once that checkbox is ticked; the Delta Options and TradingView bots are Claude-only, so their bar is always visible.
 
 - Each button uploads into its own **named timeframe slot** (`_chart_store_slot`), so all 5 can be held at once rather than one overwriting the last (`_chart_images_for_multi`, falling back to the single 📎 slot if none of the 5 are used).
-- **Analyse** (`/api/aibot/delta/analyse`) sends every uploaded slot to Claude in **one call**, with a dedicated pre-flight prompt: per-chart notes (trend/structure/S-R/pattern), then **one combined multi-timeframe verdict** ending in an explicit `READY FOR TRADING` or `NOT READY` line. This is purely advisory — it does not touch the running bot or place an order.
-- Once **Start** is clicked, the live decision loop (`_delta_bot_tick`) keeps resending all 5 uploaded charts to Claude as vision context on **every** decision tick (same ~3h freshness window as the single-slot version) — so Analyse is a pre-flight check, and Start is what actually trades off the same charts continuously.
-- Each image gets a `Chart: <label>` text block immediately before it (a small, backward-compatible extension to `_attach_images`) so Claude can tell the 5 timeframes apart, and the system prompt explicitly instructs it to use the **higher timeframes for bias, lower timeframes for entry timing** — a lower-timeframe wiggle should never override a clear higher-timeframe trend.
+- **Analyse** (`/api/aibot/<bot>/analyse`, one shared handler — `_bot_analyse_route`) sends every uploaded slot to Claude in **one call**, with a dedicated pre-flight prompt: per-chart notes (trend/structure/S-R/pattern), then **one combined multi-timeframe verdict** ending in an explicit `READY FOR TRADING` or `NOT READY` line. This is purely advisory — it does not touch the running bot or place an order.
+- Once **Start** is clicked, the live decision loop keeps resending all uploaded charts to Claude as vision context on **every** decision tick (same ~3h freshness window as the single-slot version) — so Analyse is a pre-flight check, and Start is what actually trades off the same charts continuously.
+- Each image gets a `Chart: <label>` text block immediately before it (a small, backward-compatible extension to `_attach_images`) so Claude can tell the timeframes apart, and the system prompt explicitly instructs it to use the **higher timeframes for bias, lower timeframes for entry timing** — a lower-timeframe wiggle should never override a clear higher-timeframe trend.
+
+### Automatic multi-timeframe analysis (no upload required)
+
+Chart images are now optional. Every Claude-driven bot **auto-fetches** 1D/1H/30m/15m/5m candles each decision tick via [`_bot_multi_tf_snapshot`](scripts/nifty_chart.py) — lastPrice, sma20, changePct, trend, recentHigh/recentLow per timeframe (cached ~90s so a fast tick cadence doesn't refetch 5 timeframes every call) — and adds it to the prompt as a `multiTF` block with the **same higher-timeframe-for-bias, lower-timeframe-for-entry instruction** as the image case. If a timeframe also has an uploaded image, the image is treated as the richer, primary read for that timeframe; `multiTF` fills in the rest.
+
+In addition, the first time a bot is flat and about to consider an entry (and at most once an hour after — `_ANALYSIS_MAX_AGE`), it runs one **pre-flight analysis** call — [`_bot_run_preflight_analyse`](scripts/nifty_chart.py) — using uploaded images if present, else the auto-fetched `multiTF` numbers, producing the same kind of per-timeframe notes + `READY FOR TRADING` / `NOT READY` verdict as the manual Analyse button. The result is stored on `lastAnalysis` and returned in `/status`; each panel's status poll shows it in the chat window automatically (`_surfaceAnalysis` client-side), so you see Claude's reasoning **before** it places its first trade — with or without ever uploading a chart.
 
 ---
 
@@ -151,8 +161,7 @@ Candles come from the bot's broker feed — Delta, Kite (Zerodha), or MT5. For t
 
 - The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
 - **Tick** sets how often the bot checks the market and calls Claude. Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost. A slower tick (e.g. 180s) = fewer, more-considered trades and lower cost.
-  - **Delta AI Bot**: 15s … 1d (15s/30s/1m/2m/3m/5m/10m/15m/30m/1h/1d) — extended so cadence can match a higher-timeframe, multi-chart read (see §9).
-  - **Zerodha / MT5 / Zerodha Options bots**: 15s … 10m (unchanged).
+  - All six bots share the same range — **15s … 1d** (15s/30s/1m/2m/3m/5m/10m/15m/30m/1h/1d) — so cadence can match a higher-timeframe, multi-chart read (see §9).
 
 ---
 
