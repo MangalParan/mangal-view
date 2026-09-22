@@ -1619,6 +1619,8 @@ delta_ai_state = {
     'last_tick':     {},     # {time, price, strategy, regime, signal, score, error?}
     'log_buffer':    [],     # last ~500 UI log lines for browser display
     'last_candles':  [],     # last ~150 candles for browser chart
+    'schedule':      {'startTime': '', 'stopTime': '', 'armed': False, 'startFiredDate': '', 'stopFiredDate': ''},
+    'scheduleCfg':   None,   # last /start (or /schedule) payload — replayed by the scheduler at the scheduled start time
 }
 delta_ai_lock = _threading.RLock()
 
@@ -1636,6 +1638,8 @@ zd_ai_state = {
     'last_tick':     {},
     'log_buffer':    [],
     'last_candles':  [],
+    'schedule':      {'startTime': '', 'stopTime': '', 'armed': False, 'startFiredDate': '', 'stopFiredDate': ''},
+    'scheduleCfg':   None,
 }
 zd_ai_lock = _threading.RLock()
 
@@ -2972,13 +2976,12 @@ def _delta_bot_loop():
 # Need timedelta/timezone for IST log timestamps
 import datetime as _tz_module
 
-@app.route('/api/aibot/delta/start', methods=['POST'])
-@login_required
-def delta_aibot_start():
-    data = request.json or {}
+def _delta_aibot_do_start(data):
+    """Core start logic as a plain function (data: dict) -> (resp_dict, status_code),
+    so both the HTTP route and the schedule auto-start (no request context) can use it."""
     with delta_ai_lock:
         if delta_ai_state.get('running'):
-            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+            return {'success': False, 'error': 'Bot is already running. Stop it first.'}, 400
         delta_ai_state['config'] = {
             'symbol':     (data.get('symbol') or '').upper(),
             'symbols':    [s.strip().upper() for s in (data.get('symbols') or []) if s and str(s).strip()],
@@ -3020,7 +3023,7 @@ def delta_aibot_start():
         }
         _c = delta_ai_state['config']
         if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol'] and not _c.get('tokens'):
-            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol / Tokens'}), 400
+            return {'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol / Tokens'}, 400
         delta_ai_state['scan_idx']      = 0
         delta_ai_state['position']      = None
         delta_ai_state['trades']        = []
@@ -3043,7 +3046,13 @@ def delta_aibot_start():
     _cfg_line = _bot_cfg_summary(cfg, {'seedBias': delta_ai_state.get('seedBias') or '-'})
     _bot_log('[Config] ' + _cfg_line)
     _persist_log_line('[DELTA] [CONFIG] ' + _cfg_line)
-    return jsonify({'success': True, 'message': 'Bot started server-side'})
+    return {'success': True, 'message': 'Bot started server-side'}, 200
+
+@app.route('/api/aibot/delta/start', methods=['POST'])
+@login_required
+def delta_aibot_start():
+    resp, code = _delta_aibot_do_start(request.json or {})
+    return jsonify(resp), code
 
 @app.route('/api/aibot/delta/manual', methods=['POST'])
 @login_required
@@ -3076,9 +3085,7 @@ def delta_aibot_pause():
     _bot_log('Delta Bot ' + ('paused' if paused else 'resumed'))
     return jsonify({'success': True, 'paused': paused})
 
-@app.route('/api/aibot/delta/stop', methods=['POST'])
-@login_required
-def delta_aibot_stop():
+def _delta_aibot_do_stop():
     with delta_ai_lock:
         was_running = delta_ai_state.get('running')
         delta_ai_state['running'] = False
@@ -3092,6 +3099,11 @@ def delta_aibot_stop():
     if was_running:
         _bot_log('Delta Bot stopped.')
         _persist_log_line('[DELTA] [{}] BOT STOP'.format(mode.upper()))
+
+@app.route('/api/aibot/delta/stop', methods=['POST'])
+@login_required
+def delta_aibot_stop():
+    _delta_aibot_do_stop()
     return jsonify({'success': True})
 
 # --- Claude assistant for the Delta bot -------------------------------------
@@ -4801,6 +4813,7 @@ def delta_aibot_status():
         paused    = delta_ai_state.get('paused', False)
         consec    = delta_ai_state.get('consec_losses', 0)
         last_analysis = delta_ai_state.get('lastAnalysis')
+        schedule = delta_ai_state.get('schedule')
     realized   = sum(t.get('pnl', 0) for t in trades)
     wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unrealized = 0.0
@@ -4830,6 +4843,7 @@ def delta_aibot_status():
         'last_candles': candles,
         'log':      log_buf,
         'lastAnalysis': last_analysis,
+        'schedule': schedule,
         'stats': {
             'realized':     round(realized, 4),
             'unrealized':   round(unrealized, 4),
@@ -5380,13 +5394,12 @@ def _zd_bot_loop():
         _bot_gc_tick()
         _zd_time.sleep(max(5, int((zd_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
-@app.route('/api/aibot/zerodha/start', methods=['POST'])
-@login_required
-def zd_aibot_start():
-    data = request.json or {}
+def _zd_aibot_do_start(data):
+    """Core start logic as a plain function (data: dict) -> (resp_dict, status_code),
+    so both the HTTP route and the schedule auto-start (no request context) can use it."""
     with zd_ai_lock:
         if zd_ai_state.get('running'):
-            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+            return {'success': False, 'error': 'Bot is already running. Stop it first.'}, 400
         zd_ai_state['config'] = {
             'symbol':     (data.get('symbol') or '').upper(),
             'symbols':    [s.strip().upper() for s in (data.get('symbols') or []) if s and str(s).strip()],
@@ -5428,7 +5441,7 @@ def zd_aibot_start():
         _c = zd_ai_state['config']
         _c['hardStop'] = bool(data.get('hardStop', True))   # resting SL-M at the broker (live) — default ON
         if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
-            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
+            return {'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}, 400
         zd_ai_state['scan_idx']       = 0
         zd_ai_state['position']       = None
         zd_ai_state['trades']         = []
@@ -5451,7 +5464,13 @@ def zd_aibot_start():
     _cfg_line = _bot_cfg_summary(cfg, {'seedBias': zd_ai_state.get('seedBias') or '-'})
     _zd_log('[Config] ' + _cfg_line)
     _persist_log_line('[ZERODHA] [CONFIG] ' + _cfg_line)
-    return jsonify({'success': True, 'message': 'Bot started server-side'})
+    return {'success': True, 'message': 'Bot started server-side'}, 200
+
+@app.route('/api/aibot/zerodha/start', methods=['POST'])
+@login_required
+def zd_aibot_start():
+    resp, code = _zd_aibot_do_start(request.json or {})
+    return jsonify(resp), code
 
 @app.route('/api/aibot/zerodha/manual', methods=['POST'])
 @login_required
@@ -5483,9 +5502,7 @@ def zd_aibot_pause():
     _zd_log('Zerodha Bot ' + ('paused' if paused else 'resumed'))
     return jsonify({'success': True, 'paused': paused})
 
-@app.route('/api/aibot/zerodha/stop', methods=['POST'])
-@login_required
-def zd_aibot_stop():
+def _zd_aibot_do_stop():
     with zd_ai_lock:
         was_running = zd_ai_state.get('running')
         zd_ai_state['running'] = False
@@ -5499,6 +5516,11 @@ def zd_aibot_stop():
     if was_running:
         _zd_log('Zerodha Bot stopped.')
         _persist_log_line('[ZERODHA] [{}] BOT STOP'.format(mode.upper()))
+
+@app.route('/api/aibot/zerodha/stop', methods=['POST'])
+@login_required
+def zd_aibot_stop():
+    _zd_aibot_do_stop()
     return jsonify({'success': True})
 
 @app.route('/api/aibot/zerodha/status', methods=['GET'])
@@ -5516,6 +5538,7 @@ def zd_aibot_status():
         paused    = zd_ai_state.get('paused', False)
         consec    = zd_ai_state.get('consec_losses', 0)
         last_analysis = zd_ai_state.get('lastAnalysis')
+        schedule = zd_ai_state.get('schedule')
     realized   = sum(t.get('pnl', 0) for t in trades)
     wins       = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unrealized = 0.0
@@ -5524,7 +5547,7 @@ def zd_aibot_status():
     return jsonify({
         'success':  True, 'running':  running, 'paused':   paused,
         'config':   cfg, 'position': pos, 'last_tick': last_tick,
-        'last_candles': candles, 'log':      log_buf, 'lastAnalysis': last_analysis,
+        'last_candles': candles, 'log':      log_buf, 'lastAnalysis': last_analysis, 'schedule': schedule,
         'stats': {
             'realized':     round(realized, 2),
             'unrealized':   round(unrealized, 2),
@@ -5631,6 +5654,8 @@ zo_ai_state = {
     'trades': [],          # closed trades across both legs
     'consec_losses': 0,
     'log_buffer': [],
+    'schedule': {'startTime': '', 'stopTime': '', 'armed': False, 'startFiredDate': '', 'stopFiredDate': ''},
+    'scheduleCfg': None,
 }
 zo_ai_lock = _threading.RLock()
 
@@ -6202,17 +6227,16 @@ def _zo_bot_loop():
         _bot_gc_tick()
         _zd_time.sleep(max(5, int((zo_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
-@app.route('/api/aibot/zoptions/start', methods=['POST'])
-@login_required
-def zo_aibot_start():
-    data = request.json or {}
+def _zo_aibot_do_start(data):
+    """Core start logic as a plain function (data: dict) -> (resp_dict, status_code),
+    so both the HTTP route and the schedule auto-start (no request context) can use it."""
     with zo_ai_lock:
         if zo_ai_state.get('running'):
-            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+            return {'success': False, 'error': 'Bot is already running. Stop it first.'}, 400
         buyer  = bool(data.get('optionBuyer', True))
         seller = bool(data.get('optionSeller', False))
         if not buyer and not seller:
-            return jsonify({'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}), 400
+            return {'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}, 400
         auto_strikes = bool(data.get('autoStrikes', False))
         base_symbol  = (data.get('baseSymbol') or '').upper().strip()
         opt_exch_auto = ''
@@ -6220,7 +6244,7 @@ def zo_aibot_start():
         legs = []
         if auto_strikes:
             if not base_symbol:
-                return jsonify({'success': False, 'error': 'Pick an Underlying base for Auto strikes'}), 400
+                return {'success': False, 'error': 'Pick an Underlying base for Auto strikes'}, 400
             _rcfg = {'baseSymbol': base_symbol, 'tf': data.get('tf', '5m'),
                      'api_key': (data.get('api_key') or '').strip(),
                      'model': (data.get('model') or '').strip(),
@@ -6229,7 +6253,7 @@ def zo_aibot_start():
                      'allowedStrategies': [s for s in (data.get('allowedStrategies') or ['claude']) if s in _BOT_CONFIGURABLE_ALGOS] or ['claude']}
             ce_sym, pe_sym, opt_exch_auto, auto_info = _zo_resolve_auto_strikes(_rcfg)
             if not ce_sym or not pe_sym:
-                return jsonify({'success': False, 'error': 'Auto strikes failed: ' + str(auto_info)}), 502
+                return {'success': False, 'error': 'Auto strikes failed: ' + str(auto_info)}, 502
             legs = [
                 {'symbol': ce_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
                 {'symbol': pe_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
@@ -6242,7 +6266,7 @@ def zo_aibot_start():
             if base_symbol and (ce_strike not in (None, '', 0) or pe_strike not in (None, '', 0)):
                 ce_sym, pe_sym, opt_exch_auto, auto_info = _zo_resolve_manual_strikes(base_symbol, ce_strike, pe_strike)
                 if not ce_sym or not pe_sym:
-                    return jsonify({'success': False, 'error': 'Manual strikes failed: ' + str(auto_info)}), 502
+                    return {'success': False, 'error': 'Manual strikes failed: ' + str(auto_info)}, 502
                 legs = [
                     {'symbol': ce_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
                     {'symbol': pe_sym, 'exchange': opt_exch_auto, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
@@ -6254,7 +6278,7 @@ def zo_aibot_start():
                         legs.append({'symbol': sym, 'exchange': (data.get('exch' + n) or '').upper().strip(),
                                      'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
                 if not legs:
-                    return jsonify({'success': False, 'error': 'Enter CE/PE strike prices (with an Underlying base), pick option symbols, or enable Auto strikes'}), 400
+                    return {'success': False, 'error': 'Enter CE/PE strike prices (with an Underlying base), pick option symbols, or enable Auto strikes'}, 400
         zo_ai_state['config'] = {
             'autoStrikes':  auto_strikes,
             'baseSymbol':   base_symbol,
@@ -6308,7 +6332,13 @@ def zo_aibot_start():
         cfg['mode'].upper(), modes.strip('+'), syms, cfg['qty'], cfg['tf'], _BOT_TICK_SEC))
     _persist_log_line('[ZOPTIONS] [{}] BOT START {} ({}) qty={} TF={} (server-side)'.format(
         cfg['mode'].upper(), syms, modes.strip('+'), cfg['qty'], cfg['tf']))
-    return jsonify({'success': True, 'message': 'Bot started server-side'})
+    return {'success': True, 'message': 'Bot started server-side'}, 200
+
+@app.route('/api/aibot/zoptions/start', methods=['POST'])
+@login_required
+def zo_aibot_start():
+    resp, code = _zo_aibot_do_start(request.json or {})
+    return jsonify(resp), code
 
 @app.route('/api/aibot/zoptions/manual', methods=['POST'])
 @login_required
@@ -6343,9 +6373,7 @@ def zo_aibot_pause():
     _zo_log('Options Bot ' + ('paused' if paused else 'resumed'))
     return jsonify({'success': True, 'paused': paused})
 
-@app.route('/api/aibot/zoptions/stop', methods=['POST'])
-@login_required
-def zo_aibot_stop():
+def _zo_aibot_do_stop():
     with zo_ai_lock:
         was_running = zo_ai_state.get('running')
         zo_ai_state['running'] = False
@@ -6360,6 +6388,11 @@ def zo_aibot_stop():
     if was_running:
         _zo_log('Options Bot stopped.')
         _persist_log_line('[ZOPTIONS] [{}] BOT STOP'.format(mode.upper()))
+
+@app.route('/api/aibot/zoptions/stop', methods=['POST'])
+@login_required
+def zo_aibot_stop():
+    _zo_aibot_do_stop()
     return jsonify({'success': True})
 
 @app.route('/api/aibot/zoptions/status', methods=['GET'])
@@ -6378,6 +6411,7 @@ def zo_aibot_status():
         paused  = zo_ai_state.get('paused', False)
         consec  = zo_ai_state.get('consec_losses', 0)
         last_analysis = zo_ai_state.get('lastAnalysis')
+        schedule = zo_ai_state.get('schedule')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal   = 0.0
@@ -6387,7 +6421,7 @@ def zo_aibot_status():
             unreal += _zd_calc_pnl(p['entryPrice'], lt['price'], p['qty'], p['side'])
     return jsonify({
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
-        'legs': legs, 'log': log_buf, 'lastAnalysis': last_analysis,
+        'legs': legs, 'log': log_buf, 'lastAnalysis': last_analysis, 'schedule': schedule,
         'underlyingSpot': zo_ai_state.get('underlyingSpot'), 'underlyingSym': zo_ai_state.get('underlyingSym'),
         'underlyingChartSym': zo_ai_state.get('underlyingChartSym'),
         'underlyingCandles': list(zo_ai_state.get('underlyingCandles', []))[-150:],
@@ -8678,6 +8712,8 @@ mt_ai_state = {
     'running': False, 'paused': False, 'thread': None, 'config': None,
     'position': None, 'trades': [], 'consec_losses': 0, 'last_exit_time': 0,
     'last_tick': {}, 'log_buffer': [], 'last_candles': [],
+    'schedule': {'startTime': '', 'stopTime': '', 'armed': False, 'startFiredDate': '', 'stopFiredDate': ''},
+    'scheduleCfg': None,
 }
 mt_ai_lock = _threading.RLock()
 
@@ -8994,13 +9030,12 @@ def _mt_bot_loop():
         _bot_gc_tick()
         _zd_time.sleep(max(5, int((mt_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
-@app.route('/api/aibot/mt5/start', methods=['POST'])
-@login_required
-def mt_aibot_start():
-    data = request.json or {}
+def _mt_aibot_do_start(data):
+    """Core start logic as a plain function (data: dict) -> (resp_dict, status_code),
+    so both the HTTP route and the schedule auto-start (no request context) can use it."""
     with mt_ai_lock:
         if mt_ai_state.get('running'):
-            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+            return {'success': False, 'error': 'Bot is already running. Stop it first.'}, 400
         mt_ai_state['config'] = {
             'symbol':     (data.get('symbol') or '').upper(),
             'symbols':    [s.strip().upper() for s in (data.get('symbols') or []) if s and str(s).strip()],
@@ -9040,7 +9075,7 @@ def mt_aibot_start():
         }
         _c = mt_ai_state['config']
         if not _c['symbol'] and not _c['symbols'] and not _c['autoSymbol']:
-            return jsonify({'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}), 400
+            return {'success': False, 'error': 'Pick a symbol, a watchlist, or enable Auto symbol'}, 400
         mt_ai_state['scan_idx']       = 0
         mt_ai_state['position']       = None
         mt_ai_state['trades']         = []
@@ -9065,7 +9100,13 @@ def mt_aibot_start():
     _persist_log_line('[MT5] [CONFIG] ' + _cfg_line)
     if not _mt5_backend():
         _mt_log('[Note] MT5_BACKEND not set — running but no live data/orders. Set MT5_BACKEND=metatrader5 and reconnect.')
-    return jsonify({'success': True, 'message': 'Bot started server-side'})
+    return {'success': True, 'message': 'Bot started server-side'}, 200
+
+@app.route('/api/aibot/mt5/start', methods=['POST'])
+@login_required
+def mt_aibot_start():
+    resp, code = _mt_aibot_do_start(request.json or {})
+    return jsonify(resp), code
 
 @app.route('/api/aibot/mt5/manual', methods=['POST'])
 @login_required
@@ -9097,9 +9138,7 @@ def mt_aibot_pause():
     _mt_log('MT5 Bot ' + ('paused' if paused else 'resumed'))
     return jsonify({'success': True, 'paused': paused})
 
-@app.route('/api/aibot/mt5/stop', methods=['POST'])
-@login_required
-def mt_aibot_stop():
+def _mt_aibot_do_stop():
     with mt_ai_lock:
         was_running = mt_ai_state.get('running')
         mt_ai_state['running'] = False
@@ -9113,6 +9152,11 @@ def mt_aibot_stop():
     if was_running:
         _mt_log('MT5 Bot stopped.')
         _persist_log_line('[MT5] [{}] BOT STOP'.format(mode.upper()))
+
+@app.route('/api/aibot/mt5/stop', methods=['POST'])
+@login_required
+def mt_aibot_stop():
+    _mt_aibot_do_stop()
     return jsonify({'success': True})
 
 @app.route('/api/aibot/mt5/status', methods=['GET'])
@@ -9130,6 +9174,7 @@ def mt_aibot_status():
         paused    = mt_ai_state.get('paused', False)
         consec    = mt_ai_state.get('consec_losses', 0)
         last_analysis = mt_ai_state.get('lastAnalysis')
+        schedule = mt_ai_state.get('schedule')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins     = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal   = 0.0
@@ -9138,7 +9183,7 @@ def mt_aibot_status():
     return jsonify({
         'success': True, 'running': running, 'paused': paused, 'config': cfg,
         'position': pos, 'last_tick': last_tick, 'last_candles': candles, 'log': log_buf,
-        'lastAnalysis': last_analysis,
+        'lastAnalysis': last_analysis, 'schedule': schedule,
         'stats': {
             'realized': round(realized, 5), 'unrealized': round(unreal, 5),
             'tradeCount': len(trades),
@@ -9859,7 +9904,9 @@ def zo_aibot_reset():
 # + orders go through Delta. Auto strikes (Claude picks near-ATM, OTM-biased for
 # selling) or manual strike entry.
 do_ai_state = {'running': False, 'paused': False, 'config': {}, 'legs': [], 'trades': [],
-               'consec_losses': 0, 'log': [], '_decide': True, '_last_decision_ts': 0}
+               'consec_losses': 0, 'log': [], '_decide': True, '_last_decision_ts': 0,
+               'schedule': {'startTime': '', 'stopTime': '', 'armed': False, 'startFiredDate': '', 'stopFiredDate': ''},
+               'scheduleCfg': None}
 do_ai_lock = _threading.Lock()
 
 def _do_log(msg):
@@ -10197,16 +10244,15 @@ def _do_bot_loop():
         _bot_gc_tick()
         _zd_time.sleep(max(5, int((do_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
-@app.route('/api/aibot/doptions/start', methods=['POST'])
-@login_required
-def do_aibot_start():
-    data = request.json or {}
+def _do_aibot_do_start(data):
+    """Core start logic as a plain function (data: dict) -> (resp_dict, status_code),
+    so both the HTTP route and the schedule auto-start (no request context) can use it."""
     with do_ai_lock:
         if do_ai_state.get('running'):
-            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+            return {'success': False, 'error': 'Bot is already running. Stop it first.'}, 400
         buyer  = bool(data.get('optionBuyer', True)); seller = bool(data.get('optionSeller', False))
         if not buyer and not seller:
-            return jsonify({'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}), 400
+            return {'success': False, 'error': 'Enable Option Buyer and/or Option Seller'}, 400
         auto_strikes = bool(data.get('autoStrikes', False))
         base_symbol  = (data.get('baseSymbol') or '').upper().strip()
         api_key      = (data.get('api_key') or '').strip()
@@ -10214,13 +10260,13 @@ def do_aibot_start():
         ce_strike = data.get('ceStrike'); pe_strike = data.get('peStrike')
         if auto_strikes or (base_symbol and (ce_strike not in (None, '', 0) or pe_strike not in (None, '', 0))):
             if not base_symbol:
-                return jsonify({'success': False, 'error': 'Pick an underlying (BTC / ETH)'}), 400
+                return {'success': False, 'error': 'Pick an underlying (BTC / ETH)'}, 400
             ce_sym, pe_sym, info = _do_resolve_strikes(
                 base_symbol, None if auto_strikes else ce_strike, None if auto_strikes else pe_strike,
                 sell_bias=(seller and auto_strikes), otm_pct=float(data.get('sellOtmPct', 0.25) or 0.25),
                 model=(data.get('model') or '').strip())
             if not ce_sym or not pe_sym:
-                return jsonify({'success': False, 'error': 'Strike selection failed: ' + str(info)}), 502
+                return {'success': False, 'error': 'Strike selection failed: ' + str(info)}, 502
             legs = [{'symbol': ce_sym, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0},
                     {'symbol': pe_sym, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0}]
         else:
@@ -10229,7 +10275,7 @@ def do_aibot_start():
                 if sym:
                     legs.append({'symbol': sym, 'position': None, 'last_tick': {}, 'last_candles': [], 'last_exit_time': 0})
             if not legs:
-                return jsonify({'success': False, 'error': 'Enter CE/PE strikes (with an underlying), option symbols, or enable Auto strikes'}), 400
+                return {'success': False, 'error': 'Enter CE/PE strikes (with an underlying), option symbols, or enable Auto strikes'}, 400
         do_ai_state['config'] = {
             'autoStrikes': auto_strikes, 'baseSymbol': base_symbol,
             'sym1': legs[0]['symbol'], 'sym2': legs[1]['symbol'] if len(legs) > 1 else '',
@@ -10257,7 +10303,13 @@ def do_aibot_start():
             do_ai_state['config']['mode'].upper(), syms, do_ai_state['config']['qty'], do_ai_state['config']['tf'], buyer, seller))
         _persist_log_line('[DOPT] [{}] BOT START {} qty={}'.format(do_ai_state['config']['mode'].upper(), syms, do_ai_state['config']['qty']))
         _threading.Thread(target=_do_bot_loop, daemon=True, name='doptions-aibot').start()
-    return jsonify({'success': True, 'legs': [l['symbol'] for l in legs], 'info': info})
+    return {'success': True, 'legs': [l['symbol'] for l in legs], 'info': info}, 200
+
+@app.route('/api/aibot/doptions/start', methods=['POST'])
+@login_required
+def do_aibot_start():
+    resp, code = _do_aibot_do_start(request.json or {})
+    return jsonify(resp), code
 
 @app.route('/api/aibot/doptions/manual', methods=['POST'])
 @login_required
@@ -10281,9 +10333,7 @@ def do_aibot_manual():
     _do_log('[Manual] queued {} {} {}'.format(action.upper(), leg_type, side or ''))
     return jsonify({'success': True, 'message': 'Manual {} {} {} queued — runs on next tick'.format(action, leg_type, side or '')})
 
-@app.route('/api/aibot/doptions/stop', methods=['POST'])
-@login_required
-def do_aibot_stop():
+def _do_aibot_do_stop():
     with do_ai_lock:
         mode = (do_ai_state.get('config') or {}).get('mode', 'paper')
         for leg in do_ai_state.get('legs', []):
@@ -10292,6 +10342,11 @@ def do_aibot_stop():
                 _do_close_leg(leg, lt.get('price') or leg['position']['entryPrice'], 'bot stop', do_ai_state.get('config') or {}, mode)
         do_ai_state['running'] = False; do_ai_state['paused'] = False
     _do_log('[' + mode.upper() + '] BOT STOP'); _persist_log_line('[DOPT] [' + mode.upper() + '] BOT STOP')
+
+@app.route('/api/aibot/doptions/stop', methods=['POST'])
+@login_required
+def do_aibot_stop():
+    _do_aibot_do_stop()
     return jsonify({'success': True})
 
 @app.route('/api/aibot/doptions/pause', methods=['POST'])
@@ -10313,6 +10368,7 @@ def do_aibot_status():
         log_buf = list(do_ai_state.get('log', []))[-200:]
         running = do_ai_state.get('running', False); paused = do_ai_state.get('paused', False)
         last_analysis = do_ai_state.get('lastAnalysis')
+        schedule = do_ai_state.get('schedule')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal = 0.0
@@ -10326,7 +10382,7 @@ def do_aibot_status():
                     'underlyingChartSym': do_ai_state.get('underlyingChartSym'),
                     'underlyingCandles': list(do_ai_state.get('underlyingCandles', []))[-150:],
                     'winRate': round(wins / len(trades) * 100, 1) if trades else None, 'log': log_buf,
-                    'lastAnalysis': last_analysis})
+                    'lastAnalysis': last_analysis, 'schedule': schedule})
 
 @app.route('/api/aibot/doptions/reset', methods=['POST'])
 @login_required
@@ -10386,7 +10442,9 @@ def do_aibot_resolve():
 # using TradingView candles. Same engine as the other bots: Claude strategy OR the
 # TradingView webhook-alert strategy (SuperTrend/EMA). Currency label USD or INR.
 tvb_ai_state = {'running': False, 'paused': False, 'config': {}, 'position': None,
-                'trades': [], 'consec_losses': 0, 'log': [], '_decide': True, '_last_decision_ts': 0}
+                'trades': [], 'consec_losses': 0, 'log': [], '_decide': True, '_last_decision_ts': 0,
+                'schedule': {'startTime': '', 'stopTime': '', 'armed': False, 'startFiredDate': '', 'stopFiredDate': ''},
+                'scheduleCfg': None}
 tvb_ai_lock = _threading.Lock()
 
 def _tvb_log(msg):
@@ -10555,16 +10613,15 @@ def _tvb_bot_loop():
         _bot_gc_tick()
         _zd_time.sleep(max(5, int((tvb_ai_state.get('config') or {}).get('priceTickSec', 10) or 10)))
 
-@app.route('/api/aibot/tvbot/start', methods=['POST'])
-@login_required
-def tvb_aibot_start():
-    data = request.json or {}
+def _tvb_aibot_do_start(data):
+    """Core start logic as a plain function (data: dict) -> (resp_dict, status_code),
+    so both the HTTP route and the schedule auto-start (no request context) can use it."""
     with tvb_ai_lock:
         if tvb_ai_state.get('running'):
-            return jsonify({'success': False, 'error': 'Bot is already running. Stop it first.'}), 400
+            return {'success': False, 'error': 'Bot is already running. Stop it first.'}, 400
         symbol = (data.get('symbol') or '').strip().upper()
         if not symbol:
-            return jsonify({'success': False, 'error': 'Enter a TradingView symbol (e.g. XAUUSD, USOIL, NSE:RELIANCE, MCX:GOLD1!)'}), 400
+            return {'success': False, 'error': 'Enter a TradingView symbol (e.g. XAUUSD, USOIL, NSE:RELIANCE, MCX:GOLD1!)'}, 400
         claude = bool(data.get('claude', True))
         tvb_ai_state['config'] = {
             'symbol': symbol, 'currency': (data.get('currency') or 'USD').upper(),
@@ -10595,7 +10652,13 @@ def tvb_aibot_start():
                  'claude' if claude else 'tradingview', tvb_ai_state['config']['tf']))
         _persist_log_line('[TVBOT] [PAPER] BOT START {} strat={}'.format(symbol, 'claude' if claude else 'tv'))
         _threading.Thread(target=_tvb_bot_loop, daemon=True, name='tvbot-aibot').start()
-    return jsonify({'success': True, 'symbol': symbol})
+    return {'success': True, 'symbol': symbol}, 200
+
+@app.route('/api/aibot/tvbot/start', methods=['POST'])
+@login_required
+def tvb_aibot_start():
+    resp, code = _tvb_aibot_do_start(request.json or {})
+    return jsonify(resp), code
 
 @app.route('/api/aibot/tvbot/manual', methods=['POST'])
 @login_required
@@ -10616,9 +10679,7 @@ def tvb_aibot_manual():
     _tvb_log('[Manual] queued {} {}'.format(action.upper(), side or ''))
     return jsonify({'success': True, 'message': 'Manual {} {} queued — runs on next tick'.format(action, side or '')})
 
-@app.route('/api/aibot/tvbot/stop', methods=['POST'])
-@login_required
-def tvb_aibot_stop():
+def _tvb_aibot_do_stop():
     with tvb_ai_lock:
         cfg = tvb_ai_state.get('config') or {}
         if tvb_ai_state.get('position'):
@@ -10626,6 +10687,11 @@ def tvb_aibot_stop():
             _tvb_bot_close(lt.get('price') or tvb_ai_state['position']['entryPrice'], 'bot stop', cfg)
         tvb_ai_state['running'] = False; tvb_ai_state['paused'] = False
     _tvb_log('[PAPER] BOT STOP'); _persist_log_line('[TVBOT] [PAPER] BOT STOP')
+
+@app.route('/api/aibot/tvbot/stop', methods=['POST'])
+@login_required
+def tvb_aibot_stop():
+    _tvb_aibot_do_stop()
     return jsonify({'success': True})
 
 @app.route('/api/aibot/tvbot/pause', methods=['POST'])
@@ -10647,6 +10713,7 @@ def tvb_aibot_status():
         log_buf = list(tvb_ai_state.get('log', []))[-200:]
         running = tvb_ai_state.get('running', False); paused = tvb_ai_state.get('paused', False)
         last_analysis = tvb_ai_state.get('lastAnalysis')
+        schedule = tvb_ai_state.get('schedule')
     realized = sum(t.get('pnl', 0) for t in trades)
     wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
     unreal = 0.0
@@ -10657,7 +10724,7 @@ def tvb_aibot_status():
                     'realizedPnl': round(realized, 4), 'unrealizedPnl': round(unreal, 4),
                     'winRate': round(wins / len(trades) * 100, 1) if trades else None,
                     'ccy': '₹' if (cfg.get('currency') or 'USD').upper() == 'INR' else '$', 'log': log_buf,
-                    'lastAnalysis': last_analysis})
+                    'lastAnalysis': last_analysis, 'schedule': schedule})
 
 @app.route('/api/aibot/tvbot/reset', methods=['POST'])
 @login_required
@@ -10698,6 +10765,117 @@ def tvb_aibot_chat():
     if err:
         return jsonify({'success': False, 'error': err}), 502
     return jsonify({'success': True, 'reply': text})
+
+# ============================================================================
+# Schedule (all six legacy AI bots): arm a daily start/stop time-of-day (IST)
+# and the bot starts/stops itself with no browser tab open, no external
+# scheduler dependency — mirrors the Strategy Menu's own entry/exit schedule
+# (_strat_scheduler_loop), generalized into ONE background thread that checks
+# every bot's schedule once a minute instead of one thread per bot.
+# ============================================================================
+_LEGACY_BOT_SCHEDULE_REGISTRY = [
+    {'state': delta_ai_state, 'lock': delta_ai_lock, 'log_fn': _bot_log, 'do_start': _delta_aibot_do_start, 'do_stop': _delta_aibot_do_stop, 'tag': '[DELTA]'},
+    {'state': zd_ai_state,    'lock': zd_ai_lock,    'log_fn': _zd_log,  'do_start': _zd_aibot_do_start,    'do_stop': _zd_aibot_do_stop,    'tag': '[ZERODHA]'},
+    {'state': mt_ai_state,    'lock': mt_ai_lock,    'log_fn': _mt_log,  'do_start': _mt_aibot_do_start,    'do_stop': _mt_aibot_do_stop,    'tag': '[MT5]'},
+    {'state': zo_ai_state,    'lock': zo_ai_lock,    'log_fn': _zo_log,  'do_start': _zo_aibot_do_start,    'do_stop': _zo_aibot_do_stop,    'tag': '[ZOPTIONS]'},
+    {'state': do_ai_state,    'lock': do_ai_lock,    'log_fn': _do_log,  'do_start': _do_aibot_do_start,    'do_stop': _do_aibot_do_stop,    'tag': '[DOPT]'},
+    {'state': tvb_ai_state,   'lock': tvb_ai_lock,   'log_fn': _tvb_log, 'do_start': _tvb_aibot_do_start,   'do_stop': _tvb_aibot_do_stop,   'tag': '[TVBOT]'},
+]
+_legacy_bot_scheduler_started = [False]
+
+def _legacy_bot_scheduler_tick():
+    """One pass over every registered bot's schedule — a plain function (no
+    sleep/loop) so it's directly unit-testable; the loop below just calls it
+    every 30s."""
+    now = _tg_now_ist()
+    now_hm = now.strftime('%H:%M'); today = now.strftime('%Y-%m-%d')
+    for reg in _LEGACY_BOT_SCHEDULE_REGISTRY:
+        state, lock, log_fn = reg['state'], reg['lock'], reg['log_fn']
+        with lock:
+            sched = dict(state.get('schedule') or {})
+            running = state.get('running', False)
+        if not sched.get('armed'):
+            continue
+        if not running and sched.get('startTime') and sched['startTime'] == now_hm and sched.get('startFiredDate') != today:
+            with lock: cfg_snapshot = dict(state.get('scheduleCfg') or {})
+            if cfg_snapshot:
+                resp, _code = reg['do_start'](cfg_snapshot)
+                log_fn('[Schedule] auto-start (IST {}): '.format(now_hm) + ('started' if resp.get('success') else ('failed - ' + str(resp.get('error')))))
+            else:
+                log_fn('[Schedule] start time reached but no saved config — configure the panel and arm the schedule again.')
+            with lock: state['schedule']['startFiredDate'] = today
+        elif running and sched.get('stopTime') and sched['stopTime'] == now_hm and sched.get('stopFiredDate') != today:
+            reg['do_stop']()
+            log_fn('[Schedule] auto-stop (IST {}): bot stopped.'.format(now_hm))
+            with lock: state['schedule']['stopFiredDate'] = today
+
+def _legacy_bot_scheduler_loop():
+    while True:
+        try:
+            _legacy_bot_scheduler_tick()
+        except Exception as e:
+            try: _bot_log('[Schedule] scheduler ERROR: ' + str(e))
+            except Exception: pass
+        _zd_time.sleep(30)
+
+def _legacy_bot_ensure_scheduler():
+    if not _legacy_bot_scheduler_started[0]:
+        _legacy_bot_scheduler_started[0] = True
+        _threading.Thread(target=_legacy_bot_scheduler_loop, daemon=True, name='legacy-bot-scheduler').start()
+
+def _bot_schedule_route(state, lock, log_fn, tag, data):
+    """Shared handler for every bot's /schedule route. {armed:false} disarms;
+    otherwise {startTime, stopTime} (HH:MM, IST) arms it, saving `config` (or
+    the last-used one) so the scheduler can replay it with no request context."""
+    if data.get('armed') is False:
+        with lock:
+            if state.get('schedule') is not None:
+                state['schedule']['armed'] = False
+        log_fn('[Schedule] disarmed')
+        return jsonify({'success': True, 'armed': False})
+    import re as _re_sched
+    start_t = (data.get('startTime') or '').strip()
+    stop_t  = (data.get('stopTime') or '').strip()
+    if not _re_sched.match(r'^\d{2}:\d{2}$', start_t) or not _re_sched.match(r'^\d{2}:\d{2}$', stop_t):
+        return jsonify({'success': False, 'error': 'startTime/stopTime must be HH:MM'}), 400
+    with lock:
+        state['schedule'] = {'startTime': start_t, 'stopTime': stop_t, 'armed': True,
+                              'startFiredDate': '', 'stopFiredDate': ''}
+        cfg_snapshot = data.get('config') or state.get('scheduleCfg') or {}
+        state['scheduleCfg'] = dict(cfg_snapshot)
+    _legacy_bot_ensure_scheduler()
+    log_fn('[Schedule] armed start={} stop={} (IST)'.format(start_t, stop_t))
+    return jsonify({'success': True, 'armed': True, 'startTime': start_t, 'stopTime': stop_t})
+
+@app.route('/api/aibot/delta/schedule', methods=['POST'])
+@login_required
+def delta_aibot_schedule():
+    return _bot_schedule_route(delta_ai_state, delta_ai_lock, _bot_log, '[DELTA]', request.json or {})
+
+@app.route('/api/aibot/zerodha/schedule', methods=['POST'])
+@login_required
+def zerodha_aibot_schedule():
+    return _bot_schedule_route(zd_ai_state, zd_ai_lock, _zd_log, '[ZERODHA]', request.json or {})
+
+@app.route('/api/aibot/mt5/schedule', methods=['POST'])
+@login_required
+def mt5_aibot_schedule():
+    return _bot_schedule_route(mt_ai_state, mt_ai_lock, _mt_log, '[MT5]', request.json or {})
+
+@app.route('/api/aibot/zoptions/schedule', methods=['POST'])
+@login_required
+def zoptions_aibot_schedule():
+    return _bot_schedule_route(zo_ai_state, zo_ai_lock, _zo_log, '[ZOPTIONS]', request.json or {})
+
+@app.route('/api/aibot/doptions/schedule', methods=['POST'])
+@login_required
+def doptions_aibot_schedule():
+    return _bot_schedule_route(do_ai_state, do_ai_lock, _do_log, '[DOPT]', request.json or {})
+
+@app.route('/api/aibot/tvbot/schedule', methods=['POST'])
+@login_required
+def tvbot_aibot_schedule():
+    return _bot_schedule_route(tvb_ai_state, tvb_ai_lock, _tvb_log, '[TVBOT]', request.json or {})
 
 @app.route('/api/aibot/suggest_symbols', methods=['POST'])
 @login_required
@@ -21566,6 +21744,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-start-btn start"  id="aiBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="aiBotPauseBtn" disabled>&#9208; Pause</button>
         <button class="zd-start-btn stop"   id="aiBotStopBtn" disabled>&#9632; Stop Bot</button>
+        <button class="zd-add-btn" id="aiBotScheduleBtn" type="button">&#128337; Schedule</button>
+      </div>
+      <div class="ai-input-bar" id="aiBotScheduleBar" style="display:none">
+        <label>Start time <input type="time" id="aiBotStartTime"></label>
+        <label>Stop time <input type="time" id="aiBotStopTime"></label>
+        <button class="zd-add-btn" id="aiBotScheduleArmBtn" type="button">Arm (IST)</button>
+        <button class="zd-add-btn" id="aiBotScheduleDisarmBtn" type="button">Disarm</button>
+        <span id="aiBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
 
       <!-- Log -->
@@ -21820,6 +22006,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-start-btn start"  id="mtBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="mtBotPauseBtn" disabled>&#9208; Pause</button>
         <button class="zd-start-btn stop"   id="mtBotStopBtn" disabled>&#9632; Stop Bot</button>
+        <button class="zd-add-btn" id="mtBotScheduleBtn" type="button">&#128337; Schedule</button>
+      </div>
+      <div class="ai-input-bar" id="mtBotScheduleBar" style="display:none">
+        <label>Start time <input type="time" id="mtBotStartTime"></label>
+        <label>Stop time <input type="time" id="mtBotStopTime"></label>
+        <button class="zd-add-btn" id="mtBotScheduleArmBtn" type="button">Arm (IST)</button>
+        <button class="zd-add-btn" id="mtBotScheduleDisarmBtn" type="button">Disarm</button>
+        <span id="mtBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
 
       <div class="zd-log" id="mtBotLog" style="max-height:180px"><span class="log-info">MT5 bot ready. Paper Trading default. Connect MT5, enter a symbol (EURUSD/XAUUSD), Load Chart, then Start Bot.</span></div>
@@ -22031,6 +22225,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-start-btn start"  id="deltaBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="deltaBotPauseBtn" disabled>&#9208; Pause</button>
         <button class="zd-start-btn stop"   id="deltaBotStopBtn" disabled>&#9632; Stop Bot</button>
+        <button class="zd-add-btn" id="deltaBotScheduleBtn" type="button">&#128337; Schedule</button>
+      </div>
+      <div class="ai-input-bar" id="deltaBotScheduleBar" style="display:none">
+        <label>Start time <input type="time" id="deltaBotStartTime"></label>
+        <label>Stop time <input type="time" id="deltaBotStopTime"></label>
+        <button class="zd-add-btn" id="deltaBotScheduleArmBtn" type="button">Arm (IST)</button>
+        <button class="zd-add-btn" id="deltaBotScheduleDisarmBtn" type="button">Disarm</button>
+        <span id="deltaBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
 
       <div class="zd-log" id="deltaBotLog" style="max-height:180px"><span class="log-info">Delta bot ready. Paper Trading default. Enter symbol (BTCUSD/ETHUSD), click Load Chart, then Start Bot.</span></div>
@@ -22113,7 +22315,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="tvBotLoadBtn" type="button" style="padding:7px 12px">&#128202; Load Chart</button>
         <button class="bot-log-btn" id="tvBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
         <button class="bot-log-btn" id="tvBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
+        <button class="zd-add-btn" id="tvBotScheduleBtn" type="button" style="padding:7px 12px">&#128337; Schedule</button>
         <span id="tvBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
+      </div>
+      <div class="ai-input-bar" id="tvBotScheduleBar" style="display:none">
+        <label>Start time <input type="time" id="tvBotStartTime"></label>
+        <label>Stop time <input type="time" id="tvBotStopTime"></label>
+        <button class="zd-add-btn" id="tvBotScheduleArmBtn" type="button">Arm (IST)</button>
+        <button class="zd-add-btn" id="tvBotScheduleDisarmBtn" type="button">Disarm</button>
+        <span id="tvBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
       <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points -->
       <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
@@ -22218,7 +22428,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-add-btn" id="doBotLoadBtn" type="button" style="padding:7px 12px">&#128202; Load Charts</button>
         <button class="bot-log-btn" id="doBotLogBtn" type="button" title="Open the full log.txt (all bot events) in a new tab">&#128196; log.txt</button>
         <button class="bot-log-btn" id="doBotDlBtn" type="button" title="Download this bot's log">&#11015; Download</button>
+        <button class="zd-add-btn" id="doBotScheduleBtn" type="button" style="padding:7px 12px">&#128337; Schedule</button>
         <span id="doBotPnl" style="color:#9aa0ac;font-size:12px;margin-left:8px">P/L &mdash;</span>
+      </div>
+      <div class="ai-input-bar" id="doBotScheduleBar" style="display:none">
+        <label>Start time <input type="time" id="doBotStartTime"></label>
+        <label>Stop time <input type="time" id="doBotStopTime"></label>
+        <button class="zd-add-btn" id="doBotScheduleArmBtn" type="button">Arm (IST)</button>
+        <button class="zd-add-btn" id="doBotScheduleDisarmBtn" type="button">Disarm</button>
+        <span id="doBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
       <!-- Manual mode: Buy/Sell a CE or PE leg by hand with SL/TP as % or points -->
       <div class="ai-risk-bar" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = contracts.">
@@ -22463,6 +22681,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="zd-start-btn start"  id="zoBotStartBtn">&#9654; Start Bot</button>
         <button class="zd-start-btn pause"  id="zoBotPauseBtn" disabled>&#9208; Pause</button>
         <button class="zd-start-btn stop"   id="zoBotStopBtn" disabled>&#9632; Stop Bot</button>
+        <button class="zd-add-btn" id="zoBotScheduleBtn" type="button">&#128337; Schedule</button>
+      </div>
+      <div class="ai-input-bar" id="zoBotScheduleBar" style="display:none">
+        <label>Start time <input type="time" id="zoBotStartTime"></label>
+        <label>Stop time <input type="time" id="zoBotStopTime"></label>
+        <button class="zd-add-btn" id="zoBotScheduleArmBtn" type="button">Arm (IST)</button>
+        <button class="zd-add-btn" id="zoBotScheduleDisarmBtn" type="button">Disarm</button>
+        <span id="zoBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
 
       <div class="zd-log" id="zoBotLog" style="max-height:180px"><span class="log-info">Options bot ready. Paper Trading default. Connect Zerodha, pick two option contracts (+ Add), choose Buyer/Seller, then Start Bot.</span></div>
@@ -28898,6 +29124,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function applyStatus(s) {
       if (!s || !s.success) return;
       _surfaceAnalysis(s);
+      if (s.schedule) {
+        const el = document.getElementById('aiBotScheduleStatus');
+        if (el) el.textContent = s.schedule.armed ? ('armed ' + s.schedule.startTime + ' → ' + s.schedule.stopTime + ' IST') : 'not armed';
+      }
       botRunning = !!s.running; botPaused = !!s.paused;
       startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
       _renderPauseBtn();
@@ -29027,14 +29257,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (zmSell) zmSell.addEventListener('click', function() { zSendManual('open', 'SELL'); });
     if (zmCloseBtn) zmCloseBtn.addEventListener('click', function() { zSendManual('close', ''); });
 
-    startBtn.addEventListener('click', function() {
-      if (botRunning) return;
-      const sym = symEl.value.trim().toUpperCase();
-      if (!sym && !document.getElementById('aiBotAutoSym').checked && !(document.getElementById('aiBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
+    function _buildStartCfg() {
       const s = ZerodhaStore.getSession();
       const mode = currentMode();
-      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
-      const cfg = {
+      const sym = symEl.value.trim().toUpperCase();
+      return {
         symbol:      sym,
         symbols:     (document.getElementById('aiBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
         autoSymbol:  !!document.getElementById('aiBotAutoSym').checked,
@@ -29070,6 +29297,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         pendingSec:  parseInt((document.getElementById('aiBotPendingSec')||{}).value) || 0,
         api_key:     s.apiKey || ''
       };
+    }
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const sym = symEl.value.trim().toUpperCase();
+      if (!sym && !document.getElementById('aiBotAutoSym').checked && !(document.getElementById('aiBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
+      const s = ZerodhaStore.getSession();
+      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
+      const cfg = _buildStartCfg();
       logLine('Starting Zerodha Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
       lastRenderedLogLen = 0;
       fetch('/api/aibot/zerodha/start', {
@@ -29094,6 +29329,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
         _serverStopped(); logLine('Bot stopped on server.', 'info');
       });
     });
+
+    // ---- Schedule: daily start/stop time-of-day (IST), no tab needed ----
+    (function() {
+      const btn = document.getElementById('aiBotScheduleBtn');
+      const bar = document.getElementById('aiBotScheduleBar');
+      const statusEl = document.getElementById('aiBotScheduleStatus');
+      if (!btn || !bar) return;
+      btn.addEventListener('click', function() { bar.style.display = (bar.style.display === 'none') ? '' : 'none'; });
+      document.getElementById('aiBotScheduleArmBtn').addEventListener('click', function() {
+        const startTime = document.getElementById('aiBotStartTime').value;
+        const stopTime = document.getElementById('aiBotStopTime').value;
+        if (!startTime || !stopTime) { logLine('Set both Start time and Stop time.', 'info'); return; }
+        fetch('/api/aibot/zerodha/schedule', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ startTime: startTime, stopTime: stopTime, config: _buildStartCfg() }) })
+          .then(r => r.json()).then(function(res) {
+            if (res.success) { statusEl.textContent = 'armed ' + res.startTime + ' → ' + res.stopTime + ' IST'; logLine('Schedule armed.', 'info'); }
+            else logLine('Schedule failed: ' + (res.error || 'unknown'), 'info');
+          });
+      });
+      document.getElementById('aiBotScheduleDisarmBtn').addEventListener('click', function() {
+        fetch('/api/aibot/zerodha/schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ armed: false }) })
+          .then(r => r.json()).then(function() { statusEl.textContent = 'not armed'; logLine('Schedule disarmed.', 'info'); });
+      });
+    })();
 
     function syncOnOpen() {
       fetch('/api/aibot/zerodha/status').then(r => r.json()).then(s => {
@@ -29425,6 +29684,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if($('tvBotLoadBtn')) $('tvBotLoadBtn').addEventListener('click', loadChart);
     function renderStatus(d){ if(!d||!d.success) return;
       _surfaceAnalysis(d);
+      if (d.schedule && $('tvBotScheduleStatus')) {
+        $('tvBotScheduleStatus').textContent = d.schedule.armed ? ('armed ' + d.schedule.startTime + ' → ' + d.schedule.stopTime + ' IST') : 'not armed';
+      }
       const lt=d.lastTick||{}, pos=d.position, cc=d.ccy||'$';
       if($('tvBotPrice')) $('tvBotPrice').textContent = lt.price!=null?lt.price:'—';
       if($('tvBotPos')){ $('tvBotPos').textContent = pos?(pos.side+' '+pos.qty+' @'+pos.entryPrice):'FLAT'; $('tvBotPos').className='val '+(pos?(pos.side==='BUY'?'bull':'bear'):''); }
@@ -29450,6 +29712,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if($('tvBotStopBtn')) $('tvBotStopBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/stop',{}).then(poll); });
     if($('tvBotPauseBtn')) $('tvBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
     if($('tvBotResetBtn')) $('tvBotResetBtn').addEventListener('click', function(){ post('/api/aibot/tvbot/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
+    // ---- Schedule: daily start/stop time-of-day (IST), no tab needed ----
+    (function() {
+      const sBtn = $('tvBotScheduleBtn'), sBar = $('tvBotScheduleBar'), sStatus = $('tvBotScheduleStatus');
+      if (!sBtn || !sBar) return;
+      sBtn.addEventListener('click', function(){ sBar.style.display = (sBar.style.display === 'none') ? '' : 'none'; });
+      if ($('tvBotScheduleArmBtn')) $('tvBotScheduleArmBtn').addEventListener('click', function(){
+        const startTime = $('tvBotStartTime').value, stopTime = $('tvBotStopTime').value;
+        if (!startTime || !stopTime) { addMsg('Set both Start time and Stop time.','err'); return; }
+        post('/api/aibot/tvbot/schedule', { startTime: startTime, stopTime: stopTime, config: cfg() }).then(function(res){
+          if (res && res.success) { sStatus.textContent = 'armed ' + res.startTime + ' → ' + res.stopTime + ' IST'; addMsg('Schedule armed.','bot'); }
+          else addMsg('Schedule failed: ' + ((res && res.error) || 'unknown'),'err');
+        });
+      });
+      if ($('tvBotScheduleDisarmBtn')) $('tvBotScheduleDisarmBtn').addEventListener('click', function(){
+        post('/api/aibot/tvbot/schedule', { armed: false }).then(function(){ sStatus.textContent = 'not armed'; addMsg('Schedule disarmed.','bot'); });
+      });
+    })();
     if($('tvBotClose')) $('tvBotClose').addEventListener('click', function(){ panel.style.display='none'; if(pollTimer){clearInterval(pollTimer); pollTimer=null;} });
     if(sendEl && inputEl){
       chartBtn=document.createElement('button'); chartBtn.type='button'; chartBtn.className='dbot-chat-send';
@@ -29583,6 +29862,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function renderStatus(d){
       if(!d||!d.success) return;
       _surfaceAnalysis(d);
+      if (d.schedule && $('doBotScheduleStatus')) {
+        $('doBotScheduleStatus').textContent = d.schedule.armed ? ('armed ' + d.schedule.startTime + ' → ' + d.schedule.stopTime + ' IST') : 'not armed';
+      }
       const dot=$('doBotStatusDot'); if(dot) dot.style.background = d.running ? '#26a69a' : '#787b86';
       const legs=d.legs||[];
       const ul=(d.underlyingSym && d.underlyingSpot!=null)?(d.underlyingSym+' '+d.underlyingSpot):'—';
@@ -29626,6 +29908,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if($('doBotStopBtn')) $('doBotStopBtn').addEventListener('click', function(){ post('/api/aibot/doptions/stop',{}).then(poll); });
     if($('doBotPauseBtn')) $('doBotPauseBtn').addEventListener('click', function(){ post('/api/aibot/doptions/pause',{}).then(function(d){ addMsg('Bot '+((d&&d.paused)?'paused':'resumed'),'bot'); poll(); }); });
     if($('doBotResetBtn')) $('doBotResetBtn').addEventListener('click', function(){ post('/api/aibot/doptions/reset',{}).then(function(){ addMsg('Bot reset.','bot'); poll(); }); });
+    // ---- Schedule: daily start/stop time-of-day (IST), no tab needed ----
+    (function() {
+      const sBtn = $('doBotScheduleBtn'), sBar = $('doBotScheduleBar'), sStatus = $('doBotScheduleStatus');
+      if (!sBtn || !sBar) return;
+      sBtn.addEventListener('click', function(){ sBar.style.display = (sBar.style.display === 'none') ? '' : 'none'; });
+      if ($('doBotScheduleArmBtn')) $('doBotScheduleArmBtn').addEventListener('click', function(){
+        const startTime = $('doBotStartTime').value, stopTime = $('doBotStopTime').value;
+        if (!startTime || !stopTime) { addMsg('Set both Start time and Stop time.','err'); return; }
+        post('/api/aibot/doptions/schedule', { startTime: startTime, stopTime: stopTime, config: cfg() }).then(function(res){
+          if (res && res.success) { sStatus.textContent = 'armed ' + res.startTime + ' → ' + res.stopTime + ' IST'; addMsg('Schedule armed.','bot'); }
+          else addMsg('Schedule failed: ' + ((res && res.error) || 'unknown'),'err');
+        });
+      });
+      if ($('doBotScheduleDisarmBtn')) $('doBotScheduleDisarmBtn').addEventListener('click', function(){
+        post('/api/aibot/doptions/schedule', { armed: false }).then(function(){ sStatus.textContent = 'not armed'; addMsg('Schedule disarmed.','bot'); });
+      });
+    })();
     if($('doBotClose')) $('doBotClose').addEventListener('click', function(){ panel.style.display='none'; if(pollTimer){clearInterval(pollTimer); pollTimer=null;} });
     // chart attach
     if(sendEl && inputEl){
@@ -29983,6 +30282,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function applyStatus(s) {
       if (!s || !s.success) return;
       _surfaceAnalysis(s);
+      if (s.schedule) {
+        const el = document.getElementById('zoBotScheduleStatus');
+        if (el) el.textContent = s.schedule.armed ? ('armed ' + s.schedule.startTime + ' → ' + s.schedule.stopTime + ' IST') : 'not armed';
+      }
       botRunning = !!s.running; botPaused = !!s.paused;
       startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
       _renderPauseBtn();
@@ -30052,10 +30355,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
     }
 
-    startBtn.addEventListener('click', function() {
-      if (botRunning) return;
+    function _buildStartCfg() {
       const s = ZerodhaStore.getSession();
-      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
       const sym1 = symEls[0].value.trim().toUpperCase();
       const sym2 = symEls[1].value.trim().toUpperCase();
       const autoStrikes = !!(document.getElementById('zoBotAutoStrikes') || {}).checked;
@@ -30064,16 +30365,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (baseSymbol === '__custom') baseSymbol = ((document.getElementById('zoBotBaseCustom') || {}).value || '').trim().toUpperCase();
       const ceStrike = parseFloat((document.getElementById('zoBotCeStrike') || {}).value) || 0;
       const peStrike = parseFloat((document.getElementById('zoBotPeStrike') || {}).value) || 0;
-      if (autoStrikes) {
-        if (!baseSymbol) { logLine('Pick an Underlying base for Auto strikes.', 'info'); return; }
-      } else if (baseSymbol && (ceStrike || peStrike)) {
-        logLine('Building CE/PE symbols for ' + baseSymbol + ' at your strikes (nearest expiry)…', 'info');
-      } else if (!sym1 && !sym2) {
-        logLine('Enter CE/PE strike prices (with an Underlying base), pick option symbols (+ Add), or enable Auto strikes.', 'info'); return;
-      }
-      if (!buyerChk.checked && !sellerChk.checked) { logLine('Enable Option Buyer and/or Option Seller.', 'info'); return; }
-      if (autoStrikes) logLine('Resolving CE/PE strikes for ' + baseSymbol + ' via Claude…', 'info');
-      const cfg = {
+      return {
         sym1: sym1, exch1: (exchEls[0].value || '').trim().toUpperCase(),
         sym2: sym2, exch2: (exchEls[1].value || '').trim().toUpperCase(),
         autoStrikes: autoStrikes, baseSymbol: baseSymbol,
@@ -30099,6 +30391,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
         allowedStrategies: _collectStrategies(),
         api_key: s.apiKey || ''
       };
+    }
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const s = ZerodhaStore.getSession();
+      if (!s.connected || !s.apiKey) { logLine('Connect Zerodha first — data/charts/orders use Kite.', 'info'); return; }
+      const sym1 = symEls[0].value.trim().toUpperCase();
+      const sym2 = symEls[1].value.trim().toUpperCase();
+      const autoStrikes = !!(document.getElementById('zoBotAutoStrikes') || {}).checked;
+      const baseSelEl = document.getElementById('zoBotBaseSel');
+      let baseSymbol = baseSelEl ? baseSelEl.value : '';
+      if (baseSymbol === '__custom') baseSymbol = ((document.getElementById('zoBotBaseCustom') || {}).value || '').trim().toUpperCase();
+      const ceStrike = parseFloat((document.getElementById('zoBotCeStrike') || {}).value) || 0;
+      const peStrike = parseFloat((document.getElementById('zoBotPeStrike') || {}).value) || 0;
+      if (autoStrikes) {
+        if (!baseSymbol) { logLine('Pick an Underlying base for Auto strikes.', 'info'); return; }
+      } else if (baseSymbol && (ceStrike || peStrike)) {
+        logLine('Building CE/PE symbols for ' + baseSymbol + ' at your strikes (nearest expiry)…', 'info');
+      } else if (!sym1 && !sym2) {
+        logLine('Enter CE/PE strike prices (with an Underlying base), pick option symbols (+ Add), or enable Auto strikes.', 'info'); return;
+      }
+      if (!buyerChk.checked && !sellerChk.checked) { logLine('Enable Option Buyer and/or Option Seller.', 'info'); return; }
+      if (autoStrikes) logLine('Resolving CE/PE strikes for ' + baseSymbol + ' via Claude…', 'info');
+      const cfg = _buildStartCfg();
       logLine('Starting Options Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' [' +
               (cfg.optionBuyer ? 'buyer' : '') + (cfg.optionSeller ? (cfg.optionBuyer ? '+seller' : 'seller') : '') + '] ' +
               [sym1, sym2].filter(Boolean).join(', ') + ' qty=' + cfg.qty + ' TF=' + cfg.tf + ' …', 'info');
@@ -30119,6 +30434,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
     stopBtn.addEventListener('click', function() {
       fetch('/api/aibot/zoptions/stop', { method: 'POST' }).then(r => r.json()).then(() => { _serverStopped(); logLine('Bot stopped on server.', 'info'); });
     });
+
+    // ---- Schedule: daily start/stop time-of-day (IST), no tab needed ----
+    (function() {
+      const btn = document.getElementById('zoBotScheduleBtn');
+      const bar = document.getElementById('zoBotScheduleBar');
+      const statusEl = document.getElementById('zoBotScheduleStatus');
+      if (!btn || !bar) return;
+      btn.addEventListener('click', function() { bar.style.display = (bar.style.display === 'none') ? '' : 'none'; });
+      document.getElementById('zoBotScheduleArmBtn').addEventListener('click', function() {
+        const startTime = document.getElementById('zoBotStartTime').value;
+        const stopTime = document.getElementById('zoBotStopTime').value;
+        if (!startTime || !stopTime) { logLine('Set both Start time and Stop time.', 'info'); return; }
+        fetch('/api/aibot/zoptions/schedule', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ startTime: startTime, stopTime: stopTime, config: _buildStartCfg() }) })
+          .then(r => r.json()).then(function(res) {
+            if (res.success) { statusEl.textContent = 'armed ' + res.startTime + ' → ' + res.stopTime + ' IST'; logLine('Schedule armed.', 'info'); }
+            else logLine('Schedule failed: ' + (res.error || 'unknown'), 'info');
+          });
+      });
+      document.getElementById('zoBotScheduleDisarmBtn').addEventListener('click', function() {
+        fetch('/api/aibot/zoptions/schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ armed: false }) })
+          .then(r => r.json()).then(function() { statusEl.textContent = 'not armed'; logLine('Schedule disarmed.', 'info'); });
+      });
+    })();
     // ---- Manual mode: Buy / Sell / Close a CE or PE leg with SL/TP as % or points ----
     function zoManualSLTP() {
       const g = id => { const v = parseFloat((document.getElementById(id)||{}).value); return (isFinite(v) && v > 0) ? v : undefined; };
@@ -31743,6 +32082,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function applyStatus(s) {
       if (!s || !s.success) return;
       _surfaceAnalysis(s);
+      if (s.schedule) {
+        const el = document.getElementById('mtBotScheduleStatus');
+        if (el) el.textContent = s.schedule.armed ? ('armed ' + s.schedule.startTime + ' → ' + s.schedule.stopTime + ' IST') : 'not armed';
+      }
       botRunning = !!s.running; botPaused = !!s.paused;
       startBtn.disabled = botRunning; pauseBtn.disabled = !botRunning; stopBtn.disabled = !botRunning;
       _renderPauseBtn(); if (!botRunning) stopStatusPoll();
@@ -31855,11 +32198,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (mmSell) mmSell.addEventListener('click', function() { mSendManual('open', 'SELL'); });
     if (mmCloseBtn) mmCloseBtn.addEventListener('click', function() { mSendManual('close', ''); });
 
-    startBtn.addEventListener('click', function() {
-      if (botRunning) return;
-      const sym = symEl.value.trim().toUpperCase(); if (!sym && !document.getElementById('mtBotAutoSym').checked && !(document.getElementById('mtBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
+    function _buildStartCfg() {
       const s = MT5Store.getSession();
-      const cfg = {
+      const sym = symEl.value.trim().toUpperCase();
+      return {
         symbol: sym, symbols: (document.getElementById('mtBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean), autoSymbol: !!document.getElementById('mtBotAutoSym').checked, capital: parseFloat((document.getElementById('mtBotCapital')||{}).value) || 0, qty: parseFloat(qtyEl.value) || 1, tf: tfEl.value, mode: currentMode(),
         slPct: parseFloat(slPctEl.value) || 1.0, tpPct: parseFloat(tpPctEl.value) || 2.0,
         maxConsec: parseInt(maxConsecEl.value) || 3, maxLoss: parseFloat(maxLossEl.value) || 2000,
@@ -31882,6 +32224,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         pendingSec: parseInt((document.getElementById('mtBotPendingSec')||{}).value) || 0,
         mt5_id: s.id || ''
       };
+    }
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const sym = symEl.value.trim().toUpperCase(); if (!sym && !document.getElementById('mtBotAutoSym').checked && !(document.getElementById('mtBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol.', 'info'); return; }
+      const s = MT5Store.getSession();
+      const cfg = _buildStartCfg();
       if (cfg.mode === 'live' && (!s.connected || !s.id)) { logLine('Connect MT5 before LIVE mode.', 'info'); return; }
       logLine('Starting MT5 Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / vol=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
       lastRenderedLogLen = 0;
@@ -31902,6 +32250,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
     stopBtn.addEventListener('click', function() {
       fetch('/api/aibot/mt5/stop', { method: 'POST' }).then(r => r.json()).then(() => { _serverStopped(); logLine('Bot stopped on server.', 'info'); });
     });
+
+    // ---- Schedule: daily start/stop time-of-day (IST), no tab needed ----
+    (function() {
+      const btn = document.getElementById('mtBotScheduleBtn');
+      const bar = document.getElementById('mtBotScheduleBar');
+      const statusEl = document.getElementById('mtBotScheduleStatus');
+      if (!btn || !bar) return;
+      btn.addEventListener('click', function() { bar.style.display = (bar.style.display === 'none') ? '' : 'none'; });
+      document.getElementById('mtBotScheduleArmBtn').addEventListener('click', function() {
+        const startTime = document.getElementById('mtBotStartTime').value;
+        const stopTime = document.getElementById('mtBotStopTime').value;
+        if (!startTime || !stopTime) { logLine('Set both Start time and Stop time.', 'info'); return; }
+        fetch('/api/aibot/mt5/schedule', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ startTime: startTime, stopTime: stopTime, config: _buildStartCfg() }) })
+          .then(r => r.json()).then(function(res) {
+            if (res.success) { statusEl.textContent = 'armed ' + res.startTime + ' → ' + res.stopTime + ' IST'; logLine('Schedule armed.', 'info'); }
+            else logLine('Schedule failed: ' + (res.error || 'unknown'), 'info');
+          });
+      });
+      document.getElementById('mtBotScheduleDisarmBtn').addEventListener('click', function() {
+        fetch('/api/aibot/mt5/schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ armed: false }) })
+          .then(r => r.json()).then(function() { statusEl.textContent = 'not armed'; logLine('Schedule disarmed.', 'info'); });
+      });
+    })();
     function syncOnOpen() {
       fetch('/api/aibot/mt5/status').then(r => r.json()).then(s => {
         if (s && s.success && s.running) { logLine('A server-side MT5 Bot is already running. Resuming UI sync…', 'info'); _serverStarted(); applyStatus(s); }
@@ -32771,6 +33143,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function applyStatus(s) {
       if (!s || !s.success) return;
       _surfaceAnalysis(s);
+      if (s.schedule) {
+        const el = document.getElementById('deltaBotScheduleStatus');
+        if (el) el.textContent = s.schedule.armed ? ('armed ' + s.schedule.startTime + ' → ' + s.schedule.stopTime + ' IST') : 'not armed';
+      }
       // Reconcile running/paused state
       botRunning = !!s.running;
       botPaused  = !!s.paused;
@@ -32856,11 +33232,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       wrEl.textContent = (st.winRate != null) ? (st.winRate + '% (' + st.wins + '/' + st.tradeCount + ')') : '—';
     }
 
-    startBtn.addEventListener('click', function() {
-      if (botRunning) return;
+    function _buildStartCfg() {
       const sym = symEl.value.trim().toUpperCase();
-      if (!sym && !document.getElementById('deltaBotAutoSym').checked && !document.getElementById('deltaBotTokens').checked && !(document.getElementById('deltaBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol / Tokens.', 'info'); return; }
-      const cfg = {
+      return {
         symbol:     sym,
         symbols:    (document.getElementById('deltaBotWatchlist').value || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
         autoSymbol: !!document.getElementById('deltaBotAutoSym').checked,
@@ -32897,6 +33271,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         pendingSec: parseInt((document.getElementById('deltaBotPendingSec')||{}).value) || 0,
         api_key:    (DeltaStore.getSession().apiKey) || ''
       };
+    }
+    startBtn.addEventListener('click', function() {
+      if (botRunning) return;
+      const sym = symEl.value.trim().toUpperCase();
+      if (!sym && !document.getElementById('deltaBotAutoSym').checked && !document.getElementById('deltaBotTokens').checked && !(document.getElementById('deltaBotWatchlist').value||'').trim()) { logLine('Enter a symbol, a watchlist, or tick Auto symbol / Tokens.', 'info'); return; }
+      const cfg = _buildStartCfg();
       logLine('Starting Delta Bot SERVER-SIDE: ' + cfg.mode.toUpperCase() + ' / ' + cfg.symbol + ' / qty=' + cfg.qty + ' / TF=' + cfg.tf + ' …', 'info');
       lastRenderedLogLen = 0;
       fetch('/api/aibot/delta/start', {
@@ -32931,6 +33311,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
           logLine('Delta Bot stopped on server.', 'info');
         });
     });
+
+    // ---- Schedule: daily start/stop time-of-day (IST), no tab needed ----
+    (function() {
+      const btn = document.getElementById('deltaBotScheduleBtn');
+      const bar = document.getElementById('deltaBotScheduleBar');
+      const statusEl = document.getElementById('deltaBotScheduleStatus');
+      if (!btn || !bar) return;
+      btn.addEventListener('click', function() { bar.style.display = (bar.style.display === 'none') ? '' : 'none'; });
+      document.getElementById('deltaBotScheduleArmBtn').addEventListener('click', function() {
+        const startTime = document.getElementById('deltaBotStartTime').value;
+        const stopTime = document.getElementById('deltaBotStopTime').value;
+        if (!startTime || !stopTime) { logLine('Set both Start time and Stop time.', 'info'); return; }
+        fetch('/api/aibot/delta/schedule', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ startTime: startTime, stopTime: stopTime, config: _buildStartCfg() }) })
+          .then(r => r.json()).then(function(res) {
+            if (res.success) { statusEl.textContent = 'armed ' + res.startTime + ' → ' + res.stopTime + ' IST'; logLine('Schedule armed.', 'info'); }
+            else logLine('Schedule failed: ' + (res.error || 'unknown'), 'info');
+          });
+      });
+      document.getElementById('deltaBotScheduleDisarmBtn').addEventListener('click', function() {
+        fetch('/api/aibot/delta/schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ armed: false }) })
+          .then(r => r.json()).then(function() { statusEl.textContent = 'not armed'; logLine('Schedule disarmed.', 'info'); });
+      });
+    })();
 
     // ---- Claude strategy co-pilot chat ----
     (function() {
