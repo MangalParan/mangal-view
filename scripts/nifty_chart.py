@@ -4170,6 +4170,92 @@ def _tg_nse_oi(symbol='NIFTY'):
     _TG_OI_CACHE[symbol] = {'ts': now, 'data': out}
     return out
 
+# ===== MangalView public market dashboard (landing panel) ====================
+_DASH_QUOTE_CACHE = {}
+_DASH_QUOTE_TTL = 30   # seconds — keeps repeated dashboard polls from hammering Yahoo
+
+def _dash_quote(ticker):
+    """Lightweight quote snapshot via yfinance (already a proven dependency —
+    see fetch_nifty_data): last price, change, changePct, open/high/low/prevClose.
+    Returns None on any failure so one bad ticker never breaks the whole dashboard."""
+    now = _zd_time.time()
+    ent = _DASH_QUOTE_CACHE.get(ticker)
+    if ent and now - ent['ts'] < _DASH_QUOTE_TTL:
+        return ent['data']
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period='5d', interval='1d')
+        if hist.empty:
+            return ent['data'] if ent else None
+        last = hist.iloc[-1]
+        prev = hist.iloc[-2] if len(hist) >= 2 else last
+        price = float(last['Close']); prev_close = float(prev['Close'])
+        chg = price - prev_close
+        data = {'price': round(price, 2), 'change': round(chg, 2),
+                'changePct': round(chg / prev_close * 100.0, 2) if prev_close else 0.0,
+                'open': round(float(last['Open']), 2), 'high': round(float(last['High']), 2),
+                'low': round(float(last['Low']), 2), 'prevClose': round(prev_close, 2)}
+    except Exception:
+        return ent['data'] if ent else None
+    _DASH_QUOTE_CACHE[ticker] = {'ts': now, 'data': data}
+    return data
+
+def _dash_snapshot():
+    """Aggregates everything the MangalView public dashboard shows. Every piece
+    is fetched independently and defaults to None/unavailable on failure —
+    one flaky source (esp. NSE, which sometimes blocks this server's IP; see
+    _tg_nse_oi) never takes down the rest of the page."""
+    nifty  = _dash_quote('^NSEI')
+    sensex = _dash_quote('^BSESN')
+    vix    = _dash_quote('^INDIAVIX')
+    usdinr = _dash_quote('INR=X')
+    gold   = _dash_quote('GC=F')     # USD/troy-oz
+    silver = _dash_quote('SI=F')     # USD/troy-oz
+    try:
+        nifty_chain = _tg_nse_oi('NIFTY')
+    except Exception:
+        nifty_chain = None
+    # MCX Gold (₹/10g) has no free live feed — approximated from COMEX gold ×
+    # USD/INR (import-parity math). Clearly labelled "approx" on the card; the
+    # real MCX print differs by import duty + local premium.
+    mcx_gold = None
+    if gold and usdinr:
+        try:
+            mcx_gold = round(gold['price'] * usdinr['price'] / 31.1034768 * 10, 0)
+        except Exception:
+            mcx_gold = None
+    cues = [
+        {'label': 'Dow Jones',       'key': 'DJI',    'unit': '',      'q': _dash_quote('^DJI')},
+        {'label': 'S&P 500',         'key': 'SPX',    'unit': '',      'q': _dash_quote('^GSPC')},
+        {'label': 'NASDAQ',          'key': 'IXIC',   'unit': '',      'q': _dash_quote('^IXIC')},
+        {'label': 'Nikkei 225',      'key': 'N225',   'unit': '',      'q': _dash_quote('^N225')},
+        {'label': 'Hang Seng',       'key': 'HSI',    'unit': '',      'q': _dash_quote('^HSI')},
+        {'label': 'KOSPI',           'key': 'KOSPI',  'unit': '',      'q': _dash_quote('^KS11')},
+        {'label': 'Gold',            'key': 'GOLD',   'unit': '$/oz',  'q': gold},
+        {'label': 'Silver',          'key': 'SILVER', 'unit': '$/oz',  'q': silver},
+        {'label': 'US Oil (WTI)',    'key': 'USOIL',  'unit': '$/bbl', 'q': _dash_quote('CL=F')},
+        {'label': 'UK Oil (Brent)',  'key': 'UKOIL',  'unit': '$/bbl', 'q': _dash_quote('BZ=F')},
+        {'label': 'USD / INR',       'key': 'USDINR', 'unit': '',      'q': usdinr},
+    ]
+    return {
+        'success': True,
+        'asOf': _tg_now_ist().strftime('%d %b %Y %H:%M IST'),
+        'nifty': nifty, 'sensex': sensex, 'indiaVix': vix,
+        'giftNifty': None,   # no free live GIFT Nifty feed — panel shows "—"
+        'niftyChain': nifty_chain,
+        'sensexChain': None,   # SENSEX options trade on BSE; no free OI/PCR feed (see _tg_run_index_analysis)
+        'globalCues': cues,
+        'mcxGold': {'value': mcx_gold, 'unit': '₹/10g', 'approx': True} if mcx_gold else None,
+    }
+
+@app.route('/api/dashboard/snapshot', methods=['GET'])
+@login_required
+def dashboard_snapshot():
+    try:
+        return jsonify(_dash_snapshot())
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+
 def _tg_index_analysis(name, tvsym, oi_symbol=None):
     """Detailed intraday analysis for an index — multi-TF TradingView TA + option-chain
     OI, written by Claude (bias, S/R, PCR read, trade plan, probability)."""
@@ -20787,6 +20873,223 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+
+<style>
+  #mvDash * { box-sizing: border-box; }
+  #mvDash {
+    position: fixed; inset: 0; z-index: 99999; background: #f2efe9;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    color: #1a1a2e; overflow-y: auto;
+  }
+  #mvDash .mv-topbar { height: 6px; background: linear-gradient(90deg,#c9a227,#e6c65c,#c9a227); }
+  #mvDash .mv-wrap { max-width: 820px; margin: 0 auto; padding: 18px 20px 28px; }
+  #mvDash .mv-head { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #ddd7c8; padding-bottom: 12px; margin-bottom: 16px; }
+  #mvDash .mv-brand { font-size: 22px; font-weight: 800; letter-spacing: 0.5px; color: #1a1a2e; }
+  #mvDash .mv-date { font-size: 13px; font-weight: 600; color: #8a8474; }
+  #mvDash .mv-card { background: #fff; border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  #mvDash .mv-lbl { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; color: #8a8474; }
+  #mvDash .mv-big-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }
+  #mvDash .mv-big-price { font-size: 42px; font-weight: 800; line-height: 1; }
+  #mvDash .mv-chg { display: inline-block; padding: 6px 12px; border-radius: 20px; font-size: 14px; font-weight: 700; }
+  #mvDash .mv-chg.up { background: #e3f6ef; color: #1a9d6c; }
+  #mvDash .mv-chg.down { background: #fdeceb; color: #d64545; }
+  #mvDash .mv-ohlc-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; border-top: 1px solid #eee; padding-top: 10px; }
+  #mvDash .mv-ohlc-row div span { display: block; }
+  #mvDash .mv-ohlc-row .mv-lbl { margin-bottom: 3px; }
+  #mvDash .mv-ohlc-val { font-size: 15px; font-weight: 700; }
+  #mvDash .mv-row3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-bottom: 14px; }
+  #mvDash .mv-row3 .mv-card { margin-bottom: 0; }
+  #mvDash .mv-mini-val { font-size: 24px; font-weight: 800; margin: 6px 0 4px; }
+  #mvDash .mv-mini-chg { font-size: 13px; font-weight: 700; }
+  #mvDash .mv-mini-chg.up { color: #1a9d6c; } #mvDash .mv-mini-chg.down { color: #d64545; }
+  #mvDash .mv-chain-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  #mvDash .mv-chain-title { font-size: 15px; font-weight: 800; margin-bottom: 2px; }
+  #mvDash .mv-chain-sub { font-size: 11px; color: #8a8474; margin-bottom: 10px; }
+  #mvDash .mv-pcr-row { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 12px; }
+  #mvDash .mv-pcr-val { font-size: 26px; font-weight: 800; }
+  #mvDash .mv-pcr-tag { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 10px; background: #f3eccb; color: #93701a; margin-left: 6px; vertical-align: middle; }
+  #mvDash .mv-pcr-tag.bull { background: #e3f6ef; color: #1a9d6c; }
+  #mvDash .mv-pcr-tag.bear { background: #fdeceb; color: #d64545; }
+  #mvDash .mv-sr-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+  #mvDash .mv-sr-box { border-radius: 8px; padding: 8px 10px; }
+  #mvDash .mv-sr-box.sup { background: #e3f6ef; } #mvDash .mv-sr-box.res { background: #fdeceb; }
+  #mvDash .mv-sr-box .mv-lbl { font-size: 10px; } #mvDash .mv-sr-box.sup .mv-lbl { color: #1a9d6c; } #mvDash .mv-sr-box.res .mv-lbl { color: #d64545; }
+  #mvDash .mv-sr-box b { font-size: 17px; }
+  #mvDash .mv-sr-box small { display: block; font-size: 10px; color: #8a8474; margin-top: 2px; }
+  #mvDash .mv-oi-hdr { display: flex; justify-content: space-between; font-size: 10px; font-weight: 700; color: #8a8474; margin-bottom: 4px; }
+  #mvDash .mv-oi-hdr span:first-child::before { content: ''; display: inline-block; width: 8px; height: 8px; background: #1a9d6c; border-radius: 2px; margin-right: 4px; }
+  #mvDash .mv-oi-hdr span:last-child::before { content: ''; display: inline-block; width: 8px; height: 8px; background: #d64545; border-radius: 2px; margin-right: 4px; }
+  #mvDash .mv-oi-row { display: grid; grid-template-columns: 1fr 44px 1fr; align-items: center; gap: 6px; margin-bottom: 3px; font-size: 10px; }
+  #mvDash .mv-oi-bar-l, #mvDash .mv-oi-bar-r { height: 10px; border-radius: 3px; }
+  #mvDash .mv-oi-bar-l { background: #1a9d6c; margin-left: auto; }
+  #mvDash .mv-oi-bar-r { background: #d64545; }
+  #mvDash .mv-oi-strike { text-align: center; font-weight: 700; color: #555; }
+  #mvDash .mv-unavail { font-size: 12px; color: #8a8474; padding: 18px 0; text-align: center; }
+  #mvDash .mv-cues-table { width: 100%; border-collapse: collapse; }
+  #mvDash .mv-cues-table th { text-align: left; font-size: 11px; color: #8a8474; padding-bottom: 6px; }
+  #mvDash .mv-cues-table th:last-child, #mvDash .mv-cues-table td:last-child { text-align: right; }
+  #mvDash .mv-cues-table td { padding: 7px 0; font-size: 14px; border-top: 1px solid #f0ede4; }
+  #mvDash .mv-cues-table td:first-child { font-weight: 700; }
+  #mvDash .mv-cues-pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 700; }
+  #mvDash .mv-cues-pill.up { background: #e3f6ef; color: #1a9d6c; } #mvDash .mv-cues-pill.down { background: #fdeceb; color: #d64545; } #mvDash .mv-cues-pill.flat { background: #eee; color: #888; }
+  #mvDash .mv-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; flex-wrap: wrap; gap: 10px; }
+  #mvDash .mv-foot-handle { font-weight: 700; color: #444; font-size: 13px; }
+  #mvDash .mv-foot-right { display: flex; align-items: center; gap: 12px; }
+  #mvDash .mv-disclaimer { font-size: 11px; color: #999; }
+  #mvDash .mv-enter-btn { background: #1a1a2e; color: #fff; border: none; border-radius: 8px; padding: 10px 18px; font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+  #mvDash .mv-enter-btn:hover { background: #2c2c4a; }
+  @media (max-width: 640px) {
+    #mvDash .mv-row3 { grid-template-columns: 1fr; }
+    #mvDash .mv-chain-row { grid-template-columns: 1fr; }
+    #mvDash .mv-ohlc-row { grid-template-columns: repeat(2,1fr); }
+  }
+</style>
+<div id="mvDash">
+  <div class="mv-topbar"></div>
+  <div class="mv-wrap">
+    <div class="mv-head">
+      <div class="mv-brand">MANGALVIEW</div>
+      <div class="mv-date" id="mvDate">—</div>
+    </div>
+
+    <div class="mv-card">
+      <div class="mv-lbl">NIFTY 50</div>
+      <div class="mv-big-row">
+        <div class="mv-big-price" id="mvNiftyPrice">—</div>
+        <div class="mv-chg" id="mvNiftyChg">—</div>
+      </div>
+      <div class="mv-ohlc-row" id="mvNiftyOhlc">
+        <div><span class="mv-lbl">OPEN</span><span class="mv-ohlc-val">—</span></div>
+        <div><span class="mv-lbl">HIGH</span><span class="mv-ohlc-val">—</span></div>
+        <div><span class="mv-lbl">LOW</span><span class="mv-ohlc-val">—</span></div>
+        <div><span class="mv-lbl">PREV CLOSE</span><span class="mv-ohlc-val">—</span></div>
+      </div>
+    </div>
+
+    <div class="mv-row3">
+      <div class="mv-card"><div class="mv-lbl">SENSEX</div><div class="mv-mini-val" id="mvSensexPrice">—</div><div class="mv-mini-chg" id="mvSensexChg">—</div></div>
+      <div class="mv-card"><div class="mv-lbl">INDIA VIX</div><div class="mv-mini-val" id="mvVixPrice">—</div><div class="mv-mini-chg" id="mvVixChg">—</div></div>
+      <div class="mv-card"><div class="mv-lbl">GIFT NIFTY</div><div class="mv-mini-val" id="mvGiftPrice">—</div><div class="mv-mini-chg" id="mvGiftChg">live feed unavailable</div></div>
+    </div>
+
+    <div class="mv-chain-row">
+      <div class="mv-card" id="mvNiftyChainCard">
+        <div class="mv-chain-title">NIFTY OPTION CHAIN</div>
+        <div class="mv-chain-sub" id="mvNiftyChainSub">—</div>
+        <div id="mvNiftyChainBody" class="mv-unavail">Loading…</div>
+      </div>
+      <div class="mv-card" id="mvSensexChainCard">
+        <div class="mv-chain-title">SENSEX OPTION CHAIN</div>
+        <div class="mv-chain-sub">&nbsp;</div>
+        <div class="mv-unavail">SENSEX options trade on BSE — no free live OI/PCR feed is wired up yet.</div>
+      </div>
+    </div>
+
+    <div class="mv-card">
+      <div class="mv-lbl" style="margin-bottom:8px">GLOBAL CUES</div>
+      <table class="mv-cues-table">
+        <thead><tr><th>Instrument</th><th>Value</th><th>Change</th></tr></thead>
+        <tbody id="mvCuesBody"><tr><td colspan="3" style="color:#8a8474;font-size:12px;padding:10px 0">Loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="mv-foot">
+      <div class="mv-foot-handle">@mangalview</div>
+      <div class="mv-foot-right">
+        <span class="mv-disclaimer">Educational only · Not investment advice</span>
+        <button class="mv-enter-btn" id="mvEnterBtn" type="button">Enter App &rarr;</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function fmt(n, dp) { if (n == null || isNaN(n)) return '—'; return Number(n).toLocaleString('en-IN', {minimumFractionDigits: dp||2, maximumFractionDigits: dp||2}); }
+  function chgClass(v) { return v > 0 ? 'up' : (v < 0 ? 'down' : ''); }
+  function chgArrow(v) { return v > 0 ? '▲' : (v < 0 ? '▼' : '●'); }
+
+  function renderBig(q) {
+    if (!q) return;
+    document.getElementById('mvNiftyPrice').textContent = fmt(q.price);
+    var chgEl = document.getElementById('mvNiftyChg');
+    chgEl.className = 'mv-chg ' + chgClass(q.change);
+    chgEl.textContent = chgArrow(q.change) + ' ' + (q.change >= 0 ? '+' : '') + fmt(q.change) + ' pts';
+    var cells = document.querySelectorAll('#mvNiftyOhlc .mv-ohlc-val');
+    cells[0].textContent = fmt(q.open); cells[1].textContent = fmt(q.high);
+    cells[2].textContent = fmt(q.low);  cells[3].textContent = fmt(q.prevClose);
+  }
+  function renderMini(prefix, q, unavailText) {
+    var pEl = document.getElementById(prefix + 'Price'), cEl = document.getElementById(prefix + 'Chg');
+    if (!q) { if (!unavailText) { pEl.textContent = '—'; cEl.textContent = '—'; } return; }
+    pEl.textContent = fmt(q.price);
+    cEl.className = 'mv-mini-chg ' + chgClass(q.change);
+    cEl.textContent = chgArrow(q.change) + ' ' + (q.change >= 0 ? '+' : '') + fmt(q.change) + ' pts';
+  }
+  function renderChain(d) {
+    var sub = document.getElementById('mvNiftyChainSub'), body = document.getElementById('mvNiftyChainBody');
+    if (!d) { sub.textContent = ''; body.className = 'mv-unavail'; body.innerHTML = 'Option-chain data temporarily unavailable (NSE feed).'; return; }
+    sub.textContent = 'EXPIRY ' + esc(d.expiry || '—') + ' · ATM ' + fmt(d.spot, 0);
+    var verdict = d.pcr == null ? 'N/A' : (d.pcr > 1.2 ? 'BULLISH' : (d.pcr < 0.8 ? 'BEARISH' : 'NEUTRAL'));
+    var verdictCls = verdict === 'BULLISH' ? 'bull' : (verdict === 'BEARISH' ? 'bear' : '');
+    var near = d.nearStrikesCallOI || {}, put = d.nearStrikesPutOI || {};
+    var strikes = Object.keys(near).map(Number).sort(function(a,b){return a-b;});
+    var maxOi = 1;
+    strikes.forEach(function(s){ maxOi = Math.max(maxOi, near[s]||0, put[s]||0); });
+    var oiRows = strikes.map(function(s) {
+      var cw = Math.round((near[s]||0) / maxOi * 60), pw = Math.round((put[s]||0) / maxOi * 60);
+      return '<div class="mv-oi-row">' +
+        '<div class="mv-oi-bar-l" style="width:' + pw + 'px"></div>' +
+        '<div class="mv-oi-strike">' + fmt(s, 0) + '</div>' +
+        '<div class="mv-oi-bar-r" style="width:' + cw + 'px"></div></div>';
+    }).join('');
+    body.className = '';
+    body.innerHTML =
+      '<div class="mv-pcr-row"><div><div class="mv-lbl">PCR (OI)</div><div class="mv-pcr-val">' + fmt(d.pcr) + '<span class="mv-pcr-tag ' + verdictCls + '">' + verdict + '</span></div></div>' +
+      '<div style="text-align:right;font-size:11px;color:#8a8474">CALL OI ' + fmt((d.totalCallOI||0)/10000000, 2) + ' Cr<br>PUT OI ' + fmt((d.totalPutOI||0)/10000000, 2) + ' Cr</div></div>' +
+      '<div class="mv-sr-row">' +
+      '<div class="mv-sr-box sup"><div class="mv-lbl">SUPPORT</div><b>' + fmt(d.oiSupport_maxPutOI, 0) + '</b></div>' +
+      '<div class="mv-sr-box res"><div class="mv-lbl">RESISTANCE</div><b>' + fmt(d.oiResistance_maxCallOI, 0) + '</b></div></div>' +
+      '<div class="mv-oi-hdr"><span>PUT</span><span>OI AROUND ATM</span><span>CALL</span></div>' + oiRows;
+  }
+  function renderCues(cues, mcxGold) {
+    var body = document.getElementById('mvCuesBody');
+    var rows = (cues || []).map(function(c) {
+      var q = c.q;
+      if (!q) return '<tr><td>' + esc(c.label) + '</td><td>—</td><td>—</td></tr>';
+      var cls = chgClass(q.change);
+      return '<tr><td>' + esc(c.label) + '</td><td>' + fmt(q.price) + (c.unit ? ' <span style="color:#8a8474;font-size:11px">' + esc(c.unit) + '</span>' : '') + '</td>' +
+        '<td><span class="mv-cues-pill ' + (cls||'flat') + '">' + chgArrow(q.change) + ' ' + (q.change >= 0 ? '+' : '') + fmt(q.change) + '</span></td></tr>';
+    });
+    if (mcxGold && mcxGold.value) {
+      rows.push('<tr><td>MCX Gold (approx)</td><td>' + fmt(mcxGold.value, 0) + ' <span style="color:#8a8474;font-size:11px">' + esc(mcxGold.unit) + '</span></td><td>—</td></tr>');
+    }
+    body.innerHTML = rows.join('') || '<tr><td colspan="3" style="color:#8a8474">No data</td></tr>';
+  }
+
+  function load() {
+    fetch('/api/dashboard/snapshot').then(function(r) { return r.json(); }).then(function(d) {
+      if (!d || !d.success) return;
+      document.getElementById('mvDate').textContent = d.asOf || '';
+      renderBig(d.nifty);
+      renderMini('mvSensex', d.sensex);
+      renderMini('mvVix', d.indiaVix);
+      if (!d.giftNifty) { document.getElementById('mvGiftPrice').textContent = '—'; }
+      else renderMini('mvGift', d.giftNifty);
+      renderChain(d.niftyChain);
+      renderCues(d.globalCues, d.mcxGold);
+    }).catch(function() {});
+  }
+
+  var enterBtn = document.getElementById('mvEnterBtn');
+  if (enterBtn) enterBtn.addEventListener('click', function() {
+    document.getElementById('mvDash').style.display = 'none';
+  });
+
+  load();
+  setInterval(load, 60000);
+})();
+</script>
 
 <div class="header">
   <div class="header-left">
