@@ -2043,7 +2043,7 @@ _TV_DEFAULT_TOKEN = os.environ.get('TV_WEBHOOK_TOKEN', '').strip() or 'mangalvie
 _TV_INTERVAL = {'1m': '1', '3m': '5', '5m': '5', '15m': '15', '30m': '30',
                 '1h': '60', '2h': '120', '4h': '240', '1d': '1D', '1w': '1W'}
 _TV_COLS = ['Recommend.All', 'Recommend.MA', 'Recommend.Other', 'RSI', 'Mom',
-            'MACD.macd', 'MACD.signal', 'Stoch.K', 'ADX', 'close']
+            'MACD.macd', 'MACD.signal', 'Stoch.K', 'ADX', 'close', 'change', 'change_abs']
 
 def _tv_rating_label(v):
     try: v = float(v)
@@ -2056,7 +2056,11 @@ def _tv_rating_label(v):
 
 def _tv_screener_for(tv_symbol):
     pre = (tv_symbol.split(':', 1)[0] if ':' in tv_symbol else '').upper()
-    if pre in ('NSE', 'BSE', 'MCX'):                                   return 'india'
+    # MCX (and other futures-root '1!' continuous contracts) aren't covered by
+    # the 'india' equities/index screener — confirmed empty there, live on
+    # 'futures' — see _dash_tv_quote / the MangalView dashboard's MCX Gold card.
+    if pre == 'MCX':                                                   return 'futures'
+    if pre in ('NSE', 'BSE'):                                          return 'india'
     if pre in ('BINANCE', 'COINBASE', 'BYBIT', 'OKX', 'KUCOIN', 'BITSTAMP'): return 'crypto'
     if pre in ('FX', 'FX_IDC', 'OANDA', 'FOREXCOM', 'SAXO', 'PEPPERSTONE'):  return 'forex'
     if pre in ('NASDAQ', 'NYSE', 'AMEX', 'CBOE'):                      return 'america'
@@ -2110,6 +2114,7 @@ def _tv_fetch_ta(tv_symbol, interval):
             'rsi': _f('RSI', 1), 'macdHist': (round((m.get('MACD.macd') or 0) - (m.get('MACD.signal') or 0), 4)
                                               if m.get('MACD.macd') is not None else None),
             'stochK': _f('Stoch.K', 1), 'adx': _f('ADX', 1), 'close': _f('close', 4),
+            'changePct': _f('change', 2), 'change': _f('change_abs', 4),
         }
         _TV_TA_CACHE[key] = {'ts': now, 'data': out}
         return out
@@ -4200,30 +4205,125 @@ def _dash_quote(ticker):
     _DASH_QUOTE_CACHE[ticker] = {'ts': now, 'data': data}
     return data
 
+def _dash_tv_quote(tv_symbol):
+    """Live price + change via TradingView's public scanner (_tv_fetch_ta) —
+    globally reachable (unlike NSE's own site, which Akamai-blocks most
+    server IPs), used for symbols with no other free live source: GIFT Nifty
+    (NSEIX:NIFTY1! — the actual GIFT City / NSE IX futures contract) and MCX
+    Gold futures (MCX:GOLD1!)."""
+    try:
+        ta = _tv_fetch_ta(tv_symbol, '1D')
+    except Exception:
+        return None
+    if not ta or ta.get('close') is None:
+        return None
+    return {'price': ta['close'], 'change': ta.get('change'), 'changePct': ta.get('changePct')}
+
+def _dash_active_kite_session():
+    """api_key of any connected Zerodha session (this app runs single-instance —
+    see zerodha_sessions — so 'any connected one' is 'the' one), or None."""
+    for k, v in (zerodha_sessions or {}).items():
+        if v.get('connected') and v.get('access_token'):
+            return k
+    return None
+
+_DASH_OI_CACHE = {}
+_DASH_OI_TTL = 45
+
+def _dash_kite_oi(base, api_key):
+    """Real option-chain OI/PCR/support-resistance for `base` (NIFTY/SENSEX/…)
+    via the connected Kite session — the same instrument-dump + batch-quote
+    plumbing the Strategy Menu already uses (_zo_load_opt_instruments,
+    _kite_quote_batch), which Kite's quote response includes 'oi' for.
+    NSE's own public option-chain API is blocked by Akamai bot-management from
+    most server-hosted IPs (confirmed: identical 404 with or without browser-
+    TLS impersonation), so this is the reliable path once Zerodha is connected.
+    Returns None if no session, no chain, or the quote batch comes back empty."""
+    if not api_key:
+        return None
+    key = (base, api_key)
+    now = _zd_time.time()
+    ent = _DASH_OI_CACHE.get(key)
+    if ent and now - ent['ts'] < _DASH_OI_TTL:
+        return ent['data']
+    try:
+        spot_sym, spot_exch, opt_exch = _zo_base_meta(base)
+        spot = _zo_base_spot(spot_sym, api_key)
+        if spot <= 0:
+            raise ValueError('no spot')
+        chain_all = [i for i in _zo_load_opt_instruments(opt_exch) if i.get('name', '').upper() == base]
+        if not chain_all:
+            raise ValueError('no chain')
+        today = datetime.now().strftime('%Y-%m-%d')
+        expiries = sorted({i['expiry'] for i in chain_all if i.get('expiry') and i['expiry'] >= today})
+        if not expiries:
+            raise ValueError('no expiries')
+        expiry = expiries[0]
+        leg = [i for i in chain_all if i['expiry'] == expiry]
+        strikes = sorted({i['strike'] for i in leg})
+        step = strikes[1] - strikes[0] if len(strikes) > 1 else 50
+        atm = min(strikes, key=lambda s: abs(s - spot))
+        # Near-ATM window only — batch-quoting the FULL chain (often 60-100+
+        # instruments) every dashboard poll is heavy; ±6 strikes already covers
+        # where OI concentrates in practice for the PCR/support-resistance read.
+        near = [s for s in strikes if abs(s - atm) <= 6 * step]
+        near_legs = [i for i in leg if i['strike'] in near]
+        quotes = _kite_quote_batch(api_key, [(opt_exch, i['symbol']) for i in near_legs])
+        if not quotes:
+            raise ValueError('empty quote batch')
+        ce_oi, pe_oi = {}, {}
+        for i in near_legs:
+            q = quotes.get(opt_exch + ':' + i['symbol']) or {}
+            oi = q.get('oi') or 0
+            if i['type'] == 'CE': ce_oi[i['strike']] = oi
+            elif i['type'] == 'PE': pe_oi[i['strike']] = oi
+        if not ce_oi or not pe_oi:
+            raise ValueError('no OI data')
+        tot_ce = sum(ce_oi.values()); tot_pe = sum(pe_oi.values())
+        data = {'symbol': base, 'spot': round(spot, 2), 'expiry': expiry,
+                'pcr': round(tot_pe / tot_ce, 2) if tot_ce else None,
+                'totalCallOI': tot_ce, 'totalPutOI': tot_pe,
+                'oiSupport_maxPutOI': max(pe_oi, key=pe_oi.get),
+                'oiResistance_maxCallOI': max(ce_oi, key=ce_oi.get),
+                'nearStrikesCallOI': ce_oi, 'nearStrikesPutOI': pe_oi, 'source': 'kite'}
+    except Exception:
+        data = ent['data'] if ent else None
+    _DASH_OI_CACHE[key] = {'ts': now, 'data': data}
+    return data
+
 def _dash_snapshot():
-    """Aggregates everything the MangalView public dashboard shows. Every piece
-    is fetched independently and defaults to None/unavailable on failure —
-    one flaky source (esp. NSE, which sometimes blocks this server's IP; see
-    _tg_nse_oi) never takes down the rest of the page."""
+    """Aggregates everything the MangalView dashboard shows. Every piece is
+    fetched independently and defaults to None/unavailable on failure — one
+    flaky source never takes down the rest of the page."""
     nifty  = _dash_quote('^NSEI')
     sensex = _dash_quote('^BSESN')
     vix    = _dash_quote('^INDIAVIX')
     usdinr = _dash_quote('INR=X')
     gold   = _dash_quote('GC=F')     # USD/troy-oz
     silver = _dash_quote('SI=F')     # USD/troy-oz
+
+    api_key = _dash_active_kite_session()
     try:
-        nifty_chain = _tg_nse_oi('NIFTY')
+        nifty_chain = _dash_kite_oi('NIFTY', api_key) if api_key else None
+        if not nifty_chain:
+            nifty_chain = _tg_nse_oi('NIFTY')   # occasionally reachable direct from NSE — try it too
     except Exception:
         nifty_chain = None
-    # MCX Gold (₹/10g) has no free live feed — approximated from COMEX gold ×
-    # USD/INR (import-parity math). Clearly labelled "approx" on the card; the
-    # real MCX print differs by import duty + local premium.
-    mcx_gold = None
-    if gold and usdinr:
+    try:
+        sensex_chain = _dash_kite_oi('SENSEX', api_key) if api_key else None
+    except Exception:
+        sensex_chain = None
+
+    gift_nifty = _dash_tv_quote('NSEIX:NIFTY1!')      # GIFT City / NSE IX Nifty futures
+    mcx_gold   = _dash_tv_quote('MCX:GOLD1!')          # real MCX print, not a computed proxy
+    if not mcx_gold and gold and usdinr:
+        # Last-resort import-parity approximation if TradingView is also down —
+        # clearly flagged 'approx': true so the UI can label it as such.
         try:
-            mcx_gold = round(gold['price'] * usdinr['price'] / 31.1034768 * 10, 0)
+            mcx_gold = {'price': round(gold['price'] * usdinr['price'] / 31.1034768 * 10, 0), 'approx': True}
         except Exception:
             mcx_gold = None
+
     cues = [
         {'label': 'Dow Jones',       'key': 'DJI',    'unit': '',      'q': _dash_quote('^DJI')},
         {'label': 'S&P 500',         'key': 'SPX',    'unit': '',      'q': _dash_quote('^GSPC')},
@@ -4236,16 +4336,17 @@ def _dash_snapshot():
         {'label': 'US Oil (WTI)',    'key': 'USOIL',  'unit': '$/bbl', 'q': _dash_quote('CL=F')},
         {'label': 'UK Oil (Brent)',  'key': 'UKOIL',  'unit': '$/bbl', 'q': _dash_quote('BZ=F')},
         {'label': 'USD / INR',       'key': 'USDINR', 'unit': '',      'q': usdinr},
+        {'label': 'MCX Gold (10g)',  'key': 'MCXGOLD','unit': '₹',     'q': mcx_gold},
     ]
     return {
         'success': True,
         'asOf': _tg_now_ist().strftime('%d %b %Y %H:%M IST'),
         'nifty': nifty, 'sensex': sensex, 'indiaVix': vix,
-        'giftNifty': None,   # no free live GIFT Nifty feed — panel shows "—"
+        'giftNifty': gift_nifty,
         'niftyChain': nifty_chain,
-        'sensexChain': None,   # SENSEX options trade on BSE; no free OI/PCR feed (see _tg_run_index_analysis)
+        'sensexChain': sensex_chain,
+        'kiteConnected': bool(api_key),
         'globalCues': cues,
-        'mcxGold': {'value': mcx_gold, 'unit': '₹/10g', 'approx': True} if mcx_gold else None,
     }
 
 @app.route('/api/dashboard/snapshot', methods=['GET'])
@@ -20980,10 +21081,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="mv-card" id="mvSensexChainCard">
         <div class="mv-chain-title">SENSEX OPTION CHAIN</div>
-        <div class="mv-chain-sub">&nbsp;</div>
-        <div class="mv-unavail">SENSEX options trade on BSE — no free live OI/PCR feed is wired up yet.</div>
+        <div class="mv-chain-sub" id="mvSensexChainSub">—</div>
+        <div id="mvSensexChainBody" class="mv-unavail">Loading…</div>
       </div>
     </div>
+    <div class="mv-unavail" id="mvKiteHint" style="display:none;margin:-6px 0 14px;padding:8px 12px;background:#fff;border-radius:8px">Connect Zerodha (see the Automation menu) for live NIFTY/SENSEX option-chain OI — shown here the moment it's connected.</div>
 
     <div class="mv-card">
       <div class="mv-lbl" style="margin-bottom:8px">GLOBAL CUES</div>
@@ -21026,10 +21128,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cEl.className = 'mv-mini-chg ' + chgClass(q.change);
     cEl.textContent = chgArrow(q.change) + ' ' + (q.change >= 0 ? '+' : '') + fmt(q.change) + ' pts';
   }
-  function renderChain(d) {
-    var sub = document.getElementById('mvNiftyChainSub'), body = document.getElementById('mvNiftyChainBody');
-    if (!d) { sub.textContent = ''; body.className = 'mv-unavail'; body.innerHTML = 'Option-chain data temporarily unavailable (NSE feed).'; return; }
-    sub.textContent = 'EXPIRY ' + esc(d.expiry || '—') + ' · ATM ' + fmt(d.spot, 0);
+  function renderChain(prefix, d, kiteConnected) {
+    var sub = document.getElementById(prefix + 'ChainSub'), body = document.getElementById(prefix + 'ChainBody');
+    if (!d) {
+      sub.textContent = '';
+      body.className = 'mv-unavail';
+      body.innerHTML = kiteConnected
+        ? 'Option-chain data temporarily unavailable (feed error — will retry).'
+        : 'Connect Zerodha (Automation menu) for live OI — the NSE/BSE public feeds are blocked from this server.';
+      return;
+    }
+    sub.textContent = 'EXPIRY ' + esc(d.expiry || '—') + ' · ATM ' + fmt(d.spot, 0) + (d.source === 'kite' ? ' · via Zerodha' : '');
     var verdict = d.pcr == null ? 'N/A' : (d.pcr > 1.2 ? 'BULLISH' : (d.pcr < 0.8 ? 'BEARISH' : 'NEUTRAL'));
     var verdictCls = verdict === 'BULLISH' ? 'bull' : (verdict === 'BEARISH' ? 'bear' : '');
     var near = d.nearStrikesCallOI || {}, put = d.nearStrikesPutOI || {};
@@ -21052,18 +21161,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       '<div class="mv-sr-box res"><div class="mv-lbl">RESISTANCE</div><b>' + fmt(d.oiResistance_maxCallOI, 0) + '</b></div></div>' +
       '<div class="mv-oi-hdr"><span>PUT</span><span>OI AROUND ATM</span><span>CALL</span></div>' + oiRows;
   }
-  function renderCues(cues, mcxGold) {
+  function renderCues(cues) {
     var body = document.getElementById('mvCuesBody');
     var rows = (cues || []).map(function(c) {
       var q = c.q;
-      if (!q) return '<tr><td>' + esc(c.label) + '</td><td>—</td><td>—</td></tr>';
+      var label = esc(c.label) + (c.q && c.q.approx ? ' (approx)' : '');
+      if (!q) return '<tr><td>' + label + '</td><td>—</td><td>—</td></tr>';
       var cls = chgClass(q.change);
-      return '<tr><td>' + esc(c.label) + '</td><td>' + fmt(q.price) + (c.unit ? ' <span style="color:#8a8474;font-size:11px">' + esc(c.unit) + '</span>' : '') + '</td>' +
-        '<td><span class="mv-cues-pill ' + (cls||'flat') + '">' + chgArrow(q.change) + ' ' + (q.change >= 0 ? '+' : '') + fmt(q.change) + '</span></td></tr>';
+      var valTxt = c.unit === '₹' ? ('₹' + fmt(q.price, 0)) : (fmt(q.price) + (c.unit ? ' <span style="color:#8a8474;font-size:11px">' + esc(c.unit) + '</span>' : ''));
+      var chgTxt = (q.change == null) ? '—' : ('<span class="mv-cues-pill ' + (cls||'flat') + '">' + chgArrow(q.change) + ' ' + (q.change >= 0 ? '+' : '') + fmt(q.change) + '</span>');
+      return '<tr><td>' + label + '</td><td>' + valTxt + '</td><td>' + chgTxt + '</td></tr>';
     });
-    if (mcxGold && mcxGold.value) {
-      rows.push('<tr><td>MCX Gold (approx)</td><td>' + fmt(mcxGold.value, 0) + ' <span style="color:#8a8474;font-size:11px">' + esc(mcxGold.unit) + '</span></td><td>—</td></tr>');
-    }
     body.innerHTML = rows.join('') || '<tr><td colspan="3" style="color:#8a8474">No data</td></tr>';
   }
 
@@ -21074,10 +21182,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderBig(d.nifty);
       renderMini('mvSensex', d.sensex);
       renderMini('mvVix', d.indiaVix);
-      if (!d.giftNifty) { document.getElementById('mvGiftPrice').textContent = '—'; }
-      else renderMini('mvGift', d.giftNifty);
-      renderChain(d.niftyChain);
-      renderCues(d.globalCues, d.mcxGold);
+      renderMini('mvGift', d.giftNifty, 'live feed unavailable');
+      var kiteHint = document.getElementById('mvKiteHint');
+      if (kiteHint) kiteHint.style.display = d.kiteConnected ? 'none' : '';
+      renderChain('mvNifty', d.niftyChain, d.kiteConnected);
+      renderChain('mvSensex', d.sensexChain, d.kiteConnected);
+      renderCues(d.globalCues);
     }).catch(function() {});
   }
 
