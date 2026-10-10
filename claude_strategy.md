@@ -116,7 +116,8 @@ The price Claude analyses for an option leg is the **premium**, not the index. T
 
 Each panel has a **📊 TradingView** toggle. There's no official API for a user's private chart indicators, so it provides the realistic equivalents, fed to Claude as **context only** (Claude still decides):
 
-- **Technical Analysis (auto)** — pulled from TradingView's public scanner for the symbol + timeframe: overall **STRONG BUY → STRONG SELL** rating plus RSI, MACD histogram, Stochastic, ADX, and the moving-average / oscillator sub-ratings. Shown in the small panel display and refreshed ~20s. See [`_tv_fetch_ta`](scripts/nifty_chart.py).
+- **Technical Analysis (auto)** — pulled from TradingView's public scanner for the symbol + timeframe: overall **STRONG BUY → STRONG SELL** rating plus RSI, MACD histogram, Stochastic, ADX, the moving-average / oscillator sub-ratings, and the day's **`change`/`changePct`** (point and % move). Shown in the small panel display and refreshed ~20s. See [`_tv_fetch_ta`](scripts/nifty_chart.py).
+- **MCX symbols now actually return data.** `_tv_screener_for` was routing `MCX:*` tickers (e.g. a Gold/Crude Oil MCX `tvSymbol`) to TradingView's `india` equities/index screener, which returns nothing for futures contracts — so TV confirmation was silently empty for any bot configured with an MCX symbol. Fixed to use the `futures` screener, which does carry them.
 - **Custom indicators (webhook)** — create a TradingView **Alert** on your own Pine indicator with a Webhook URL `<origin>/api/aibot/tv/webhook?token=<token>` and a JSON body like `{"symbol":"NIFTY","signal":"BUY","indicator":"MyPine"}`. The latest signal per symbol is stored and passed to Claude with its age. See [`aibot_tv_webhook`](scripts/nifty_chart.py).
 - For the **Options** bot, TradingView is read on the **underlying** (e.g. NSE:NIFTY), since option contracts aren't on TradingView TA.
 - Influence is **context only**: Claude lifts conviction when TV aligns with its own read and raises its bar when TV opposes — it never trades against its own structure read just because TV disagrees. A stale webhook (large `ageSec`) is weighted weakly.
@@ -162,6 +163,7 @@ Candles come from the bot's broker feed — Delta, Kite (Zerodha), or MT5. For t
 - The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
 - **Tick** sets how often the bot checks the market and calls Claude. Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost. A slower tick (e.g. 180s) = fewer, more-considered trades and lower cost.
   - All six bots share the same range — **15s … 1d** (15s/30s/1m/2m/3m/5m/10m/15m/30m/1h/1d) — so cadence can match a higher-timeframe, multi-chart read (see §9).
+- **Schedule** — every bot panel has a Schedule button: set a daily **Start time** and **Stop time** (IST) and arm it, and the bot starts/stops itself at those times with no browser tab open. Arming snapshots the panel's current config (symbol, qty, SL/TP, strategy checkboxes, etc.) so the exact same setup replays automatically — it does **not** change anything about how Claude decides once running, only when the bot is live. One shared background thread (`_legacy_bot_scheduler_tick`) checks all six bots' armed schedules once a minute; a fired-date guard stops it firing more than once per day per edge. See [`_bot_schedule_route`](scripts/nifty_chart.py).
 
 ---
 
