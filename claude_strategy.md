@@ -162,9 +162,9 @@ Candles come from the bot's broker feed — Delta, Kite (Zerodha), or MT5. For t
 
 ## 11. Model & cadence
 
-- The **Model** selector (Haiku / Sonnet / Opus) chooses which Claude model makes the decisions — Haiku is cheapest/fastest, Opus is the most capable.
+- The **Model** selector lists the full current Claude lineup, grouped Flagship / Opus / Sonnet / Haiku (`_CLAUDE_MODEL_IDS`) — Haiku is cheapest/fastest, Fable 5.1 the most capable, Sonnet the balance of the two. Defaults to **Sonnet 5.5** (`claude-sonnet-5-5`).
 - **Tick** sets how often the bot checks the market and calls Claude. Each tick = **one Claude API call per running bot / leg**, so the tick interval drives both responsiveness and API cost. A slower tick (e.g. 180s) = fewer, more-considered trades and lower cost.
-  - All six bots share the same range — **15s … 1d** (15s/30s/1m/2m/3m/5m/10m/15m/30m/1h/1d) — so cadence can match a higher-timeframe, multi-chart read (see §9).
+  - All six bots share the same range — **15s … 1d** (15s/30s/1m/2m/3m/5m/10m/15m/30m/1h/1d), defaulting to **15m** — so cadence can match a higher-timeframe, multi-chart read (see §9).
 - **Schedule** — every bot panel has a Schedule button: set a daily **Start time** and **Stop time** (IST) and arm it, and the bot starts/stops itself at those times with no browser tab open. Arming snapshots the panel's current config (symbol, qty, SL/TP, strategy checkboxes, etc.) so the exact same setup replays automatically — it does **not** change anything about how Claude decides once running, only when the bot is live. One shared background thread (`_legacy_bot_scheduler_tick`) checks all six bots' armed schedules once a minute; a fired-date guard stops it firing more than once per day per edge. See [`_bot_schedule_route`](scripts/nifty_chart.py).
 
 ---

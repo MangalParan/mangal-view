@@ -3140,21 +3140,37 @@ def _sanitize_delta_patch(patch):
     return clean, rejected
 
 # Friendly model names chosen in each AI bot panel → Anthropic model IDs.
+# Full current lineup (Project-Glasswing-gated Mythos 5.1 excluded — not
+# generally available). 'haiku'/'sonnet'/'opus' are kept mapped to their
+# current-generation model for configs/schedules saved before this list grew.
 _CLAUDE_MODEL_IDS = {
-    'haiku':  'claude-haiku-4-5-20251001',
-    'sonnet': 'claude-sonnet-4-6',
-    'opus':   'claude-opus-4-8',
+    'fable51':  'claude-fable-5-1',
+    'fable5':   'claude-fable-5',
+    'opus55':   'claude-opus-5-5',
+    'opus5':    'claude-opus-5',
+    'opus48':   'claude-opus-4-8',
+    'opus47':   'claude-opus-4-7',
+    'opus46':   'claude-opus-4-6',
+    'sonnet55': 'claude-sonnet-5-5',
+    'sonnet5':  'claude-sonnet-5',
+    'sonnet46': 'claude-sonnet-4-6',
+    'haiku55':  'claude-haiku-5-5',
+    'haiku45':  'claude-haiku-4-5',
+    'haiku':    'claude-haiku-5-5',
+    'sonnet':   'claude-sonnet-5-5',
+    'opus':     'claude-opus-5-5',
 }
 
 def _resolve_claude_model(name):
-    """Map a panel model choice (haiku/sonnet/opus) to an Anthropic model ID.
-    Accepts a full 'claude-*' id as-is. Falls back to CLAUDE_MODEL env / sonnet."""
+    """Map a panel model choice (e.g. sonnet55/opus5/haiku45) to an Anthropic
+    model ID. Accepts a full 'claude-*' id as-is. Falls back to CLAUDE_MODEL
+    env / current Sonnet."""
     key = (name or '').strip().lower()
     if key in _CLAUDE_MODEL_IDS:
         return _CLAUDE_MODEL_IDS[key]
     if key.startswith('claude-'):
         return key
-    return os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6').strip() or 'claude-sonnet-4-6'
+    return os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5-5').strip() or 'claude-sonnet-5-5'
 
 # ---- Vision: chart-image input for Claude (base64 image content blocks) ------
 # A user can upload a TradingView chart (SuperTrend / EMA / PSAR / S-R, multi-TF) in
@@ -22038,8 +22054,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when realised P/L drops below this">Daily loss &#8377;<input type="number" id="aiBotMaxLoss" value="2000" min="100"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="aiBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
-        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="aiBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="aiBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="aiBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <!-- Connection status -->
       <div class="zd-status-bar" id="aiBotStatusBar" style="margin-bottom:10px">
@@ -22340,8 +22356,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when realised P/L drops below this">Daily loss<input type="number" id="mtBotMaxLoss" value="2000" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="mtBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
-        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="mtBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="mtBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="mtBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <div class="zd-status-bar" id="mtBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="mtBotStatusDot"></span>
@@ -22532,8 +22548,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when realised P/L drops below this">Daily loss<input type="number" id="deltaBotMaxLoss" value="200" min="10"></label>
         <label title="Bot banks the open trade and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit<input type="number" id="deltaBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
-        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="deltaBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost. Match this to your uploaded chart timeframes for longer-horizon trading.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="deltaBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost. Match this to your uploaded chart timeframes for longer-horizon trading.">Tick<select id="deltaBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <div class="zd-status-bar" id="deltaBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="deltaBotStatusDot"></span>
@@ -22757,8 +22773,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Fixed units to trade if Capital is 0.">Qty<input type="number" id="tvBotQty" value="1" min="0" step="0.01" style="width:70px"></label>
         <label>SL%<input type="number" id="tvBotSlPct" value="1.0" min="0.1" step="0.1" style="width:60px"></label>
         <label>TP%<input type="number" id="tvBotTpPct" value="2.0" min="0.1" step="0.1" style="width:60px"></label>
-        <label>Model<select id="tvBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label>Tick<select id="tvBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+        <label>Model<select id="tvBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
+        <label>Tick<select id="tvBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
 
       <!-- Multi-timeframe chart upload (optional): upload 1D/1H/30m/15m/5m charts,
@@ -22857,8 +22873,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Trading capital (USDT) — context for Claude.">Capital $<input type="number" id="doBotCapital" value="1000" min="0" step="100"></label>
         <label title="Bot auto-stops when realised P/L drops below this.">Daily loss $<input type="number" id="doBotMaxLoss" value="50" min="1"></label>
         <label title="Bot banks + stops once realised+open P/L reaches this. 0 = off.">Daily profit $<input type="number" id="doBotMaxProfit" value="0" min="0"></label>
-        <label>Model<select id="doBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="How often the bot checks + calls Claude.">Tick<select id="doBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+        <label>Model<select id="doBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
+        <label title="How often the bot checks + calls Claude.">Tick<select id="doBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
         <label title="Paper = simulated. Live = real Delta orders.">Mode<select id="doBotMode"><option value="paper" selected>Paper</option><option value="live">Live</option></select></label>
       </div>
 
@@ -22977,8 +22993,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Bot auto-stops when realised P/L drops below this">Daily loss &#8377;<input type="number" id="zoBotMaxLoss" value="2000" min="100"></label>
         <label title="Bot banks open trades and stops once realised+open P/L reaches this. 0 = disabled.">Daily profit &#8377;<input type="number" id="zoBotMaxProfit" value="0" min="0" step="1"></label>
         <span class="sep"></span>
-        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="zoBotModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
-        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120" selected>2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900">15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
+        <label title="Claude model used for trade decisions — Haiku is cheapest/fastest, Opus is the most capable (and priciest).">Model<select id="zoBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
+        <label title="Tick interval — how often the bot checks the market &amp; calls Claude. Lower = faster but more API cost.">Tick<select id="zoBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
       </div>
       <div class="zd-status-bar" id="zoBotStatusBar" style="margin-bottom:10px">
         <span class="zd-status-dot" id="zoBotStatusDot"></span>
@@ -23254,7 +23270,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label><span>Expiry</span><select id="stratZoExpirySel"><option value="">&mdash;</option></select></label>
           <label title="SELL legs are picked at or below this delta (0.20 = 20 delta)"><span>Target Delta</span><input type="number" id="stratZoTargetDelta" value="0.20" min="0.01" max="0.90" step="0.01" style="width:80px"></label>
           <label title="Hedge (BUY) strike = sold strike +/- this many points"><span>Hedge distance (pts)</span><input type="number" id="stratZoHedgeDist" value="500" min="10" step="10" style="width:100px"></label>
-          <label><span>Model</span><select id="stratZoModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+          <label><span>Model</span><select id="stratZoModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
           <button class="zd-add-btn" id="stratZoClaudeBtn" type="button">&#129302; Claude strategy</button>
           <span id="stratZoClaudeInfo" style="color:#787b86;font-size:11px"></span>
         </div>
@@ -23396,7 +23412,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label><span>Expiry</span><select id="stratDoExpirySel"><option value="">&mdash;</option></select></label>
           <label title="SELL legs are picked at or below this delta (0.20 = 20 delta) — uses Delta Exchange's native greeks"><span>Target Delta</span><input type="number" id="stratDoTargetDelta" value="0.20" min="0.01" max="0.90" step="0.01" style="width:80px"></label>
           <label title="Hedge (BUY) strike = sold strike +/- this many price points. BTC/ETH strikes are far apart in $ terms — 500 suits BTC, ETH usually wants ~50 (auto-suggested when you switch Underlying)."><span>Hedge distance ($)</span><input type="number" id="stratDoHedgeDist" value="500" min="1" step="1" style="width:100px"></label>
-          <label><span>Model</span><select id="stratDoModel"><option value="haiku">Haiku</option><option value="sonnet" selected>Sonnet</option><option value="opus">Opus</option></select></label>
+          <label><span>Model</span><select id="stratDoModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
           <button class="zd-add-btn" id="stratDoClaudeBtn" type="button">&#129302; Claude strategy</button>
           <span id="stratDoClaudeInfo" style="color:#787b86;font-size:11px"></span>
         </div>
