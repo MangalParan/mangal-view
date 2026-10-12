@@ -32,7 +32,7 @@ Positive score = bullish/oversold-bounce bias, negative = bearish/overbought-fad
 
 ### Checkbox
 
-Each of the four legacy AI bot panels (Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot / TradingView bot) now has a **Quant** checkbox next to **Claude AI**, using the existing generic `.strat-chk` / `data-strat="quant"` mechanism — no new plumbing needed, it's collected into `allowedStrategies` exactly like every other strategy checkbox and logged in the `[CONFIG]` line on Start.
+Each of the six legacy AI bot panels (Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot, Delta Options AI Bot, TradingView bot) now has a **Quant** checkbox next to **Claude AI**, using the existing generic `.strat-chk` / `data-strat="quant"` mechanism — no new plumbing needed, it's collected into `allowedStrategies` exactly like every other strategy checkbox and logged in the `[CONFIG]` line on Start. On the Delta Options bot the Claude AI checkbox itself is fixed on (checked, disabled) — that bot has no non-Claude trading mode — but Quant still toggles freely and drives Claude's conviction the same way.
 
 ### Wiring
 
@@ -48,4 +48,4 @@ When the checkbox is off, none of the extra indicator computation runs (`_bot_qu
 
 ### Where it applies
 
-All call sites that already share `_claude_trade_signal` — the Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot (per-leg), and the TradingView-alerts bot — get this automatically, since the wiring lives inside `_claude_trade_signal` itself rather than at each call site. The **Strategy Menu** (Iron Condor / Short Strangle / Jade Lizard / EMA Crossover — see `claude_strategy.md` Part 2) is unaffected: it never calls `_claude_trade_signal` and uses Claude only for strike selection, not direction.
+All call sites that already share `_claude_trade_signal` — the Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot (per-leg), Delta Options AI Bot (per-leg), and the TradingView-alerts bot — get this automatically, since the wiring lives inside `_claude_trade_signal` itself rather than at each call site. The **Strategy Menu** (Iron Condor / Short Strangle / Jade Lizard / EMA Crossover — see `claude_strategy.md` Part 2) is unaffected: it never calls `_claude_trade_signal` and uses Claude only for strike selection, not direction.

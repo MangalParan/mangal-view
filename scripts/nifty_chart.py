@@ -10564,6 +10564,13 @@ def _do_aibot_do_start(data):
             'tickSec': max(5, int(data.get('tickSec', _BOT_TICK_SEC) or _BOT_TICK_SEC)),
             'model': (data.get('model') or '').strip(), 'api_key': api_key,
             'strategies': 'claude', 'manualOnly': bool(data.get('manualOnly', False)),
+            # This bot is Claude-only (no non-Claude fallback mode), so 'claude'
+            # always stays in the list regardless of what the client sends —
+            # the checkbox for it is fixed on in the UI. 'quant' passes through
+            # when the user ticks it, driving Claude's conviction same as the
+            # other bots (see _claude_trade_signal's quant block).
+            'allowedStrategies': list({'claude'} | {s for s in (data.get('allowedStrategies') or [])
+                                                     if s in _BOT_CONFIGURABLE_ALGOS}),
         }
         do_ai_state['legs'] = legs; do_ai_state['trades'] = []; do_ai_state['consec_losses'] = 0
         do_ai_state['running'] = True; do_ai_state['paused'] = False; do_ai_state['_last_decision_ts'] = 0
@@ -19700,7 +19707,7 @@ HELP_QUANT_STRATEGY_PAGE = r"""<!DOCTYPE html>
 
 <h2>4. Where It Applies</h2>
 <div class="card">
-<p>Every bot that shares the Claude decision engine &mdash; Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot (per-leg), and the TradingView-alerts bot &mdash; gets this automatically, since the wiring lives in the shared engine rather than at each bot's call site.</p>
+<p>Every bot that shares the Claude decision engine &mdash; Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot (per-leg), Delta Options AI Bot (per-leg), and the TradingView-alerts bot &mdash; gets this automatically, since the wiring lives in the shared engine rather than at each bot's call site. On the Delta Options bot, Claude AI itself is fixed on (that bot has no non-Claude mode), but Quant still toggles freely.</p>
 <p>The <a href="/help/claude-strategy">Strategy Menu</a> (Iron Condor / Short Strangle / Jade Lizard / EMA Crossover) is unaffected: it never uses the shared decision engine and uses Claude only for strike selection, not direction.</p>
 </div>
 
@@ -23192,6 +23199,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>Model<select id="doBotModel"><optgroup label="Flagship"><option value="fable51">Fable 5.1</option><option value="fable5">Fable 5</option></optgroup><optgroup label="Opus"><option value="opus55">Opus 5.5</option><option value="opus5">Opus 5</option><option value="opus48">Opus 4.8</option><option value="opus47">Opus 4.7</option><option value="opus46">Opus 4.6</option></optgroup><optgroup label="Sonnet"><option value="sonnet55" selected>Sonnet 5.5</option><option value="sonnet5">Sonnet 5</option><option value="sonnet46">Sonnet 4.6</option></optgroup><optgroup label="Haiku"><option value="haiku55">Haiku 5.5</option><option value="haiku45">Haiku 4.5</option></optgroup></select></label>
         <label title="How often the bot checks + calls Claude.">Tick<select id="doBotTickSec"><option value="15">15s</option><option value="30">30s</option><option value="60">1m</option><option value="120">2m</option><option value="180">3m</option><option value="300">5m</option><option value="600">10m</option><option value="900" selected>15m</option><option value="1800">30m</option><option value="3600">1h</option><option value="86400">1d</option></select></label>
         <label title="Paper = simulated. Live = real Delta orders.">Mode<select id="doBotMode"><option value="paper" selected>Paper</option><option value="live">Live</option></select></label>
+      </div>
+
+      <div class="ai-strat-bar">
+        <span class="lbl">&#127919; Strategy:</span>
+        <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
+          <label title="This bot is Claude-only — there is no non-Claude trading mode to fall back to, so this stays on." style="color:#b388ff;opacity:0.75"><input type="checkbox" class="strat-chk" data-strat="claude" id="doBotClaudeChk" checked disabled> &#129302; Claude AI (always on)</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
+        </span>
+        <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; this bot has no non-Claude mode)</span>
       </div>
 
       <!-- Multi-timeframe chart upload (optional): upload 1D/1H/30m/15m/5m charts,
@@ -30636,6 +30652,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if(mb) mb.addEventListener('click', function(){ mx=!mx; panel.classList.toggle('maximized', mx); this.innerHTML=mx?'&#9635;':'&#9633;'; });
       if(pb) pb.addEventListener('click', function(){ const u=new URL(window.location.href); u.searchParams.set('doBotPopout','1'); window.open(u.toString(),'doBotPopout','width=1000,height=900,resizable=yes,scrollbars=yes'); });
     })();
+    // ---- Strategy checkboxes (Claude AI is fixed on — this bot has no non-
+    // Claude mode; Quant is the one actually toggleable here, same mechanism
+    // as every other bot's .strat-chk / data-strat collection). ----
+    const DO_STRAT_KEY = 'mangalview_doptions_strategies_v1';
+    const doStratChks = Array.from(panel.querySelectorAll('.strat-chk'));
+    try {
+      const saved = JSON.parse(localStorage.getItem(DO_STRAT_KEY) || 'null');
+      if (Array.isArray(saved)) doStratChks.forEach(function(c){ if (!c.disabled) c.checked = saved.indexOf(c.dataset.strat) !== -1; });
+    } catch(e) {}
+    function _collectStrategies() { return doStratChks.filter(function(c){ return c.checked; }).map(function(c){ return c.dataset.strat; }); }
+    doStratChks.forEach(function(c){ c.addEventListener('change', function(){
+      try { localStorage.setItem(DO_STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {}
+    }); });
+
     function cfg(){
       const auto = !!$('doBotAutoStrikes').checked;
       return { autoStrikes: auto, baseSymbol: $('doBotBaseSel').value,
@@ -30645,7 +30675,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         maxProfit: parseFloat($('doBotMaxProfit').value)||0, maxConsec: parseInt($('doBotMaxConsec').value)||3,
         slPct: parseFloat($('doBotSlPct').value)||30, tpPct: parseFloat($('doBotTpPct').value)||50,
         optionBuyer: !!$('doBotBuyer').checked, optionSeller: !!$('doBotSeller').checked,
-        manualOnly: !!($('doBotManualOnly')||{}).checked,
+        manualOnly: !!($('doBotManualOnly')||{}).checked, allowedStrategies: _collectStrategies(),
         model: $('doBotModel').value, tickSec: parseInt($('doBotTickSec').value)||120, api_key: deltaApiKey() };
     }
     function doManualSLTP(){ const g=id=>{ const v=parseFloat(($(id)||{}).value); return (isFinite(v)&&v>0)?v:undefined; };
