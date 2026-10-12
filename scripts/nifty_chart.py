@@ -4928,7 +4928,11 @@ def _bot_analyse_route(state, lock, log_fn, persist_tag, source, api_key_field=N
     multi_tf = None
     if not imgs:
         api_key = cfg.get(api_key_field) if api_key_field else None
-        multi_tf = _bot_multi_tf_snapshot(source, symbol, api_key=api_key)
+        # Delta Options AI bot's symbol_field is 'baseSymbol' — a bare base
+        # (BTC/ETH/SOL), not a tradeable Delta ticker (fetch_delta_data needs
+        # 'BTCUSD', not 'BTC'). Resolve the real ticker before fetching.
+        mtf_symbol = _do_resolve_spot_symbol(symbol) if (source == 'delta' and symbol_field == 'baseSymbol') else symbol
+        multi_tf = _bot_multi_tf_snapshot(source, mtf_symbol, api_key=api_key)
         if not multi_tf:
             return jsonify({'success': False, 'error': 'Upload at least one chart (1D/1H/30m/15m/5m), or wait a moment for live data to be available.'}), 400
     text, err = _bot_build_analysis(imgs, multi_tf, symbol, model)
@@ -10162,6 +10166,31 @@ def _do_spot_candles(base, interval):
             return c
     return []
 
+_DO_SPOT_SYMBOL_CACHE = {}
+
+def _do_resolve_spot_symbol(base):
+    """Which Delta ticker a bare base (BTC/ETH/SOL) actually trades under —
+    USD perpetual, falling back to USDT, same probe _do_spot_candles already
+    does. fetch_delta_data('1d', 'BTC') returns nothing — it needs the full
+    ticker ('BTCUSD') — so callers that only have the base symbol (the
+    multiTF snapshot / pre-flight analysis) need this instead of passing the
+    bare base straight to _bot_multi_tf_snapshot. Cached 1h since the winning
+    suffix for a given base essentially never changes mid-session."""
+    base = (base or '').upper().strip()
+    if not base:
+        return ''
+    now = _zd_time.time()
+    ent = _DO_SPOT_SYMBOL_CACHE.get(base)
+    if ent and now - ent['ts'] < 3600:
+        return ent['sym']
+    sym = base + 'USD'
+    for suf in ('USD', 'USDT'):
+        if fetch_delta_data('1d', base + suf):
+            sym = base + suf
+            break
+    _DO_SPOT_SYMBOL_CACHE[base] = {'ts': now, 'sym': sym}
+    return sym
+
 def _do_load_options(base):
     """Active CALL/PUT option products on Delta for the underlying (e.g. BTC)."""
     base = (base or '').upper().strip()
@@ -10400,7 +10429,8 @@ def _do_bot_tick():
     # Multi-timeframe read of the UNDERLYING + a pre-flight written analysis
     # (chart images if uploaded, else these numbers) once before the first
     # entry / after going flat on every leg.
-    _mtf_ctx = _bot_multi_tf_snapshot('delta', cfg.get('baseSymbol') or '') if (decide and cfg.get('baseSymbol')) else None
+    _mtf_ctx = (_bot_multi_tf_snapshot('delta', _do_resolve_spot_symbol(cfg.get('baseSymbol')))
+                if (decide and cfg.get('baseSymbol')) else None)
     _do_imgs = _chart_images_for_multi(do_ai_state) if decide else []
     if decide and not any(l.get('position') for l in do_ai_state['legs']) and _bot_preflight_stale(do_ai_state):
         _bot_run_preflight_analyse(do_ai_state, do_ai_lock, _do_log, '[DOPT]',
