@@ -6240,6 +6240,39 @@ def _zo_option_meta(symbol, exchange, spot):
                 pass
     return meta
 
+def _zo_roll_leg(leg, cfg, option_type):
+    """Called right after a sold leg is force-closed because the underlying
+    drifted into the near-expiry gamma-stop zone for its strike (see the
+    nearExpiryStopPct check in _zo_bot_tick). Re-resolves a fresh, currently-
+    OTM strike for the SAME role via _zo_resolve_auto_strikes so the
+    strategy keeps selling premium instead of sitting idle on a strike
+    that's now too close to the money. Only when Auto strikes is on — a
+    manually-entered symbol is never silently swapped. If the resolved
+    strike is missing or (sparse/illiquid chain) comes back identical to
+    the one just closed, does NOT roll — logs why and leaves the leg flat,
+    so a degenerate chain can't loop open/instant-close/roll every tick."""
+    if not cfg.get('autoStrikes'):
+        return
+    old_symbol = leg['symbol']
+    try:
+        ce_sym, pe_sym, opt_exch, info = _zo_resolve_auto_strikes(cfg)
+    except Exception as e:
+        ce_sym = pe_sym = None
+        info = str(e)
+    new_symbol = ce_sym if option_type == 'CE' else pe_sym
+    if not new_symbol or new_symbol.upper() == (old_symbol or '').upper():
+        msg = '{} could not find a safer {} strike ({}) — leg left flat.'.format(old_symbol, option_type, info)
+        _zo_log('[Roll] ' + msg)
+        _persist_log_line('[ZOPTIONS] [Roll] ' + msg)
+        return
+    leg['symbol']       = new_symbol
+    leg['exchange']     = opt_exch
+    leg['last_tick']    = {}
+    leg['last_candles'] = []
+    msg = '{} -> {} ({})'.format(old_symbol, new_symbol, info)
+    _zo_log('[Roll] ' + msg)
+    _persist_log_line('[ZOPTIONS] [Roll] ' + msg)
+
 def _zo_bot_tick():
     cfg = zo_ai_state.get('config') or {}
     if not cfg: return
@@ -6363,6 +6396,8 @@ def _zo_bot_tick():
                     elif (not is_long) and sig == 'BUY':       reason = 'signal reversal'
                 if reason:
                     _zo_close_leg(leg, exit_px, reason, cfg, mode)
+                    if 'expiry gamma' in reason:
+                        _zo_roll_leg(leg, cfg, pos.get('optionType'))
                 else:
                     _zo_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(
                         symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
@@ -10304,6 +10339,36 @@ def _do_apply_breakers(cfg, mode):
     do_ai_state['running'] = False
     _do_log('[STOP] ' + trip + ' — all legs closed, bot stopped.'); _persist_log_line('[DOPT] [STOP] ' + trip)
 
+def _do_roll_leg(leg, cfg, option_type):
+    """Delta Options mirror of _zo_roll_leg — see there for the full rationale.
+    Re-resolves a fresh OTM strike for the SAME role via _do_resolve_strikes
+    right after a near-expiry gamma-stop close, only when Auto strikes is on,
+    and refuses to roll (leaving the leg flat, logged) if the chain can't
+    offer anything other than the strike just closed."""
+    if not cfg.get('autoStrikes'):
+        return
+    base = (cfg.get('baseSymbol') or '').upper().strip()
+    old_symbol = leg['symbol']
+    try:
+        ce_sym, pe_sym, info = _do_resolve_strikes(
+            base, sell_bias=True, otm_pct=float(cfg.get('sellOtmPct', 0.25) or 0.25),
+            model=(cfg.get('model') or '').strip())
+    except Exception as e:
+        ce_sym = pe_sym = None
+        info = str(e)
+    new_symbol = ce_sym if option_type == 'CE' else pe_sym
+    if not new_symbol or new_symbol.upper() == (old_symbol or '').upper():
+        msg = '{} could not find a safer {} strike ({}) — leg left flat.'.format(old_symbol, option_type, info)
+        _do_log('[Roll] ' + msg)
+        _persist_log_line('[DOPT] [Roll] ' + msg)
+        return
+    leg['symbol']       = new_symbol
+    leg['last_tick']    = {}
+    leg['last_candles'] = []
+    msg = '{} -> {} ({})'.format(old_symbol, new_symbol, info)
+    _do_log('[Roll] ' + msg)
+    _persist_log_line('[DOPT] [Roll] ' + msg)
+
 def _do_bot_tick():
     cfg = do_ai_state.get('config') or {}
     if not cfg: return
@@ -10396,6 +10461,8 @@ def _do_bot_tick():
                     elif (not is_long) and sig == 'BUY': reason = 'signal reversal'
                 if reason:
                     _do_close_leg(leg, exit_px, reason, cfg, mode)
+                    if 'expiry gamma' in reason:
+                        _do_roll_leg(leg, cfg, pos.get('optionType'))
                 else:
                     _do_log('[Tick] {} px={} SL={} TP={} ({} from {})'.format(symbol, round(price, 2), pos.get('sl'), pos.get('tp'), pos['side'], pos['entryPrice']))
             else:
