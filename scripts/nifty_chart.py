@@ -19403,6 +19403,310 @@ HELP_MANUAL_PAGE = r"""<!DOCTYPE html>
 </div></body></html>"""
 
 
+HELP_CLAUDE_STRATEGY_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mangal View - Claude AI Trading Strategy</title>""" + HELP_PAGE_STYLE + r"""
+</head><body>
+<div class="help-header">
+  <div><h1>&#129302; Claude AI Trading Strategy</h1><a href="/">&larr; Back to Chart</a></div>
+  <button class="download-btn" onclick="downloadPDF()">&#128196; Download PDF</button>
+</div>
+<div class="help-body">
+
+<div class="card">
+<p>Claude makes trading decisions in <strong>two distinct places</strong> in this app, with very different scopes:</p>
+<ol>
+<li><strong>The six legacy AI bots</strong> (Zerodha, Delta, MT5, Zerodha Options, Delta Options, TradingView bot) &mdash; Claude is given full autonomy: it decides entries, exits, direction, and its own stop-loss/target every tick. This is Part 1 below.</li>
+<li><strong>The Strategy Menu</strong> (Iron Condor / Short Strangle / Jade Lizard / EMA 5/13 Crossover, on NSE index options via Zerodha or BTC/ETH/XAUT options via Delta Exchange) &mdash; Claude's role is much narrower: it only ever picks <strong>which strike</strong> to sell, inside a target-delta window you set. It never sets its own SL/TP, never decides direction, and its output is validated/snapped to real strikes with a deterministic fallback if it fails. This is Part 2 below.</li>
+</ol>
+<p>See also <a href="/help/quant-strategy">Quant Strategy</a> &mdash; the statistical model that can feed into (or replace) Claude's own read.</p>
+</div>
+
+<h2>Part 1 &mdash; The Six Legacy AI Bots</h2>
+<div class="card">
+<p>The core decision engine runs <strong>once per tick</strong> for each bot / option leg. When the Claude AI strategy is selected (the default on four bots; the only mode on Delta Options and the TradingView bot), Claude decides entries, exits, stop-loss and target on its own &mdash; none of the legacy algo strategies are used.</p>
+</div>
+
+<h2>1. What It Looks At (data gathered each tick)</h2>
+<div class="card">
+<p>Every tick the bot fetches recent candles and builds a market-context bundle that is sent to Claude:</p>
+<table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><code>regime</code></td><td>uptrend / downtrend / range-choppy (from SMA stack + medium trend)</td></tr>
+<tr><td><code>sma10</code>, <code>sma20</code>, <code>sma50</code></td><td>Moving averages for trend structure</td></tr>
+<tr><td><code>trendShortPct</code>, <code>trendMediumPct</code></td><td>% change over short / medium windows</td></tr>
+<tr><td><code>rangePct20</code>, <code>recentHigh20</code>, <code>recentLow20</code></td><td>20-bar range and extremes</td></tr>
+<tr><td><code>supports</code>, <code>resistances</code></td><td>Swing-pivot S/R levels (5-bar fractals)</td></tr>
+<tr><td><code>nearestSupport</code>, <code>nearestResistance</code></td><td>Closest level below / above price</td></tr>
+<tr><td><code>distToSupportPct</code>, <code>distToResistancePct</code></td><td>% distance to those levels</td></tr>
+<tr><td><code>volAvg20</code>, <code>volRecent3</code>, <code>volRatio</code></td><td>Volume / participation (whipsaw filter)</td></tr>
+<tr><td><code>position</code></td><td>Current open trade: side, entry, unrealized %</td></tr>
+<tr><td><code>recentTrades</code></td><td>Last ~8 closed trades (P/L + exit reason) so it learns</td></tr>
+<tr><td><code>ohlcv</code></td><td>Raw last 36 candles, so Claude reads the actual price action</td></tr>
+<tr><td><code>underlying*</code> (options only)</td><td>Underlying spot + trend so a CE/PE leg trades with direction</td></tr>
+</table>
+</div>
+
+<h2>2. Decision Logic (how Claude is instructed to trade)</h2>
+<div class="card">
+<p>The system prompt frames Claude as an <strong>elite intraday trader</strong> optimizing for maximum profit with a high win rate, trading like a market maker reading order flow &mdash; not a retail breakout-chaser. In priority order:</p>
+<ol>
+<li><strong>Market direction</strong> &mdash; trade WITH the higher-timeframe trend (regime / SMAs / trend %). In range/choppy regimes, default to <span class="tag" style="background:#37474f;color:#cfd8dc">HOLD</span> unless price is reacting at a clean level.</li>
+<li><strong>Structure (S/R)</strong> &mdash; <span class="tag tag-buy">BUY</span> near support in uptrends, <span class="tag tag-sell">SELL</span> near resistance in downtrends. Never buy straight into resistance or sell straight into support. Best entries are <em>at</em> structure, not mid-range.</li>
+<li><strong>Market-maker / smart money</strong> &mdash; anticipate liquidity. Market makers run price into obvious stop clusters just beyond recent swing highs/lows (liquidity grabs / stop hunts), then reverse. A sweep that immediately reclaims is a high-probability reversal entry in the reclaim direction. Avoid chasing a breakout that just swept a level on a long wick &mdash; wait for the reclaim/retest.</li>
+<li><strong>Confirmation</strong> &mdash; require participation: rising volume (<code>volRatio &gt; 1.1</code>) on the move being traded. Weak/declining volume = whipsaw &rarr; HOLD.</li>
+<li><strong>Anti-whipsaw</strong> &mdash; if already in a position, default to staying. Only flip on a genuine structural reversal (level break + reclaim against the position).</li>
+<li><strong>Learn</strong> &mdash; review recent trades. If recent trades lost in conditions like now (especially "signal reversal" exits), be more selective and HOLD more.</li>
+</ol>
+<h4>What It Deliberately Avoids</h4>
+<p>It does <strong>not</strong> chase vertical breakouts / runaway moves. Buying a fast, extended rally means buying into resistance with a wide stop &mdash; exactly the "be the liquidity" trap. In fast, wide-bar, range-expanding conditions it HOLDs and waits for the pullback/retest of the breakout level to enter with a tight stop and &ge;1.5 reward:risk. Sitting out a strong one-way move is the strategy working as intended, not a fault.</p>
+</div>
+
+<h2>3. Self-Scoring (Claude's own conviction)</h2>
+<div class="card">
+<p>There is <strong>no fixed Min score gate</strong>. Claude rates each setup on its own 0&ndash;10 conviction scale and only returns BUY/SELL when conviction is genuinely high (<strong>&ge; 7</strong>); otherwise HOLD. A high win rate comes from passing on mediocre setups &mdash; when in doubt, HOLD.</p>
+</div>
+
+<h2>4. Risk &mdash; Claude Owns SL / TP</h2>
+<div class="card">
+<p>On every BUY/SELL, Claude must return:</p>
+<ul>
+<li><strong><code>slPct</code></strong> &mdash; stop-loss %, derived from a specific price level, never a round guess: pick the real invalidation level (nearest support/resistance, or a price/zone it names in its reasoning) and compute <code>slPct = abs(lastPrice - level) / lastPrice * 100</code>, with a small buffer beyond it.</li>
+<li><strong><code>tpPct</code></strong> &mdash; target %, computed the same way against the next opposing S/R level, with reward:risk &ge; 1.5.</li>
+<li><strong>Consistency check (mandatory)</strong> &mdash; if the reasoning names a price or zone, <code>slPct</code>/<code>tpPct</code> must correspond to that same price. Claude must not cite one level and then quietly set a tighter number to make the trade look better on paper.</li>
+<li><strong>In high volatility, it must not tighten the stop below the real level to compensate</strong> &mdash; a stop tighter than the actual invalidation just gets clipped by noise. If the genuine invalidation sits far away, the setup risks too much right now: lower conviction / HOLD, not a faked tighter stop.</li>
+</ul>
+<p style="color:#ff9100"><strong>Why this rule exists:</strong> a live loss where the stated reasoning named an 80,800 demand zone ~0.5&ndash;0.7% away, but the actual <code>slPct</code> set was only ~0.22% &mdash; an artificially tight, structurally-inconsistent stop that, combined with 25x leverage, turned ordinary noise into a ~5.5%-of-capital loss.</p>
+<p>These <strong>override</strong> the panel's SL/TP. In the UI, the manual SL %, Target %, Min score, Score buffer, Cooldown and Quality filter controls are hidden &mdash; Claude manages all of them. Only <strong>Max consec losses</strong> and <strong>Movable TP/SL</strong> remain user-adjustable.</p>
+</div>
+
+<h2>5. Response Format</h2>
+<div class="card">
+<p>Claude replies with strict JSON only:</p>
+<pre style="background:#1e222d;border:1px solid #2a2e39;border-radius:6px;padding:12px 16px;overflow-x:auto;color:#ff9100;font-size:13px">{ "signal": "BUY" | "SELL" | "HOLD", "score": -10..10, "reason": "&lt;=160 chars", "slPct": &lt;num&gt;, "tpPct": &lt;num&gt; }</pre>
+<p><code>score</code> sign matches the signal; <code>reason</code> is logged to the activity log.</p>
+</div>
+
+<h2>6. How The Bot Acts On The Signal</h2>
+<div class="card">
+<ul>
+<li><strong>Flat</strong> &rarr; if signal is BUY/SELL, open at market with Claude's SL/TP. Quantity is the manual Qty field, or capital-sized (qty + leverage chosen by Claude) when <strong>Auto symbol</strong> is on for Zerodha / Delta / MT5. Options quantity is always manual.</li>
+<li><strong>In a position</strong> &rarr; exit on <strong>SL hit</strong>, <strong>TP hit</strong>, or <strong>signal reversal</strong> (Claude flips to the opposite side).</li>
+<li><strong>Profit lock</strong> &rarr; if realised + open P/L reaches the Daily profit target, bank the trade and stop.</li>
+<li><strong>Circuit breakers</strong> (auto-stop the bot): Max consecutive losses, Max daily loss, Max daily profit.</li>
+</ul>
+</div>
+
+<h2>7. Options Specifics (Zerodha / Delta Options bots)</h2>
+<div class="card">
+<ul>
+<li><strong>Underlying base</strong> (NIFTY / BANKNIFTY / FINNIFTY / SENSEX / any stock, or BTC/ETH on Delta) feeds Claude as context only &mdash; no chart is drawn for it.</li>
+<li><strong>Auto strikes ON</strong> &rarr; Claude picks the CE and PE strikes near ATM at the nearest expiry from the live option chain, then trades each leg with the same per-tick logic.</li>
+<li><strong>Auto strikes OFF</strong> &rarr; you enter the CE and PE option symbols manually (two legs).</li>
+</ul>
+<h3>Option Buyer vs Option Seller</h3>
+<p>The price Claude analyses for an option leg is the <strong>premium</strong>, not the index. <strong>BUY</strong> = go long the option (Option Buyer). <strong>SELL</strong> = go short / sell the option (Option Seller). Each leg is fed <code>optionType</code>, <code>strike</code>, <code>moneyness</code>, <code>underlyingVsStrikePct</code>, <code>dte</code>, the underlying trend, and which modes are on.</p>
+<ul>
+<li><span class="tag tag-buy">BUYER</span> only when the premium will likely expand: a fresh directional thrust in the option's favour and IV not collapsing. Will not buy a bleeding/mid-range premium into a flat or opposing underlying &mdash; the classic morning trap where theta + IV crush melt a long.</li>
+<li><span class="tag tag-sell">SELLER</span> harvests decay: shorts a rich premium likely to fall &mdash; choppy/range-bound or opposing underlying, post-open IV crush, or OTM strikes the underlying won't reach. Prefers OTM, lower-DTE, elevated premium.</li>
+<li><strong>Short-option risk is large/undefined</strong>, so a SELL always carries a tight premium-% stop (e.g. 25&ndash;40%) and exits immediately if the underlying starts trending in the option's favour.</li>
+</ul>
+<h3>Near-Expiry Gamma Stop + Auto-Roll</h3>
+<p>Once a sold leg has <strong>&le;1 DTE</strong>, every tick independently checks whether the underlying has drifted within <code>nearExpiryStopPct</code> (default <strong>0.15%</strong>) of that leg's strike, and force-exits immediately if so, regardless of the premium-% stop &mdash; gamma near expiry can blow the premium-% stop past any reasonable <code>slPct</code> on a tiny underlying move.</p>
+<p><strong>Auto-roll:</strong> since a leg's strike is picked once and never re-struck just by Claude trading it, the underlying can drift a comfortably-OTM strike into this gamma zone over the session. When that happens (Auto strikes only), the leg immediately re-resolves a fresh, currently-OTM strike for the same role and keeps running there, instead of leaving Claude to keep re-selling a strike the bot will instantly force-exit again. If the chain can't offer anything safer, it does <strong>not</strong> roll &mdash; logs why and leaves the leg flat rather than looping.</p>
+</div>
+
+<h2>8. TradingView + Quant Confirmation (optional)</h2>
+<div class="card">
+<p>Each panel has a <strong>&#128202; TradingView</strong> toggle, feeding Claude context only (Claude still decides):</p>
+<ul>
+<li><strong>Technical Analysis (auto)</strong> &mdash; TradingView's public scanner for the symbol + timeframe: overall STRONG BUY&rarr;STRONG SELL rating plus RSI, MACD histogram, Stochastic, ADX, moving-average/oscillator sub-ratings, and the day's change/change%.</li>
+<li><strong>Custom indicators (webhook)</strong> &mdash; your own TradingView Alert on a Pine indicator, posted to a webhook URL; the latest signal per symbol is passed to Claude with its age.</li>
+<li>Influence is context only: Claude lifts conviction when TV aligns with its own read and raises its bar when TV opposes.</li>
+</ul>
+<h3>Quant Confirmation</h3>
+<p>Each panel also has a <strong>&#128202; Quant</strong> checkbox next to Claude AI. When ticked, a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner Channel, Hurst exponent, variance ratio, percentile rank, return skew) runs fresh each tick and adds a <code>quant</code> block to the prompt: Claude raises conviction when the quant score/verdict agrees with its own read and lowers it when it opposes &mdash; same "confirmation, not override" relationship as TradingView. Off by default. Full model details: <a href="/help/quant-strategy">Quant Strategy</a>.</p>
+</div>
+
+<h2>9. Chart Image Input (Vision) + Multi-Timeframe Analysis</h2>
+<div class="card">
+<p>Each bot chat has a <strong>&#128206; attach</strong> button. Upload a TradingView chart screenshot and Claude uses it as vision input &mdash; it reads the chart to answer chat questions, and in the live trade loop the latest uploaded chart is fed to Claude on every decision as the <strong>primary structure read</strong>. A chart stays "current" for ~3 hours, then expires.</p>
+<h3>Multi-Timeframe Chart Upload + Analyse</h3>
+<p>Every AI bot panel has a Charts bar with five dedicated upload buttons &mdash; <strong>1D, 1H, 30m, 15m, 5m</strong>. Each uploads into its own named slot, so all five can be held at once. The <strong>Analyse</strong> button sends every uploaded slot to Claude in one call for a combined multi-timeframe verdict (<code>READY FOR TRADING</code> / <code>NOT READY</code>) before you click Start &mdash; purely advisory, doesn't touch the running bot.</p>
+<h3>Automatic Multi-Timeframe Analysis (no upload required)</h3>
+<p>Chart images are optional. Every Claude-driven bot auto-fetches 1D/1H/30m/15m/5m candles each decision tick (lastPrice, sma20, changePct, trend, recentHigh/recentLow per timeframe) and adds it to the prompt &mdash; same higher-timeframe-for-bias, lower-timeframe-for-entry instruction as the image case. The first time a bot is flat and about to enter (and at most once an hour after), it also runs one pre-flight analysis call and posts the written verdict to the chat window automatically, so you see Claude's reasoning <strong>before</strong> its first trade &mdash; with or without ever uploading a chart.</p>
+</div>
+
+<h2>10. Data Source &amp; Fallback</h2>
+<div class="card">
+<p>Candles come from the bot's broker feed &mdash; Delta, Kite (Zerodha), or MT5. For the MT5 bot in paper mode with the TradingView toggle on, if the MT5 feed is unavailable the bot falls back to TradingView candles so paper trading keeps running; MT5 stays primary and switches back when the feed recovers. Live mode has no such fallback.</p>
+</div>
+
+<h2>11. Model, Cadence &amp; Schedule</h2>
+<div class="card">
+<ul>
+<li>The <strong>Model</strong> selector lists the full current Claude lineup, grouped Flagship / Opus / Sonnet / Haiku &mdash; Haiku is cheapest/fastest, the Flagship tier the most capable, Sonnet the balance of the two. Defaults to <strong>Sonnet 5.5</strong>.</li>
+<li><strong>Tick</strong> sets how often the bot checks the market and calls Claude &mdash; each tick is one Claude API call per running bot/leg, so it drives both responsiveness and API cost. Range is 15s&hellip;1d across all six bots, defaulting to <strong>15m</strong>.</li>
+<li><strong>Schedule</strong> &mdash; every bot panel has a Schedule button: set a daily Start time and Stop time (IST) and arm it, and the bot starts/stops itself at those times with no browser tab open. Arming snapshots the panel's current config so the exact same setup replays automatically.</li>
+</ul>
+</div>
+
+<h2>12. Honest Caveats (Legacy Bots)</h2>
+<div class="card">
+<ul>
+<li>This is a <strong>discretionary, LLM-judgment</strong> strategy, not a backtested quant edge. No strategy guarantees profit &mdash; markets gap and reverse.</li>
+<li>The circuit breakers (max consecutive losses, max daily loss/profit) and SL on every trade are what cap the downside.</li>
+<li>Always <strong>paper-trade first</strong> to see how it behaves on your symbols and timeframe before going live.</li>
+</ul>
+</div>
+
+<h2>Part 2 &mdash; The Strategy Menu (multi-leg options strategies)</h2>
+<div class="card">
+<p>Opened from <strong>Automation &rarr; Strategy Menu</strong>: a completely different engine from Part 1, built for defined multi-leg options strategies rather than free-form directional trading. Two independent sides &mdash; <strong>Zerodha Options Strategy</strong> (NIFTY / BANKNIFTY / FINNIFTY / SENSEX via Kite) and <strong>Delta Options Strategy</strong> (BTC / ETH / XAUT options via Delta Exchange &mdash; unrelated to the Part 1 Delta AI Bot, a naming coincidence).</p>
+</div>
+
+<h2>13. Strategy Types</h2>
+<div class="card">
+<table>
+<tr><th>Type</th><th>Legs</th><th>Notes</th></tr>
+<tr><td><strong>Iron Condor</strong></td><td>sellCE, sellPE, hedgeCE, hedgePE</td><td>Both sides sold + hedged, always.</td></tr>
+<tr><td><strong>Short Strangle</strong></td><td>sellCE, sellPE</td><td>No hedges &mdash; undefined risk by design, flagged in the UI.</td></tr>
+<tr><td><strong>Jade Lizard</strong></td><td>sellCE, sellPE, hedgeCE</td><td>Call side hedged, put side naked &mdash; no upside risk if credit &gt; call-spread width.</td></tr>
+<tr><td><strong>EMA 5/13 Crossover</strong></td><td>sellCE, sellPE, hedgeCE, hedgePE</td><td>Not Claude-driven at all (see &sect;13.3). Only the side matching the current EMA regime is ever actually open.</td></tr>
+</table>
+</div>
+
+<h2>13.1 Claude's Role: Strike Selection Only</h2>
+<div class="card">
+<p>The <strong>"Claude strategy"</strong> button is the <em>only</em> place Claude is consulted here, and its job is narrow: pick which strike to sell, nothing else.</p>
+<ul>
+<li>Claude chooses a sell strike from pre-filtered candidates, each with <code>|delta|</code> at or below the target delta; its answer is snapped to the nearest real candidate strike &mdash; it can never invent a strike or symbol.</li>
+<li><strong>Delta comes from real greeks, not a guess</strong>: Black-Scholes from the NSE/Kite chain's IV on the Zerodha side; the exchange's own native greeks on Delta Exchange (more accurate for crypto vol surfaces).</li>
+<li>Any Claude failure &mdash; bad JSON, timeout, unparseable strike &mdash; silently falls back to the deterministic delta-walk. You're never left with zero legs.</li>
+<li><strong>Hedge strikes are never Claude's call.</strong> Always deterministic: sold strike &plusmn; hedge distance points, snapped to the nearest listed strike.</li>
+<li>Claude is not asked about SL/TP, direction, or timing here &mdash; those are plain configured percentages, applied identically regardless of how the strike was chosen.</li>
+</ul>
+</div>
+
+<h2>13.2 Risk, Sizing, and Exits</h2>
+<div class="card">
+<ul>
+<li><strong>SL % / TP %</strong> (default 50% / 50%) apply to sold legs only. Hedge (BUY) legs never carry their own SL/TP.</li>
+<li><strong>Hedge-linked exit</strong>: when a sold leg's SL or TP fires, its paired hedge leg is closed in the same step &mdash; never left open alone.</li>
+<li><strong>Position size</strong> = a plain manual qty (lots for Zerodha, raw contracts for Delta) &mdash; not capital/leverage-sized like the legacy bots.</li>
+<li><strong>Circuit breakers</strong>: Max consecutive losses, Max daily loss &mdash; checked once per tick.</li>
+</ul>
+</div>
+
+<h2>13.3 EMA 5/13 Crossover &mdash; A Pure Technical Strategy, No LLM Signal</h2>
+<div class="card">
+<p>This strategy type computes EMA(5) vs EMA(13) on the underlying (configurable periods and timeframe, default 15m) every tick:</p>
+<ul>
+<li><span class="tag tag-buy">Bullish</span> regime (fast EMA &gt; slow EMA) &rarr; sell PE (+ its hedge). <span class="tag tag-sell">Bearish</span> &rarr; sell CE (+ its hedge). The active side switches automatically as the regime flips.</li>
+<li>Claude is only invoked, if at all, to pick the strike for whichever side the crossover says should be active &mdash; the direction call itself is a deterministic formula, not an LLM judgment. This is the opposite of Part 1, where Claude reads structure and decides direction itself.</li>
+</ul>
+</div>
+
+<h2>13.4 Non Stop &mdash; Continuous Re-Entry</h2>
+<div class="card">
+<ul>
+<li>A <strong>Non Stop</strong> checkbox makes the strategy trade continuously: when a sold leg closes on TP or SL, it immediately re-resolves that same role at the same target delta and re-opens it &mdash; deterministic, not another Claude call.</li>
+<li>Stops itself once Max consec losses trips.</li>
+<li><strong>EMA Crossover strategies are inherently continuous</strong> regardless of the checkbox.</li>
+<li><strong>Zerodha only</strong>: Non Stop (and EMA Crossover) is time-boxed to a configurable market-hours window, default <strong>09:25&ndash;15:00 IST</strong> &mdash; squares off everything at/after close and withholds new re-entries outside the window. Delta side has no such window &mdash; crypto trades 24/7.</li>
+</ul>
+</div>
+
+<h2>13.5 What's Logged</h2>
+<div class="card">
+<p><code>log_options.txt</code> gets a full <code>[CONFIG]</code> line on every Start &mdash; strategy type, underlying, expiry, target delta, hedge distance, position size, SL%/TP%, buyer/seller mode, non-stop + its window, EMA periods &mdash; everything needed to reproduce or audit a run.</p>
+</div>
+
+<h2>13.6 Honest Caveats (Strategy Menu)</h2>
+<div class="card">
+<ul>
+<li>Claude's only discretion here is which strike to sell within a delta band you set &mdash; it is not deciding whether to trade, which direction, or how much risk to take.</li>
+<li><strong>Short Strangle has no hedge &mdash; undefined risk.</strong> Iron Condor / Jade Lizard cap risk via the hedge leg(s), but only as far as the hedge distance actually reaches.</li>
+<li><strong>Non Stop compounds losing streaks fast</strong> in a choppy market &mdash; every SL hit immediately re-enters. The Max consec losses breaker is the only backstop.</li>
+<li>No cross-restart persistence: trades/P&amp;L live in memory only &mdash; a server restart loses history (the log file is the durable record).</li>
+<li>Always <strong>paper-trade first</strong>.</li>
+</ul>
+</div>
+
+</div></body></html>"""
+
+
+HELP_QUANT_STRATEGY_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mangal View - Quant Trading Strategy</title>""" + HELP_PAGE_STYLE + r"""
+</head><body>
+<div class="help-header">
+  <div><h1>&#128202; Quant Trading Strategy</h1><a href="/">&larr; Back to Chart</a></div>
+  <button class="download-btn" onclick="downloadPDF()">&#128196; Download PDF</button>
+</div>
+<div class="help-body">
+
+<div class="card">
+<p>This page documents every "Quant" strategy in the app: the statistical model itself, and the two different ways it's used &mdash; as a standalone vote in the non-Claude algo engine, and as a checkbox that automatically drives the <a href="/help/claude-strategy">Claude AI strategy</a>.</p>
+</div>
+
+<h2>1. What The Quant Model Computes</h2>
+<div class="card">
+<p>A <strong>deterministic statistical/mean-reversion model</strong> &mdash; no Claude call, pure math on OHLCV. Every bar it computes a composite score from:</p>
+<table>
+<tr><th>Signal</th><th>What It Measures</th><th>Contribution</th></tr>
+<tr><td><strong>Z-Score</strong> (20-bar)</td><td>How many std-devs price is from its recent mean</td><td>|z|&gt;2 &rarr; extreme (&plusmn;2.0); |z|&gt;1 &rarr; moderate (&plusmn;1.0)</td></tr>
+<tr><td><strong>Linear-regression deviation</strong></td><td>Distance from the 20-bar regression line, in std-devs</td><td>&gt;1.5&sigma; off &rarr; reversion signal (&plusmn;2.0); on-trend near the line &rarr; trend-following nudge (&plusmn;0.5)</td></tr>
+<tr><td><strong>Bollinger %B</strong></td><td>Position within the 20-bar Bollinger Bands</td><td>&lt;0.05 &rarr; oversold (+1.5); &gt;0.95 &rarr; overbought (&minus;1.5)</td></tr>
+<tr><td><strong>Stochastic RSI</strong></td><td>Momentum of RSI itself (14-bar stochastic of RSI)</td><td>Cross up from &lt;20 (+2.0); cross down from &gt;80 (&minus;2.0)</td></tr>
+<tr><td><strong>Keltner Channel</strong> (EMA21 &plusmn; 2&times;ATR14)</td><td>Price outside its volatility-adjusted envelope</td><td>Below lower (+1.5); above upper (&minus;1.5)</td></tr>
+<tr><td><strong>Hurst exponent proxy</strong> (rescaled range, 20-bar)</td><td>Regime: mean-reverting (H&lt;0.4) vs trending (H&gt;0.6)</td><td>Mean-reverting + already extreme &rarr; reversion bet (&plusmn;1.5); trending &rarr; follow last bar (&plusmn;1.0)</td></tr>
+<tr><td><strong>Variance ratio</strong> (1-bar vs 2-bar)</td><td>Mean-reversion vs random-walk/momentum in returns</td><td>Ratio&lt;0.7 + directional z &rarr; reversion bet (&plusmn;1.5)</td></tr>
+<tr><td><strong>Price percentile rank</strong> (50-bar)</td><td>Where price sits in its recent range</td><td>&lt;10th percentile (+1.0); &gt;90th (&minus;1.0)</td></tr>
+<tr><td><strong>Return skew</strong> (20-bar)</td><td>Asymmetry of recent returns</td><td>Skew&gt;0.5 (+1.0); &lt;&minus;0.5 (&minus;1.0)</td></tr>
+</table>
+<p>Positive score = bullish/oversold-bounce bias, negative = bearish/overbought-fade bias. The composite becomes a verdict:</p>
+<table>
+<tr><th>Score</th><th>Verdict</th></tr>
+<tr><td>&ge; 5</td><td><span class="tag tag-buy">STRONG BUY</span></td></tr>
+<tr><td>&ge; 3.5</td><td><span class="tag tag-buy">BUY</span></td></tr>
+<tr><td>&le; &minus;5</td><td><span class="tag tag-sell">STRONG SELL</span></td></tr>
+<tr><td>&le; &minus;3.5</td><td><span class="tag tag-sell">SELL</span></td></tr>
+<tr><td>otherwise</td><td><span class="tag" style="background:#37474f;color:#cfd8dc">NEUTRAL</span></td></tr>
+</table>
+<p>The summary returned is <code>{score, verdict, indicators (top contributors), rsi, macd, vwap}</code>, computed fresh each tick, only when Quant is actually enabled.</p>
+</div>
+
+<h2>2. Quant As A Standalone Vote (non-Claude mode)</h2>
+<div class="card">
+<p><code>'quant'</code> is one of the configurable algos and is on by default. When the <strong>Claude AI</strong> strategy checkbox is <em>unchecked</em> on a bot panel, the Quant model is included in the pool of algos the bot scores and votes across each tick, alongside MFactor, MStreet, StatArb, and the others. This path has no UI checkbox of its own &mdash; it's simply always in the default voting pool when Claude is off.</p>
+</div>
+
+<h2>3. Quant Driving The Claude Strategy</h2>
+<div class="card">
+<p><strong>When the Claude AI strategy is selected, none of the legacy algos run &mdash; Claude trades entirely on its own.</strong> That left no way for the Quant model to influence a Claude-driven bot at all, until this checkbox was added.</p>
+<h3>Checkbox</h3>
+<p>Each of the legacy AI bot panels (Zerodha, Delta, MT5, Zerodha Options, TradingView bot) has a <strong>&#128202; Quant</strong> checkbox next to Claude AI &mdash; collected into the strategy list exactly like every other strategy checkbox, and logged in the <code>[CONFIG]</code> line on Start.</p>
+<h3>Wiring</h3>
+<p>When Quant is enabled alongside Claude:</p>
+<ol>
+<li>The quant model runs fresh for that tick's candles.</li>
+<li>If it returns a summary, a <strong>QUANT</strong> block is added to Claude's system prompt (mirroring the existing TradingView confirmation block) instructing Claude to treat the quant score/verdict as a vote: raise conviction when it agrees with Claude's own structure read (even on a borderline setup), lower conviction or HOLD when it opposes, treat NEUTRAL as a mild vote for HOLD unless everything else is unanimous.</li>
+<li>The summary itself (score, verdict, indicators, rsi, macd, vwap) is attached to the payload, so Claude sees the actual numbers, not just the instruction.</li>
+</ol>
+<p>Claude still makes the final call and still owns its own SL/TP &mdash; Quant is a <strong>vote</strong>, not an override, the same "confirmation, not override" relationship as TradingView. This "automatically drives" Claude's conviction without letting a single statistical model force trades the price action itself doesn't support.</p>
+<p>When the checkbox is off, none of the extra indicator computation runs &mdash; pure-Claude mode stays exactly as cheap as before.</p>
+</div>
+
+<h2>4. Where It Applies</h2>
+<div class="card">
+<p>Every bot that shares the Claude decision engine &mdash; Zerodha AI Bot, Delta AI Bot, MT5 AI Bot, Zerodha Options AI Bot (per-leg), and the TradingView-alerts bot &mdash; gets this automatically, since the wiring lives in the shared engine rather than at each bot's call site.</p>
+<p>The <a href="/help/claude-strategy">Strategy Menu</a> (Iron Condor / Short Strangle / Jade Lizard / EMA Crossover) is unaffected: it never uses the shared decision engine and uses Claude only for strike selection, not direction.</p>
+</div>
+
+</div></body></html>"""
+
+
 @app.route("/help/algos")
 @login_required
 def help_algos():
@@ -19419,6 +19723,18 @@ def help_indicators():
 @login_required
 def help_manual():
     return Response(HELP_MANUAL_PAGE, content_type="text/html")
+
+
+@app.route("/help/claude-strategy")
+@login_required
+def help_claude_strategy():
+    return Response(HELP_CLAUDE_STRATEGY_PAGE, content_type="text/html")
+
+
+@app.route("/help/quant-strategy")
+@login_required
+def help_quant_strategy():
+    return Response(HELP_QUANT_STRATEGY_PAGE, content_type="text/html")
 
 
 @app.route("/")
@@ -23731,10 +24047,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="zm-item" id="zoomReset">&#8634; &nbsp; Reset / Fit All</button>
     </div>
   </div>
-  <div class="separator" style="display:none"></div>
-  <div class="help-dropdown-wrapper" style="display:none">
+  <div class="separator"></div>
+  <div class="help-dropdown-wrapper">
     <button class="ind-btn" id="btnHelp"><span class="dot" style="background:#66bb6a"></span>Help &#9662;</button>
     <div class="help-dropdown" id="helpDropdown">
+      <a class="help-item" href="/help/claude-strategy" target="_blank">&#129302; Claude Strategy</a>
+      <a class="help-item" href="/help/quant-strategy" target="_blank">&#128202; Quant Strategy</a>
       <a class="help-item" href="/help/algos" target="_blank">&#128202; Algos</a>
       <a class="help-item" href="/help/indicators" target="_blank">&#128200; Indicators</a>
       <a class="help-item" href="/help/manual" target="_blank">&#128214; User Manual</a>
