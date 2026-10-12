@@ -33,9 +33,13 @@ from openpyxl.utils import get_column_letter
 LINE_RE = re.compile(r'^\[(?P<ts>[^\]]+)\]\s+(?P<rest>.*)$')
 
 ENTRY_RE = re.compile(
-    r'ENTRY (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
+    # side may be a plain 'BUY'/'SELL' or the options-leg phrasing
+    # 'SELL-to-open (short)' / 'BUY-to-open (long)' (_zo_open_leg / _do_open_leg).
+    r'ENTRY (?P<side>BUY|SELL)(?:-to-open \((?:long|short)\))? (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
     r'SL=(?P<sl>[\d.]+) TP=(?P<tp>[\d.]+) strat=(?P<strat>\S+) score=(?P<score>[\d.]+)'
-    r'(?:\s+\[cap (?P<cap>[^\]]+)\])?(?:\s+[—-]\s+(?P<note>.*))?$')
+    # trailing bracket is either '[cap <capital/leverage>]' (Delta/Zerodha/MT5) or
+    # '[<n> lot×<lotsize>]' (ZOPTIONS) — both land in the same Cap/Lev column.
+    r'(?:\s+\[(?:cap (?P<cap>[^\]]+)|(?P<lot>[^\]]+))\])?(?:\s+[—-]\s+(?P<note>.*))?$')
 
 EXIT_RE = re.compile(
     r'EXIT (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<sym>\S+) @ (?P<px>[\d.]+) '
@@ -153,21 +157,32 @@ def parse_files(paths):
                         'side': em.group('side'), 'qty': float(em.group('qty')),
                         'entry_px': float(em.group('px')), 'sl': float(em.group('sl')),
                         'tp': float(em.group('tp')), 'strategy': em.group('strat'),
-                        'score': float(em.group('score')), 'cap': em.group('cap') or '',
+                        'score': float(em.group('score')), 'cap': em.group('cap') or em.group('lot') or '',
                         'entry_note': (em.group('note') or '').strip(), 'role': '',
                         'exit_time': '', 'exit_px': '', 'pnl': '', 'exit_reason': '',
                         'entry_order': '', 'exit_order': '',
                     }
                     leg['continuation'] = 'YES' if 'continuation' in leg['entry_note'].lower() else ''
                     trades.append(leg)
-                    open_pos[bot] = leg
+                    # Keyed by (bot, symbol) not just bot: single-instrument bots
+                    # (Delta/Zerodha/MT5/TVBot) only ever have one symbol open at a
+                    # time, so this changes nothing for them — but leg-based bots in
+                    # this same legacy log format (ZOPTIONS/DOPTIONS) can hold TWO
+                    # concurrent legs (CE+PE) under one bot tag with no role= field
+                    # to disambiguate; keying by bot alone let a second leg's ENTRY
+                    # silently overwrite the first leg's still-open position,
+                    # orphaning it and risking a later EXIT pairing against the
+                    # wrong leg entirely.
+                    pos_key = (bot, em.group('sym'))
+                    open_pos[pos_key] = leg
                     last_event_idx_by_bot[bot] = (leg, 'entry')
                     continue
 
                 # --- EXIT ---
                 xm = EXIT_RE.search(msg)
                 if xm:
-                    leg = open_pos.get(bot)
+                    pos_key = (bot, xm.group('sym'))
+                    leg = open_pos.get(pos_key)
                     if leg is None:  # orphan exit — make a stub
                         leg = {'entry_time': '', 'bot': bot, 'symbol': xm.group('sym'),
                                'side': 'BUY' if xm.group('side') == 'SELL' else 'SELL',
@@ -180,7 +195,7 @@ def parse_files(paths):
                     leg['exit_px'] = float(xm.group('px'))
                     leg['pnl'] = _pnl(xm.group('pnl'))
                     leg['exit_reason'] = xm.group('reason').strip()
-                    open_pos[bot] = None
+                    open_pos[pos_key] = None
                     last_event_idx_by_bot[bot] = (leg, 'exit')
                     continue
 
