@@ -1986,8 +1986,21 @@ def _bot_multi_tf_snapshot(source, symbol, api_key=None, max_age_sec=90):
         win20 = candles[-n20:]
         hi = max(c['high'] for c in win20); lo = min(c['low'] for c in win20)
         trend = 'up' if last > sma20 * 1.001 else ('down' if last < sma20 * 0.999 else 'flat')
+        # Order-flow proxy: net buy-bar vs sell-bar volume over the same 20-bar
+        # window (no real L2 feed available) — gives Claude a buying/selling
+        # pressure read per timeframe alongside trend and S/R.
+        buy_vol  = sum((c.get('volume', 0) or 0) for c in win20 if c['close'] >= c['open'])
+        sell_vol = sum((c.get('volume', 0) or 0) for c in win20 if c['close'] < c['open'])
+        tot_vol  = buy_vol + sell_vol
+        if tot_vol > 0:
+            vol_delta_pct = round((buy_vol - sell_vol) / tot_vol * 100.0, 1)
+            order_flow = ('buyers in control' if vol_delta_pct > 10 else
+                          'sellers in control' if vol_delta_pct < -10 else 'balanced')
+        else:
+            vol_delta_pct, order_flow = 0.0, 'no volume data'
         out[tf] = {'lastPrice': round(last, 5), 'sma20': round(sma20, 5), 'changePct': round(chg, 2),
-                   'trend': trend, 'recentHigh': round(hi, 5), 'recentLow': round(lo, 5)}
+                   'trend': trend, 'recentHigh': round(hi, 5), 'recentLow': round(lo, 5),
+                   'orderFlow': order_flow, 'volDeltaPct': vol_delta_pct}
     if out:
         _BOT_MULTI_TF_CACHE[key] = {'ts': now, 'data': out}
     return out or None
@@ -2756,13 +2769,17 @@ def _delta_bot_tick():
         _tv   = _tv_context(cfg, 'delta', symbol, '')
         _imgs = _chart_images_for_multi(delta_ai_state)
         _mtf  = _bot_multi_tf_snapshot('delta', symbol)
-        if not delta_ai_state.get('position') and _bot_preflight_stale(delta_ai_state):
+        _preflight_pending = not delta_ai_state.get('position') and _bot_preflight_stale(delta_ai_state)
+        if _preflight_pending:
             _bot_run_preflight_analyse(delta_ai_state, delta_ai_lock, _bot_log, '[DELTA]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
-                                     extra_ctx=(_ectx or None), images=_imgs)
+        if _preflight_pending:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
+        else:
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
+                                         extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -3038,6 +3055,7 @@ def _delta_aibot_do_start(data):
         delta_ai_state['last_tick']     = {}
         delta_ai_state['last_candles']  = []
         delta_ai_state['seedBias']      = _seed_bias_norm(data.get('seedBias'))   # Option D: open in this bias at start
+        delta_ai_state['lastAnalysis']  = None   # force a fresh pre-flight read on this Start, even if within freshness window
         delta_ai_state['running']       = True
         delta_ai_state['paused']        = False
         t = _threading.Thread(target=_delta_bot_loop, daemon=True, name='delta-aibot')
@@ -3353,7 +3371,13 @@ def _call_claude(system, messages, max_tokens=1024, model=None, images=None, tim
 # (per freshness window) before the bot's first entry after starting/going
 # flat: uses uploaded chart images if any are present, else the auto-fetched
 # numeric multiTF snapshot, and posts a written verdict the panel's chat
-# window shows via the 'lastAnalysis' field in /status. ---
+# window shows via the 'lastAnalysis' field in /status. Each bot's tick loop
+# HOLDs (no _claude_trade_signal call) on the tick it runs this, so trading
+# never starts before the pre-flight read for 1d/1h/30m/15m/5m (bias, S/R,
+# order flow) completes — see the '_preflight_pending' gate next to each
+# _claude_trade_signal call site. lastAnalysis is cleared on every Start, so
+# a fresh pre-flight always runs before that run's first trade, even if the
+# last one was within the freshness window. ---
 _ANALYSIS_MAX_AGE = 3600   # re-run the pre-flight read at most once an hour
 
 def _bot_build_analysis(images, multi_tf, symbol, model):
@@ -3364,9 +3388,11 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
         system = (
             "You are a professional multi-timeframe technical analyst reviewing chart screenshots for " + symbol +
             " as a pre-flight check before a trading bot goes live (or continues trading) on them. You were given "
-            + str(len(images)) + " chart(s), in this order: " + labels + ". For EACH chart, briefly note trend/"
-            "structure, key support/resistance, and any notable pattern or indicator reading visible (EMA, "
-            "SuperTrend, volume, etc.). Then give ONE combined multi-timeframe verdict: use the higher timeframes "
+            + str(len(images)) + " chart(s), in this order: " + labels + ". For EACH chart, briefly state three "
+            "things: (1) BIAS — the trend/directional bias; (2) SUPPORT/RESISTANCE — the key levels visible; "
+            "(3) ORDER FLOW — buying vs selling pressure read from volume bars/candle structure if visible on the "
+            "chart, else say not visible. Also note any other notable pattern or indicator reading (EMA, "
+            "SuperTrend, etc.). Then give ONE combined multi-timeframe verdict: use the higher timeframes "
             "for the dominant trend/bias and the lower ones for entry timing — don't let a lower-timeframe wiggle "
             "override a clear higher-timeframe trend. State the overall bias (bullish/bearish/neutral/choppy) and "
             "the highest-confidence trade idea if any (direction + rough entry/invalidation zone). End with ONE "
@@ -3380,13 +3406,16 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
             "You are a professional multi-timeframe technical analyst reviewing an auto-fetched numeric snapshot "
             "for " + symbol + " as a pre-flight check before a trading bot goes live. No chart image was uploaded, "
             "so read the numbers directly: for each timeframe in 'multiTF' you have lastPrice, sma20, changePct "
-            "(10-bar), trend (vs sma20) and the 20-bar recentHigh/recentLow. For EACH timeframe present, briefly "
-            "note the trend and where price sits vs its recent range. Then give ONE combined multi-timeframe "
-            "verdict: use the higher timeframes (1d/1h) for the dominant trend/bias and the lower ones (30m/15m/"
-            "5m) for entry timing — don't let a lower-timeframe wiggle override a clear higher-timeframe trend. "
-            "State the overall bias (bullish/bearish/neutral/choppy) and the highest-confidence trade idea if any. "
-            "End with ONE clear final line: either 'READY FOR TRADING' with a one-sentence reason, or 'NOT READY' "
-            "with why. Be concise — this is a pre-flight check, not a full report.")
+            "(10-bar), trend (vs sma20), the 20-bar recentHigh/recentLow, and orderFlow/volDeltaPct (net buy-bar "
+            "vs sell-bar volume over the same 20-bar window). For EACH timeframe present, briefly state three "
+            "things: (1) BIAS — the trend vs sma20; (2) SUPPORT/RESISTANCE — the nearest recentLow/recentHigh "
+            "levels vs lastPrice; (3) ORDER FLOW — read straight off orderFlow/volDeltaPct. Then give ONE "
+            "combined multi-timeframe verdict: use the higher timeframes (1d/1h) for the dominant trend/bias and "
+            "the lower ones (30m/15m/5m) for entry timing — don't let a lower-timeframe wiggle override a clear "
+            "higher-timeframe trend. State the overall bias (bullish/bearish/neutral/choppy) and the highest-"
+            "confidence trade idea if any. End with ONE clear final line: either 'READY FOR TRADING' with a "
+            "one-sentence reason, or 'NOT READY' with why. Be concise — this is a pre-flight check, not a full "
+            "report.")
         import json as _json
         user = _json.dumps({'symbol': symbol, 'multiTF': multi_tf})
         return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700, model=model, timeout=60)
@@ -3404,8 +3433,8 @@ def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, 
     labels = ', '.join(i.get('label', '?') for i in images) if images else (', '.join(_BOT_MULTI_TF) + ' (auto, no chart uploaded)')
     with lock:
         state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not images}
-    log_fn('[Analyse] ' + labels + ' -> ' + (text or '')[:160].replace('\n', ' '))
-    _persist_log_line(persist_tag + ' [ANALYSE] ' + labels)
+    log_fn('[Analyse] Preflight analysis done (' + labels + ') -> ' + (text or '')[:160].replace('\n', ' '))
+    _persist_log_line(persist_tag + ' [ANALYSE] Preflight analysis done (' + labels + ')')
     return text
 
 def _bot_preflight_stale(state):
@@ -5408,13 +5437,17 @@ def _zd_bot_tick():
         _tv   = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
         _imgs = _chart_images_for_multi(zd_ai_state)
         _mtf  = _bot_multi_tf_snapshot('kite', symbol, api_key=cfg.get('api_key'))
-        if not zd_ai_state.get('position') and _bot_preflight_stale(zd_ai_state):
+        _preflight_pending = not zd_ai_state.get('position') and _bot_preflight_stale(zd_ai_state)
+        if _preflight_pending:
             _bot_run_preflight_analyse(zd_ai_state, zd_ai_lock, _zd_log, '[ZERODHA]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
-                                     extra_ctx=(_ectx or None), images=_imgs)
+        if _preflight_pending:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
+        else:
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
+                                         extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -5658,6 +5691,7 @@ def _zd_aibot_do_start(data):
         zd_ai_state['last_tick']      = {}
         zd_ai_state['last_candles']   = []
         zd_ai_state['seedBias']       = _seed_bias_norm(data.get('seedBias'))   # Option D: open in this bias at start
+        zd_ai_state['lastAnalysis']   = None   # force a fresh pre-flight read on this Start, even if within freshness window
         zd_ai_state['running']        = True
         zd_ai_state['paused']         = False
         t = _threading.Thread(target=_zd_bot_loop, daemon=True, name='zerodha-aibot')
@@ -6317,7 +6351,9 @@ def _zo_bot_tick():
     _mtf_ctx = (_bot_multi_tf_snapshot('kite', cfg.get('baseSymbol') or '', api_key=cfg.get('api_key'))
                 if (_zo_decide and cfg.get('baseSymbol')) else None)
     _zo_imgs = _chart_images_for_multi(zo_ai_state) if _zo_decide else []
-    if (_zo_decide and not any(l.get('position') for l in zo_ai_state['legs']) and _bot_preflight_stale(zo_ai_state)):
+    _zo_preflight_pending = (_zo_decide and not any(l.get('position') for l in zo_ai_state['legs'])
+                             and _bot_preflight_stale(zo_ai_state))
+    if _zo_preflight_pending:
         _bot_run_preflight_analyse(zo_ai_state, zo_ai_lock, _zo_log, '[ZOPTIONS]',
                                    cfg.get('baseSymbol') or 'options', cfg.get('model'), _zo_imgs, _mtf_ctx)
     for leg in list(zo_ai_state['legs']):
@@ -6366,6 +6402,8 @@ def _zo_bot_tick():
             if _mtf_ctx: leg_ctx['multiTF'] = _mtf_ctx
         if manual_only:
             strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+        elif _zo_decide and _zo_preflight_pending:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
         elif _zo_decide:
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx,
                                          images=_zo_imgs)
@@ -6559,6 +6597,7 @@ def _zo_aibot_do_start(data):
         zo_ai_state['trades']        = []
         zo_ai_state['consec_losses'] = 0
         zo_ai_state['log_buffer']    = []
+        zo_ai_state['lastAnalysis']  = None   # force a fresh pre-flight read on this Start, even if within freshness window
         zo_ai_state['running']       = True
         zo_ai_state['paused']        = False
         t = _threading.Thread(target=_zo_bot_loop, daemon=True, name='zoptions-aibot')
@@ -9113,13 +9152,17 @@ def _mt_bot_tick():
         _tv   = _tv_context(cfg, 'mt5', symbol, '')
         _imgs = _chart_images_for_multi(mt_ai_state)
         _mtf  = _bot_multi_tf_snapshot('mt5', symbol, api_key=cfg.get('mt5_id'))
-        if not mt_ai_state.get('position') and _bot_preflight_stale(mt_ai_state):
+        _preflight_pending = not mt_ai_state.get('position') and _bot_preflight_stale(mt_ai_state)
+        if _preflight_pending:
             _bot_run_preflight_analyse(mt_ai_state, mt_ai_lock, _mt_log, '[MT5]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
-                                     extra_ctx=(_ectx or None), images=_imgs)
+        if _preflight_pending:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
+        else:
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
+                                         extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -9327,6 +9370,7 @@ def _mt_aibot_do_start(data):
         mt_ai_state['last_tick']      = {}
         mt_ai_state['last_candles']   = []
         mt_ai_state['seedBias']       = _seed_bias_norm(data.get('seedBias'))   # Option D: open in this bias at start
+        mt_ai_state['lastAnalysis']   = None   # force a fresh pre-flight read on this Start, even if within freshness window
         mt_ai_state['running']        = True
         mt_ai_state['paused']         = False
         t = _threading.Thread(target=_mt_bot_loop, daemon=True, name='mt5-aibot')
@@ -10432,7 +10476,9 @@ def _do_bot_tick():
     _mtf_ctx = (_bot_multi_tf_snapshot('delta', _do_resolve_spot_symbol(cfg.get('baseSymbol')))
                 if (decide and cfg.get('baseSymbol')) else None)
     _do_imgs = _chart_images_for_multi(do_ai_state) if decide else []
-    if decide and not any(l.get('position') for l in do_ai_state['legs']) and _bot_preflight_stale(do_ai_state):
+    _do_preflight_pending = (decide and not any(l.get('position') for l in do_ai_state['legs'])
+                             and _bot_preflight_stale(do_ai_state))
+    if _do_preflight_pending:
         _bot_run_preflight_analyse(do_ai_state, do_ai_lock, _do_log, '[DOPT]',
                                    cfg.get('baseSymbol') or 'options', cfg.get('model'), _do_imgs, _mtf_ctx)
     for leg in list(do_ai_state['legs']):
@@ -10472,6 +10518,8 @@ def _do_bot_tick():
             continue   # manual handled this leg this tick; auto-logic resumes next tick
         if manual_only:
             strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
+        elif decide and _do_preflight_pending:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
         elif decide:
             leg_ctx = dict(base_ctx) if base_ctx else {}
             leg_ctx.update(_do_option_meta(symbol, (base_ctx or {}).get('underlyingSpot') or 0))
@@ -10603,6 +10651,7 @@ def _do_aibot_do_start(data):
                                                      if s in _BOT_CONFIGURABLE_ALGOS}),
         }
         do_ai_state['legs'] = legs; do_ai_state['trades'] = []; do_ai_state['consec_losses'] = 0
+        do_ai_state['lastAnalysis'] = None   # force a fresh pre-flight read on this Start, even if within freshness window
         do_ai_state['running'] = True; do_ai_state['paused'] = False; do_ai_state['_last_decision_ts'] = 0
         syms = ', '.join(l['symbol'] for l in legs)
         if info: _do_log('[Auto] ' + info)
@@ -10823,13 +10872,17 @@ def _tvb_bot_tick():
         _tv   = _tv_context(cfg, 'tradingview', symbol, '') if cfg.get('tvEnabled') else None
         _imgs = _chart_images_for_multi(tvb_ai_state)
         _mtf  = _bot_multi_tf_snapshot('tradingview', symbol)
-        if not tvb_ai_state.get('position') and _bot_preflight_stale(tvb_ai_state):
+        _preflight_pending = not tvb_ai_state.get('position') and _bot_preflight_stale(tvb_ai_state)
+        if _preflight_pending:
             _bot_run_preflight_analyse(tvb_ai_state, tvb_ai_lock, _tvb_log, '[TVBOT]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
-                                     tvb_ai_state.get('trades'), extra_ctx=(_ectx or None), images=_imgs)
+        if _preflight_pending:
+            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
+        else:
+            strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
+                                         tvb_ai_state.get('trades'), extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -10954,6 +11007,7 @@ def _tvb_aibot_do_start(data):
         if data.get('seedBias') in ('BUY', 'SELL'):
             tvb_ai_state['seedBias'] = data.get('seedBias')
         tvb_ai_state['position'] = None; tvb_ai_state['trades'] = []; tvb_ai_state['consec_losses'] = 0
+        tvb_ai_state['lastAnalysis'] = None   # force a fresh pre-flight read on this Start, even if within freshness window
         tvb_ai_state['running'] = True; tvb_ai_state['paused'] = False; tvb_ai_state['_last_decision_ts'] = 0
         _tvb_log('[PAPER] BOT START {} ({}) strat={} TF={}'.format(symbol, tvb_ai_state['config']['currency'],
                  'claude' if claude else 'tradingview', tvb_ai_state['config']['tf']))
