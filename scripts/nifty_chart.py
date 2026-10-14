@@ -10983,10 +10983,13 @@ def _tvb_aibot_do_start(data):
         if not symbol:
             return {'success': False, 'error': 'Enter a TradingView symbol (e.g. XAUUSD, USOIL, NSE:RELIANCE, MCX:GOLD1!)'}, 400
         claude = bool(data.get('claude', True))
+        quant_on = bool(data.get('quant', True))
         tvb_ai_state['config'] = {
             'symbol': symbol, 'currency': (data.get('currency') or 'USD').upper(),
             'strategies': 'claude' if claude else 'tv',
-            'allowedStrategies': ['claude'] if claude else [],   # _bot_is_claude() reads this, not 'strategies'
+            # _bot_is_claude() / the quant block in _claude_trade_signal read this,
+            # not 'strategies'. 'quant' only matters while claude is on.
+            'allowedStrategies': (['claude'] if claude else []) + (['quant'] if (claude and quant_on) else []),
             'tvEnabled': bool(data.get('tvEnabled', True)),
             'manualOnly': bool(data.get('manualOnly', False)),
             'tvSymbol': symbol, 'emaMode': bool(data.get('emaMode', False)),
@@ -20919,6 +20922,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ai-strat-bar input[type=checkbox] { cursor: pointer; }
   .ai-risk-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
   .ai-risk-bar input { width: 70px; padding: 3px 6px; background: #131722; border: 1px solid #2a2e39; border-radius: 3px; color: #d1d4dc; font-size: 12px; text-align: right; }
+  .adv-toggle {
+    display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9aa0ac;
+    cursor: pointer; margin: -2px 0 8px 2px; user-select: none;
+  }
+  .adv-toggle:hover { color: #d1d4dc; }
+  .adv-toggle .tri { display: inline-block; font-size: 9px; }
   .ai-disclaimer {
     font-size: 11px; color: #f0b429; background: rgba(240,180,41,0.06);
     border: 1px solid rgba(240,180,41,0.25); border-radius: 6px;
@@ -22559,11 +22568,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="aiBotClaudeChk" checked> &#129302; Claude AI</label>
-          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant" id="aiBotQuantChk" checked> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="aiBotIncludeMM"><input type="checkbox" id="aiBotIncludeMMA"></span>
       </div>
+
+      <div class="adv-toggle" id="aiBotAdvToggle"><span class="tri">&#9656;</span><span class="txt">More strategies &amp; settings</span></div>
 
       <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
            1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
@@ -22582,7 +22593,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
-      <div class="ai-strat-bar" data-tv="aiBot" data-tv-broker="kite">
+      <div class="ai-strat-bar adv-row" style="display:none" data-tv="aiBot" data-tv-broker="kite">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="aiBotTV"> Use TradingView (Claude weighs it)</label>
         <label title="EMA-only mode: trade the EMA 5/13 alert directly (BUY→long, SELL→short); SuperTrend &amp; trend gate are ignored. Exits on TP%/opposite-EMA + SL backstop; TP-continuation up to 'Max cont.' then waits for the next EMA alert."><input type="checkbox" id="aiBotEmaMode" checked> EMA 5/13 mode</label>
@@ -22594,7 +22605,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Risk controls -->
-      <div class="ai-risk-bar">
+      <div class="ai-risk-bar adv-row" style="display:none">
         <label title="Bot auto-stops when this many consecutive losing trades occur">Max consec losses: <input type="number" id="aiBotMaxConsec" value="3" min="1"></label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="aiBotMovable"> Movable TP/SL</label>
         <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
@@ -22607,7 +22618,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Option D: manual SuperTrend bias seed — open in this direction at Start (TV mode) -->
-      <div class="ai-risk-bar" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend. (TV mode only.)">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend. (TV mode only.)">
         <span style="color:#9aa0ac;font-size:12px">&#129517; Start bias:</span>
         <button class="zd-add-btn" id="aiBotBiasLong"   type="button" title="Seed a LONG (BUY) — bot opens long at Start">&#9650; Long</button>
         <button class="zd-add-btn" id="aiBotBiasShort"  type="button" title="Seed a SHORT (SELL) — bot opens short at Start">&#9660; Short</button>
@@ -22617,7 +22628,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points (paper + live) -->
-      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable Claude/TV auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). Works in paper and live; SL/TP are managed while the bot runs. Runs on the next tick.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual trading. Tick 'Manual mode' then Start to disable Claude/TV auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). Works in paper and live; SL/TP are managed while the bot runs. Runs on the next tick.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
         <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="aiBotManualOnly"> Manual mode</label>
         <label>Qty <input type="number" id="aiBotManualQty" placeholder="cfg" style="width:64px" min="0" step="1"></label>
@@ -22632,7 +22643,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Win-protect: chop filter + TP-continuation guards (maximise wins) -->
-      <div class="ai-risk-bar" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
         <span style="color:#9aa0ac;font-size:12px">&#128737; Win-protect:</span>
         <label title="Skip TV entries when the market is choppy (Kaufman efficiency ratio below Min ER)"><input type="checkbox" id="aiBotAvoidRange" checked> Avoid chop</label>
         <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="aiBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
@@ -22824,11 +22835,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="mtBotClaudeChk" checked> &#129302; Claude AI</label>
-          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant" id="mtBotQuantChk" checked> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="mtBotIncludeMM"><input type="checkbox" id="mtBotIncludeMMA"></span>
       </div>
+
+      <div class="adv-toggle" id="mtBotAdvToggle"><span class="tri">&#9656;</span><span class="txt">More strategies &amp; settings</span></div>
 
       <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
            1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
@@ -22847,7 +22860,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
-      <div class="ai-strat-bar" data-tv="mtBot" data-tv-broker="mt5">
+      <div class="ai-strat-bar adv-row" style="display:none" data-tv="mtBot" data-tv-broker="mt5">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="mtBotTV"> Use TradingView (Claude weighs it)</label>
         <label title="EMA-only mode: trade the EMA 5/13 alert directly (BUY→long, SELL→short); SuperTrend &amp; trend gate are ignored. Exits on TP%/opposite-EMA + SL backstop; TP-continuation up to 'Max cont.' then waits for the next EMA alert."><input type="checkbox" id="mtBotEmaMode" checked> EMA 5/13 mode</label>
@@ -22858,7 +22871,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="mtBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
 
-      <div class="ai-risk-bar">
+      <div class="ai-risk-bar adv-row" style="display:none">
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="mtBotMaxConsec" value="3" min="1"></label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="mtBotMovable"> Movable TP/SL</label>
         <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
@@ -22870,7 +22883,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Option D: manual SuperTrend bias seed — open in this direction at Start (TV mode) -->
-      <div class="ai-risk-bar" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend. (TV mode only.)">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend. (TV mode only.)">
         <span style="color:#9aa0ac;font-size:12px">&#129517; Start bias:</span>
         <button class="zd-add-btn" id="mtBotBiasLong"   type="button" title="Seed a LONG (BUY) — bot opens long at Start">&#9650; Long</button>
         <button class="zd-add-btn" id="mtBotBiasShort"  type="button" title="Seed a SHORT (SELL) — bot opens short at Start">&#9660; Short</button>
@@ -22880,7 +22893,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points (paper + live) -->
-      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
         <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="mtBotManualOnly"> Manual mode</label>
         <label>Qty <input type="number" id="mtBotManualQty" placeholder="cfg" style="width:64px" min="0" step="0.01"></label>
@@ -22895,7 +22908,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Win-protect: chop filter + TP-continuation guards (maximise wins) -->
-      <div class="ai-risk-bar" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
         <span style="color:#9aa0ac;font-size:12px">&#128737; Win-protect:</span>
         <label title="Skip TV entries when the market is choppy (Kaufman efficiency ratio below Min ER)"><input type="checkbox" id="mtBotAvoidRange" checked> Avoid chop</label>
         <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="mtBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
@@ -23033,11 +23046,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="deltaBotClaudeChk" checked> &#129302; Claude AI</label>
-          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant" id="deltaBotQuantChk" checked> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="deltaBotIncludeMM"><input type="checkbox" id="deltaBotIncludeMMA"></span>
       </div>
+
+      <div class="adv-toggle" id="deltaBotAdvToggle"><span class="tri">&#9656;</span><span class="txt">More strategies &amp; settings</span></div>
 
       <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
            1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
@@ -23056,7 +23071,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) — extra context for Claude -->
-      <div class="ai-strat-bar" data-tv="deltaBot" data-tv-broker="delta">
+      <div class="ai-strat-bar adv-row" style="display:none" data-tv="deltaBot" data-tv-broker="delta">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="deltaBotTV"> Use TradingView (Claude weighs it)</label>
         <label title="EMA-only mode: trade the EMA 5/13 alert directly (BUY→long, SELL→short); SuperTrend &amp; trend gate are ignored. Exits on TP%/opposite-EMA + SL backstop; TP-continuation up to 'Max cont.' then waits for the next EMA alert."><input type="checkbox" id="deltaBotEmaMode" checked> EMA 5/13 mode</label>
@@ -23067,7 +23082,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="deltaBotTVHook" style="display:none;flex-basis:100%;font-size:10px;color:#787b86;word-break:break-all"></div>
       </div>
 
-      <div class="ai-risk-bar">
+      <div class="ai-risk-bar adv-row" style="display:none">
         <label>Max consec losses: <input type="number" id="deltaBotMaxConsec" value="3" min="1"></label>
         <label title="Drag the green TP / red SL lines on the chart to adjust the open trade"><input type="checkbox" id="deltaBotMovable"> Movable TP/SL</label>
         <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
@@ -23089,7 +23104,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Option D: manual SuperTrend bias seed — open in this direction at Start (no waiting for a flip) -->
-      <div class="ai-risk-bar" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual SuperTrend bias. When set, the bot opens a position in this direction the moment you Start — instead of waiting for the next SuperTrend alert. Detect reads the live SuperTrend.">
         <span style="color:#9aa0ac;font-size:12px">&#129517; Start bias:</span>
         <button class="zd-add-btn" id="deltaBotBiasLong"  type="button" title="Seed a LONG (BUY) — bot opens long at Start">&#9650; Long</button>
         <button class="zd-add-btn" id="deltaBotBiasShort" type="button" title="Seed a SHORT (SELL) — bot opens short at Start">&#9660; Short</button>
@@ -23099,7 +23114,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points (paper + live) -->
-      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
         <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="deltaManualOnly"> Manual mode</label>
         <label>Qty <input type="number" id="deltaManualQty" placeholder="cfg" style="width:64px" min="0" step="1"></label>
@@ -23114,7 +23129,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Win-protect: chop filter + TP-continuation guards (maximise wins) -->
-      <div class="ai-risk-bar" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Maximise wins: skip entries in choppy/ranging markets and protect TP-continuation chains (tighter SL, depth cap).">
         <span style="color:#9aa0ac;font-size:12px">&#128737; Win-protect:</span>
         <label title="Skip TV entries when the market is choppy (Kaufman efficiency ratio below Min ER)"><input type="checkbox" id="deltaBotAvoidRange" checked> Avoid chop</label>
         <label title="Ranging if efficiency ratio &lt; this (0.2–0.4 typical; lower = allow choppier entries)">Min ER <input type="number" id="deltaBotMinER" value="0.28" min="0" max="1" step="0.01" style="width:58px"></label>
@@ -23173,8 +23188,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Any TradingView symbol — XAUUSD, USOIL, OANDA:XAUUSD, NSE:RELIANCE, MCX:GOLD1!, BINANCE:BTCUSDT …"><span>Symbol</span><input type="text" id="tvBotSymbol" placeholder="XAUUSD" style="min-width:180px"></label>
         <label title="Currency label for P/L (USD for XAUUSD/USOIL; INR for NSE/MCX).">Currency<select id="tvBotCurrency"><option value="USD" selected>USD $</option><option value="INR">INR ₹</option></select></label>
         <label title="Claude AI decides trades, or trade on your TradingView webhook alerts (SuperTrend/EMA).">Strategy<select id="tvBotStrategy"><option value="claude" selected>&#129302; Claude AI</option><option value="tv">&#128200; TradingView alerts</option></select></label>
+        <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" id="tvBotQuantChk" checked> &#128202; Quant</label>
         <label>TF<select id="tvBotTF"><option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option><option value="15m">15m</option><option value="1h">1h</option></select></label>
       </div>
+
+      <div class="adv-toggle" id="tvBotAdvToggle"><span class="tri">&#9656;</span><span class="txt">More settings</span></div>
       <div class="ai-input-bar">
         <label title="Paper capital in the chosen currency (context + capital-based sizing).">Capital<input type="number" id="tvBotCapital" value="1000" min="0" step="100" style="width:100px"></label>
         <label title="Leverage for capital-based sizing (qty = capital × leverage ÷ price).">Lev<input type="number" id="tvBotLeverage" value="1" min="1" max="125" style="width:56px"></label>
@@ -23206,7 +23224,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Only enter WITH the EMA50/200 trend (needs ma4/ma5 in the SuperTrend alert)."><input type="checkbox" id="tvBotTrendGate"> Trend gate</label>
         <span style="color:#787b86;font-size:10px">Send TradingView webhook alerts to <code>/api/aibot/tv/webhook?token=…</code> for this symbol.</span>
       </div>
-      <div class="ai-risk-bar">
+      <div class="ai-risk-bar adv-row" style="display:none">
         <label>Daily loss <input type="number" id="tvBotMaxLoss" value="50" min="1" style="width:70px"></label>
         <label>Daily profit <input type="number" id="tvBotMaxProfit" value="0" min="0" style="width:70px"></label>
         <label>Max consec losses <input type="number" id="tvBotMaxConsec" value="3" min="1" style="width:50px"></label>
@@ -23230,7 +23248,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="tvBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
       <!-- Manual mode: Buy/Sell by hand with SL/TP as % or points -->
-      <div class="ai-risk-bar" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual trading. Tick 'Manual mode' then Start to disable auto-entries; use Buy/Sell to enter at market with the SL/TP below (enter EITHER % or points; points win). SL/TP are managed while the bot runs.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
         <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="tvBotManualOnly"> Manual mode</label>
         <label>Qty <input type="number" id="tvBotManualQty" placeholder="cfg" style="width:64px" min="0" step="0.01"></label>
@@ -23290,10 +23308,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="This bot is Claude-only — there is no non-Claude trading mode to fall back to, so this stays on." style="color:#b388ff;opacity:0.75"><input type="checkbox" class="strat-chk" data-strat="claude" id="doBotClaudeChk" checked disabled> &#129302; Claude AI (always on)</label>
-          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant" id="doBotQuantChk" checked> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; this bot has no non-Claude mode)</span>
       </div>
+
+      <div class="adv-toggle" id="doBotAdvToggle"><span class="tri">&#9656;</span><span class="txt">More strategies &amp; settings</span></div>
 
       <!-- Multi-timeframe chart upload (optional): upload 1D/1H/30m/15m/5m charts,
            click Analyse for a combined pre-flight read, then Start trades with all
@@ -23329,10 +23349,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label title="Stop-loss % of premium (Claude may override).">SL%<input type="number" id="doBotSlPct" value="30" min="1" style="width:60px"></label>
         <label title="Target % of premium (Claude may override).">TP%<input type="number" id="doBotTpPct" value="50" min="1" style="width:60px"></label>
         <button class="zd-add-btn" id="doBotResolveBtn" type="button" title="Preview the CE/PE option symbols">&#128269; Preview strikes</button>
-      </div>
-      <div class="ai-risk-bar">
-        <label>Max consec losses <input type="number" id="doBotMaxConsec" value="3" min="1" style="width:56px"></label>
         <span id="doBotResolveOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
+      </div>
+      <div class="ai-risk-bar adv-row" style="display:none">
+        <label>Max consec losses <input type="number" id="doBotMaxConsec" value="3" min="1" style="width:56px"></label>
       </div>
       <div class="ai-input-bar">
         <button class="zd-add-btn" id="doBotStartBtn" style="padding:7px 16px;background:#26a69a;color:#fff">&#9654; Start</button>
@@ -23352,7 +23372,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="doBotScheduleStatus" style="color:#787b86;font-size:11px">not armed</span>
       </div>
       <!-- Manual mode: Buy/Sell a CE or PE leg by hand with SL/TP as % or points -->
-      <div class="ai-risk-bar" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = contracts.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = contracts.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
         <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="doBotManualOnly"> Manual mode</label>
         <label>Leg <select id="doBotManualLeg" style="background:#1e222d;color:#d1d4dc;border:1px solid #2a2e39;border-radius:4px;padding:3px"><option value="CE">CE</option><option value="PE">PE</option></select></label>
@@ -23531,11 +23551,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="lbl">&#127919; Strategy:</span>
         <span class="strat-pick" style="display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center">
           <label title="Claude AI decides trades on its own from recent price data. Needs ANTHROPIC_API_KEY on the server." style="color:#b388ff"><input type="checkbox" class="strat-chk" data-strat="claude" id="zoBotClaudeChk" checked> &#129302; Claude AI</label>
-          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant"> &#128202; Quant</label>
+          <label title="Feed a deterministic statistical/mean-reversion model (Z-score, regression deviation, Bollinger %B, StochRSI, Keltner, Hurst, variance ratio, skew) to Claude — it automatically drives Claude's conviction: raises it when the quant verdict agrees, lowers it when it opposes."><input type="checkbox" class="strat-chk" data-strat="quant" id="zoBotQuantChk" checked> &#128202; Quant</label>
         </span>
         <span style="color:#787b86;font-size:10px">(Claude trades autonomously &mdash; set Min score ~6 for a high win rate)</span>
         <span style="display:none"><input type="checkbox" id="zoBotIncludeMM"><input type="checkbox" id="zoBotIncludeMMA"></span>
       </div>
+
+      <div class="adv-toggle" id="zoBotAdvToggle"><span class="tri">&#9656;</span><span class="txt">More strategies &amp; settings</span></div>
 
       <!-- Multi-timeframe chart upload (shown when Claude AI strategy is on): upload
            1D/1H/30m/15m/5m charts, click Analyse for a combined pre-flight read, then
@@ -23554,7 +23576,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- TradingView (TA + custom-indicator webhook) on the UNDERLYING — context for Claude -->
-      <div class="ai-strat-bar" data-tv="zoBot" data-tv-broker="kite">
+      <div class="ai-strat-bar adv-row" style="display:none" data-tv="zoBot" data-tv-broker="kite">
         <span class="lbl">&#128202; TradingView:</span>
         <label title="Feed TradingView's technical analysis of the UNDERLYING + your custom-indicator alert webhook to Claude as extra confirmation. Claude still decides. If you UNTICK Claude AI, the bot trades directly on the TradingView alerts."><input type="checkbox" id="zoBotTV"> Use TradingView (Claude weighs it)</label>
         <label>Symbol <input type="text" id="zoBotTVSym" placeholder="auto e.g. NSE:NIFTY" style="min-width:150px"></label>
@@ -23565,7 +23587,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Manual mode: Buy/Sell a CE or PE leg by hand with SL/TP as % or points -->
-      <div class="ai-risk-bar" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = lots.">
+      <div class="ai-risk-bar adv-row" style="display:none" title="Manual trading on a CE or PE leg. Tick 'Manual mode' then Start to disable Claude auto-entries; pick CE/PE and press Buy or Sell to enter at market with the SL/TP below (as % or premium points; points win). Qty = lots.">
         <span style="color:#9aa0ac;font-size:12px">&#9995; Manual:</span>
         <label title="Disable auto-entries — only your Buy/Sell buttons open trades"><input type="checkbox" id="zoBotManualOnly"> Manual mode</label>
         <label>Leg <select id="zoBotManualLeg" style="background:#1e222d;color:#d1d4dc;border:1px solid #2a2e39;border-radius:4px;padding:3px"><option value="CE">CE</option><option value="PE">PE</option></select></label>
@@ -23580,7 +23602,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="zoBotManualOut" style="color:#9aa0ac;font-size:11px">&mdash;</span>
       </div>
 
-      <div class="ai-risk-bar">
+      <div class="ai-risk-bar adv-row" style="display:none">
         <label title="Bot auto-stops after this many consecutive losing trades">Max consec losses: <input type="number" id="zoBotMaxConsec" value="3" min="1"></label>
         <span style="color:#787b86;font-size:10px">&#129302; Claude sets entries, SL/TP &amp; its own conviction score automatically.</span>
         <span style="display:none">
@@ -29500,8 +29522,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }).catch(function() {});
   })();
 
+  // ---- Shared: small triangle to expand/collapse the secondary strategy &
+  // settings rows (TradingView, Max consec losses, Start bias, Manual mode,
+  // Win-protect) on every AI bot panel — collapsed by default so Claude AI +
+  // Quant stay the only strategy picks visible up front. ----
+  function _wireAdvToggle(toggleId) {
+    const btn = document.getElementById(toggleId);
+    if (!btn) return;
+    const panel = btn.closest('.zerodha-panel');
+    if (!panel) return;
+    const tri = btn.querySelector('.tri');
+    const txt = btn.querySelector('.txt');
+    let open = false;
+    btn.addEventListener('click', function() {
+      open = !open;
+      panel.querySelectorAll('.adv-row').forEach(function(el) { el.style.display = open ? '' : 'none'; });
+      if (tri) tri.innerHTML = open ? '&#9662;' : '&#9656;';
+      if (txt) txt.textContent = open ? 'Hide strategies & settings' : 'More strategies & settings';
+    });
+  }
+
   // ---- Zerodha AI Bot Panel ----
   (function() {
+    _wireAdvToggle('aiBotAdvToggle');
     const panel    = document.getElementById('aiBotPanel');
     const header   = document.getElementById('aiBotHeader');
     const closeBtn = document.getElementById('aiBotClose');
@@ -30542,6 +30585,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // ---- TradingView AI Bot Panel (paper, any symbol) ----
   (function() {
+    _wireAdvToggle('tvBotAdvToggle');
     const panel = document.getElementById('tvBotPanel');
     if (!panel) return;
     const $ = function(id){ return document.getElementById(id); };
@@ -30571,7 +30615,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if(stratSel) stratSel.addEventListener('change', function(){ const o=$('tvBotTvOpts'); if(o) o.style.display = stratSel.value==='tv' ? 'flex' : 'none'; });
     function cfg(){ const claude = $('tvBotStrategy').value==='claude';
       return { symbol:($('tvBotSymbol').value||'').trim().toUpperCase(), currency:$('tvBotCurrency').value,
-        claude:claude, tvEnabled:true, emaMode:!!$('tvBotEmaMode').checked, trendGate:!!$('tvBotTrendGate').checked,
+        claude:claude, quant:!!($('tvBotQuantChk')||{}).checked, tvEnabled:true, emaMode:!!$('tvBotEmaMode').checked, trendGate:!!$('tvBotTrendGate').checked,
         capital:parseFloat($('tvBotCapital').value)||0, leverage:parseFloat($('tvBotLeverage').value)||1,
         qty:parseFloat($('tvBotQty').value)||1, tf:$('tvBotTF').value, slPct:parseFloat($('tvBotSlPct').value)||1,
         tpPct:parseFloat($('tvBotTpPct').value)||2, maxLoss:parseFloat($('tvBotMaxLoss').value)||50,
@@ -30706,6 +30750,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // ---- Delta Options AI Bot Panel (BTC/ETH calls & puts) ----
   (function() {
+    _wireAdvToggle('doBotAdvToggle');
     const panel = document.getElementById('doBotPanel');
     if (!panel) return;
     const $ = function(id){ return document.getElementById(id); };
@@ -30924,6 +30969,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // ---- Zerodha Options AI Bot Panel (two legs, buyer/seller) ----
   (function() {
+    _wireAdvToggle('zoBotAdvToggle');
     const panel    = document.getElementById('zoBotPanel');
     if (!panel) return;
     const header   = document.getElementById('zoBotHeader');
@@ -32827,6 +32873,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   // ---- MT5 AI Bot Panel (server-side, mirrors Delta/Zerodha) ----
   (function() {
+    _wireAdvToggle('mtBotAdvToggle');
     const panel = document.getElementById('mtBotPanel');
     if (!panel) return;
     const header = document.getElementById('mtBotHeader');
@@ -33461,6 +33508,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   // for candles and /api/delta/order for live execution. Symbols are Delta's
   // BTCUSD / ETHUSD / BTCUSDT shape.
   (function() {
+    _wireAdvToggle('deltaBotAdvToggle');
     const panel    = document.getElementById('deltaBotPanel');
     const header   = document.getElementById('deltaBotHeader');
     const closeBtn = document.getElementById('deltaBotClose');
