@@ -3422,11 +3422,14 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
 
 def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, images, multi_tf):
     """Runs _bot_build_analysis, stores it on state['lastAnalysis'] (picked up
-    by the panel's status poll and shown in the chat window), and logs it —
-    to BOTH the bot's own log panel and log.txt (persist), on success AND on
-    failure, so a persistently-failing pre-flight (which also means trading
-    stays gated — see the '_preflight_pending' check next to each
-    _claude_trade_signal call site) is visible in log.txt instead of silent."""
+    by the panel's status poll and shown in full in the chat window), and logs
+    it — to BOTH the bot's own log panel (short, for the compact panel view)
+    and log.txt (the FULL text: every timeframe's bias/support-resistance/
+    order-flow note plus the READY/NOT READY verdict, not just a one-line
+    summary), on success AND on failure, so a persistently-failing pre-flight
+    (which also means trading stays gated — see the '_preflight_pending'
+    check next to each _claude_trade_signal call site) is visible in log.txt
+    instead of silent."""
     text, err = _bot_build_analysis(images, multi_tf, symbol, model)
     if err:
         msg = 'Preflight analysis failed: ' + str(err)[:200]
@@ -3437,7 +3440,7 @@ def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, 
     with lock:
         state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not images}
     log_fn('[Analyse] Preflight analysis done (' + labels + ') -> ' + (text or '')[:160].replace('\n', ' '))
-    _persist_log_line(persist_tag + ' [ANALYSE] Preflight analysis done (' + labels + ')')
+    _persist_log_line(persist_tag + ' [ANALYSE] Preflight analysis done (' + labels + '):\n' + (text or '(empty response)'))
     return text
 
 def _bot_preflight_stale(state):
