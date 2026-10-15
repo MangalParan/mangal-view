@@ -2337,13 +2337,12 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
                 "or HOLD; NEUTRAL is a mild vote for HOLD unless everything else is unanimous. This is a "
                 "quantitative vote alongside price action, not a replacement for it.\n")
 
-    min_enter = float(cfg.get('minScore', 0) or 0) + float(cfg.get('scoreBuffer', 0) or 0)
-    if min_enter <= 0:
-        gate = ("Score the setup YOURSELF on a 0-10 conviction scale and ONLY take BUY/SELL when your own conviction "
-                "is genuinely HIGH (>=7); otherwise HOLD. A high win rate comes from passing on mediocre setups — "
-                "when in doubt, HOLD.")
-    else:
-        gate = ("Only choose BUY or SELL when your conviction |score| >= " + str(min_enter) + " (score sign matches signal).")
+    # Claude (+ Quant) runs entirely on its own judgment — no external minScore/
+    # scoreBuffer numeric floor. Score the setup for logging/UI purposes, but the
+    # BUY/SELL/HOLD call itself is Claude's own read, not gated by a fixed number.
+    gate = ("Decide BUY, SELL or HOLD purely from your own read of the setup — there is no externally imposed score "
+            "threshold. Still report your conviction as 'score' for the record. A high win rate comes from passing "
+            "on mediocre setups, so when genuinely unsure, HOLD.")
     # Operator note: the user's latest chat message is stored on the config and fed to
     # the live decision loop as guidance (a bias, a level, "only longs", "stay flat"…).
     note_txt, note_age = '', None
@@ -3423,12 +3422,16 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
 
 def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, images, multi_tf):
     """Runs _bot_build_analysis, stores it on state['lastAnalysis'] (picked up
-    by the panel's status poll and shown in the chat window), and logs it.
-    Called from each bot's tick loop before its first entry after start/flat —
-    see the 'preflight' gate next to each _claude_trade_signal call site."""
+    by the panel's status poll and shown in the chat window), and logs it —
+    to BOTH the bot's own log panel and log.txt (persist), on success AND on
+    failure, so a persistently-failing pre-flight (which also means trading
+    stays gated — see the '_preflight_pending' check next to each
+    _claude_trade_signal call site) is visible in log.txt instead of silent."""
     text, err = _bot_build_analysis(images, multi_tf, symbol, model)
     if err:
-        log_fn('[Analyse] auto pre-flight failed: ' + str(err)[:160])
+        msg = 'Preflight analysis failed: ' + str(err)[:200]
+        log_fn('[Analyse] ' + msg)
+        _persist_log_line(persist_tag + ' [ANALYSE] ' + msg)
         return None
     labels = ', '.join(i.get('label', '?') for i in images) if images else (', '.join(_BOT_MULTI_TF) + ' (auto, no chart uploaded)')
     with lock:
@@ -29640,14 +29643,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function _mmaEnabled() { return !!incMMAChk.checked; }
 
     // ---- Configurable strategy checkboxes (extras on the always-on core) ----
-    const STRAT_KEY = 'mangalview_aibot_strategies_v3';
+    // Claude AI + Quant are the standing default (checked in the HTML) every
+    // time this panel loads — no localStorage override, so an old saved
+    // preference (e.g. from before Quant existed) can never silently turn it
+    // back off. Still toggleable per-run; just not persisted across reloads.
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
-    try {
-      const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null');
-      if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; });
-    } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
-    function _saveStrategies() { try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} }
     // When the Claude AI strategy is selected, Claude owns SL/TP (set per trade
     // from market structure) — disable the manual SL/Target inputs to make that clear.
     const _claudeChk = stratChks.find(c => c.dataset.strat === 'claude');
@@ -29660,7 +29661,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
       });
     }
-    stratChks.forEach(c => c.addEventListener('change', function(){ _saveStrategies(); _syncClaudeSLTP(); }));
+    stratChks.forEach(c => c.addEventListener('change', function(){ _syncClaudeSLTP(); }));
     _syncClaudeSLTP();
 
     // ---- Open / Close ----
@@ -30783,18 +30784,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if(pb) pb.addEventListener('click', function(){ const u=new URL(window.location.href); u.searchParams.set('doBotPopout','1'); window.open(u.toString(),'doBotPopout','width=1000,height=900,resizable=yes,scrollbars=yes'); });
     })();
     // ---- Strategy checkboxes (Claude AI is fixed on — this bot has no non-
-    // Claude mode; Quant is the one actually toggleable here, same mechanism
-    // as every other bot's .strat-chk / data-strat collection). ----
-    const DO_STRAT_KEY = 'mangalview_doptions_strategies_v1';
+    // Claude mode; Quant is the one actually toggleable here). Both are the
+    // standing default (checked in the HTML) every time this panel loads —
+    // no localStorage override. Still toggleable per-run; just not persisted
+    // across reloads. ----
     const doStratChks = Array.from(panel.querySelectorAll('.strat-chk'));
-    try {
-      const saved = JSON.parse(localStorage.getItem(DO_STRAT_KEY) || 'null');
-      if (Array.isArray(saved)) doStratChks.forEach(function(c){ if (!c.disabled) c.checked = saved.indexOf(c.dataset.strat) !== -1; });
-    } catch(e) {}
     function _collectStrategies() { return doStratChks.filter(function(c){ return c.checked; }).map(function(c){ return c.dataset.strat; }); }
-    doStratChks.forEach(function(c){ c.addEventListener('change', function(){
-      try { localStorage.setItem(DO_STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {}
-    }); });
 
     function cfg(){
       const auto = !!$('doBotAutoStrikes').checked;
@@ -31030,6 +31025,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     // ---- Persistence (buyer/seller, strategies, MM) ----
     const ZO_PREF = 'mangalview_zoptions_prefs_v3';
+    // Claude AI + Quant are the standing default (checked in the HTML) every
+    // time this panel loads — no localStorage override. Still toggleable
+    // per-run; just not persisted across reloads.
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
     try {
       const p = JSON.parse(localStorage.getItem(ZO_PREF) || 'null');
@@ -31038,17 +31036,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (typeof p.seller === 'boolean') sellerChk.checked = p.seller;
         if (typeof p.mm === 'boolean')  incMMChk.checked  = p.mm;
         if (typeof p.mma === 'boolean') incMMAChk.checked = p.mma;
-        if (Array.isArray(p.strats)) stratChks.forEach(c => { c.checked = p.strats.indexOf(c.dataset.strat) !== -1; });
       }
     } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
     function _savePrefs() {
       try { localStorage.setItem(ZO_PREF, JSON.stringify({
         buyer: buyerChk.checked, seller: sellerChk.checked,
-        mm: incMMChk.checked, mma: incMMAChk.checked, strats: _collectStrategies()
+        mm: incMMChk.checked, mma: incMMAChk.checked
       })); } catch(e) {}
     }
-    [buyerChk, sellerChk, incMMChk, incMMAChk].concat(stratChks).forEach(c => c.addEventListener('change', _savePrefs));
+    [buyerChk, sellerChk, incMMChk, incMMAChk].forEach(c => c.addEventListener('change', _savePrefs));
     // Claude owns SL/TP when its strategy is selected — disable the manual inputs.
     const _claudeChk = stratChks.find(c => c.dataset.strat === 'claude');
     function _syncClaudeSLTP() {
@@ -32927,9 +32924,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     function currentMode() { const r = document.querySelector('input[name="mtBotMode"]:checked'); return r ? r.value : 'paper'; }
 
-    const STRAT_KEY = 'mangalview_mt5_strategies_v3';
+    // Claude AI + Quant are the standing default (checked in the HTML) every
+    // time this panel loads — no localStorage override. Still toggleable
+    // per-run; just not persisted across reloads.
     const stratChks = Array.from(panel.querySelectorAll('.strat-chk'));
-    try { const saved = JSON.parse(localStorage.getItem(STRAT_KEY) || 'null'); if (Array.isArray(saved)) stratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; }); } catch(e) {}
     function _collectStrategies() { return stratChks.filter(c => c.checked).map(c => c.dataset.strat); }
     // Claude owns SL/TP when its strategy is selected — disable the manual inputs.
     const _claudeChk = stratChks.find(c => c.dataset.strat === 'claude');
@@ -32942,7 +32940,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
       });
     }
-    stratChks.forEach(c => c.addEventListener('change', function(){ try { localStorage.setItem(STRAT_KEY, JSON.stringify(_collectStrategies())); } catch(e) {} _syncClaudeSLTP(); }));
+    stratChks.forEach(c => c.addEventListener('change', function(){ _syncClaudeSLTP(); }));
     _syncClaudeSLTP();
 
     document.getElementById('btnMT5Bot').addEventListener('click', function() {
@@ -33676,14 +33674,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function _dMMAEnabled() { return !!dIncMMAChk.checked; }
 
     // ---- Configurable strategy checkboxes (extras on the always-on core) ----
-    const D_STRAT_KEY = 'mangalview_delta_aibot_strategies_v3';
+    // Claude AI + Quant are the standing default (checked in the HTML) every
+    // time this panel loads — no localStorage override. Still toggleable
+    // per-run; just not persisted across reloads.
     const dStratChks = Array.from(panel.querySelectorAll('.strat-chk'));
-    try {
-      const saved = JSON.parse(localStorage.getItem(D_STRAT_KEY) || 'null');
-      if (Array.isArray(saved)) dStratChks.forEach(c => { c.checked = saved.indexOf(c.dataset.strat) !== -1; });
-    } catch(e) {}
     function _dCollectStrategies() { return dStratChks.filter(c => c.checked).map(c => c.dataset.strat); }
-    function _dSaveStrategies() { try { localStorage.setItem(D_STRAT_KEY, JSON.stringify(_dCollectStrategies())); } catch(e) {} }
     // Claude owns SL/TP when its strategy is selected — disable the manual inputs.
     const _dClaudeChk = dStratChks.find(c => c.dataset.strat === 'claude');
     function _dSyncClaudeSLTP() {
@@ -33695,7 +33690,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const lab = el.closest('label'); if (lab) lab.style.opacity = on ? '0.45' : '';
       });
     }
-    dStratChks.forEach(c => c.addEventListener('change', function(){ _dSaveStrategies(); _dSyncClaudeSLTP(); }));
+    dStratChks.forEach(c => c.addEventListener('change', function(){ _dSyncClaudeSLTP(); }));
     _dSyncClaudeSLTP();
 
     // ---- Regime + strategy (same as Zerodha bot) ----
