@@ -3322,14 +3322,25 @@ def _attach_images(messages, images):
         msgs[idx]['content'] = list(blocks) + [{'type': 'text', 'text': str(c)}]
     return msgs
 
-def _call_claude(system, messages, max_tokens=1024, model=None, images=None, timeout=45):
+def _call_claude(system, messages, max_tokens=1024, model=None, images=None, timeout=45, effort=None):
     """Call the Anthropic Messages API via stdlib only (no SDK dependency).
     Reads ANTHROPIC_API_KEY from the environment. `model` is a panel choice
     (haiku/sonnet/opus) or full id; None uses the env default. `images` is an
     optional list of {'media','data'} base64 chart blocks (vision). `timeout` defaults
     to 45s (fine for every existing caller); pass a larger value for callers already
     running in a background thread that ask for enough max_tokens to plausibly need
-    longer (e.g. many detailed picks in one call). Returns (text, error)."""
+    longer (e.g. many detailed picks in one call).
+    `effort` ('low'/'medium'/'high'/'xhigh'/'max') is optional and omitted by
+    default: current Claude models (Sonnet 5.5, Opus 5.5, etc.) run adaptive
+    extended thinking even when the request has no 'thinking' field at all,
+    and thinking tokens come out of the SAME max_tokens budget as the visible
+    text — on a short analytical reply this can eat nearly the whole budget
+    and leave little or no text (stop_reason 'max_tokens' with an empty/cut-off
+    response). Pass effort='low' for callers that want a short, fast, mostly-
+    text answer (e.g. the pre-flight analysis) to keep thinking token spend
+    down; leave it unset for callers that benefit from deeper reasoning (e.g.
+    the live trade-decision call) at the cost of some of the budget going to
+    thinking. Returns (text, error)."""
     api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
     if not api_key:
         return None, 'ANTHROPIC_API_KEY is not set on the server. Add it in your environment (Render → Environment) and redeploy.'
@@ -3337,10 +3348,13 @@ def _call_claude(system, messages, max_tokens=1024, model=None, images=None, tim
     if images:
         messages = _attach_images(messages, images)
     import urllib.request as _ur, json as _json
-    body = _json.dumps({
+    _req_body = {
         'model': model, 'max_tokens': max_tokens,
         'system': system, 'messages': messages,
-    }).encode('utf-8')
+    }
+    if effort:
+        _req_body['output_config'] = {'effort': effort}
+    body = _json.dumps(_req_body).encode('utf-8')
     req = _ur.Request('https://api.anthropic.com/v1/messages', data=body, method='POST',
                       headers={'content-type': 'application/json',
                                'x-api-key': api_key,
@@ -3398,8 +3412,15 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
             "clear final line: either 'READY FOR TRADING' with a one-sentence reason, or 'NOT READY' with what's "
             "missing or conflicting between timeframes. Be concise — this is a pre-flight check, not a full report.")
         user = 'Analyse these charts for ' + symbol + ' and tell me if you are ready for trading.'
-        return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700, model=model,
-                            images=images, timeout=60)
+        # Current Claude models run adaptive thinking by default even with no
+        # 'thinking' field sent, and those tokens come out of max_tokens too —
+        # at default (high) effort that was eating nearly the whole budget and
+        # leaving a cut-off or empty response (stop_reason 'max_tokens'). This
+        # is a short analytical write-up, not a hard reasoning task, so pin
+        # effort low to keep thinking-token spend down, with enough max_tokens
+        # headroom to comfortably fit the full bias+S/R+order-flow text anyway.
+        return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=2000, model=model,
+                            images=images, timeout=60, effort='low')
     if multi_tf:
         system = (
             "You are a professional multi-timeframe technical analyst reviewing an auto-fetched numeric snapshot "
@@ -3417,7 +3438,9 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
             "report.")
         import json as _json
         user = _json.dumps({'symbol': symbol, 'multiTF': multi_tf})
-        return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=700, model=model, timeout=60)
+        # See the image branch above for why this isn't 700 and why effort='low'.
+        return _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=2000, model=model,
+                            timeout=60, effort='low')
     return None, 'no chart images and no auto-fetched data available yet'
 
 def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, images, multi_tf):
@@ -3431,6 +3454,13 @@ def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, 
     check next to each _claude_trade_signal call site) is visible in log.txt
     instead of silent."""
     text, err = _bot_build_analysis(images, multi_tf, symbol, model)
+    if not err and not (text or '').strip():
+        # Claude returned no error but also no text (e.g. the response got cut
+        # off by max_tokens before writing anything) — treat as a failure so it
+        # retries next eligible tick instead of "succeeding" with nothing, which
+        # would otherwise mark lastAnalysis fresh and silently release the
+        # trading gate on an empty read.
+        err = 'empty response from Claude (no error, but no text — likely cut off)'
     if err:
         msg = 'Preflight analysis failed: ' + str(err)[:200]
         log_fn('[Analyse] ' + msg)
