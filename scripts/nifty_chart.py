@@ -11950,8 +11950,20 @@ def _load_kite_all_instruments():
 # DON'T pull the full ~90k-row Kite dump into memory (~100MB) just to find one
 # instrument. Streams the dump once per new symbol and caches only that symbol.
 _KITE_ONE_CACHE = {}   # 'SYMBOL' -> {token, exchange, tick_size, lot_size} | None
+# Kite's actual index tradingsymbols aren't the bare names everyone types —
+# "NIFTY" has no exact match in the instruments dump, only "NIFTY 50" does —
+# so a bot panel's Symbol field (or the Analyse button) silently got zero
+# candles for every common index typed the "natural" way. Mirrors _ZO_BASE_MAP
+# (ZOPTIONS' own underlying→tradingsymbol map) and the JS BASE_SPOT table.
+_KITE_INDEX_ALIASES = {
+    'NIFTY': 'NIFTY 50', 'NIFTY50': 'NIFTY 50',
+    'BANKNIFTY': 'NIFTY BANK', 'NIFTYBANK': 'NIFTY BANK',
+    'FINNIFTY': 'NIFTY FIN SERVICE',
+    'MIDCPNIFTY': 'NIFTY MID SELECT',
+}
 def _resolve_kite_instrument(symbol):
     sym_u = (symbol or '').upper().strip()
+    sym_u = _KITE_INDEX_ALIASES.get(sym_u, sym_u)
     if not sym_u:
         return None
     if sym_u in _KITE_ONE_CACHE:
