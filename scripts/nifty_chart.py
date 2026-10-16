@@ -2768,17 +2768,11 @@ def _delta_bot_tick():
         _tv   = _tv_context(cfg, 'delta', symbol, '')
         _imgs = _chart_images_for_multi(delta_ai_state)
         _mtf  = _bot_multi_tf_snapshot('delta', symbol)
-        _preflight_pending = not delta_ai_state.get('position') and _bot_preflight_stale(delta_ai_state)
-        if _preflight_pending:
-            _bot_run_preflight_analyse(delta_ai_state, delta_ai_lock, _bot_log, '[DELTA]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        if _preflight_pending:
-            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
-        else:
-            strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
-                                         extra_ctx=(_ectx or None), images=_imgs)
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
+                                     extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -3381,17 +3375,13 @@ def _call_claude(system, messages, max_tokens=1024, model=None, images=None, tim
     return text, None
 
 # --- Pre-flight multi-timeframe analysis, shared by every AI bot. Runs once
-# (per freshness window) before the bot's first entry after starting/going
-# flat: uses uploaded chart images if any are present, else the auto-fetched
-# numeric multiTF snapshot, and posts a written verdict the panel's chat
-# window shows via the 'lastAnalysis' field in /status. Each bot's tick loop
-# HOLDs (no _claude_trade_signal call) on the tick it runs this, so trading
-# never starts before the pre-flight read for 1d/1h/30m/15m/5m (bias, S/R,
-# order flow) completes — see the '_preflight_pending' gate next to each
-# _claude_trade_signal call site. lastAnalysis is cleared on every Start, so
-# a fresh pre-flight always runs before that run's first trade, even if the
-# last one was within the freshness window. ---
-_ANALYSIS_MAX_AGE = 3600   # re-run the pre-flight read at most once an hour
+# purely user-triggered via the Charts bar's Analyse button (_bot_analyse_route):
+# uses uploaded chart images if any are present, else the auto-fetched numeric
+# multiTF snapshot (so it still works with nothing uploaded), and posts a
+# written verdict the panel's chat window shows via the 'lastAnalysis' field
+# in /status. Starting the bot does NOT run or wait on this — Start begins
+# trading immediately; Analyse is an optional, separate pre-check you run
+# whenever you want a fresh read. ---
 
 def _bot_build_analysis(images, multi_tf, symbol, model):
     """(text, err) — a pre-flight multi-timeframe read, from chart images when
@@ -3444,40 +3434,32 @@ def _bot_build_analysis(images, multi_tf, symbol, model):
     return None, 'no chart images and no auto-fetched data available yet'
 
 def _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, images, multi_tf):
-    """Runs _bot_build_analysis, stores it on state['lastAnalysis'] (picked up
-    by the panel's status poll and shown in full in the chat window), and logs
-    it — to BOTH the bot's own log panel (short, for the compact panel view)
-    and log.txt (the FULL text: every timeframe's bias/support-resistance/
-    order-flow note plus the READY/NOT READY verdict, not just a one-line
-    summary), on success AND on failure, so a persistently-failing pre-flight
-    (which also means trading stays gated — see the '_preflight_pending'
-    check next to each _claude_trade_signal call site) is visible in log.txt
-    instead of silent."""
+    """Runs _bot_build_analysis for the Analyse button, stores it on
+    state['lastAnalysis'] (picked up by the panel's status poll and shown in
+    full, with a leading "Preflight analysis done" line, in the chat window),
+    and logs it — to BOTH the bot's own log panel (short, for the compact
+    panel view) and log.txt (the FULL text: every timeframe's bias/support-
+    resistance/order-flow note plus the READY/NOT READY verdict, not just a
+    one-line summary) — on success AND on failure, so a failing pre-flight is
+    visible in log.txt instead of silent. Returns (text, err); text already
+    carries the "done" header on success."""
     text, err = _bot_build_analysis(images, multi_tf, symbol, model)
     if not err and not (text or '').strip():
         # Claude returned no error but also no text (e.g. the response got cut
-        # off by max_tokens before writing anything) — treat as a failure so it
-        # retries next eligible tick instead of "succeeding" with nothing, which
-        # would otherwise mark lastAnalysis fresh and silently release the
-        # trading gate on an empty read.
+        # off by max_tokens before writing anything) — treat as a failure.
         err = 'empty response from Claude (no error, but no text — likely cut off)'
     if err:
         msg = 'Preflight analysis failed: ' + str(err)[:200]
         log_fn('[Analyse] ' + msg)
         _persist_log_line(persist_tag + ' [ANALYSE] ' + msg)
-        return None
+        return None, err
     labels = ', '.join(i.get('label', '?') for i in images) if images else (', '.join(_BOT_MULTI_TF) + ' (auto, no chart uploaded)')
+    done_text = '✅ Preflight analysis done (' + labels + ')\n\n' + text
     with lock:
-        state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not images}
+        state['lastAnalysis'] = {'text': done_text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not images}
     log_fn('[Analyse] Preflight analysis done (' + labels + ') -> ' + (text or '')[:160].replace('\n', ' '))
-    _persist_log_line(persist_tag + ' [ANALYSE] Preflight analysis done (' + labels + '):\n' + (text or '(empty response)'))
-    return text
-
-def _bot_preflight_stale(state):
-    """True when this bot has no recent pre-flight analysis — used to gate an
-    automatic re-run (once per _ANALYSIS_MAX_AGE) before the next entry."""
-    la = state.get('lastAnalysis') or {}
-    return (int(_zd_time.time()) - int(la.get('ts', 0) or 0)) > _ANALYSIS_MAX_AGE
+    _persist_log_line(persist_tag + ' [ANALYSE] Preflight analysis done (' + labels + '):\n' + text)
+    return done_text, None
 
 # =============================== Telegram (Nifty_MV_bot) ======================
 # Sends a daily pre-market brief (Claude + live TradingView TA) and forwards bot
@@ -4977,13 +4959,15 @@ def _bot_chart_upload_route(state, lock, log_fn):
     return jsonify({'success': True, 'slot': slot, 'slots': _chart_slots_status(state)})
 
 def _bot_analyse_route(state, lock, log_fn, persist_tag, source, api_key_field=None, symbol_field='symbol'):
-    """Shared handler for every bot's manual 'Analyse' button: a pre-flight
-    multi-timeframe read using uploaded chart images if present, else the
-    auto-fetched numeric multiTF snapshot (so it still works with nothing
-    uploaded) — WITHOUT touching the bot's running state or placing any
-    order. Start (separately) begins trading and keeps resending the same
-    context each decision tick (see the preflight gate next to each
-    _claude_trade_signal call site)."""
+    """Shared handler for every bot's manual 'Analyse' button (Charts bar): a
+    pre-flight multi-timeframe read (bias/support-resistance/order-flow per
+    1D/1H/30m/15m/5m) using uploaded chart images if present, else the
+    auto-fetched numeric multiTF snapshot — so it runs even with nothing
+    uploaded — WITHOUT touching the bot's running state or placing any order.
+    Runs _bot_run_preflight_analyse so the result (success or failure) is
+    logged in full to log.txt and shown in the chat window the same way,
+    whether triggered from here or anywhere else. Start (separately) begins
+    trading immediately and does not run or wait on this."""
     data = request.json or {}
     with lock:
         cfg = dict(state.get('config') or {})
@@ -4998,17 +4982,10 @@ def _bot_analyse_route(state, lock, log_fn, persist_tag, source, api_key_field=N
         # 'BTCUSD', not 'BTC'). Resolve the real ticker before fetching.
         mtf_symbol = _do_resolve_spot_symbol(symbol) if (source == 'delta' and symbol_field == 'baseSymbol') else symbol
         multi_tf = _bot_multi_tf_snapshot(source, mtf_symbol, api_key=api_key)
-        if not multi_tf:
-            return jsonify({'success': False, 'error': 'Upload at least one chart (1D/1H/30m/15m/5m), or wait a moment for live data to be available.'}), 400
-    text, err = _bot_build_analysis(imgs, multi_tf, symbol, model)
+    text, err = _bot_run_preflight_analyse(state, lock, log_fn, persist_tag, symbol, model, imgs, multi_tf)
     if err:
         return jsonify({'success': False, 'error': err}), 502
-    labels = ', '.join(i.get('label', '?') for i in imgs) if imgs else (', '.join(_BOT_MULTI_TF) + ' (auto, no chart uploaded)')
-    with lock:
-        state['lastAnalysis'] = {'text': text, 'ts': int(_zd_time.time()), 'charts': labels, 'auto': not imgs}
-    log_fn('[Analyse] ' + labels + ' -> ' + (text or '')[:160].replace('\n', ' '))
-    _persist_log_line(persist_tag + ' [ANALYSE] ' + labels)
-    return jsonify({'success': True, 'reply': text, 'charts': labels})
+    return jsonify({'success': True, 'reply': text})
 
 @app.route('/api/aibot/delta/chart_upload', methods=['POST'])
 @login_required
@@ -5473,17 +5450,11 @@ def _zd_bot_tick():
         _tv   = _tv_context(cfg, 'kite', symbol, cfg.get('exchange', ''))
         _imgs = _chart_images_for_multi(zd_ai_state)
         _mtf  = _bot_multi_tf_snapshot('kite', symbol, api_key=cfg.get('api_key'))
-        _preflight_pending = not zd_ai_state.get('position') and _bot_preflight_stale(zd_ai_state)
-        if _preflight_pending:
-            _bot_run_preflight_analyse(zd_ai_state, zd_ai_lock, _zd_log, '[ZERODHA]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        if _preflight_pending:
-            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
-        else:
-            strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
-                                         extra_ctx=(_ectx or None), images=_imgs)
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
+                                     extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -6381,17 +6352,13 @@ def _zo_bot_tick():
         zo_ai_state['underlyingSpot'] = _us; zo_ai_state['underlyingSym'] = (cfg.get('baseSymbol') or '').upper()
     # TradingView readout for the UNDERLYING (option contracts aren't on TV TA).
     tv_ctx = _tv_context(cfg, 'kite', cfg.get('baseSymbol') or '', '') if _zo_decide else None
-    # Multi-timeframe read of the UNDERLYING (direction driver for every leg) + a
-    # pre-flight written analysis (chart images if uploaded, else these numbers)
-    # once before the first entry / after going flat on every leg.
+    # Multi-timeframe read of the UNDERLYING (direction driver for every leg) —
+    # fed to Claude as context every tick. Pre-flight analysis is a separate,
+    # user-triggered thing now (the Analyse button, see _bot_analyse_route) —
+    # Start does not run or wait on it.
     _mtf_ctx = (_bot_multi_tf_snapshot('kite', cfg.get('baseSymbol') or '', api_key=cfg.get('api_key'))
                 if (_zo_decide and cfg.get('baseSymbol')) else None)
     _zo_imgs = _chart_images_for_multi(zo_ai_state) if _zo_decide else []
-    _zo_preflight_pending = (_zo_decide and not any(l.get('position') for l in zo_ai_state['legs'])
-                             and _bot_preflight_stale(zo_ai_state))
-    if _zo_preflight_pending:
-        _bot_run_preflight_analyse(zo_ai_state, zo_ai_lock, _zo_log, '[ZOPTIONS]',
-                                   cfg.get('baseSymbol') or 'options', cfg.get('model'), _zo_imgs, _mtf_ctx)
     for leg in list(zo_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -6438,8 +6405,6 @@ def _zo_bot_tick():
             if _mtf_ctx: leg_ctx['multiTF'] = _mtf_ctx
         if manual_only:
             strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
-        elif _zo_decide and _zo_preflight_pending:
-            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
         elif _zo_decide:
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx,
                                          images=_zo_imgs)
@@ -9188,17 +9153,11 @@ def _mt_bot_tick():
         _tv   = _tv_context(cfg, 'mt5', symbol, '')
         _imgs = _chart_images_for_multi(mt_ai_state)
         _mtf  = _bot_multi_tf_snapshot('mt5', symbol, api_key=cfg.get('mt5_id'))
-        _preflight_pending = not mt_ai_state.get('position') and _bot_preflight_stale(mt_ai_state)
-        if _preflight_pending:
-            _bot_run_preflight_analyse(mt_ai_state, mt_ai_lock, _mt_log, '[MT5]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        if _preflight_pending:
-            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
-        else:
-            strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
-                                         extra_ctx=(_ectx or None), images=_imgs)
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
+                                     extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -10506,17 +10465,12 @@ def _do_bot_tick():
     if uspot:
         do_ai_state['underlyingSpot'] = uspot
         do_ai_state['underlyingSym'] = (cfg.get('baseSymbol') or '').upper()
-    # Multi-timeframe read of the UNDERLYING + a pre-flight written analysis
-    # (chart images if uploaded, else these numbers) once before the first
-    # entry / after going flat on every leg.
+    # Multi-timeframe read of the UNDERLYING — fed to Claude as context every
+    # tick. Pre-flight analysis is a separate, user-triggered thing now (the
+    # Analyse button, see _bot_analyse_route) — Start does not run or wait on it.
     _mtf_ctx = (_bot_multi_tf_snapshot('delta', _do_resolve_spot_symbol(cfg.get('baseSymbol')))
                 if (decide and cfg.get('baseSymbol')) else None)
     _do_imgs = _chart_images_for_multi(do_ai_state) if decide else []
-    _do_preflight_pending = (decide and not any(l.get('position') for l in do_ai_state['legs'])
-                             and _bot_preflight_stale(do_ai_state))
-    if _do_preflight_pending:
-        _bot_run_preflight_analyse(do_ai_state, do_ai_lock, _do_log, '[DOPT]',
-                                   cfg.get('baseSymbol') or 'options', cfg.get('model'), _do_imgs, _mtf_ctx)
     for leg in list(do_ai_state['legs']):
         symbol = leg['symbol']
         if not symbol: continue
@@ -10554,8 +10508,6 @@ def _do_bot_tick():
             continue   # manual handled this leg this tick; auto-logic resumes next tick
         if manual_only:
             strat = {'name': 'manual', 'signal': 'HOLD', 'score': 0.0, 'reason': '(manual mode — waiting for Buy/Sell)'}
-        elif decide and _do_preflight_pending:
-            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
         elif decide:
             leg_ctx = dict(base_ctx) if base_ctx else {}
             leg_ctx.update(_do_option_meta(symbol, (base_ctx or {}).get('underlyingSpot') or 0))
@@ -10908,17 +10860,11 @@ def _tvb_bot_tick():
         _tv   = _tv_context(cfg, 'tradingview', symbol, '') if cfg.get('tvEnabled') else None
         _imgs = _chart_images_for_multi(tvb_ai_state)
         _mtf  = _bot_multi_tf_snapshot('tradingview', symbol)
-        _preflight_pending = not tvb_ai_state.get('position') and _bot_preflight_stale(tvb_ai_state)
-        if _preflight_pending:
-            _bot_run_preflight_analyse(tvb_ai_state, tvb_ai_lock, _tvb_log, '[TVBOT]', symbol, cfg.get('model'), _imgs, _mtf)
         _ectx = {}
         if _tv:  _ectx['tradingview'] = _tv
         if _mtf: _ectx['multiTF'] = _mtf
-        if _preflight_pending:
-            strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(pre-flight analysis just ran — trading resumes next tick)'}
-        else:
-            strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
-                                         tvb_ai_state.get('trades'), extra_ctx=(_ectx or None), images=_imgs)
+        strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
+                                     tvb_ai_state.get('trades'), extra_ctx=(_ectx or None), images=_imgs)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -19662,10 +19608,10 @@ HELP_CLAUDE_STRATEGY_PAGE = r"""<!DOCTYPE html>
 <div class="card">
 <p>Each bot chat has a <strong>&#128206; attach</strong> button. Upload a TradingView chart screenshot and Claude uses it as vision input &mdash; it reads the chart to answer chat questions, and in the live trade loop the latest uploaded chart is fed to Claude on every decision as the <strong>primary structure read</strong>. A chart stays "current" for ~3 hours, then expires.</p>
 <h3>Multi-Timeframe Chart Upload + Analyse</h3>
-<p>Every AI bot panel has a Charts bar with five dedicated upload buttons &mdash; <strong>1D, 1H, 30m, 15m, 5m</strong>. Each uploads into its own named slot, so all five can be held at once. The <strong>Analyse</strong> button sends every uploaded slot to Claude in one call for a combined multi-timeframe verdict (<code>READY FOR TRADING</code> / <code>NOT READY</code>) before you click Start &mdash; purely advisory, doesn't touch the running bot.</p>
+<p>Every AI bot panel has a Charts bar with five dedicated upload buttons &mdash; <strong>1D, 1H, 30m, 15m, 5m</strong>. Each uploads into its own named slot, so all five can be held at once. The <strong>Analyse</strong> button sends every uploaded slot to Claude in one call for a combined multi-timeframe verdict (<code>READY FOR TRADING</code> / <code>NOT READY</code>) &mdash; purely advisory, doesn't touch the running bot, and is entirely separate from Start (click it any time, before or after Start).</p>
 <h3>Automatic Multi-Timeframe Analysis (no upload required)</h3>
 <p>Chart images are optional. Every Claude-driven bot auto-fetches 1D/1H/30m/15m/5m candles each decision tick (lastPrice, sma20, changePct, trend, recentHigh/recentLow, and a volume-based order-flow proxy per timeframe) and adds it to the prompt &mdash; same higher-timeframe-for-bias, lower-timeframe-for-entry instruction as the image case.</p>
-<p><strong>Every time you click Start</strong> (and again at most once an hour after, while the bot stays flat), it runs one pre-flight analysis call covering <strong>bias, support/resistance, and order flow</strong> for each timeframe, posts the written verdict to the chat window automatically, and logs <code>Preflight analysis done</code>. Trading itself waits on it &mdash; the bot HOLDs on the tick that runs pre-flight instead of also placing a trade decision that same tick, so you always see Claude's reasoning <strong>before</strong> its first trade, with or without ever uploading a chart.</p>
+<p>Pre-flight analysis runs only when you click <strong>Analyse</strong> &mdash; covering <strong>bias, support/resistance, and order flow</strong> for each timeframe, with or without an uploaded chart. <strong>Start does not run or wait on it</strong> &mdash; Start begins trading immediately on its own schedule; Analyse is a separate, optional check you can run any time. On success it posts a <code>&#9989; Preflight analysis done (...)</code> message to the chat window and writes the full text to <code>log.txt</code>; a failure (e.g. no usable data) is logged too, so it's never silent.</p>
 </div>
 
 <h2>10. Data Source &amp; Fallback</h2>
