@@ -4598,29 +4598,18 @@ def dashboard_universe():
            [{'symbol': s, 'type': 'stock'} for s in _TG_FNO]
     return jsonify({'success': True, 'rows': rows})
 
-@app.route('/api/dashboard/analyse', methods=['GET'])
-@login_required
-def dashboard_analyse():
-    symbol = (request.args.get('symbol') or '').strip().upper()
-    tv_symbol = _dash_analysis_universe().get(symbol)
-    if not tv_symbol:
-        return jsonify({'success': False, 'error': 'Unknown symbol'}), 400
-    out = {tf: _dash_tf_analysis(tv_symbol, tf) for tf in _DASH_ANALYSIS_TF}
-    if not any(out.values()):
-        return jsonify({'success': False, 'error': 'No TradingView data available for ' + symbol + ' right now'}), 502
-
-    # Entry: current market price, read from the highest timeframe that has
-    # data (1D first) — just the LTP, not a Claude-suggested trade price.
+def _dash_entry_side(out):
+    """Entry (current LTP, from the highest timeframe that has data) and a
+    deterministic BUY/SHORT/NEUTRAL Side from the two higher timeframes
+    (1D + 1H) agreeing on SuperTrend direction and EMA 5/13 state — mirrors
+    "use the higher timeframe for bias" used elsewhere in this app, without
+    a Claude call. Shared by the single-symbol Analyse route and the
+    category screener below."""
     entry = None
     for tf in _DASH_ANALYSIS_TF:
         if out.get(tf):
             entry = out[tf]['lastPrice']
             break
-
-    # Side: deterministic BUY/SHORT/NEUTRAL bias from the two higher timeframes
-    # (1D + 1H) agreeing on SuperTrend direction and EMA 5/13 state — mirrors
-    # "use the higher timeframe for bias" used elsewhere in this app, without
-    # a Claude call.
     side = 'NEUTRAL'
     votes = []
     for tf in ('1d', '1h'):
@@ -4635,10 +4624,98 @@ def dashboard_analyse():
         side = 'BUY'
     elif votes and all(v == 'bearish' for v in votes):
         side = 'SHORT'
+    return entry, side
 
+@app.route('/api/dashboard/analyse', methods=['GET'])
+@login_required
+def dashboard_analyse():
+    symbol = (request.args.get('symbol') or '').strip().upper()
+    tv_symbol = _dash_analysis_universe().get(symbol)
+    if not tv_symbol:
+        return jsonify({'success': False, 'error': 'Unknown symbol'}), 400
+    out = {tf: _dash_tf_analysis(tv_symbol, tf) for tf in _DASH_ANALYSIS_TF}
+    if not any(out.values()):
+        return jsonify({'success': False, 'error': 'No TradingView data available for ' + symbol + ' right now'}), 502
+    entry, side = _dash_entry_side(out)
     fundamentals = _dash_fundamentals(tv_symbol)
     return jsonify({'success': True, 'symbol': symbol, 'tvSymbol': tv_symbol, 'entry': entry, 'side': side,
                     'fundamentals': fundamentals, 'timeframes': out})
+
+# --- Stocks Investing tab: pick a category (Momentum / Positional F&O /
+# Intraday F&O), rank the universe with the existing _tg_scan logic (same
+# ranking the Telegram alerts + Stocks Bot panel already use), and run the
+# deterministic 1D analysis above on the top 10. ---
+_DASH_SCREEN_KINDS = {
+    'momentum':   {'label': 'Momentum Investing',     'universe': 'NIFTY500'},
+    'positional': {'label': 'Positional F&O Stocks',  'universe': 'FNO'},
+    'fno':        {'label': 'Intraday F&O Stocks',    'universe': 'FNO'},
+}
+_DASH_SCREEN_CACHE = {}   # {kind: {'ts': float, 'data': [...]}}
+_DASH_SCREEN_TTL = 120
+
+def _dash_screen_top10(kind):
+    """Top 10 symbols for a category — momentum ranks by 3-month performance,
+    everything else by TradingView's composite rating (same _tg_scan every
+    other ranked list in this app already uses)."""
+    meta = _DASH_SCREEN_KINDS.get(kind)
+    if not meta:
+        return []
+    rows = _tg_scan(meta['universe'])
+    if not rows:
+        return []
+    if kind == 'momentum':
+        rows = [r for r in rows if r['perf3m'] is not None]
+        rows.sort(key=lambda r: r['perf3m'], reverse=True)
+    else:
+        rows.sort(key=lambda r: r['score'], reverse=True)
+    return [r['sym'] for r in rows[:10]]
+
+def _dash_screen_row(symbol):
+    """One screener row: the 1D read (bias/S-R/SuperTrend/EMA/RSI/ADX/SMA50/
+    SMA200/technicalScore) plus the fundamental score, for a single symbol."""
+    tv_symbol = 'NSE:' + symbol
+    r = _dash_tf_analysis(tv_symbol, '1d')
+    if not r:
+        return None
+    fundamentals = _dash_fundamentals(tv_symbol)
+    return {
+        'symbol': symbol, 'lastPrice': r['lastPrice'], 'bias': r['trendBias'],
+        'support': r['support'], 'resistance': r['resistance'],
+        'superTrend': r['superTrend'], 'emaCross': r['emaCross'],
+        'rsi': r['rsi'], 'adx': r['adx'], 'sma50': r['sma50'], 'sma200': r['sma200'],
+        'technicalScore': r['technicalScore'],
+        'fundamentalScore': fundamentals['score'] if fundamentals else None,
+    }
+
+@app.route('/api/dashboard/screen', methods=['GET'])
+@login_required
+def dashboard_screen():
+    kind = (request.args.get('kind') or '').strip().lower()
+    if kind not in _DASH_SCREEN_KINDS:
+        return jsonify({'success': False, 'error': 'Unknown category'}), 400
+    now = _zd_time.time()
+    cached = _DASH_SCREEN_CACHE.get(kind)
+    if cached and (now - cached['ts']) < _DASH_SCREEN_TTL:
+        return jsonify({'success': True, 'kind': kind, 'label': _DASH_SCREEN_KINDS[kind]['label'], 'rows': cached['data']})
+    symbols = _dash_screen_top10(kind)
+    if not symbols:
+        return jsonify({'success': False, 'error': 'No ranked stocks available right now'}), 502
+    import concurrent.futures as _cf
+    # Capped at 4 concurrent TradingView websocket connections — 10-at-once
+    # (like _tg_bot_supertrend_batch uses for its own, smaller shortlists)
+    # measured a 60-90% success rate here; 4 measured 10/10 reliably.
+    with _cf.ThreadPoolExecutor(max_workers=min(4, len(symbols))) as ex:
+        futs = {ex.submit(_dash_screen_row, s): s for s in symbols}
+        results = {}
+        for fut in _cf.as_completed(futs):
+            sym = futs[fut]
+            try:
+                results[sym] = fut.result()
+            except Exception:
+                results[sym] = None
+    rows = [results[s] for s in symbols if results.get(s)]
+    _DASH_SCREEN_CACHE[kind] = {'ts': now, 'data': rows}
+    return jsonify({'success': True, 'kind': kind, 'label': _DASH_SCREEN_KINDS[kind]['label'], 'rows': rows})
 
 def _tg_index_analysis(name, tvsym, oi_symbol=None):
     """Detailed intraday analysis for an index — multi-TF TradingView TA + option-chain
@@ -21794,6 +21871,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="mv-tabs">
       <button class="mv-tab-btn active" id="mvTabBtnMarkets" type="button">Markets</button>
       <button class="mv-tab-btn" id="mvTabBtnAnalysis" type="button">Stocks &amp; Index</button>
+      <button class="mv-tab-btn" id="mvTabBtnInvesting" type="button">Stocks Investing</button>
     </div>
 
     <div id="mvTabMarkets">
@@ -21851,6 +21929,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="mv-chain-sub">1D · 1H · 30m · 15m · 5m — Support/Resistance, SuperTrend(10,3), EMA 5/13 cross, RSI, ADX, SMA50/200, order flow</div>
         <div class="mv-sum-row" id="mvAnalysisSummary" style="margin-top:8px"></div>
         <div class="mv-tf-table-wrap" id="mvAnalysisBody"><div class="mv-unavail">Pick a symbol and click Analyse.</div></div>
+      </div>
+    </div>
+
+    <div id="mvTabInvesting" style="display:none">
+      <div class="mv-card">
+        <div class="mv-lbl" style="margin-bottom:8px">CATEGORY</div>
+        <div id="mvScreenCats"></div>
+      </div>
+      <div class="mv-card" id="mvScreenResult" style="display:none">
+        <div class="mv-chain-title" id="mvScreenTitle">—</div>
+        <div class="mv-chain-sub">Top 10, 1D basis — Bias, Fund./Tech. score, Support, Resistance, SuperTrend, EMA 5/13, RSI, ADX, SMA50/200</div>
+        <div class="mv-tf-table-wrap" id="mvScreenBody"><div class="mv-unavail">Pick a category and click Analyse.</div></div>
       </div>
     </div>
 
@@ -21955,17 +22045,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   // 1D/1H/30m/15m/5m technical read (/api/dashboard/analyse) — Support/
   // Resistance, SuperTrend(10,3), EMA 5/13 cross, order flow, trend bias. ----
   (function() {
-    var tabBtns = { markets: document.getElementById('mvTabBtnMarkets'), analysis: document.getElementById('mvTabBtnAnalysis') };
-    var tabPanels = { markets: document.getElementById('mvTabMarkets'), analysis: document.getElementById('mvTabAnalysis') };
+    var tabBtns = { markets: document.getElementById('mvTabBtnMarkets'), analysis: document.getElementById('mvTabBtnAnalysis'),
+                    investing: document.getElementById('mvTabBtnInvesting') };
+    var tabPanels = { markets: document.getElementById('mvTabMarkets'), analysis: document.getElementById('mvTabAnalysis'),
+                      investing: document.getElementById('mvTabInvesting') };
     if (!tabBtns.analysis || !tabPanels.analysis) return;
     function showTab(name) {
       Object.keys(tabPanels).forEach(function(k) {
+        if (!tabPanels[k] || !tabBtns[k]) return;
         tabPanels[k].style.display = (k === name) ? '' : 'none';
         tabBtns[k].classList.toggle('active', k === name);
       });
     }
     tabBtns.markets.addEventListener('click', function() { showTab('markets'); });
     tabBtns.analysis.addEventListener('click', function() { showTab('analysis'); if (!univLoaded) loadUniverse(); });
+    if (tabBtns.investing) tabBtns.investing.addEventListener('click', function() { showTab('investing'); });
 
     var univLoaded = false, univRows = [];
     function loadUniverse() {
@@ -22049,6 +22143,65 @@ HTML_PAGE = r"""<!DOCTYPE html>
                   '<td>' + (r.sma200 != null ? fmt(r.sma200) : '—') + '</td>' +
                   '<td class="' + scoreClass(r.technicalScore) + '">' + (r.technicalScore != null ? r.technicalScore : '—') + '</td>' +
                   '<td class="' + biasClass(r.orderFlow) + '">' + esc(r.orderFlow) + ' (' + r.volDeltaPct + '%)</td></tr>';
+        });
+        html += '</tbody></table>';
+        body.innerHTML = html;
+      }).catch(function() {
+        if (btn) btn.disabled = false;
+        body.innerHTML = '<div class="mv-unavail">Network error.</div>';
+      });
+    }
+
+    // ---- Stocks Investing tab: pick a category, Analyse screens the top 10
+    // ranked stocks (same ranking the Telegram alerts already use) and shows
+    // one row per stock with its 1D bias/Fund./Tech. score/S-R/SuperTrend/
+    // EMA 5/13/RSI/ADX/SMA50/SMA200 (/api/dashboard/screen). ----
+    var SCREEN_CATS = [
+      { kind: 'momentum',   label: 'Momentum Investing' },
+      { kind: 'positional', label: 'Positional F&O Stocks' },
+      { kind: 'fno',        label: 'Intraday F&O Stocks' },
+    ];
+    var catsEl = document.getElementById('mvScreenCats');
+    if (catsEl) {
+      catsEl.innerHTML = SCREEN_CATS.map(function(c) {
+        return '<div class="mv-sym-row"><span class="mv-sym-name">' + esc(c.label) + '</span>' +
+               '<button class="mv-analyse-btn" data-kind="' + c.kind + '" type="button">Analyse</button></div>';
+      }).join('');
+      Array.prototype.forEach.call(catsEl.querySelectorAll('.mv-analyse-btn'), function(btn) {
+        btn.addEventListener('click', function() { runScreen(btn.dataset.kind, btn); });
+      });
+    }
+    function runScreen(kind, btn) {
+      var resultCard = document.getElementById('mvScreenResult');
+      var title = document.getElementById('mvScreenTitle');
+      var body = document.getElementById('mvScreenBody');
+      resultCard.style.display = '';
+      body.innerHTML = '<div class="mv-unavail">Screening top 10… (fetches live data for 10 stocks, can take up to ~15s)</div>';
+      resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (btn) btn.disabled = true;
+      fetch('/api/dashboard/screen?kind=' + encodeURIComponent(kind)).then(function(r) { return r.json(); }).then(function(d) {
+        if (btn) btn.disabled = false;
+        if (!d || !d.success) { body.innerHTML = '<div class="mv-unavail">' + esc((d && d.error) || 'Screen failed') + '</div>'; return; }
+        title.textContent = d.label + ' — Top ' + d.rows.length;
+        var html = '<table class="mv-tf-table"><thead><tr><th>Symbol</th><th>LTP</th><th>Bias</th><th>Fund.</th><th>Tech.</th>' +
+                   '<th>Support</th><th>Resistance</th><th>SuperTrend</th><th>EMA 5/13</th><th>RSI</th><th>ADX</th>' +
+                   '<th>SMA50</th><th>SMA200</th></tr></thead><tbody>';
+        d.rows.forEach(function(r) {
+          var st = r.superTrend ? (r.superTrend.direction + ' (' + fmt(r.superTrend.value) + ')') : '—';
+          var ec = r.emaCross ? r.emaCross.state : '—';
+          html += '<tr><td><b>' + esc(r.symbol) + '</b></td>' +
+                  '<td>' + (r.lastPrice != null ? fmt(r.lastPrice) : '—') + '</td>' +
+                  '<td class="' + biasClass(r.bias) + '">' + esc(r.bias) + '</td>' +
+                  '<td class="' + scoreClass(r.fundamentalScore) + '">' + (r.fundamentalScore != null ? r.fundamentalScore : 'N/A') + '</td>' +
+                  '<td class="' + scoreClass(r.technicalScore) + '">' + (r.technicalScore != null ? r.technicalScore : '—') + '</td>' +
+                  '<td>' + (r.support != null ? fmt(r.support) : '—') + '</td>' +
+                  '<td>' + (r.resistance != null ? fmt(r.resistance) : '—') + '</td>' +
+                  '<td class="' + biasClass(r.superTrend && r.superTrend.direction) + '">' + esc(st) + '</td>' +
+                  '<td class="' + biasClass(r.emaCross && r.emaCross.state) + '">' + esc(ec) + '</td>' +
+                  '<td>' + (r.rsi != null ? r.rsi : '—') + '</td>' +
+                  '<td>' + (r.adx != null ? r.adx : '—') + '</td>' +
+                  '<td>' + (r.sma50 != null ? fmt(r.sma50) : '—') + '</td>' +
+                  '<td>' + (r.sma200 != null ? fmt(r.sma200) : '—') + '</td></tr>';
         });
         html += '</tbody></table>';
         body.innerHTML = html;
