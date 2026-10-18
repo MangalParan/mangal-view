@@ -4717,6 +4717,229 @@ def dashboard_screen():
     _DASH_SCREEN_CACHE[kind] = {'ts': now, 'data': rows}
     return jsonify({'success': True, 'kind': kind, 'label': _DASH_SCREEN_KINDS[kind]['label'], 'rows': rows})
 
+# --- ETF tab: a curated, live-verified universe of NSE-listed ETFs (there's
+# no "scan all ETFs" source in this app, unlike stocks), grouped into
+# segments, ranked within each segment by the same deterministic 1D read
+# used elsewhere (_dash_tf_analysis) — no Claude call. ---
+_DASH_ETF_SEGMENTS = {
+    'index':  {'label': 'Equity Index / Broad Market',
+               'symbols': ['NIFTYBEES', 'JUNIORBEES', 'BANKBEES', 'MIDCAPETF', 'MOM50', 'LOWVOL1', 'ALPHA']},
+    'sector': {'label': 'Sectoral / Thematic',
+               'symbols': ['ITBEES', 'PHARMABEES', 'PSUBNKBEES', 'CPSEETF', 'AUTOBEES', 'INFRABEES', 'HEALTHY']},
+    'gold':   {'label': 'Gold', 'symbols': ['GOLDBEES', 'HDFCGOLD']},
+    'silver': {'label': 'Silver', 'symbols': ['SILVERBEES']},
+    'debt':   {'label': 'Debt / Liquid', 'symbols': ['LIQUIDBEES']},
+    'intl':   {'label': 'International', 'symbols': ['MON100', 'MAFANG', 'MASPTOP50']},
+}
+
+def _dash_etf_segment_rows(seg_key):
+    meta = _DASH_ETF_SEGMENTS.get(seg_key)
+    if not meta:
+        return None
+    rows = []
+    for sym in meta['symbols']:
+        r = _dash_tf_analysis('NSE:' + sym, '1d')
+        if not r:
+            continue
+        rows.append({
+            'symbol': sym, 'lastPrice': r['lastPrice'], 'bias': r['trendBias'],
+            'support': r['support'], 'resistance': r['resistance'],
+            'superTrend': r['superTrend'], 'emaCross': r['emaCross'],
+            'rsi': r['rsi'], 'adx': r['adx'], 'sma50': r['sma50'], 'sma200': r['sma200'],
+            'technicalScore': r['technicalScore'],
+        })
+    rows.sort(key=lambda x: (x['technicalScore'] if x['technicalScore'] is not None else -1), reverse=True)
+    return rows
+
+@app.route('/api/dashboard/etf', methods=['GET'])
+@login_required
+def dashboard_etf():
+    """One Analyse click ranks every segment at once (small, fixed universe —
+    unlike the stock screener there's no 'top 10 out of hundreds' step)."""
+    import concurrent.futures as _cf
+    all_symbols = sorted({s for m in _DASH_ETF_SEGMENTS.values() for s in m['symbols']})
+    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(lambda s: _dash_tf_analysis('NSE:' + s, '1d'), all_symbols))   # warm the cache concurrently
+    segments = {k: {'label': m['label'], 'rows': _dash_etf_segment_rows(k)} for k, m in _DASH_ETF_SEGMENTS.items()}
+    return jsonify({'success': True, 'segments': segments})
+
+# --- Mutual Funds tab: real NAV-history-based ranking via the free mfapi.in
+# public API (moneycontrol and similar sites are blocked by Akamai bot-
+# management from this server — confirmed the same way NSE's option-chain
+# API is). No expense ratio / AUM is available from this source, so ranking
+# is by realized CAGR return only; that limitation is surfaced in the UI. ---
+_DASH_MF_FULL_CACHE = {'ts': 0, 'data': None}
+_DASH_MF_FULL_TTL = 24 * 3600   # the ~38k-scheme master list barely changes; this download takes ~25s
+
+def _dash_mf_full_list():
+    now = _zd_time.time()
+    if _DASH_MF_FULL_CACHE['data'] and (now - _DASH_MF_FULL_CACHE['ts']) < _DASH_MF_FULL_TTL:
+        return _DASH_MF_FULL_CACHE['data']
+    import urllib.request as _ur, json as _j
+    try:
+        req = _ur.Request('https://api.mfapi.in/mf', headers={'User-Agent': 'Mozilla/5.0'})
+        with _ur.urlopen(req, timeout=60) as r:
+            data = _j.loads(r.read().decode('utf-8'))
+    except Exception:
+        return _DASH_MF_FULL_CACHE['data'] or []
+    _DASH_MF_FULL_CACHE['ts'] = now
+    _DASH_MF_FULL_CACHE['data'] = data
+    return data
+
+# name_any: candidate pre-filter on the scheme NAME (OR of keyword-groups,
+# cheap, just narrows ~38k down before any network call per candidate).
+# cat_has: the REAL filter, checked against the structured scheme_category
+# field from each candidate's own NAV-history response. Needed because scheme
+# names lie — e.g. a 57%-1Y "small cap"-named series fund turned out to be
+# miscategorised ("Growth"); matching on the real AMFI category instead of
+# the name alone was the fix (verified live before writing this).
+_DASH_MF_SEGMENTS = {
+    'small':      {'label': 'Small Cap',             'name_any': [['small cap']], 'cat_has': 'small cap'},
+    'mid':        {'label': 'Mid Cap',                'name_any': [['mid cap']], 'cat_has': 'mid cap'},
+    'large':      {'label': 'Large Cap',              'name_any': [['large cap'], ['bluechip']], 'cat_has': 'large cap'},
+    'flexicap':   {'label': 'Flexi Cap',              'name_any': [['flexi cap']], 'cat_has': 'flexi cap'},
+    'debt':       {'label': 'Debt',                   'name_any': [['debt fund'], ['corporate bond'], ['banking and psu'],
+                                                                     ['short duration'], ['gilt fund'], ['dynamic bond']], 'cat_has': 'debt'},
+    'multiasset': {'label': 'Multi Asset',            'name_any': [['multi asset']], 'cat_has': 'multi asset'},
+    'global':     {'label': 'Global / International', 'name_any': [['global'], ['international'], ['overseas'], ['nasdaq'],
+                                                                     ['us fund'], ['us equity'], ['fof']], 'cat_has': 'overseas'},
+}
+_DASH_MF_NAME_EXCLUDE = ('idcw', 'dividend', 'bonus', 'regular plan')
+
+def _dash_mf_candidates(seg_key, cap=35):
+    meta = _DASH_MF_SEGMENTS.get(seg_key)
+    if not meta:
+        return []
+    out = []
+    for d in _dash_mf_full_list():
+        name = (d.get('schemeName') or '').lower()
+        if 'direct' not in name or 'growth' not in name:
+            continue
+        if any(x in name for x in _DASH_MF_NAME_EXCLUDE):
+            continue
+        if not any(all(kw in name for kw in group) for group in meta['name_any']):
+            continue
+        out.append({'code': d.get('schemeCode'), 'name': d.get('schemeName')})
+        if len(out) >= cap:
+            break
+    return out
+
+_DASH_MF_NAV_CACHE = {}   # {code: {'ts': float, 'data': {'meta':{}, 'navs':[(date,nav),...]}}}
+_DASH_MF_NAV_TTL = 24 * 3600   # NAV updates once a day — no need to refetch sooner
+
+def _dash_mf_nav_history(code):
+    now = _zd_time.time()
+    cached = _DASH_MF_NAV_CACHE.get(code)
+    if cached and (now - cached['ts']) < _DASH_MF_NAV_TTL:
+        return cached['data']
+    import urllib.request as _ur, json as _j
+    from datetime import datetime as _mfdt
+    try:
+        req = _ur.Request('https://api.mfapi.in/mf/' + str(code), headers={'User-Agent': 'Mozilla/5.0'})
+        with _ur.urlopen(req, timeout=15) as r:
+            raw = _j.loads(r.read().decode('utf-8'))
+    except Exception:
+        return None
+    navs = []
+    for row in (raw.get('data') or []):
+        try:
+            navs.append((_mfdt.strptime(row['date'], '%d-%m-%Y'), float(row['nav'])))
+        except (ValueError, KeyError, TypeError):
+            continue
+    if not navs:
+        return None
+    data = {'meta': raw.get('meta') or {}, 'navs': navs}   # already newest-first from the API
+    _DASH_MF_NAV_CACHE[code] = {'ts': now, 'data': data}
+    return data
+
+def _dash_mf_cagr(navs, days):
+    if not navs:
+        return None
+    from datetime import timedelta as _mftd
+    latest_date, latest_nav = navs[0]
+    target = latest_date - _mftd(days=days)
+    old = next((pair for pair in navs if pair[0] <= target), None)
+    if not old or latest_nav <= 0 or old[1] <= 0:
+        return None
+    elapsed = (latest_date - old[0]).days
+    if elapsed < days * 0.85:   # not enough real history behind this NAV point — don't extrapolate
+        return None
+    try:
+        return round(((latest_nav / old[1]) ** (365.0 / elapsed) - 1) * 100, 2)
+    except Exception:
+        return None
+
+def _dash_mf_volatility(navs, days=365):
+    """Annualized stdev of daily NAV returns over the trailing window — a rough
+    risk parameter, not a Sharpe ratio (no risk-free rate data available)."""
+    if not navs or len(navs) < 30:
+        return None
+    from datetime import timedelta as _mftd
+    cutoff = navs[0][0] - _mftd(days=days)
+    window = [v for d, v in navs if d >= cutoff]
+    if len(window) < 30:
+        return None
+    rets = [window[i] / window[i + 1] - 1 for i in range(len(window) - 1) if window[i + 1] > 0]
+    if len(rets) < 20:
+        return None
+    try:
+        import statistics as _mfstats
+        return round(_mfstats.pstdev(rets) * (252 ** 0.5) * 100, 1)
+    except Exception:
+        return None
+
+_DASH_MF_RANK_CACHE = {}   # {seg_key: {'ts': float, 'data': [...]}}
+_DASH_MF_RANK_TTL = 6 * 3600   # fund returns don't move intraday; re-rank a few times a day at most
+
+def _dash_mf_rank(seg_key):
+    now = _zd_time.time()
+    cached = _DASH_MF_RANK_CACHE.get(seg_key)
+    if cached and (now - cached['ts']) < _DASH_MF_RANK_TTL:
+        return cached['data']
+    meta = _DASH_MF_SEGMENTS.get(seg_key)
+    candidates = _dash_mf_candidates(seg_key) if meta else []
+    if not candidates:
+        return []
+    import concurrent.futures as _cf
+    rows = []
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_dash_mf_nav_history, c['code']): c for c in candidates}
+        for fut in _cf.as_completed(futs):
+            c = futs[fut]
+            try:
+                hist = fut.result()
+            except Exception:
+                hist = None
+            if not hist:
+                continue
+            category = (hist['meta'] or {}).get('scheme_category') or ''
+            if meta['cat_has'] not in category.lower():
+                continue   # name matched, but the real AMFI category doesn't — drop it
+            r1y = _dash_mf_cagr(hist['navs'], 365)
+            r3y = _dash_mf_cagr(hist['navs'], 1095)
+            if r1y is None or r3y is None:
+                continue   # require 3Y of real history too — excludes very new/thin schemes
+            rows.append({
+                'code': c['code'], 'name': c['name'], 'fundHouse': (hist['meta'] or {}).get('fund_house'),
+                'category': category, 'nav': hist['navs'][0][1],
+                'return1y': r1y, 'return3y': r3y, 'volatility': _dash_mf_volatility(hist['navs']),
+            })
+    rows.sort(key=lambda r: r['return1y'], reverse=True)
+    top = rows[:10]
+    _DASH_MF_RANK_CACHE[seg_key] = {'ts': now, 'data': top}
+    return top
+
+@app.route('/api/dashboard/mf', methods=['GET'])
+@login_required
+def dashboard_mf():
+    seg = (request.args.get('segment') or '').strip().lower()
+    if seg not in _DASH_MF_SEGMENTS:
+        return jsonify({'success': False, 'error': 'Unknown segment'}), 400
+    rows = _dash_mf_rank(seg)
+    if not rows:
+        return jsonify({'success': False, 'error': 'No ranked funds available for this segment right now'}), 502
+    return jsonify({'success': True, 'segment': seg, 'label': _DASH_MF_SEGMENTS[seg]['label'], 'rows': rows})
+
 def _tg_index_analysis(name, tvsym, oi_symbol=None):
     """Detailed intraday analysis for an index — multi-TF TradingView TA + option-chain
     OI, written by Claude (bias, S/R, PCR read, trade plan, probability)."""
@@ -21872,6 +22095,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="mv-tab-btn active" id="mvTabBtnMarkets" type="button">Markets</button>
       <button class="mv-tab-btn" id="mvTabBtnAnalysis" type="button">Stocks &amp; Index</button>
       <button class="mv-tab-btn" id="mvTabBtnInvesting" type="button">Stocks Investing</button>
+      <button class="mv-tab-btn" id="mvTabBtnMF" type="button">Mutual Funds</button>
+      <button class="mv-tab-btn" id="mvTabBtnETF" type="button">ETF</button>
     </div>
 
     <div id="mvTabMarkets">
@@ -21942,6 +22167,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="mv-chain-sub">Top 10, 1D basis — Bias, Fund./Tech. score, Support, Resistance, SuperTrend, EMA 5/13, RSI, ADX, SMA50/200</div>
         <div class="mv-tf-table-wrap" id="mvScreenBody"><div class="mv-unavail">Pick a category and click Analyse.</div></div>
       </div>
+    </div>
+
+    <div id="mvTabMF" style="display:none">
+      <div class="mv-card">
+        <div class="mv-lbl" style="margin-bottom:8px">SEGMENT</div>
+        <div id="mvMfCats"></div>
+      </div>
+      <div class="mv-card" id="mvMfResult" style="display:none">
+        <div class="mv-chain-title" id="mvMfTitle">—</div>
+        <div class="mv-chain-sub">Top 10 by real 1Y return (direct-growth plans, api.mfapi.in NAV history) — no expense ratio/AUM data available from this source; not investment advice.</div>
+        <div class="mv-tf-table-wrap" id="mvMfBody"><div class="mv-unavail">Pick a segment and click Analyse. First click overall can take up to ~40s (one-time fund-list download); later clicks are fast.</div></div>
+      </div>
+    </div>
+
+    <div id="mvTabETF" style="display:none">
+      <div class="mv-card">
+        <button class="mv-analyse-btn" id="mvEtfAnalyseBtn" type="button" style="padding:9px 18px">Analyse — rank ETFs in every segment</button>
+      </div>
+      <div id="mvEtfResult" style="display:none"></div>
     </div>
 
     <div class="mv-foot">
@@ -22046,9 +22290,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   // Resistance, SuperTrend(10,3), EMA 5/13 cross, order flow, trend bias. ----
   (function() {
     var tabBtns = { markets: document.getElementById('mvTabBtnMarkets'), analysis: document.getElementById('mvTabBtnAnalysis'),
-                    investing: document.getElementById('mvTabBtnInvesting') };
+                    investing: document.getElementById('mvTabBtnInvesting'), mf: document.getElementById('mvTabBtnMF'),
+                    etf: document.getElementById('mvTabBtnETF') };
     var tabPanels = { markets: document.getElementById('mvTabMarkets'), analysis: document.getElementById('mvTabAnalysis'),
-                      investing: document.getElementById('mvTabInvesting') };
+                      investing: document.getElementById('mvTabInvesting'), mf: document.getElementById('mvTabMF'),
+                      etf: document.getElementById('mvTabETF') };
     if (!tabBtns.analysis || !tabPanels.analysis) return;
     function showTab(name) {
       Object.keys(tabPanels).forEach(function(k) {
@@ -22060,6 +22306,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     tabBtns.markets.addEventListener('click', function() { showTab('markets'); });
     tabBtns.analysis.addEventListener('click', function() { showTab('analysis'); if (!univLoaded) loadUniverse(); });
     if (tabBtns.investing) tabBtns.investing.addEventListener('click', function() { showTab('investing'); });
+    if (tabBtns.mf) tabBtns.mf.addEventListener('click', function() { showTab('mf'); });
+    if (tabBtns.etf) tabBtns.etf.addEventListener('click', function() { showTab('etf'); });
 
     var univLoaded = false, univRows = [];
     function loadUniverse() {
@@ -22208,6 +22456,96 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }).catch(function() {
         if (btn) btn.disabled = false;
         body.innerHTML = '<div class="mv-unavail">Network error.</div>';
+      });
+    }
+
+    // ---- Mutual Funds tab: pick a segment, Analyse ranks the top 10
+    // direct-growth schemes by real 1Y NAV return (/api/dashboard/mf). ----
+    var MF_SEGS = [
+      { key: 'small', label: 'Small Cap' }, { key: 'mid', label: 'Mid Cap' }, { key: 'large', label: 'Large Cap' },
+      { key: 'flexicap', label: 'Flexi Cap' }, { key: 'debt', label: 'Debt' },
+      { key: 'multiasset', label: 'Multi Asset' }, { key: 'global', label: 'Global / International' },
+    ];
+    var mfCatsEl = document.getElementById('mvMfCats');
+    if (mfCatsEl) {
+      mfCatsEl.innerHTML = MF_SEGS.map(function(s) {
+        return '<div class="mv-sym-row"><span class="mv-sym-name">' + esc(s.label) + '</span>' +
+               '<button class="mv-analyse-btn" data-seg="' + s.key + '" type="button">Analyse</button></div>';
+      }).join('');
+      Array.prototype.forEach.call(mfCatsEl.querySelectorAll('.mv-analyse-btn'), function(btn) {
+        btn.addEventListener('click', function() { runMfScreen(btn.dataset.seg, btn); });
+      });
+    }
+    function runMfScreen(seg, btn) {
+      var resultCard = document.getElementById('mvMfResult');
+      var title = document.getElementById('mvMfTitle');
+      var body = document.getElementById('mvMfBody');
+      resultCard.style.display = '';
+      body.innerHTML = '<div class="mv-unavail">Ranking top 10… (first click overall can take up to ~40s; later clicks are fast)</div>';
+      resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (btn) btn.disabled = true;
+      fetch('/api/dashboard/mf?segment=' + encodeURIComponent(seg)).then(function(r) { return r.json(); }).then(function(d) {
+        if (btn) btn.disabled = false;
+        if (!d || !d.success) { body.innerHTML = '<div class="mv-unavail">' + esc((d && d.error) || 'Screen failed') + '</div>'; return; }
+        title.textContent = d.label + ' — Top ' + d.rows.length + ' (Direct, Growth)';
+        var html = '<table class="mv-tf-table"><thead><tr><th>Fund</th><th>Fund House</th><th>1Y Return</th>' +
+                   '<th>3Y Return</th><th>Volatility</th></tr></thead><tbody>';
+        d.rows.forEach(function(r) {
+          html += '<tr><td><b>' + esc(r.name) + '</b></td>' +
+                  '<td>' + esc(r.fundHouse || '—') + '</td>' +
+                  '<td class="' + (r.return1y >= 0 ? 'mv-bias-bull' : 'mv-bias-bear') + '">' + fmt(r.return1y, 2) + '%</td>' +
+                  '<td class="' + (r.return3y >= 0 ? 'mv-bias-bull' : 'mv-bias-bear') + '">' + fmt(r.return3y, 2) + '%</td>' +
+                  '<td>' + (r.volatility != null ? r.volatility + '%' : '—') + '</td></tr>';
+        });
+        html += '</tbody></table>';
+        body.innerHTML = html;
+      }).catch(function() {
+        if (btn) btn.disabled = false;
+        body.innerHTML = '<div class="mv-unavail">Network error.</div>';
+      });
+    }
+
+    // ---- ETF tab: one Analyse call ranks every segment at once (small, fixed
+    // universe) via /api/dashboard/etf. ----
+    var etfBtn = document.getElementById('mvEtfAnalyseBtn');
+    if (etfBtn) etfBtn.addEventListener('click', function() { runEtfScreen(etfBtn); });
+    function runEtfScreen(btn) {
+      var resultEl = document.getElementById('mvEtfResult');
+      resultEl.style.display = '';
+      resultEl.innerHTML = '<div class="mv-card"><div class="mv-unavail">Ranking every ETF segment… (~10-15s)</div></div>';
+      resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (btn) btn.disabled = true;
+      fetch('/api/dashboard/etf').then(function(r) { return r.json(); }).then(function(d) {
+        if (btn) btn.disabled = false;
+        if (!d || !d.success) { resultEl.innerHTML = '<div class="mv-card"><div class="mv-unavail">' + esc((d && d.error) || 'Analysis failed') + '</div></div>'; return; }
+        var html = '';
+        Object.keys(d.segments).forEach(function(k) {
+          var seg = d.segments[k];
+          html += '<div class="mv-card"><div class="mv-chain-title">' + esc(seg.label) + '</div>';
+          if (!seg.rows || !seg.rows.length) { html += '<div class="mv-unavail">No data.</div></div>'; return; }
+          html += '<div class="mv-tf-table-wrap"><table class="mv-tf-table"><thead><tr><th>ETF</th><th>LTP</th><th>Bias</th>' +
+                  '<th>Tech. score</th><th>Support</th><th>Resistance</th><th>SuperTrend</th><th>EMA 5/13</th>' +
+                  '<th>RSI</th><th>ADX</th></tr></thead><tbody>';
+          seg.rows.forEach(function(r, i) {
+            var st = r.superTrend ? (r.superTrend.direction + ' (' + fmt(r.superTrend.value) + ')') : '—';
+            var ec = r.emaCross ? r.emaCross.state : '—';
+            html += '<tr' + (i === 0 ? ' style="background:#f3f1ea"' : '') + '><td><b>' + esc(r.symbol) + (i === 0 ? ' &#9733;' : '') + '</b></td>' +
+                    '<td>' + fmt(r.lastPrice) + '</td>' +
+                    '<td class="' + biasClass(r.bias) + '">' + esc(r.bias) + '</td>' +
+                    '<td class="' + scoreClass(r.technicalScore) + '">' + (r.technicalScore != null ? r.technicalScore : '—') + '</td>' +
+                    '<td>' + (r.support != null ? fmt(r.support) : '—') + '</td>' +
+                    '<td>' + (r.resistance != null ? fmt(r.resistance) : '—') + '</td>' +
+                    '<td class="' + biasClass(r.superTrend && r.superTrend.direction) + '">' + esc(st) + '</td>' +
+                    '<td class="' + biasClass(r.emaCross && r.emaCross.state) + '">' + esc(ec) + '</td>' +
+                    '<td>' + (r.rsi != null ? r.rsi : '—') + '</td>' +
+                    '<td>' + (r.adx != null ? r.adx : '—') + '</td></tr>';
+          });
+          html += '</tbody></table></div></div>';
+        });
+        resultEl.innerHTML = html;
+      }).catch(function() {
+        if (btn) btn.disabled = false;
+        resultEl.innerHTML = '<div class="mv-card"><div class="mv-unavail">Network error.</div></div>';
       });
     }
   })();
