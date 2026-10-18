@@ -2056,7 +2056,8 @@ _TV_DEFAULT_TOKEN = os.environ.get('TV_WEBHOOK_TOKEN', '').strip() or 'mangalvie
 _TV_INTERVAL = {'1m': '1', '3m': '5', '5m': '5', '15m': '15', '30m': '30',
                 '1h': '60', '2h': '120', '4h': '240', '1d': '1D', '1w': '1W'}
 _TV_COLS = ['Recommend.All', 'Recommend.MA', 'Recommend.Other', 'RSI', 'Mom',
-            'MACD.macd', 'MACD.signal', 'Stoch.K', 'ADX', 'close', 'change', 'change_abs']
+            'MACD.macd', 'MACD.signal', 'Stoch.K', 'ADX', 'close', 'change', 'change_abs',
+            'SMA50', 'SMA200']
 
 def _tv_rating_label(v):
     try: v = float(v)
@@ -2128,6 +2129,7 @@ def _tv_fetch_ta(tv_symbol, interval):
                                               if m.get('MACD.macd') is not None else None),
             'stochK': _f('Stoch.K', 1), 'adx': _f('ADX', 1), 'close': _f('close', 4),
             'changePct': _f('change', 2), 'change': _f('change_abs', 4),
+            'sma50': _f('SMA50', 2), 'sma200': _f('SMA200', 2),
         }
         _TV_TA_CACHE[key] = {'ts': now, 'data': out}
         return out
@@ -4424,6 +4426,7 @@ def dashboard_snapshot():
 # no Claude call) for any symbol in the dashboard's universe list, sourced from
 # TradingView candles. ---
 _DASH_ANALYSIS_TF = ['1d', '1h', '30m', '15m', '5m']
+_DASH_TF_SCANNER_SUFFIX = {'1d': '1D', '1h': '60', '30m': '30', '15m': '15', '5m': '5'}   # _tv_fetch_ta's interval format
 _DASH_INDEX_TV = {
     'NIFTY': 'NSE:NIFTY', 'BANKNIFTY': 'NSE:BANKNIFTY',
     'FINNIFTY': 'NSE:CNXFINANCE', 'SENSEX': 'BSE:SENSEX',
@@ -4437,6 +4440,59 @@ def _dash_analysis_universe():
     for s in _TG_FNO:
         u[s] = 'NSE:' + s
     return u
+
+_DASH_FUND_CACHE = {}   # {tv_symbol: {'ts': float, 'data': {...} | None}}
+_DASH_FUND_TTL = 3600   # fundamentals barely move intraday — cache an hour
+
+def _dash_fund_score(f):
+    """Deterministic 0-100 fundamental composite from real TradingView ratios —
+    NOT a Claude judgement (unlike the Stocks Bot panel's fundamentalScore,
+    which IS Claude-scored). Weighted average of whatever ratios are actually
+    available: ROE 30%, Debt/Equity (inverse) 25%, YoY revenue growth 25%,
+    dividend yield 10%, P/E (inverse, mild) 10%. A missing ratio just drops
+    out of the weighted average rather than zeroing the score. Returns None
+    when nothing is available (e.g. indices have no fundamentals)."""
+    parts = []   # (score_0_100, weight)
+    roe = f.get('return_on_equity_fq')
+    if roe is not None:
+        parts.append((max(0.0, min(100.0, roe / 25.0 * 100)), 0.30))
+    dte = f.get('debt_to_equity')
+    if dte is not None:
+        parts.append((max(0.0, min(100.0, 100 - dte * 50)), 0.25))
+    rev = f.get('total_revenue_yoy_growth_ttm')
+    if rev is not None:
+        parts.append((max(0.0, min(100.0, 50 + rev * 2.5)), 0.25))
+    dy = f.get('dividend_yield_recent')
+    if dy is not None:
+        parts.append((max(0.0, min(100.0, dy / 4.0 * 100)), 0.10))
+    pe = f.get('price_earnings_ttm')
+    if pe is not None and pe > 0:
+        parts.append((max(0.0, min(100.0, 100 - (pe - 15) * 2)), 0.10))
+    if not parts:
+        return None
+    tot_w = sum(w for _, w in parts)
+    return round(sum(s * w for s, w in parts) / tot_w)
+
+def _dash_fundamentals(tv_symbol):
+    """Real fundamental ratios (same columns the Stocks Bot panel already
+    pulls via _tg_bot_fundamentals) plus the deterministic composite score
+    above. None for symbols with no fundamental data (indices)."""
+    now = _zd_time.time()
+    cached = _DASH_FUND_CACHE.get(tv_symbol)
+    if cached and (now - cached['ts']) < _DASH_FUND_TTL:
+        return cached['data']
+    rows = _tv_scan_many([tv_symbol], cols=_TG_BOT_EXTRA_COLS)
+    f = rows[0] if rows else {}
+    data = None
+    if f.get('price_earnings_ttm') is not None or f.get('return_on_equity_fq') is not None:
+        data = {
+            'peRatio': f.get('price_earnings_ttm'), 'eps': f.get('earnings_per_share_basic_ttm'),
+            'dividendYield': f.get('dividend_yield_recent'), 'debtToEquity': f.get('debt_to_equity'),
+            'roe': f.get('return_on_equity_fq'), 'revenueGrowthYoy': f.get('total_revenue_yoy_growth_ttm'),
+            'score': _dash_fund_score(f),
+        }
+    _DASH_FUND_CACHE[tv_symbol] = {'ts': now, 'data': data}
+    return data
 
 _DASH_TF_ANALYSIS_CACHE = {}   # {(tv_symbol, interval): {'ts': float, 'data': {...}}}
 _DASH_TF_ANALYSIS_TTL = 60
@@ -4514,11 +4570,21 @@ def _dash_tf_analysis(tv_symbol, interval):
     else:
         vol_delta_pct, order_flow = 0.0, 'no volume data'
 
+    # RSI / ADX / SMA50 / SMA200 / technical rating — TradingView's public scanner,
+    # same source _tv_context already uses for the AI bots' TradingView block.
+    ta = _tv_fetch_ta(tv_symbol, _DASH_TF_SCANNER_SUFFIX.get(interval, '1D'))
+    rsi = adx = sma50 = sma200 = technical_score = None
+    if ta:
+        rsi, adx, sma50, sma200 = ta.get('rsi'), ta.get('adx'), ta.get('sma50'), ta.get('sma200')
+        if ta.get('ratingScore') is not None:
+            technical_score = round((ta['ratingScore'] + 1) / 2 * 100)
+
     data = {
         'lastPrice': round(last, 2), 'sma20': round(sma20, 2), 'trendBias': trend,
         'support': support, 'resistance': resistance,
         'superTrend': super_trend, 'emaCross': ema_cross,
         'orderFlow': order_flow, 'volDeltaPct': vol_delta_pct,
+        'rsi': rsi, 'adx': adx, 'sma50': sma50, 'sma200': sma200, 'technicalScore': technical_score,
     }
     _DASH_TF_ANALYSIS_CACHE[key] = {'ts': now, 'data': data}
     return data
@@ -4542,7 +4608,37 @@ def dashboard_analyse():
     out = {tf: _dash_tf_analysis(tv_symbol, tf) for tf in _DASH_ANALYSIS_TF}
     if not any(out.values()):
         return jsonify({'success': False, 'error': 'No TradingView data available for ' + symbol + ' right now'}), 502
-    return jsonify({'success': True, 'symbol': symbol, 'tvSymbol': tv_symbol, 'timeframes': out})
+
+    # Entry: current market price, read from the highest timeframe that has
+    # data (1D first) — just the LTP, not a Claude-suggested trade price.
+    entry = None
+    for tf in _DASH_ANALYSIS_TF:
+        if out.get(tf):
+            entry = out[tf]['lastPrice']
+            break
+
+    # Side: deterministic BUY/SHORT/NEUTRAL bias from the two higher timeframes
+    # (1D + 1H) agreeing on SuperTrend direction and EMA 5/13 state — mirrors
+    # "use the higher timeframe for bias" used elsewhere in this app, without
+    # a Claude call.
+    side = 'NEUTRAL'
+    votes = []
+    for tf in ('1d', '1h'):
+        r = out.get(tf)
+        if not r:
+            continue
+        if r.get('superTrend'):
+            votes.append(r['superTrend']['direction'])
+        if r.get('emaCross'):
+            votes.append(r['emaCross']['state'])
+    if votes and all(v == 'bullish' for v in votes):
+        side = 'BUY'
+    elif votes and all(v == 'bearish' for v in votes):
+        side = 'SHORT'
+
+    fundamentals = _dash_fundamentals(tv_symbol)
+    return jsonify({'success': True, 'symbol': symbol, 'tvSymbol': tv_symbol, 'entry': entry, 'side': side,
+                    'fundamentals': fundamentals, 'timeframes': out})
 
 def _tg_index_analysis(name, tvsym, oi_symbol=None):
     """Detailed intraday analysis for an index — multi-TF TradingView TA + option-chain
@@ -21675,6 +21771,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #mvDash .mv-bias-bull { color: #1a9d6c; font-weight: 700; }
   #mvDash .mv-bias-bear { color: #d64545; font-weight: 700; }
   #mvDash .mv-bias-flat { color: #8a8474; font-weight: 700; }
+  #mvDash .mv-sum-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; }
+  #mvDash .mv-sum-box { border-radius: 8px; padding: 8px 10px; background: #f3f1ea; }
+  #mvDash .mv-sum-box.buy { background: #e3f6ef; } #mvDash .mv-sum-box.short { background: #fdeceb; }
+  #mvDash .mv-sum-box .mv-lbl { font-size: 10px; }
+  #mvDash .mv-sum-box b { font-size: 17px; display: block; margin-top: 2px; }
+  @media (max-width: 640px) { #mvDash .mv-sum-row { grid-template-columns: 1fr; } }
   @media (max-width: 640px) {
     #mvDash .mv-row3 { grid-template-columns: 1fr; }
     #mvDash .mv-chain-row { grid-template-columns: 1fr; }
@@ -21746,7 +21848,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="mv-card" id="mvAnalysisResult" style="display:none">
         <div class="mv-chain-title" id="mvAnalysisTitle">—</div>
-        <div class="mv-chain-sub">1D · 1H · 30m · 15m · 5m — Support/Resistance, SuperTrend(10,3), EMA 5/13 cross, order flow</div>
+        <div class="mv-chain-sub">1D · 1H · 30m · 15m · 5m — Support/Resistance, SuperTrend(10,3), EMA 5/13 cross, RSI, ADX, SMA50/200, order flow</div>
+        <div class="mv-sum-row" id="mvAnalysisSummary" style="margin-top:8px"></div>
         <div class="mv-tf-table-wrap" id="mvAnalysisBody"><div class="mv-unavail">Pick a symbol and click Analyse.</div></div>
       </div>
     </div>
@@ -21897,23 +22000,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return (v === 'bullish' || v === 'up' || v === 'buyers in control') ? 'mv-bias-bull' :
              (v === 'bearish' || v === 'down' || v === 'sellers in control') ? 'mv-bias-bear' : 'mv-bias-flat';
     }
+    function sideClass(side) { return side === 'BUY' ? 'buy' : (side === 'SHORT' ? 'short' : ''); }
+    function scoreClass(score) {
+      if (score == null) return 'mv-bias-flat';
+      return score >= 60 ? 'mv-bias-bull' : (score <= 40 ? 'mv-bias-bear' : 'mv-bias-flat');
+    }
+    function renderSummary(d) {
+      var el = document.getElementById('mvAnalysisSummary');
+      var fundScore = d.fundamentals ? d.fundamentals.score : null;
+      el.innerHTML =
+        '<div class="mv-sum-box"><div class="mv-lbl">ENTRY (LTP)</div><b>' + (d.entry != null ? fmt(d.entry) : '—') + '</b></div>' +
+        '<div class="mv-sum-box ' + sideClass(d.side) + '"><div class="mv-lbl">SIDE</div><b>' + esc(d.side) + '</b></div>' +
+        '<div class="mv-sum-box"><div class="mv-lbl">FUND. SCORE</div><b class="' + scoreClass(fundScore) + '">' +
+          (fundScore != null ? fundScore : 'N/A') + '</b></div>';
+    }
     function runAnalysis(symbol, btn) {
       var resultCard = document.getElementById('mvAnalysisResult');
       var title = document.getElementById('mvAnalysisTitle');
+      var summary = document.getElementById('mvAnalysisSummary');
       var body = document.getElementById('mvAnalysisBody');
       resultCard.style.display = '';
       title.textContent = symbol;
+      summary.innerHTML = '';
       body.innerHTML = '<div class="mv-unavail">Analysing…</div>';
       resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       if (btn) btn.disabled = true;
       fetch('/api/dashboard/analyse?symbol=' + encodeURIComponent(symbol)).then(function(r) { return r.json(); }).then(function(d) {
         if (btn) btn.disabled = false;
         if (!d || !d.success) { body.innerHTML = '<div class="mv-unavail">' + esc((d && d.error) || 'Analysis failed') + '</div>'; return; }
+        renderSummary(d);
         var html = '<table class="mv-tf-table"><thead><tr><th>TF</th><th>Bias</th><th>Support</th><th>Resistance</th>' +
-                   '<th>SuperTrend</th><th>EMA 5/13</th><th>Order flow</th></tr></thead><tbody>';
+                   '<th>SuperTrend</th><th>EMA 5/13</th><th>RSI</th><th>ADX</th><th>SMA50</th><th>SMA200</th>' +
+                   '<th>Tech. score</th><th>Order flow</th></tr></thead><tbody>';
         TF_ORDER.forEach(function(tf) {
           var r = d.timeframes[tf];
-          if (!r) { html += '<tr><td><b>' + TF_LABEL[tf] + '</b></td><td colspan="6" style="color:#8a8474">no data</td></tr>'; return; }
+          if (!r) { html += '<tr><td><b>' + TF_LABEL[tf] + '</b></td><td colspan="11" style="color:#8a8474">no data</td></tr>'; return; }
           var st = r.superTrend ? (r.superTrend.direction + ' (' + fmt(r.superTrend.value) + ')') : '—';
           var ec = r.emaCross ? (r.emaCross.state + (r.emaCross.crossedBarsAgo != null ? ' · crossed ' + r.emaCross.crossedBarsAgo + ' bars ago' : '')) : '—';
           html += '<tr><td><b>' + TF_LABEL[tf] + '</b></td>' +
@@ -21922,6 +22043,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
                   '<td>' + (r.resistance != null ? fmt(r.resistance) : '—') + '</td>' +
                   '<td class="' + biasClass(r.superTrend && r.superTrend.direction) + '">' + esc(st) + '</td>' +
                   '<td class="' + biasClass(r.emaCross && r.emaCross.state) + '">' + esc(ec) + '</td>' +
+                  '<td>' + (r.rsi != null ? r.rsi : '—') + '</td>' +
+                  '<td>' + (r.adx != null ? r.adx : '—') + '</td>' +
+                  '<td>' + (r.sma50 != null ? fmt(r.sma50) : '—') + '</td>' +
+                  '<td>' + (r.sma200 != null ? fmt(r.sma200) : '—') + '</td>' +
+                  '<td class="' + scoreClass(r.technicalScore) + '">' + (r.technicalScore != null ? r.technicalScore : '—') + '</td>' +
                   '<td class="' + biasClass(r.orderFlow) + '">' + esc(r.orderFlow) + ' (' + r.volDeltaPct + '%)</td></tr>';
         });
         html += '</tbody></table>';
