@@ -4420,6 +4420,130 @@ def dashboard_snapshot():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
+# --- Stocks & Index tab: on-demand multi-timeframe technical read (deterministic,
+# no Claude call) for any symbol in the dashboard's universe list, sourced from
+# TradingView candles. ---
+_DASH_ANALYSIS_TF = ['1d', '1h', '30m', '15m', '5m']
+_DASH_INDEX_TV = {
+    'NIFTY': 'NSE:NIFTY', 'BANKNIFTY': 'NSE:BANKNIFTY',
+    'FINNIFTY': 'NSE:CNXFINANCE', 'SENSEX': 'BSE:SENSEX',
+}
+
+def _dash_analysis_universe():
+    """{display symbol: TradingView ticker} for every row the Stocks & Index
+    tab lists — the 4 major indices plus the existing liquid F&O stock list
+    (_TG_FNO), so the universe stays in sync with whatever that list already is."""
+    u = dict(_DASH_INDEX_TV)
+    for s in _TG_FNO:
+        u[s] = 'NSE:' + s
+    return u
+
+_DASH_TF_ANALYSIS_CACHE = {}   # {(tv_symbol, interval): {'ts': float, 'data': {...}}}
+_DASH_TF_ANALYSIS_TTL = 60
+
+def _dash_tf_analysis(tv_symbol, interval):
+    """One timeframe's deterministic read for the Stocks & Index tab: trend
+    bias, nearest support/resistance (swing-pivot fractals), SuperTrend(10,3)
+    direction, EMA 5/13 cross state, and a volume-delta order-flow proxy —
+    the same pieces already computed elsewhere in this file (the S/R logic
+    in _claude_trade_signal, the order-flow proxy in _bot_multi_tf_snapshot,
+    compute_supertrend) but packaged as plain numbers, no Claude call."""
+    key = (tv_symbol, interval)
+    now = _zd_time.time()
+    cached = _DASH_TF_ANALYSIS_CACHE.get(key)
+    if cached and (now - cached['ts']) < _DASH_TF_ANALYSIS_TTL:
+        return cached['data']
+    try:
+        candles = fetch_tradingview_data(interval, tv_symbol)
+    except Exception:
+        candles = None
+    if not candles or len(candles) < 30:
+        return None
+
+    win = candles[-60:]
+    closes = [c['close'] for c in win]
+    last = closes[-1]
+    n20 = min(20, len(closes))
+    sma20 = sum(closes[-n20:]) / n20
+    trend = 'up' if last > sma20 * 1.001 else ('down' if last < sma20 * 0.999 else 'flat')
+
+    # Support/resistance — 5-bar swing-pivot fractals (same method _claude_trade_signal uses)
+    sr_highs, sr_lows = [], []
+    for i in range(2, len(win) - 2):
+        h, l = win[i]['high'], win[i]['low']
+        if h >= win[i-1]['high'] and h >= win[i-2]['high'] and h >= win[i+1]['high'] and h >= win[i+2]['high']:
+            sr_highs.append(round(h, 2))
+        if l <= win[i-1]['low'] and l <= win[i-2]['low'] and l <= win[i+1]['low'] and l <= win[i+2]['low']:
+            sr_lows.append(round(l, 2))
+    resistance = min((x for x in sr_highs if x > last), default=None)
+    support    = max((x for x in sr_lows if x < last), default=None)
+
+    # SuperTrend(10,3) — reuse the existing indicator
+    st = compute_supertrend(candles, 10, 3.0)
+    super_trend = None
+    if st:
+        s = st[-1]
+        super_trend = {'direction': 'bullish' if s['direction'] == 1 else 'bearish', 'value': s['value']}
+
+    # EMA 5/13 cross: current state + how many bars ago it last flipped
+    ema5, ema13 = compute_ema(closes, 5), compute_ema(closes, 13)
+    ema_cross = None
+    if ema5[-1] and ema13[-1]:
+        cur_diff = ema5[-1] - ema13[-1]
+        state = 'bullish' if cur_diff > 0 else 'bearish'
+        valid_from = 13 - 1   # compute_ema seeds at index period-1; before that it's 0.0
+        crossed_ago = None
+        for back in range(1, len(closes) - valid_from):
+            idx = len(closes) - 1 - back
+            if not ema5[idx] or not ema13[idx]:
+                break
+            if (ema5[idx] - ema13[idx] > 0) != (cur_diff > 0):
+                crossed_ago = back
+                break
+        ema_cross = {'state': state, 'crossedBarsAgo': crossed_ago}
+
+    # Order flow — net buy-bar vs sell-bar volume, same proxy as _bot_multi_tf_snapshot
+    win20 = win[-n20:]
+    buy_vol  = sum((c.get('volume', 0) or 0) for c in win20 if c['close'] >= c['open'])
+    sell_vol = sum((c.get('volume', 0) or 0) for c in win20 if c['close'] < c['open'])
+    tot_vol  = buy_vol + sell_vol
+    if tot_vol > 0:
+        vol_delta_pct = round((buy_vol - sell_vol) / tot_vol * 100.0, 1)
+        order_flow = ('buyers in control' if vol_delta_pct > 10 else
+                      'sellers in control' if vol_delta_pct < -10 else 'balanced')
+    else:
+        vol_delta_pct, order_flow = 0.0, 'no volume data'
+
+    data = {
+        'lastPrice': round(last, 2), 'sma20': round(sma20, 2), 'trendBias': trend,
+        'support': support, 'resistance': resistance,
+        'superTrend': super_trend, 'emaCross': ema_cross,
+        'orderFlow': order_flow, 'volDeltaPct': vol_delta_pct,
+    }
+    _DASH_TF_ANALYSIS_CACHE[key] = {'ts': now, 'data': data}
+    return data
+
+@app.route('/api/dashboard/universe', methods=['GET'])
+@login_required
+def dashboard_universe():
+    """{symbol, type} rows for the Stocks & Index tab's table — the 4 major
+    indices plus the existing liquid F&O stock list."""
+    rows = [{'symbol': s, 'type': 'index'} for s in _DASH_INDEX_TV] + \
+           [{'symbol': s, 'type': 'stock'} for s in _TG_FNO]
+    return jsonify({'success': True, 'rows': rows})
+
+@app.route('/api/dashboard/analyse', methods=['GET'])
+@login_required
+def dashboard_analyse():
+    symbol = (request.args.get('symbol') or '').strip().upper()
+    tv_symbol = _dash_analysis_universe().get(symbol)
+    if not tv_symbol:
+        return jsonify({'success': False, 'error': 'Unknown symbol'}), 400
+    out = {tf: _dash_tf_analysis(tv_symbol, tf) for tf in _DASH_ANALYSIS_TF}
+    if not any(out.values()):
+        return jsonify({'success': False, 'error': 'No TradingView data available for ' + symbol + ' right now'}), 502
+    return jsonify({'success': True, 'symbol': symbol, 'tvSymbol': tv_symbol, 'timeframes': out})
+
 def _tg_index_analysis(name, tvsym, oi_symbol=None):
     """Detailed intraday analysis for an index — multi-TF TradingView TA + option-chain
     OI, written by Claude (bias, S/R, PCR read, trade plan, probability)."""
@@ -21533,6 +21657,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #mvDash .mv-disclaimer { font-size: 11px; color: #999; }
   #mvDash .mv-enter-btn { background: #1a1a2e; color: #fff; border: none; border-radius: 8px; padding: 10px 18px; font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap; }
   #mvDash .mv-enter-btn:hover { background: #2c2c4a; }
+  #mvDash .mv-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  #mvDash .mv-tab-btn { background: #fff; border: 1px solid #ddd7c8; border-radius: 20px; padding: 7px 16px; font-size: 13px; font-weight: 700; color: #8a8474; cursor: pointer; }
+  #mvDash .mv-tab-btn.active { background: #1a1a2e; color: #fff; border-color: #1a1a2e; }
+  #mvDash .mv-search { width: 100%; padding: 9px 12px; border: 1px solid #ddd7c8; border-radius: 8px; font-size: 13px; margin-bottom: 10px; box-sizing: border-box; background: #fff; }
+  #mvDash .mv-sym-list { max-height: 420px; overflow-y: auto; }
+  #mvDash .mv-sym-row { display: flex; justify-content: space-between; align-items: center; padding: 9px 2px; border-top: 1px solid #f0ede4; }
+  #mvDash .mv-sym-row:first-child { border-top: none; }
+  #mvDash .mv-sym-name { font-weight: 700; font-size: 13px; }
+  #mvDash .mv-sym-tag { font-size: 10px; color: #8a8474; margin-left: 6px; font-weight: 400; }
+  #mvDash .mv-analyse-btn { background: #1a1a2e; color: #fff; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+  #mvDash .mv-analyse-btn:disabled { opacity: 0.5; cursor: default; }
+  #mvDash .mv-tf-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+  #mvDash .mv-tf-table th { text-align: left; color: #8a8474; font-size: 10px; padding: 4px 6px; white-space: nowrap; }
+  #mvDash .mv-tf-table td { padding: 6px; border-top: 1px solid #f0ede4; white-space: nowrap; }
+  #mvDash .mv-tf-table-wrap { overflow-x: auto; }
+  #mvDash .mv-bias-bull { color: #1a9d6c; font-weight: 700; }
+  #mvDash .mv-bias-bear { color: #d64545; font-weight: 700; }
+  #mvDash .mv-bias-flat { color: #8a8474; font-weight: 700; }
   @media (max-width: 640px) {
     #mvDash .mv-row3 { grid-template-columns: 1fr; }
     #mvDash .mv-chain-row { grid-template-columns: 1fr; }
@@ -21547,6 +21689,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="mv-date" id="mvDate">—</div>
     </div>
 
+    <div class="mv-tabs">
+      <button class="mv-tab-btn active" id="mvTabBtnMarkets" type="button">Markets</button>
+      <button class="mv-tab-btn" id="mvTabBtnAnalysis" type="button">Stocks &amp; Index</button>
+    </div>
+
+    <div id="mvTabMarkets">
     <div class="mv-card">
       <div class="mv-lbl">NIFTY 50</div>
       <div class="mv-big-row">
@@ -21587,6 +21735,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <thead><tr><th>Instrument</th><th>Value</th><th>Change</th></tr></thead>
         <tbody id="mvCuesBody"><tr><td colspan="3" style="color:#8a8474;font-size:12px;padding:10px 0">Loading…</td></tr></tbody>
       </table>
+    </div>
+    </div>
+
+    <div id="mvTabAnalysis" style="display:none">
+      <input class="mv-search" id="mvSymSearch" type="text" placeholder="Search symbol…" autocomplete="off">
+      <div class="mv-card">
+        <div class="mv-lbl" style="margin-bottom:8px">INDICES &amp; F&amp;O STOCKS</div>
+        <div class="mv-sym-list" id="mvSymList"><div class="mv-unavail">Loading…</div></div>
+      </div>
+      <div class="mv-card" id="mvAnalysisResult" style="display:none">
+        <div class="mv-chain-title" id="mvAnalysisTitle">—</div>
+        <div class="mv-chain-sub">1D · 1H · 30m · 15m · 5m — Support/Resistance, SuperTrend(10,3), EMA 5/13 cross, order flow</div>
+        <div class="mv-tf-table-wrap" id="mvAnalysisBody"><div class="mv-unavail">Pick a symbol and click Analyse.</div></div>
+      </div>
     </div>
 
     <div class="mv-foot">
@@ -21684,6 +21846,92 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderCues(d.globalCues);
     }).catch(function() {});
   }
+
+  // ---- Stocks & Index tab: lists every index + F&O stock the backend knows
+  // (/api/dashboard/universe), and per-row Analyse fetches a deterministic
+  // 1D/1H/30m/15m/5m technical read (/api/dashboard/analyse) — Support/
+  // Resistance, SuperTrend(10,3), EMA 5/13 cross, order flow, trend bias. ----
+  (function() {
+    var tabBtns = { markets: document.getElementById('mvTabBtnMarkets'), analysis: document.getElementById('mvTabBtnAnalysis') };
+    var tabPanels = { markets: document.getElementById('mvTabMarkets'), analysis: document.getElementById('mvTabAnalysis') };
+    if (!tabBtns.analysis || !tabPanels.analysis) return;
+    function showTab(name) {
+      Object.keys(tabPanels).forEach(function(k) {
+        tabPanels[k].style.display = (k === name) ? '' : 'none';
+        tabBtns[k].classList.toggle('active', k === name);
+      });
+    }
+    tabBtns.markets.addEventListener('click', function() { showTab('markets'); });
+    tabBtns.analysis.addEventListener('click', function() { showTab('analysis'); if (!univLoaded) loadUniverse(); });
+
+    var univLoaded = false, univRows = [];
+    function loadUniverse() {
+      var listEl = document.getElementById('mvSymList');
+      fetch('/api/dashboard/universe').then(function(r) { return r.json(); }).then(function(d) {
+        if (!d || !d.success) { listEl.innerHTML = '<div class="mv-unavail">Could not load the symbol list.</div>'; return; }
+        univRows = d.rows || []; univLoaded = true;
+        renderSymList(univRows);
+      }).catch(function() { listEl.innerHTML = '<div class="mv-unavail">Network error.</div>'; });
+    }
+    function renderSymList(rows) {
+      var el = document.getElementById('mvSymList');
+      if (!rows.length) { el.innerHTML = '<div class="mv-unavail">No match.</div>'; return; }
+      el.innerHTML = rows.map(function(r) {
+        return '<div class="mv-sym-row"><div><span class="mv-sym-name">' + esc(r.symbol) + '</span>' +
+               '<span class="mv-sym-tag">' + (r.type === 'index' ? 'INDEX' : 'F&amp;O') + '</span></div>' +
+               '<button class="mv-analyse-btn" data-sym="' + esc(r.symbol) + '" type="button">Analyse</button></div>';
+      }).join('');
+      Array.prototype.forEach.call(el.querySelectorAll('.mv-analyse-btn'), function(btn) {
+        btn.addEventListener('click', function() { runAnalysis(btn.dataset.sym, btn); });
+      });
+    }
+    var searchEl = document.getElementById('mvSymSearch');
+    if (searchEl) searchEl.addEventListener('input', function() {
+      var q = this.value.trim().toUpperCase();
+      renderSymList(q ? univRows.filter(function(r) { return r.symbol.indexOf(q) !== -1; }) : univRows);
+    });
+
+    var TF_ORDER = ['1d', '1h', '30m', '15m', '5m'];
+    var TF_LABEL = { '1d': '1D', '1h': '1H', '30m': '30m', '15m': '15m', '5m': '5m' };
+    function biasClass(v) {
+      return (v === 'bullish' || v === 'up' || v === 'buyers in control') ? 'mv-bias-bull' :
+             (v === 'bearish' || v === 'down' || v === 'sellers in control') ? 'mv-bias-bear' : 'mv-bias-flat';
+    }
+    function runAnalysis(symbol, btn) {
+      var resultCard = document.getElementById('mvAnalysisResult');
+      var title = document.getElementById('mvAnalysisTitle');
+      var body = document.getElementById('mvAnalysisBody');
+      resultCard.style.display = '';
+      title.textContent = symbol;
+      body.innerHTML = '<div class="mv-unavail">Analysing…</div>';
+      resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (btn) btn.disabled = true;
+      fetch('/api/dashboard/analyse?symbol=' + encodeURIComponent(symbol)).then(function(r) { return r.json(); }).then(function(d) {
+        if (btn) btn.disabled = false;
+        if (!d || !d.success) { body.innerHTML = '<div class="mv-unavail">' + esc((d && d.error) || 'Analysis failed') + '</div>'; return; }
+        var html = '<table class="mv-tf-table"><thead><tr><th>TF</th><th>Bias</th><th>Support</th><th>Resistance</th>' +
+                   '<th>SuperTrend</th><th>EMA 5/13</th><th>Order flow</th></tr></thead><tbody>';
+        TF_ORDER.forEach(function(tf) {
+          var r = d.timeframes[tf];
+          if (!r) { html += '<tr><td><b>' + TF_LABEL[tf] + '</b></td><td colspan="6" style="color:#8a8474">no data</td></tr>'; return; }
+          var st = r.superTrend ? (r.superTrend.direction + ' (' + fmt(r.superTrend.value) + ')') : '—';
+          var ec = r.emaCross ? (r.emaCross.state + (r.emaCross.crossedBarsAgo != null ? ' · crossed ' + r.emaCross.crossedBarsAgo + ' bars ago' : '')) : '—';
+          html += '<tr><td><b>' + TF_LABEL[tf] + '</b></td>' +
+                  '<td class="' + biasClass(r.trendBias) + '">' + esc(r.trendBias) + '</td>' +
+                  '<td>' + (r.support != null ? fmt(r.support) : '—') + '</td>' +
+                  '<td>' + (r.resistance != null ? fmt(r.resistance) : '—') + '</td>' +
+                  '<td class="' + biasClass(r.superTrend && r.superTrend.direction) + '">' + esc(st) + '</td>' +
+                  '<td class="' + biasClass(r.emaCross && r.emaCross.state) + '">' + esc(ec) + '</td>' +
+                  '<td class="' + biasClass(r.orderFlow) + '">' + esc(r.orderFlow) + ' (' + r.volDeltaPct + '%)</td></tr>';
+        });
+        html += '</tbody></table>';
+        body.innerHTML = html;
+      }).catch(function() {
+        if (btn) btn.disabled = false;
+        body.innerHTML = '<div class="mv-unavail">Network error.</div>';
+      });
+    }
+  })();
 
   var enterBtn = document.getElementById('mvEnterBtn');
   if (enterBtn) enterBtn.addEventListener('click', function() {
