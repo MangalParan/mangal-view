@@ -2465,6 +2465,18 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
     if tp_pct is not None: out['tpPct'] = tp_pct
     return out
 
+def _bot_log_decision(persist_tag, symbol, strat):
+    """Persists every live Claude decision tick (HOLD included, not just
+    entries/exits) to log.txt — previously only ENTRY/EXIT/START/STOP/CONFIG/
+    ANALYSE were persisted, so a run of HOLDs (the normal, expected behaviour
+    of a selective strategy) was invisible outside the bot panel's own
+    in-browser log, making 'why no trade' undiagnosable from log.txt alone.
+    Call right after every real _claude_trade_signal(...) call (not the
+    '(holding between decisions)' placeholder tick, which isn't a real
+    Claude call and would just be noise)."""
+    _persist_log_line('{} [DECISION] {} signal={} score={} — {}'.format(
+        persist_tag, symbol, strat.get('signal'), strat.get('score'), str(strat.get('reason', ''))[:200]))
+
 # Curated liquid universes for Auto-Symbol mode (Claude picks from these).
 _BOT_UNIVERSE = {
     'delta': ['BTCUSD', 'ETHUSD', 'SOLUSD', 'BNBUSD', 'XRPUSD', 'AVAXUSD'],
@@ -2775,6 +2787,7 @@ def _delta_bot_tick():
         if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, delta_ai_state.get('position'), delta_ai_state.get('trades'),
                                      extra_ctx=(_ectx or None), images=_imgs)
+        _bot_log_decision('[DELTA]', symbol, strat)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -5975,6 +5988,7 @@ def _zd_bot_tick():
         if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, zd_ai_state.get('position'), zd_ai_state.get('trades'),
                                      extra_ctx=(_ectx or None), images=_imgs)
+        _bot_log_decision('[ZERODHA]', symbol, strat)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -6928,6 +6942,7 @@ def _zo_bot_tick():
         elif _zo_decide:
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), zo_ai_state.get('trades'), extra_ctx=leg_ctx,
                                          images=_zo_imgs)
+            _bot_log_decision('[ZOPTIONS]', symbol, strat)
         elif is_claude:
             strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
         else:
@@ -9678,6 +9693,7 @@ def _mt_bot_tick():
         if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, mt_ai_state.get('position'), mt_ai_state.get('trades'),
                                      extra_ctx=(_ectx or None), images=_imgs)
+        _bot_log_decision('[MT5]', symbol, strat)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
@@ -11035,6 +11051,7 @@ def _do_bot_tick():
             if _mtf_ctx: leg_ctx['multiTF'] = _mtf_ctx
             strat = _claude_trade_signal(symbol, candles, interval, cfg, leg.get('position'), do_ai_state.get('trades'),
                                          extra_ctx=leg_ctx, images=_do_imgs)
+            _bot_log_decision('[DOPT]', symbol, strat)
         else:
             strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
         sig = strat['signal']
@@ -11385,6 +11402,7 @@ def _tvb_bot_tick():
         if _mtf: _ectx['multiTF'] = _mtf
         strat = _claude_trade_signal(symbol, candles, interval, cfg, tvb_ai_state.get('position'),
                                      tvb_ai_state.get('trades'), extra_ctx=(_ectx or None), images=_imgs)
+        _bot_log_decision('[TVBOT]', symbol, strat)
     elif _bot_is_claude(cfg):
         strat = {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': '(holding between decisions)'}
     else:
