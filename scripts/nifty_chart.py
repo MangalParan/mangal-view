@@ -1957,6 +1957,14 @@ def _bot_fetch_candles(symbol, interval, source, api_key=None):
 # manual 1D/1H/30m/15m/5m upload set, just numeric instead of a screenshot.
 _BOT_MULTI_TF = ['1d', '1h', '30m', '15m', '5m']
 _BOT_MULTI_TF_CACHE = {}   # {(source, symbol): {'ts': float, 'data': {...}}}
+# Kite's raw index historical candles always report 0 volume (confirmed
+# across every NIFTY pre-flight check — the index itself isn't a traded
+# instrument), which silently killed the order-flow read on every timeframe.
+# For these bare index names, fetch the current-month NFO futures contract
+# instead (tracks the index tightly intraday, _kite_nearest_future_symbol
+# above) — real price action AND real volume, versus the index's price-only,
+# always-zero-volume feed.
+_KITE_VOL_PROXY_INDEXES = {'NIFTY', 'NIFTY50', 'BANKNIFTY', 'NIFTYBANK', 'FINNIFTY', 'MIDCPNIFTY'}
 
 def _bot_multi_tf_snapshot(source, symbol, api_key=None, max_age_sec=90):
     """Auto-fetched 1D/1H/30m/15m/5m read for `symbol` — lastPrice/sma20/
@@ -1969,10 +1977,15 @@ def _bot_multi_tf_snapshot(source, symbol, api_key=None, max_age_sec=90):
     cached = _BOT_MULTI_TF_CACHE.get(key)
     if cached and (now - cached['ts']) < max_age_sec:
         return cached['data']
+    fetch_symbol = symbol
+    if source == 'kite' and (symbol or '').upper().strip() in _KITE_VOL_PROXY_INDEXES:
+        fut = _kite_nearest_future_symbol(symbol)
+        if fut:
+            fetch_symbol = fut
     out = {}
     for tf in _BOT_MULTI_TF:
         try:
-            candles = _bot_fetch_candles(symbol, tf, source, api_key=api_key)
+            candles = _bot_fetch_candles(fetch_symbol, tf, source, api_key=api_key)
         except Exception:
             candles = None
         if not candles or len(candles) < 10:
@@ -2438,7 +2451,17 @@ def _claude_trade_signal(symbol, candles, tf, cfg, position=None, recent_trades=
     if extra_ctx:
         _payload.update(extra_ctx)
     user = _json.dumps(_payload, default=str)
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'), images=images)
+    # 1500, not 400: current Claude models run adaptive thinking even with no
+    # 'thinking' field sent (confirmed live — the options-leg prompt alone
+    # triggered 82-94 thinking tokens across 8/8 trials), and those tokens come
+    # out of this same budget. At 400 that intermittently left no room for the
+    # actual JSON, producing valid-but-empty {"signal":"HOLD","score":0}
+    # responses — roughly half of all live decision ticks on some days.
+    # Deliberately NOT setting effort='low' here (unlike the pre-flight call)
+    # — this is the live trade decision itself, so full reasoning depth is
+    # worth the headroom; the model still stops early (end_turn) when it
+    # doesn't need the extra room, so this costs nothing on a normal tick.
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=1500, model=cfg.get('model'), images=images)
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:220]}
     sig, score, reason, sl_pct, tp_pct, fcast = 'HOLD', 0.0, '', None, None, None
@@ -2590,7 +2613,8 @@ def _claude_auto_pick(source, interval, cfg, api_key, recent_trades):
         "\"BUY\"|\"SELL\"|\"HOLD\",\"score\":<-10..10>,\"reason\":\"<=160 chars\",\"slPct\":<optional>,\"tpPct\":"
         "<optional>,\"leverage\":<1-20>}.")
     user = _json.dumps({'candidates': cands, 'recentTrades': trades_ctx, 'capitalUSD': cap}, default=str)
-    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=400, model=cfg.get('model'))
+    # See _claude_trade_signal's call for why this isn't 400 anymore.
+    text, err = _call_claude(system, [{'role': 'user', 'content': user}], max_tokens=1500, model=cfg.get('model'))
     if err:
         return {'name': 'claude', 'signal': 'HOLD', 'score': 0.0, 'reason': 'Claude unavailable: ' + err[:160], 'symbol': cands[0]['symbol']}
     try:
@@ -12483,6 +12507,36 @@ def _load_kite_all_instruments():
         return rows
     except Exception:
         return _ZD_KITE_CACHE.get('data', [])
+
+# Kite's raw index historical data always reports 0 volume (an index isn't a
+# traded instrument — its futures contract is, and tracks it tightly
+# intraday). Used as a volume PROXY for index multiTF snapshots — see
+# _bot_multi_tf_snapshot's _KITE_VOL_PROXY_INDEXES substitution below.
+_KITE_FUT_CACHE = {}   # {'NIFTY': {'ts': float, 'symbol': 'NIFTY26OCTFUT' | None}}
+_KITE_FUT_TTL = 6 * 3600   # the near-month contract only rolls monthly
+
+def _kite_nearest_future_symbol(index_name):
+    """Current/near-month NFO futures tradingsymbol for a Kite index name
+    (e.g. 'NIFTY' -> 'NIFTY26OCTFUT'), or None if not found."""
+    key = (index_name or '').upper().strip()
+    if not key:
+        return None
+    now = _zd_time.time()
+    cached = _KITE_FUT_CACHE.get(key)
+    if cached and (now - cached['ts']) < _KITE_FUT_TTL:
+        return cached['symbol']
+    sym = None
+    try:
+        rows = _load_kite_all_instruments()
+        futs = [r for r in rows if r['name'].upper() == key and r['type'] == 'FUT'
+                and r['exchange'] == 'NFO' and r['expiry']]
+        futs.sort(key=lambda r: r['expiry'])
+        if futs:
+            sym = futs[0]['symbol']
+    except Exception:
+        sym = None
+    _KITE_FUT_CACHE[key] = {'ts': now, 'symbol': sym}
+    return sym
 
 # Per-symbol token/exchange resolver — used by the bots & order paths so they
 # DON'T pull the full ~90k-row Kite dump into memory (~100MB) just to find one
