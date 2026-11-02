@@ -4754,6 +4754,151 @@ def dashboard_screen():
     _DASH_SCREEN_CACHE[kind] = {'ts': now, 'data': rows}
     return jsonify({'success': True, 'kind': kind, 'label': _DASH_SCREEN_KINDS[kind]['label'], 'rows': rows})
 
+# --- Positional F&O Selling category: ranks the F&O stock universe by how
+# "rich" their option premium is (IV vs the stock's own realized volatility)
+# with an ATM liquidity floor, for premium-selling candidates. Needs a live
+# Kite session (real option premiums -> real IV via Black-Scholes inversion,
+# reusing _strat_kite_chain/_bs_iv_from_price — the same machinery the
+# Strategy Menu bot already uses) - returns 'no Kite session' without one,
+# same graceful-degradation pattern as the dashboard's NIFTY/SENSEX OI cards.
+#
+# IV Rank / IV Percentile (the traditionally-named option-selling metrics)
+# need a YEAR of this stock's own historical IV, which no free source has
+# for NSE stocks - confirmed, not just assumed, before building this. IV/HV
+# ratio is the stand-in: both IV and HV are real, computed numbers; the
+# ratio is a standard, legitimate "is this premium rich" read, just not the
+# same thing as a true percentile-of-own-history rank. Labelled as IV/HV in
+# the UI, not "IV Rank", to keep that distinction honest. ---
+_DASH_HV_LOOKBACK = 20   # trading days — a standard short-term realized-vol window
+
+def _dash_hv(symbol, lookback_days=_DASH_HV_LOOKBACK):
+    """Annualized historical (realized) volatility, %, from daily closes —
+    stdev of daily log returns over the lookback, scaled by sqrt(252)."""
+    try:
+        candles = fetch_tradingview_data('1d', 'NSE:' + symbol)
+    except Exception:
+        candles = None
+    if not candles or len(candles) < lookback_days + 1:
+        return None
+    closes = [c['close'] for c in candles[-(lookback_days + 1):]]
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))
+            if closes[i - 1] > 0 and closes[i] > 0]
+    if len(rets) < lookback_days * 0.8:
+        return None
+    n = len(rets)
+    mean = sum(rets) / n
+    var = sum((r - mean) ** 2 for r in rets) / max(1, n - 1)
+    return round((var ** 0.5) * (252 ** 0.5) * 100.0, 2)
+
+def _dash_iv_hv_richness(iv_hv_ratio):
+    """0-100 'premium richness' score from the IV/HV ratio — a documented
+    linear stand-in (ratio 0.7 -> 0, ratio 1.8 -> 100), NOT a true percentile
+    of this stock's own historical IV (see the module comment above)."""
+    return round(max(0.0, min(100.0, (iv_hv_ratio - 0.7) / (1.8 - 0.7) * 100.0)))
+
+def _dash_sell_reason(r):
+    """Deterministic one-line explanation (no Claude call, consistent with
+    every other dashboard tab) from the real numbers already on the row."""
+    rich = ('very rich' if r['ivHvRatio'] >= 1.5 else 'rich' if r['ivHvRatio'] >= 1.2 else
+            'fair' if r['ivHvRatio'] >= 0.9 else 'cheap')
+    liq = 'liquid' if r['atmOI'] >= 5000 else 'thin'
+    bias_note = ('trend-neutral, fits a strangle' if r.get('bias') == 'flat' else
+                 'uptrend — favours selling puts' if r.get('bias') == 'up' else
+                 'downtrend — favours selling calls' if r.get('bias') == 'down' else '')
+    return ('IV {iv}% vs {lb}-day HV {hv}% ({ratio}x, {rich} premium). ATM OI {oi:,} ({liq}).{bias}'.format(
+        iv=r['iv'], lb=_DASH_HV_LOOKBACK, hv=r['hv'], ratio=r['ivHvRatio'], rich=rich,
+        oi=r['atmOI'], liq=liq, bias=(' ' + bias_note if bias_note else '')))
+
+def _dash_option_sell_one(symbol, api_key):
+    """IV (ATM, from live Kite option premiums), HV, IV/HV ratio, ATM OI for
+    one stock. None if the chain/spot/HV can't be read right now."""
+    try:
+        spot, _expiries, rows, _err = _strat_kite_chain(symbol, api_key)
+    except Exception:
+        rows, spot = [], 0.0
+    if not rows or spot <= 0:
+        return None
+    atm = min(rows, key=lambda r: abs(r['strike'] - spot))
+    iv_vals = [v for v in (atm.get('CE_IV') or 0, atm.get('PE_IV') or 0) if v > 0]
+    if not iv_vals:
+        return None
+    iv_pct = round(sum(iv_vals) / len(iv_vals), 2)
+    hv_pct = _dash_hv(symbol)
+    if not hv_pct:
+        return None
+    atm_oi = int((atm.get('CE_OI') or 0) + (atm.get('PE_OI') or 0))
+    ratio = round(iv_pct / hv_pct, 2) if hv_pct > 0 else None
+    if ratio is None:
+        return None
+    return {'symbol': symbol, 'iv': iv_pct, 'hv': hv_pct, 'ivHvRatio': ratio,
+            'richnessScore': _dash_iv_hv_richness(ratio), 'atmOI': atm_oi, 'atmStrike': atm['strike']}
+
+_DASH_SELL_CACHE = {'ts': 0, 'data': None}
+_DASH_SELL_TTL = 300   # live option premiums move fast; 5 min cache
+_DASH_SELL_MIN_OI = 1000   # combined ATM CE+PE OI floor — drops illiquid names a short can't safely exit
+
+def _dash_option_sell_candidates(api_key):
+    """Top 10 F&O stocks for premium selling: richest IV-vs-HV with enough
+    ATM liquidity to exit safely, each enriched with the same 1D technical/
+    fundamental read (_dash_screen_row) the other Stocks Investing
+    categories already show. None without a live Kite session."""
+    if not api_key:
+        return None
+    now = _zd_time.time()
+    if _DASH_SELL_CACHE['data'] and (now - _DASH_SELL_CACHE['ts']) < _DASH_SELL_TTL:
+        return _DASH_SELL_CACHE['data']
+    import concurrent.futures as _cf
+    metrics = []
+    # Phase 1: cheap IV/HV/OI pass across the whole F&O universe (Kite REST +
+    # one TradingView daily-candle call each) to find the richest candidates
+    # before paying for the heavier full technical read on just the top 10.
+    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_dash_option_sell_one, s, api_key): s for s in _TG_FNO}
+        for fut in _cf.as_completed(futs):
+            try:
+                r = fut.result()
+            except Exception:
+                r = None
+            if r:
+                metrics.append(r)
+    liquid = [r for r in metrics if r['atmOI'] >= _DASH_SELL_MIN_OI]
+    pool = liquid or metrics   # fall back to the full pool if nothing clears the liquidity floor
+    pool.sort(key=lambda r: r['ivHvRatio'], reverse=True)
+    top = pool[:10]
+    # Phase 2: the existing per-symbol technical/fundamental read, only for the 10 survivors.
+    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+        tech_futs = {ex.submit(_dash_screen_row, r['symbol']): r['symbol'] for r in top}
+        tech_by_sym = {}
+        for fut in _cf.as_completed(tech_futs):
+            sym = tech_futs[fut]
+            try:
+                tech_by_sym[sym] = fut.result()
+            except Exception:
+                tech_by_sym[sym] = None
+    rows = []
+    for r in top:
+        tech = tech_by_sym.get(r['symbol'])
+        if tech:
+            r.update({k: v for k, v in tech.items() if k != 'symbol'})
+        r['reason'] = _dash_sell_reason(r)
+        rows.append(r)
+    _DASH_SELL_CACHE['ts'] = now
+    _DASH_SELL_CACHE['data'] = rows
+    return rows
+
+@app.route('/api/dashboard/optionsell', methods=['GET'])
+@login_required
+def dashboard_optionsell():
+    api_key = _dash_active_kite_session()
+    if not api_key:
+        return jsonify({'success': False, 'error': 'Connect Zerodha (Automation menu) — option selling needs live '
+                        'option premiums to compute real IV, which only your own Kite session can provide.'}), 400
+    rows = _dash_option_sell_candidates(api_key)
+    if not rows:
+        return jsonify({'success': False, 'error': 'No option-selling candidates available right now '
+                        '(check market hours / Kite connection)'}), 502
+    return jsonify({'success': True, 'label': 'Positional F&O Selling', 'rows': rows})
+
 # --- ETF tab: a curated, live-verified universe of NSE-listed ETFs (there's
 # no "scan all ETFs" source in this app, unlike stocks), grouped into
 # segments, ranked within each segment by the same deterministic 1D read
@@ -7599,16 +7744,19 @@ def _strat_kite_chain(base, api_key, expiry=None):
         if i['strike'] not in strikes:
             continue
         key = i['exchange'] + ':' + i['symbol']
-        ltp = float((quotes.get(key) or {}).get('last_price') or 0)
+        q = quotes.get(key) or {}
+        ltp = float(q.get('last_price') or 0)
         if ltp <= 0:
             continue
         iv = _bs_iv_from_price(ltp, spot, i['strike'], dte, i['type'])
         if iv is None:
             continue
         row = rows_by_strike.setdefault(i['strike'], {'strike': i['strike'], 'expiry': target,
-                                                        'CE_IV': 0, 'CE_LTP': 0, 'PE_IV': 0, 'PE_LTP': 0})
+                                                        'CE_IV': 0, 'CE_LTP': 0, 'PE_IV': 0, 'PE_LTP': 0,
+                                                        'CE_OI': 0, 'PE_OI': 0})
         row[i['type'] + '_IV'] = round(iv * 100.0, 2)
         row[i['type'] + '_LTP'] = ltp
+        row[i['type'] + '_OI'] = int(q.get('oi') or 0)
     rows = sorted(rows_by_strike.values(), key=lambda r: r['strike'])
     return spot, expiries, rows, ('' if rows else 'could not price ' + base + ' strikes via Kite (check connection/market hours)')
 
@@ -22480,6 +22628,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       { kind: 'momentum',   label: 'Momentum Investing' },
       { kind: 'positional', label: 'Positional F&O Stocks' },
       { kind: 'fno',        label: 'Intraday F&O Stocks' },
+      { kind: 'optionsell', label: 'Positional F&O Selling' },
     ];
     var catsEl = document.getElementById('mvScreenCats');
     if (catsEl) {
@@ -22488,7 +22637,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                '<button class="mv-analyse-btn" data-kind="' + c.kind + '" type="button">Analyse</button></div>';
       }).join('');
       Array.prototype.forEach.call(catsEl.querySelectorAll('.mv-analyse-btn'), function(btn) {
-        btn.addEventListener('click', function() { runScreen(btn.dataset.kind, btn); });
+        btn.addEventListener('click', function() {
+          if (btn.dataset.kind === 'optionsell') { runOptionSell(btn); } else { runScreen(btn.dataset.kind, btn); }
+        });
       });
     }
     function runScreen(kind, btn) {
@@ -22522,6 +22673,54 @@ HTML_PAGE = r"""<!DOCTYPE html>
                   '<td>' + (r.adx != null ? r.adx : '—') + '</td>' +
                   '<td>' + (r.sma50 != null ? fmt(r.sma50) : '—') + '</td>' +
                   '<td>' + (r.sma200 != null ? fmt(r.sma200) : '—') + '</td></tr>';
+        });
+        html += '</tbody></table>';
+        body.innerHTML = html;
+      }).catch(function() {
+        if (btn) btn.disabled = false;
+        body.innerHTML = '<div class="mv-unavail">Network error.</div>';
+      });
+    }
+
+    // ---- Positional F&O Selling: ranks the F&O universe by IV vs the
+    // stock's own historical volatility (IV/HV), not a true "IV Rank" —
+    // that needs a year of this stock's own IV history, which no free
+    // source has for NSE stocks, so this is labelled IV/HV throughout.
+    // Needs a live Kite session for real option premiums. ----
+    function runOptionSell(btn) {
+      var resultCard = document.getElementById('mvScreenResult');
+      var title = document.getElementById('mvScreenTitle');
+      var body = document.getElementById('mvScreenBody');
+      resultCard.style.display = '';
+      body.innerHTML = '<div class="mv-unavail">Screening F&O universe for rich premium (IV vs HV)… can take up to ~20s</div>';
+      resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (btn) btn.disabled = true;
+      fetch('/api/dashboard/optionsell').then(function(r) { return r.json(); }).then(function(d) {
+        if (btn) btn.disabled = false;
+        if (!d || !d.success) { body.innerHTML = '<div class="mv-unavail">' + esc((d && d.error) || 'Screen failed') + '</div>'; return; }
+        title.textContent = d.label + ' — Top ' + d.rows.length;
+        var html = '<div class="mv-unavail" style="margin-bottom:8px">IV/HV is a premium-richness read (own IV vs own ' +
+                   '20-day realized volatility), not a true IV Rank/Percentile — NSE stocks have no free source for a ' +
+                   'year of historical IV. Higher IV/HV = richer premium to sell.</div>' +
+                   '<table class="mv-tf-table"><thead><tr><th>Symbol</th><th>Bias</th><th>Fund.</th><th>Tech.</th>' +
+                   '<th>IV</th><th>HV</th><th>IV/HV</th><th>ATM OI</th><th>SuperTrend</th><th>EMA 5/13</th>' +
+                   '<th>RSI</th><th>ADX</th><th>Reason</th></tr></thead><tbody>';
+        d.rows.forEach(function(r) {
+          var st = r.superTrend ? (r.superTrend.direction + ' (' + fmt(r.superTrend.value) + ')') : '—';
+          var ec = r.emaCross ? r.emaCross.state : '—';
+          html += '<tr><td><b>' + esc(r.symbol) + '</b></td>' +
+                  '<td class="' + biasClass(r.bias) + '">' + esc(r.bias || '—') + '</td>' +
+                  '<td class="' + scoreClass(r.fundamentalScore) + '">' + (r.fundamentalScore != null ? r.fundamentalScore : 'N/A') + '</td>' +
+                  '<td class="' + scoreClass(r.technicalScore) + '">' + (r.technicalScore != null ? r.technicalScore : '—') + '</td>' +
+                  '<td>' + (r.iv != null ? r.iv + '%' : '—') + '</td>' +
+                  '<td>' + (r.hv != null ? r.hv + '%' : '—') + '</td>' +
+                  '<td><b>' + (r.ivHvRatio != null ? r.ivHvRatio + 'x' : '—') + '</b></td>' +
+                  '<td>' + (r.atmOI != null ? r.atmOI.toLocaleString('en-IN') : '—') + '</td>' +
+                  '<td class="' + biasClass(r.superTrend && r.superTrend.direction) + '">' + esc(st) + '</td>' +
+                  '<td class="' + biasClass(r.emaCross && r.emaCross.state) + '">' + esc(ec) + '</td>' +
+                  '<td>' + (r.rsi != null ? r.rsi : '—') + '</td>' +
+                  '<td>' + (r.adx != null ? r.adx : '—') + '</td>' +
+                  '<td style="max-width:260px;font-size:12px">' + esc(r.reason || '—') + '</td></tr>';
         });
         html += '</tbody></table>';
         body.innerHTML = html;
