@@ -4771,11 +4771,14 @@ def dashboard_screen():
 # the UI, not "IV Rank", to keep that distinction honest. ---
 _DASH_HV_LOOKBACK = 20   # trading days — a standard short-term realized-vol window
 
-def _dash_hv(symbol, lookback_days=_DASH_HV_LOOKBACK):
+def _dash_hv(symbol, api_key, lookback_days=_DASH_HV_LOOKBACK):
     """Annualized historical (realized) volatility, %, from daily closes —
-    stdev of daily log returns over the lookback, scaled by sqrt(252)."""
+    stdev of daily log returns over the lookback, scaled by sqrt(252).
+    Reads from Kite (fast plain REST, same session the IV fetch already
+    needs) rather than opening a fresh TradingView websocket per stock —
+    43 of those one at a time was slow enough to time out the request."""
     try:
-        candles = fetch_tradingview_data('1d', 'NSE:' + symbol)
+        candles = _bot_fetch_candles(symbol, '1d', 'kite', api_key=api_key)
     except Exception:
         candles = None
     if not candles or len(candles) < lookback_days + 1:
@@ -4823,7 +4826,7 @@ def _dash_option_sell_one(symbol, api_key):
     if not iv_vals:
         return None
     iv_pct = round(sum(iv_vals) / len(iv_vals), 2)
-    hv_pct = _dash_hv(symbol)
+    hv_pct = _dash_hv(symbol, api_key)
     if not hv_pct:
         return None
     atm_oi = int((atm.get('CE_OI') or 0) + (atm.get('PE_OI') or 0))
@@ -4849,10 +4852,12 @@ def _dash_option_sell_candidates(api_key):
         return _DASH_SELL_CACHE['data']
     import concurrent.futures as _cf
     metrics = []
-    # Phase 1: cheap IV/HV/OI pass across the whole F&O universe (Kite REST +
-    # one TradingView daily-candle call each) to find the richest candidates
-    # before paying for the heavier full technical read on just the top 10.
-    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+    # Phase 1: cheap IV/HV/OI pass across the whole F&O universe — all plain
+    # Kite REST calls now (chain+quote for IV, Kite daily candles for HV, no
+    # TradingView websocket), so a higher fan-out than the TradingView-bound
+    # phase 2 below is safe — finds the richest candidates before paying for
+    # the heavier full technical read on just the top 10.
+    with _cf.ThreadPoolExecutor(max_workers=6) as ex:
         futs = {ex.submit(_dash_option_sell_one, s, api_key): s for s in _TG_FNO}
         for fut in _cf.as_completed(futs):
             try:
